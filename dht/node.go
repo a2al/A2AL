@@ -40,6 +40,8 @@ type Node struct {
 
 	recvOnce sync.Once
 	wg       sync.WaitGroup
+
+	tabMu sync.RWMutex // routing.Table (Add / NearestN)
 }
 
 type waitEntry struct {
@@ -168,7 +170,41 @@ func (n *Node) remember(from net.Addr, dec *protocol.DecodedMessage) {
 	id := a2al.NodeIDFromAddress(dec.SenderAddr)
 	n.peers[nodeIDKey(id)] = from
 	n.peerMu.Unlock()
-	n.table.Add(nodeInfoFromMessage(dec, from))
+	n.tabAdd(nodeInfoFromMessage(dec, from))
+}
+
+func (n *Node) tabAdd(ni protocol.NodeInfo) {
+	n.tabMu.Lock()
+	defer n.tabMu.Unlock()
+	n.table.Add(ni)
+}
+
+func (n *Node) tabNearest(target a2al.NodeID, k int) []protocol.NodeInfo {
+	n.tabMu.RLock()
+	defer n.tabMu.RUnlock()
+	return n.table.NearestN(target, k)
+}
+
+// absorbNodeInfo merges a contact into the routing table and, when IP:port looks usable, sets UDP dial address.
+func (n *Node) absorbNodeInfo(ni protocol.NodeInfo) {
+	n.tabAdd(ni)
+	if ni.Port == 0 || (len(ni.IP) != 4 && len(ni.IP) != 16) {
+		return
+	}
+	var id a2al.NodeID
+	if len(ni.NodeID) != len(id) {
+		return
+	}
+	copy(id[:], ni.NodeID)
+	udp := &net.UDPAddr{IP: append([]byte(nil), ni.IP...), Port: int(ni.Port)}
+	n.BindPeerAddr(id, udp)
+}
+
+// BindPeerAddr registers the transport dial address for a remote NodeID (e.g. MemTransport name lookup in tests).
+func (n *Node) BindPeerAddr(id a2al.NodeID, addr net.Addr) {
+	n.peerMu.Lock()
+	defer n.peerMu.Unlock()
+	n.peers[nodeIDKey(id)] = addr
 }
 
 func (n *Node) reply(from net.Addr, req *protocol.DecodedMessage, msgType uint8, body any) {
@@ -199,7 +235,7 @@ func (n *Node) onFindNode(from net.Addr, dec *protocol.DecodedMessage) {
 	var tid a2al.NodeID
 	copy(tid[:], target)
 	resp := &protocol.BodyFindNodeResp{
-		Nodes:        n.table.NearestN(tid, routing.K),
+		Nodes:        n.tabNearest(tid, routing.K),
 		ObservedAddr: ObservedAddr(from),
 	}
 	n.reply(from, dec, protocol.MsgFindNodeResp, resp)
@@ -212,7 +248,7 @@ func (n *Node) onFindValue(from net.Addr, dec *protocol.DecodedMessage) {
 	copy(tid[:], target)
 	rec := n.store.Get(tid, time.Now())
 	resp := &protocol.BodyFindValueResp{
-		Nodes:        n.table.NearestN(tid, routing.K),
+		Nodes:        n.tabNearest(tid, routing.K),
 		ObservedAddr: ObservedAddr(from),
 	}
 	if rec != nil {
@@ -287,20 +323,38 @@ func (n *Node) StoreAt(ctx context.Context, peer net.Addr, rec protocol.SignedRe
 	return dec.Body.(*protocol.BodyStoreResp).Stored, nil
 }
 
-// FindValue queries peer for a record at key NodeID.
-func (n *Node) FindValue(ctx context.Context, peer net.Addr, key a2al.NodeID) (*protocol.SignedRecord, error) {
+// FindNode asks peer for closest nodes to target NodeID.
+func (n *Node) FindNode(ctx context.Context, peer net.Addr, target a2al.NodeID) ([]protocol.NodeInfo, error) {
+	hdr := protocol.Header{Version: protocol.ProtocolVersion, MsgType: protocol.MsgFindNode}
+	body := &protocol.BodyFindNode{Target: target[:]}
+	dec, err := n.sendAndWait(ctx, peer, hdr, body, protocol.MsgFindNodeResp)
+	if err != nil {
+		return nil, err
+	}
+	br := dec.Body.(*protocol.BodyFindNodeResp)
+	return br.Nodes, nil
+}
+
+// FindValueWithNodes queries peer; returns optional record and closest nodes from the response.
+func (n *Node) FindValueWithNodes(ctx context.Context, peer net.Addr, key a2al.NodeID) (*protocol.SignedRecord, []protocol.NodeInfo, error) {
 	hdr := protocol.Header{Version: protocol.ProtocolVersion, MsgType: protocol.MsgFindValue}
 	body := &protocol.BodyFindValue{Target: key[:]}
 	dec, err := n.sendAndWait(ctx, peer, hdr, body, protocol.MsgFindValueResp)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	br := dec.Body.(*protocol.BodyFindValueResp)
 	if br.Record == nil {
-		return nil, nil
+		return nil, br.Nodes, nil
 	}
 	r := *br.Record
-	return &r, nil
+	return &r, br.Nodes, nil
+}
+
+// FindValue queries peer for a record at key NodeID.
+func (n *Node) FindValue(ctx context.Context, peer net.Addr, key a2al.NodeID) (*protocol.SignedRecord, error) {
+	rec, _, err := n.FindValueWithNodes(ctx, peer, key)
+	return rec, err
 }
 
 // AddContact pins a peer's dial address and seeds the routing table.
@@ -310,7 +364,7 @@ func (n *Node) AddContact(addr net.Addr, ni protocol.NodeInfo) {
 	n.peerMu.Lock()
 	n.peers[nodeIDKey(peerID)] = addr
 	n.peerMu.Unlock()
-	n.table.Add(ni)
+	n.tabAdd(ni)
 }
 
 // LocalAddr returns the underlying transport address.
