@@ -48,27 +48,25 @@ type DecodedMessage struct {
 	Body         any
 }
 
-// MarshalSignedMessage canonical-encodes header and body, signs, and returns the outer CBOR bytes.
-func MarshalSignedMessage(hdr Header, body any, priv ed25519.PrivateKey) ([]byte, error) {
-	if err := headerWireCheck(hdr); err != nil {
-		return nil, err
+func marshalSignedCore(hdr Header, body any) (bodyCBOR []byte, preimage []byte, err error) {
+	if err = headerWireCheck(hdr); err != nil {
+		return nil, nil, err
 	}
-	if err := bodyWireCheck(hdr.MsgType, body); err != nil {
-		return nil, err
+	if err = bodyWireCheck(hdr.MsgType, body); err != nil {
+		return nil, nil, err
 	}
-	if len(priv) != ed25519.PrivateKeySize {
-		return nil, fmt.Errorf("%w: invalid private key", ErrInvalidMessage)
-	}
-	bodyCBOR, err := canonical.Marshal(body)
+	bodyCBOR, err = canonical.Marshal(body)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	hdrCBOR, err := canonical.Marshal(hdr)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	sig := acrypto.SignDetached(priv, signPayload(hdrCBOR, bodyCBOR))
-	pub := priv.Public().(ed25519.PublicKey)
+	return bodyCBOR, signPayload(hdrCBOR, bodyCBOR), nil
+}
+
+func buildOuter(hdr Header, bodyCBOR []byte, pub ed25519.PublicKey, sig []byte) ([]byte, error) {
 	outer := wireOuter{
 		Header:       hdr,
 		Body:         bodyCBOR,
@@ -76,6 +74,44 @@ func MarshalSignedMessage(hdr Header, body any, priv ed25519.PrivateKey) ([]byte
 		Signature:    sig,
 	}
 	return canonical.Marshal(outer)
+}
+
+// MarshalSignedMessage canonical-encodes header and body, signs, and returns the outer CBOR bytes.
+func MarshalSignedMessage(hdr Header, body any, priv ed25519.PrivateKey) ([]byte, error) {
+	bodyCBOR, pre, err := marshalSignedCore(hdr, body)
+	if err != nil {
+		return nil, err
+	}
+	if len(priv) != ed25519.PrivateKeySize {
+		return nil, fmt.Errorf("%w: invalid private key", ErrInvalidMessage)
+	}
+	sig := acrypto.SignDetached(priv, pre)
+	pub := priv.Public().(ed25519.PublicKey)
+	return buildOuter(hdr, bodyCBOR, pub, sig)
+}
+
+// MarshalSignedMessageKeyStore signs with KeyStore (spec: same preimage as MarshalSignedMessage).
+func MarshalSignedMessageKeyStore(hdr Header, body any, ks acrypto.KeyStore, addr a2al.Address) ([]byte, error) {
+	bodyCBOR, pre, err := marshalSignedCore(hdr, body)
+	if err != nil {
+		return nil, err
+	}
+	sig, err := ks.Sign(addr, pre)
+	if err != nil {
+		return nil, err
+	}
+	if len(sig) != ed25519.SignatureSize {
+		return nil, ErrInvalidMessage
+	}
+	pubBytes, err := ks.PublicKey(addr)
+	if err != nil {
+		return nil, err
+	}
+	if len(pubBytes) != ed25519.PublicKeySize {
+		return nil, ErrInvalidMessage
+	}
+	pub := append(ed25519.PublicKey(nil), pubBytes...)
+	return buildOuter(hdr, bodyCBOR, pub, sig)
 }
 
 // VerifyAndDecode parses the outer message, re-canonicalizes header/body, verifies Ed25519,
