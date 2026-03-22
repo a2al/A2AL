@@ -3,6 +3,7 @@ package dht
 import (
 	"context"
 	"fmt"
+	"net"
 	"testing"
 	"time"
 
@@ -209,5 +210,74 @@ func TestTenNodes_memMultiHop(t *testing.T) {
 	}
 	if len(er.Endpoints) != 1 || er.Endpoints[0] != "quic://198.51.100.7:7777" {
 		t.Fatalf("endpoints %+v", er.Endpoints)
+	}
+}
+
+func TestBootstrapAddrs_mem(t *testing.T) {
+	netw := transport.NewMemNetwork()
+	trS, _ := netw.NewTransport("seed")
+	trA, _ := netw.NewTransport("nodeA")
+	trB, _ := netw.NewTransport("nodeB")
+	defer trS.Close()
+	defer trA.Close()
+	defer trB.Close()
+
+	ksS, ksA, ksB := newMemKS(t), newMemKS(t), newMemKS(t)
+	nodeS, _ := NewNode(Config{Transport: trS, Keystore: ksS})
+	nodeA, _ := NewNode(Config{Transport: trA, Keystore: ksA})
+	nodeB, _ := NewNode(Config{Transport: trB, Keystore: ksB})
+	defer nodeS.Close()
+	defer nodeA.Close()
+	defer nodeB.Close()
+
+	type nm struct {
+		n  *Node
+		ks *memKS
+		tr *transport.MemTransport
+	}
+	all := []nm{{nodeS, ksS, trS}, {nodeA, ksA, trA}, {nodeB, ksB, trB}}
+	for i := range all {
+		for j := range all {
+			if i == j {
+				continue
+			}
+			all[i].n.BindPeerAddr(a2al.NodeIDFromAddress(all[j].ks.addr), all[j].tr.LocalAddr())
+		}
+	}
+
+	nodeS.Start()
+	nodeA.Start()
+	nodeB.Start()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	if err := nodeA.BootstrapAddrs(ctx, []net.Addr{trS.LocalAddr()}); err != nil {
+		t.Fatal("bootstrapAddrs A:", err)
+	}
+	if err := nodeB.BootstrapAddrs(ctx, []net.Addr{trS.LocalAddr()}); err != nil {
+		t.Fatal("bootstrapAddrs B:", err)
+	}
+
+	now := time.Now().Truncate(time.Second)
+	rec, err := protocol.SignEndpointRecord(ksA.priv, ksA.addr, protocol.EndpointPayload{
+		Endpoints: []string{"quic://10.0.0.1:1234"},
+		NatType:   protocol.NATUnknown,
+	}, 1, uint64(now.Unix()), 3600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := nodeA.PublishEndpointRecord(ctx, rec); err != nil {
+		t.Fatal("publish A:", err)
+	}
+
+	q := NewQuery(nodeB)
+	key := a2al.NodeIDFromAddress(ksA.addr)
+	er, err := q.Resolve(ctx, key)
+	if err != nil {
+		t.Fatal("resolve:", err)
+	}
+	if len(er.Endpoints) != 1 || er.Endpoints[0] != "quic://10.0.0.1:1234" {
+		t.Fatalf("want [quic://10.0.0.1:1234], got %v", er.Endpoints)
 	}
 }

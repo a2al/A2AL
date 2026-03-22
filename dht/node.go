@@ -304,22 +304,39 @@ func (n *Node) sendAndWait(ctx context.Context, to net.Addr, hdr protocol.Header
 	}
 }
 
+// PeerIdentity holds the identity extracted from a PONG response.
+type PeerIdentity struct {
+	Address a2al.Address
+	NodeID  a2al.NodeID
+}
+
 // Ping sends PING and waits for PONG. Start() must be running.
 func (n *Node) Ping(ctx context.Context, peer net.Addr) error {
+	_, err := n.PingIdentity(ctx, peer)
+	return err
+}
+
+// PingIdentity sends PING, waits for PONG, and returns the remote peer's identity extracted from the response. The peer is automatically registered into the routing table and dial address map.
+func (n *Node) PingIdentity(ctx context.Context, peer net.Addr) (*PeerIdentity, error) {
 	tx := make([]byte, 20)
 	if _, err := crand.Read(tx); err != nil {
-		return err
+		return nil, err
 	}
 	hdr := protocol.Header{Version: protocol.ProtocolVersion, MsgType: protocol.MsgPing, TxID: tx}
 	body := &protocol.BodyPing{Address: n.addr[:]}
 	dec, err := n.sendAndWait(ctx, peer, hdr, body, protocol.MsgPong)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if _, ok := dec.Body.(*protocol.BodyPong); !ok {
-		return errors.New("dht: expected PONG")
+		return nil, errors.New("dht: expected PONG")
 	}
-	return nil
+	peerAddr := dec.SenderAddr
+	peerNID := a2al.NodeIDFromAddress(peerAddr)
+	ni := nodeInfoFromMessage(dec, peer)
+	n.BindPeerAddr(peerNID, peer)
+	n.tabAdd(ni)
+	return &PeerIdentity{Address: peerAddr, NodeID: peerNID}, nil
 }
 
 // StoreAt sends STORE to peer and waits for STORE_RESP.
@@ -386,8 +403,10 @@ func (n *Node) Address() a2al.Address { return n.addr }
 // NodeID returns the DHT key for this node.
 func (n *Node) NodeID() a2al.NodeID { return n.nid }
 
-// Close stops the node context and closes the transport.
+// Close stops the node, closes the transport, and waits for the receive loop to exit.
 func (n *Node) Close() error {
 	n.cancel()
-	return n.tr.Close()
+	err := n.tr.Close()
+	n.wg.Wait()
+	return err
 }

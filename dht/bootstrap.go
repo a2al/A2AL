@@ -4,22 +4,44 @@ import (
 	"context"
 	"errors"
 	"net"
+	"time"
 
 	"github.com/a2al/a2al"
 	"github.com/a2al/a2al/protocol"
 	"github.com/a2al/a2al/routing"
 )
 
-// BootstrapSeed is a known dial address plus wire NodeInfo (spec Step 9).
+// BootstrapAddrs connects to seed nodes by raw network addresses (ip:port only). For each address it sends PING, extracts the peer's identity from the PONG, registers the peer, then runs FIND_NODE(self) to widen the routing table. This is the recommended bootstrap entry point — callers do not need to know the seed's Address or NodeID in advance.
+func (n *Node) BootstrapAddrs(ctx context.Context, addrs []net.Addr) error {
+	if n == nil {
+		return errors.New("dht: nil node")
+	}
+	n.Start()
+	contacted := 0
+	for _, addr := range addrs {
+		if _, err := n.PingIdentity(ctx, addr); err == nil {
+			contacted++
+		}
+	}
+	if contacted == 0 && len(addrs) > 0 {
+		return errors.New("dht: all bootstrap seeds unreachable")
+	}
+	if contacted > 0 {
+		q := NewQuery(n)
+		if _, err := q.FindNode(ctx, n.nid); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// BootstrapSeed is a known dial address plus wire NodeInfo (legacy; prefer BootstrapAddrs).
 type BootstrapSeed struct {
 	Addr net.Addr
 	Info protocol.NodeInfo
 }
 
-// DefaultBootstrapSeeds is the built-in seed list (empty by default). Append or replace at init / runtime; file-based config can merge into the slice the app passes to Bootstrap.
-var DefaultBootstrapSeeds []BootstrapSeed
-
-// Bootstrap registers seeds and runs FIND_NODE(self) to widen the routing table.
+// Bootstrap registers seeds with pre-known identity and runs FIND_NODE(self). For seeds where only ip:port is known, use BootstrapAddrs instead.
 func (n *Node) Bootstrap(ctx context.Context, seeds []BootstrapSeed) error {
 	if n == nil {
 		return errors.New("dht: nil node")
@@ -36,17 +58,21 @@ func (n *Node) Bootstrap(ctx context.Context, seeds []BootstrapSeed) error {
 	return err
 }
 
-// StartWithBootstrap starts the receive loop then bootstraps.
-func (n *Node) StartWithBootstrap(ctx context.Context, seeds []BootstrapSeed) error {
+// StartWithBootstrap starts the receive loop then bootstraps with raw addresses.
+func (n *Node) StartWithBootstrap(ctx context.Context, addrs []net.Addr) error {
 	n.Start()
-	return n.Bootstrap(ctx, seeds)
+	return n.BootstrapAddrs(ctx, addrs)
 }
 
-// PublishEndpointRecord runs FIND_NODE toward the record key and STOREs at up to three closest dialable peers.
+// PublishEndpointRecord stores the record locally and pushes it to up to three closest reachable peers via FIND_NODE + STORE.
+// Storing locally ensures the node is always discoverable (even as the first node in the network).
 func (n *Node) PublishEndpointRecord(ctx context.Context, rec protocol.SignedRecord) error {
 	if n == nil {
 		return errors.New("dht: nil node")
 	}
+	// Always store locally first so the record is discoverable regardless of routing table state.
+	n.store.Put(rec, time.Now())
+
 	var pubAddr a2al.Address
 	copy(pubAddr[:], rec.Address)
 	key := a2al.NodeIDFromAddress(pubAddr)
@@ -56,14 +82,13 @@ func (n *Node) PublishEndpointRecord(ctx context.Context, rec protocol.SignedRec
 	}
 	peers := n.tabNearest(key, routing.K)
 	if len(peers) == 0 {
-		return errors.New("dht: no peers to publish")
+		return nil // local-only publish; no peers yet
 	}
 	limit := 3
 	if len(peers) < limit {
 		limit = len(peers)
 	}
 	var lastErr error
-	stored := false
 	for i := 0; i < limit; i++ {
 		var id a2al.NodeID
 		copy(id[:], peers[i].NodeID)
@@ -71,20 +96,9 @@ func (n *Node) PublishEndpointRecord(ctx context.Context, rec protocol.SignedRec
 		if !ok {
 			continue
 		}
-		ok, err := n.StoreAt(ctx, addr, rec)
-		if err != nil {
+		if _, err := n.StoreAt(ctx, addr, rec); err != nil {
 			lastErr = err
-			continue
-		}
-		if ok {
-			stored = true
 		}
 	}
-	if stored {
-		return nil
-	}
-	if lastErr != nil {
-		return lastErr
-	}
-	return errors.New("dht: publish rejected or unroutable")
+	return lastErr
 }
