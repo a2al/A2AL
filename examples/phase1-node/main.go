@@ -1,12 +1,14 @@
+// Copyright 2026 The A2AL Authors. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 // Phase1-node: 单一 A2AL DHT 节点。
 //
 // 启动后自动生成身份、监听 UDP、bootstrap（若提供种子）、发布自己的端点记录。
 // 然后等待用户在 stdin 输入 Address 进行解析查询。
 //
 // 用法:
-//   go run . -listen :5001 -debug :2634
-//   go run . -listen :5002 -bootstrap 127.0.0.1:5001 -debug :2635
-//   go run . -listen :5003 -bootstrap 127.0.0.1:5001 -debug :2636
+//   go run . -listen :5001 -ip 1.2.3.4 -debug :2634
+//   go run . -listen :5002 -ip 1.2.3.5 -bootstrap 1.2.3.4:5001 -debug :2635
 //
 // 浏览器查看节点状态:
 //   http://127.0.0.1:2634/debug/identity
@@ -36,6 +38,7 @@ func main() {
 	listen := flag.String("listen", ":5001", "UDP listen address")
 	bootstrapAddr := flag.String("bootstrap", "", "seed node UDP address (e.g. 127.0.0.1:5001)")
 	debugAddr := flag.String("debug", "", "debug HTTP address (e.g. 127.0.0.1:2634)")
+	extIP := flag.String("ip", "", "external IP for endpoint record (e.g. 1.2.3.4)")
 	flag.Parse()
 
 	ks, err := newSimpleKS()
@@ -84,10 +87,15 @@ func main() {
 	}
 
 	localUDP := tr.LocalAddr().(*net.UDPAddr)
-	endpoint := fmt.Sprintf("udp://%s:%d", localUDP.IP, localUDP.Port)
-	if localUDP.IP.IsUnspecified() {
-		endpoint = fmt.Sprintf("udp://127.0.0.1:%d", localUDP.Port)
+	host := *extIP
+	if host == "" {
+		if localUDP.IP.IsUnspecified() {
+			host = "127.0.0.1"
+		} else {
+			host = localUDP.IP.String()
+		}
 	}
+	endpoint := fmt.Sprintf("udp://%s:%d", host, localUDP.Port)
 	payload := protocol.EndpointPayload{Endpoints: []string{endpoint}, NatType: protocol.NATUnknown}
 
 	publish := func() {

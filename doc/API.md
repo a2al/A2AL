@@ -86,7 +86,3 @@ rec, err := protocol.SignEndpointRecord(priv, addr, EndpointPayload{...}, seq, t
 ```bash
 go test -vet=off -count=1 ./...
 ```
-
-## 详细设计
-
-`doc-local/A2AL 工程规划 spec.md`。
