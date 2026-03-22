@@ -17,6 +17,9 @@ jobs:
       - run: go test -vet=off -count=1 ./...
         env:
           CGO_ENABLED: "0"
+      - run: cd examples/phase1-node && go build .
+        env:
+          CGO_ENABLED: "0"
 
   cross-build:
     runs-on: ubuntu-latest
