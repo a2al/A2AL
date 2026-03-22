@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/a2al/a2al"
@@ -42,6 +43,10 @@ type Node struct {
 	wg       sync.WaitGroup
 
 	tabMu sync.RWMutex // routing.Table (Add / NearestN)
+
+	statsRx  atomic.Uint64
+	statsTx  atomic.Uint64
+	statsRPC atomic.Uint64 // outbound request/response pairs (sendAndWait success)
 }
 
 type waitEntry struct {
@@ -108,6 +113,7 @@ func (n *Node) recvLoop() {
 		if err != nil {
 			continue
 		}
+		n.statsRx.Add(1)
 		if n.tryDeliver(dec) {
 			continue
 		}
@@ -217,7 +223,9 @@ func (n *Node) reply(from net.Addr, req *protocol.DecodedMessage, msgType uint8,
 	if err != nil {
 		return
 	}
-	_ = n.tr.Send(from, raw)
+	if err := n.tr.Send(from, raw); err == nil {
+		n.statsTx.Add(1)
+	}
 }
 
 func (n *Node) onPing(from net.Addr, dec *protocol.DecodedMessage) {
@@ -282,8 +290,10 @@ func (n *Node) sendAndWait(ctx context.Context, to net.Addr, hdr protocol.Header
 		n.unregisterWait(hdr.TxID)
 		return nil, err
 	}
+	n.statsTx.Add(1)
 	select {
 	case dec := <-ch:
+		n.statsRPC.Add(1)
 		return dec, nil
 	case <-ctx.Done():
 		n.unregisterWait(hdr.TxID)

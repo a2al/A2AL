@@ -16,6 +16,9 @@ type BootstrapSeed struct {
 	Info protocol.NodeInfo
 }
 
+// DefaultBootstrapSeeds is the built-in seed list (empty by default). Append or replace at init / runtime; file-based config can merge into the slice the app passes to Bootstrap.
+var DefaultBootstrapSeeds []BootstrapSeed
+
 // Bootstrap registers seeds and runs FIND_NODE(self) to widen the routing table.
 func (n *Node) Bootstrap(ctx context.Context, seeds []BootstrapSeed) error {
 	if n == nil {

@@ -1,6 +1,7 @@
 package dht
 
 import (
+	"encoding/hex"
 	"sync"
 	"time"
 
@@ -87,4 +88,40 @@ func (s *Store) Len() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.m)
+}
+
+// StoreRecordDebug is a JSON-friendly store row (spec §3.6).
+type StoreRecordDebug struct {
+	KeyNodeIDHex string `json:"key_node_id_hex"`
+	AddressHex   string `json:"address_hex"`
+	RecType      uint8  `json:"rec_type"`
+	Seq          uint64 `json:"seq"`
+	Timestamp    uint64 `json:"timestamp"`
+	TTL          uint32 `json:"ttl_seconds"`
+	PayloadLen   int    `json:"payload_cbor_len"`
+}
+
+// DebugRecords lists non-expired verified records (spec §3.6).
+func (s *Store) DebugRecords(now time.Time) []StoreRecordDebug {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []StoreRecordDebug
+	for k, list := range s.m {
+		list = s.filterExpiredLocked(list, now)
+		for _, r := range list {
+			if protocol.VerifySignedRecord(r, now) != nil {
+				continue
+			}
+			out = append(out, StoreRecordDebug{
+				KeyNodeIDHex: hex.EncodeToString([]byte(k)),
+				AddressHex:   hex.EncodeToString(r.Address),
+				RecType:      r.RecType,
+				Seq:          r.Seq,
+				Timestamp:    r.Timestamp,
+				TTL:          r.TTL,
+				PayloadLen:   len(r.Payload),
+			})
+		}
+	}
+	return out
 }

@@ -1,6 +1,8 @@
 package routing
 
 import (
+	"encoding/hex"
+	"net"
 	"sort"
 
 	"github.com/a2al/a2al"
@@ -134,4 +136,48 @@ func (t *Table) OldestInBucket(peer a2al.NodeID) (protocol.NodeInfo, bool) {
 		return protocol.NodeInfo{}, false
 	}
 	return t.b[bi].nodes[0], true
+}
+
+// PeerDebugRow is a JSON-friendly routing row (spec §3.6).
+type PeerDebugRow struct {
+	Bucket        int    `json:"bucket"`
+	XORDistToSelf string `json:"xor_distance_to_self_hex"`
+	AddressHex    string `json:"address_hex"`
+	NodeIDHex     string `json:"node_id_hex"`
+	IP            string `json:"ip"`
+	Port          uint16 `json:"port"`
+}
+
+// DebugPeerRows returns a flat list of peers with bucket index and XOR distance to local self (read-only snapshot; caller must serialize table access if concurrent).
+func (t *Table) DebugPeerRows() []PeerDebugRow {
+	var out []PeerDebugRow
+	for bi := range t.b {
+		for _, node := range t.b[bi].nodes {
+			var nid a2al.NodeID
+			copy(nid[:], node.NodeID)
+			if nid == t.self {
+				continue
+			}
+			d := a2al.Distance(nid, t.self)
+			out = append(out, PeerDebugRow{
+				Bucket:        bi,
+				XORDistToSelf: hex.EncodeToString(d[:]),
+				AddressHex:    hex.EncodeToString(node.Address),
+				NodeIDHex:     hex.EncodeToString(node.NodeID),
+				IP:            formatIP(node.IP),
+				Port:          node.Port,
+			})
+		}
+	}
+	return out
+}
+
+func formatIP(ip []byte) string {
+	if len(ip) == 4 {
+		return net.IPv4(ip[0], ip[1], ip[2], ip[3]).String()
+	}
+	if len(ip) == 16 {
+		return net.IP(append([]byte(nil), ip...)).String()
+	}
+	return ""
 }

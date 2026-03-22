@@ -2,6 +2,7 @@ package dht
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -133,5 +134,80 @@ func TestPublishEndpointRecord_mem(t *testing.T) {
 	}
 	if len(er.Endpoints) != 1 || er.Endpoints[0] != "quic://192.0.2.1:9999" {
 		t.Fatal(er.Endpoints)
+	}
+}
+
+func TestTenNodes_memMultiHop(t *testing.T) {
+	const nPeer = 10
+	netw := transport.NewMemNetwork()
+	type pack struct {
+		n  *Node
+		ks *memKS
+		tr *transport.MemTransport
+	}
+	packs := make([]pack, nPeer)
+	for i := 0; i < nPeer; i++ {
+		tr, err := netw.NewTransport(fmt.Sprintf("n%d", i))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ks := newMemKS(t)
+		node, err := NewNode(Config{Transport: tr, Keystore: ks})
+		if err != nil {
+			t.Fatal(err)
+		}
+		packs[i] = pack{n: node, ks: ks, tr: tr}
+	}
+	defer func() {
+		for i := range packs {
+			_ = packs[i].n.Close()
+			_ = packs[i].tr.Close()
+		}
+	}()
+
+	for i := range packs {
+		for j := range packs {
+			if i == j {
+				continue
+			}
+			pid := a2al.NodeIDFromAddress(packs[j].ks.addr)
+			packs[i].n.BindPeerAddr(pid, packs[j].tr.LocalAddr())
+		}
+		packs[i].n.Start()
+	}
+
+	seed := BootstrapSeed{Addr: packs[0].tr.LocalAddr(), Info: contactNI(packs[0].ks.addr)}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	for i := range packs {
+		if err := packs[i].n.Bootstrap(ctx, []BootstrapSeed{seed}); err != nil {
+			t.Fatalf("bootstrap %d: %v", i, err)
+		}
+	}
+
+	pub := &packs[5]
+	hub := &packs[8]
+	resolver := &packs[9]
+	now := time.Now().Truncate(time.Second)
+	rec, err := protocol.SignEndpointRecord(pub.ks.priv, pub.ks.addr, protocol.EndpointPayload{
+		Endpoints: []string{"quic://198.51.100.7:7777"},
+		NatType:   protocol.NATUnknown,
+	}, 1, uint64(now.Unix()), 3600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ok, err := pub.n.StoreAt(ctx, hub.tr.LocalAddr(), rec)
+	if err != nil || !ok {
+		t.Fatalf("store: ok=%v err=%v", ok, err)
+	}
+
+	q := NewQuery(resolver.n)
+	key := a2al.NodeIDFromAddress(pub.ks.addr)
+	er, err := q.Resolve(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(er.Endpoints) != 1 || er.Endpoints[0] != "quic://198.51.100.7:7777" {
+		t.Fatalf("endpoints %+v", er.Endpoints)
 	}
 }
