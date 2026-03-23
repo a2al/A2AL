@@ -51,13 +51,26 @@ See [`doc/API.md`](doc/API.md) for the full API reference.
 
 ## Try the Demo
 
+**Same machine:**
+
 ```bash
 cd examples/phase1-node
 
-go run . -listen :5001 -debug :2634                          # node 1
-go run . -listen :5002 -bootstrap 127.0.0.1:5001 -debug :2635  # node 2
-go run . -listen :5003 -bootstrap 127.0.0.1:5001 -debug :2636  # node 3
+go run . -listen :5001 -debug :2634                                    # node 1
+go run . -listen :5002 -bootstrap 127.0.0.1:5001 -debug :2635         # node 2
+go run . -listen :5003 -bootstrap 127.0.0.1:5001 -debug :2636         # node 3
 ```
+
+**Different machines** (specify the externally reachable IP with `-ip`):
+
+```bash
+# machine A (192.168.1.10)
+./phase1-node -listen :5001 -ip 192.168.1.10 -debug :2634
+
+# machine B (192.168.1.20)
+./phase1-node -listen :5001 -ip 192.168.1.20 -bootstrap 192.168.1.10:5001 -debug :2634
+```
+
 Each node prints its AID on startup. Type any AID in a terminal to resolve its endpoint. Any node can serve as a bootstrap peer. Node state is visible at `http://localhost:2634/debug/routing`.
 
 ## Contributing
