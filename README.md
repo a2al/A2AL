@@ -61,6 +61,14 @@ go run . -listen :5002 -bootstrap 127.0.0.1:5001 -debug :2635         # node 2
 go run . -listen :5003 -bootstrap 127.0.0.1:5001 -debug :2636         # node 3
 ```
 
+**Phase 2** (`host`：QUIC + 可选 `-quic` 独立端口；`-min-observed 1` 便于单种子测试）:
+
+```bash
+cd examples/phase2-node
+go run . -listen :5001 -quic :5002 -ip 127.0.0.1 -debug :2634
+go run . -listen :5003 -quic :5004 -bootstrap 127.0.0.1:5001 -ip 127.0.0.1 -debug :2635
+```
+
 **Different machines** (specify the externally reachable IP with `-ip`):
 
 ```bash

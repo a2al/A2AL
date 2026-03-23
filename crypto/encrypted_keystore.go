@@ -1,4 +1,4 @@
-﻿// Copyright 2026 The A2AL Authors. All rights reserved.
+// Copyright 2026 The A2AL Authors. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
 package crypto
@@ -161,6 +161,23 @@ func (e *EncryptedKeyStore) List() ([]a2al.Address, error) {
 		return nil, err
 	}
 	return []a2al.Address{a}, nil
+}
+
+// Ed25519PrivateKey returns the decrypted identity for QUIC/TLS (Phase 2). Requires Load or Generate first.
+func (e *EncryptedKeyStore) Ed25519PrivateKey(address a2al.Address) (ed25519.PrivateKey, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.priv == nil {
+		return nil, ErrNoIdentity
+	}
+	want, err := AddressFromPublicKey(e.priv.Public().(ed25519.PublicKey))
+	if err != nil {
+		return nil, err
+	}
+	if want != address {
+		return nil, errors.New("a2al/crypto: address does not match loaded key")
+	}
+	return e.priv, nil
 }
 
 func encryptIdentity(pass, seed []byte) ([]byte, error) {

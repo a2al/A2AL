@@ -1,4 +1,4 @@
-﻿// Copyright 2026 The A2AL Authors. All rights reserved.
+// Copyright 2026 The A2AL Authors. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
 package dht
@@ -309,8 +309,9 @@ func (n *Node) sendAndWait(ctx context.Context, to net.Addr, hdr protocol.Header
 
 // PeerIdentity holds the identity extracted from a PONG response.
 type PeerIdentity struct {
-	Address a2al.Address
-	NodeID  a2al.NodeID
+	Address      a2al.Address
+	NodeID       a2al.NodeID
+	ObservedWire []byte // BodyPong.observed_addr (how reporter sees us); may be nil
 }
 
 // Ping sends PING and waits for PONG. Start() must be running.
@@ -331,7 +332,8 @@ func (n *Node) PingIdentity(ctx context.Context, peer net.Addr) (*PeerIdentity, 
 	if err != nil {
 		return nil, err
 	}
-	if _, ok := dec.Body.(*protocol.BodyPong); !ok {
+	pong, ok := dec.Body.(*protocol.BodyPong)
+	if !ok {
 		return nil, errors.New("dht: expected PONG")
 	}
 	peerAddr := dec.SenderAddr
@@ -339,7 +341,11 @@ func (n *Node) PingIdentity(ctx context.Context, peer net.Addr) (*PeerIdentity, 
 	ni := nodeInfoFromMessage(dec, peer)
 	n.BindPeerAddr(peerNID, peer)
 	n.tabAdd(ni)
-	return &PeerIdentity{Address: peerAddr, NodeID: peerNID}, nil
+	var obs []byte
+	if len(pong.ObservedAddr) > 0 {
+		obs = append([]byte(nil), pong.ObservedAddr...)
+	}
+	return &PeerIdentity{Address: peerAddr, NodeID: peerNID, ObservedWire: obs}, nil
 }
 
 // StoreAt sends STORE to peer and waits for STORE_RESP.
