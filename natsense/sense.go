@@ -14,15 +14,27 @@ import (
 	"github.com/a2al/a2al/protocol"
 )
 
+// NAT type constants (mirror protocol.NAT* for convenience).
+const (
+	NATUnknown       uint8 = 0
+	NATFullCone      uint8 = 1
+	NATRestricted    uint8 = 2
+	NATPortRestrict  uint8 = 3
+	NATSymmetric     uint8 = 4
+)
+
 const defaultMinAgree = 3
 
-// Sense tracks distinct peers that reported the same reflected UDP endpoint (wire bytes).
+// Sense tracks distinct peers that reported the same reflected UDP endpoint (wire bytes)
+// and infers a basic NAT type from observed port consistency.
 type Sense struct {
 	mu sync.Mutex
 	// min distinct NodeIDs that must have reported the same canonical key
 	min int
 	// canonical key "host:port" -> reporters
 	votes map[string]map[nodeIDKey]struct{}
+	// distinct observed ports (for NAT type inference)
+	observedPorts map[uint16]struct{}
 }
 
 type nodeIDKey [32]byte
@@ -33,7 +45,11 @@ func NewSense(minAgreeingPeers int) *Sense {
 	if m <= 0 {
 		m = defaultMinAgree
 	}
-	return &Sense{min: m, votes: make(map[string]map[nodeIDKey]struct{})}
+	return &Sense{
+		min:           m,
+		votes:         make(map[string]map[nodeIDKey]struct{}),
+		observedPorts: make(map[uint16]struct{}),
+	}
 }
 
 // MinAgreeing returns the configured threshold.
@@ -71,6 +87,7 @@ func (s *Sense) Record(reporter a2al.NodeID, observed []byte) {
 		s.votes[key] = m
 	}
 	m[z] = struct{}{}
+	s.observedPorts[port] = struct{}{}
 }
 
 // TrustedUDP returns host and port if some observed key has >= min distinct reporters.
@@ -109,6 +126,32 @@ func (s *Sense) TrustedWire() ([]byte, bool) {
 		return nil, false
 	}
 	return b, true
+}
+
+// InferNATType returns a basic NAT type inference based on observed port
+// consistency across reporters (spec Phase 2a):
+//   - All reporters saw the same port → endpoint-independent mapping (FullCone/Restricted)
+//   - Different ports → NATSymmetric
+//   - Insufficient data → NATUnknown
+//
+// Distinguishing FullCone from Restricted requires active probing (Phase 2b).
+func (s *Sense) InferNATType() uint8 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	total := 0
+	for _, m := range s.votes {
+		total += len(m)
+	}
+	if total < s.min {
+		return NATUnknown
+	}
+	if len(s.observedPorts) == 1 {
+		return NATFullCone // or restricted — indistinguishable without active probing
+	}
+	if len(s.observedPorts) > 1 {
+		return NATSymmetric
+	}
+	return NATUnknown
 }
 
 func netParseHost(host string) net.IP {

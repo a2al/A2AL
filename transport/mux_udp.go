@@ -16,12 +16,14 @@ const (
 	readBufSize  = 65536
 )
 
-// UDPMux demultiplexes one UDP socket between DHT (CBOR) and QUIC (RFC 9000 long header
-// 0xc0–0xff, plus short headers from registered peers). Same-port sharing per spec Phase 2a.
+// UDPMux demultiplexes one UDP socket between DHT (CBOR) and QUIC (RFC 9000).
+//
+// Discrimination: all QUIC packets (long and short header) have the "Fixed Bit"
+// (0x40) set per RFC 9000 §17. A2AL DHT messages are CBOR maps whose first byte
+// falls in 0xa0-0xbf, where bit 6 is always clear. Checking `data[0]&0x40 != 0`
+// is therefore a reliable, stateless discriminator — no peer tracking needed.
 type UDPMux struct {
 	conn *net.UDPConn
-
-	quicPeers sync.Map // string (UDPAddr.String()) -> struct{}
 
 	dhtIn chan pkt
 	qIn   chan pkt
@@ -33,7 +35,7 @@ type UDPMux struct {
 	readDone chan struct{}
 	wg       sync.WaitGroup
 
-	// quic virtual conn deadlines (do not forward to *UDPConn — shared fd would break mux readLoop)
+	// QUIC virtual conn deadlines (never forwarded to *UDPConn — shared fd).
 	qMu      sync.Mutex
 	qReadDL  time.Time
 	qWriteDL time.Time
@@ -44,7 +46,7 @@ type pkt struct {
 	addr net.Addr
 }
 
-// NewUDPMux wraps an existing UDP listener. StartReadLoop must be called before use.
+// NewUDPMux wraps an existing UDP listener. Call StartReadLoop before use.
 func NewUDPMux(conn *net.UDPConn) *UDPMux {
 	return &UDPMux{
 		conn:     conn,
@@ -54,17 +56,6 @@ func NewUDPMux(conn *net.UDPConn) *UDPMux {
 	}
 }
 
-// MarkQUICPeer registers a remote UDP address as carrying QUIC (short-header) packets.
-func (m *UDPMux) MarkQUICPeer(addr net.Addr) {
-	m.quicPeers.Store(addr.String(), struct{}{})
-}
-
-// UnmarkQUICPeer removes the registration (e.g. when a QUIC connection closes).
-func (m *UDPMux) UnmarkQUICPeer(addr net.Addr) {
-	m.quicPeers.Delete(addr.String())
-}
-
-// StartReadLoop begins demuxing UDP datagrams; it returns when the connection is closed.
 func (m *UDPMux) StartReadLoop() {
 	m.wg.Add(1)
 	go m.readLoop()
@@ -89,10 +80,7 @@ func (m *UDPMux) readLoop() {
 		data := make([]byte, n)
 		copy(data, buf[:n])
 		p := pkt{data: data, addr: addr}
-		if m.isQUICPacket(data, addr) {
-			// Register peer for subsequent QUIC short headers before Accept/Dial returns.
-			m.MarkQUICPeer(addr)
-			// Never drop QUIC: handshake needs every datagram. Backpressure UDP reads if quic-go is slow.
+		if isQUICPacket(data[0]) {
 			m.qIn <- p
 		} else {
 			select {
@@ -103,29 +91,23 @@ func (m *UDPMux) readLoop() {
 	}
 }
 
-func (m *UDPMux) isQUICPacket(data []byte, from net.Addr) bool {
-	if len(data) == 0 {
-		return false
-	}
-	// Long header: two high bits set (RFC 9000).
-	if (data[0] & 0xc0) == 0xc0 {
-		return true
-	}
-	_, ok := m.quicPeers.Load(from.String())
-	return ok
+// isQUICPacket returns true if the first byte has the QUIC Fixed Bit (0x40) set.
+// All QUIC long and 1-RTT short header packets set this bit (RFC 9000 §17).
+// CBOR maps (our DHT wire format) start with 0xa0-0xbf where bit 6 is clear.
+func isQUICPacket(firstByte byte) bool {
+	return firstByte&0x40 != 0
 }
 
-// DHTTransport returns the DHT packet plane for this mux.
+// DHTTransport returns the DHT packet plane.
 func (m *UDPMux) DHTTransport() *MuxDHTTransport {
 	return &MuxDHTTransport{m: m}
 }
 
-// QUICPacketConn returns a net.PacketConn that only sees QUIC-labelled datagrams.
+// QUICPacketConn returns a net.PacketConn that only sees QUIC datagrams.
 func (m *UDPMux) QUICPacketConn() net.PacketConn {
 	return &muxQUICConn{m: m}
 }
 
-// Close closes the UDP socket and stops demuxing.
 func (m *UDPMux) Close() error {
 	var err error
 	m.closeOnce.Do(func() {
@@ -142,15 +124,16 @@ func (m *UDPMux) Close() error {
 	return nil
 }
 
-// WaitReadLoop waits until the read loop exits (after Close).
+// WaitReadLoop blocks until the read loop exits (after Close).
 func (m *UDPMux) WaitReadLoop() {
 	<-m.readDone
 }
 
-// MuxDHTTransport implements Transport for DHT over UDPMux.
-type MuxDHTTransport struct {
-	m *UDPMux
-}
+// ---------------------------------------------------------------------------
+// DHT Transport (implements transport.Transport)
+// ---------------------------------------------------------------------------
+
+type MuxDHTTransport struct{ m *UDPMux }
 
 func (t *MuxDHTTransport) Send(addr net.Addr, data []byte) error {
 	if len(data) > MaxPacketSize {
@@ -172,18 +155,17 @@ func (t *MuxDHTTransport) Receive() ([]byte, net.Addr, error) {
 	}
 }
 
-func (t *MuxDHTTransport) LocalAddr() net.Addr {
-	return t.m.conn.LocalAddr()
-}
+func (t *MuxDHTTransport) LocalAddr() net.Addr { return t.m.conn.LocalAddr() }
 
 func (t *MuxDHTTransport) Close() error {
-	// UDP lifecycle is owned by UDPMux; Host closes the mux after stopping QUIC.
-	return nil
+	return nil // lifecycle owned by UDPMux
 }
 
-type muxQUICConn struct {
-	m *UDPMux
-}
+// ---------------------------------------------------------------------------
+// QUIC PacketConn
+// ---------------------------------------------------------------------------
+
+type muxQUICConn struct{ m *UDPMux }
 
 func (c *muxQUICConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 	for {
@@ -201,10 +183,10 @@ func (c *muxQUICConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 			case <-c.m.readDone:
 				timer.Stop()
 				return 0, nil, net.ErrClosed
-			case pkt := <-c.m.qIn:
+			case pk := <-c.m.qIn:
 				timer.Stop()
-				n := copy(p, pkt.data)
-				return n, pkt.addr, nil
+				n := copy(p, pk.data)
+				return n, pk.addr, nil
 			case <-timer.C:
 				return 0, nil, os.ErrDeadlineExceeded
 			}
@@ -213,9 +195,9 @@ func (c *muxQUICConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 		select {
 		case <-c.m.readDone:
 			return 0, nil, net.ErrClosed
-		case pkt := <-c.m.qIn:
-			n := copy(p, pkt.data)
-			return n, pkt.addr, nil
+		case pk := <-c.m.qIn:
+			n := copy(p, pk.data)
+			return n, pk.addr, nil
 		}
 	}
 }
@@ -224,13 +206,8 @@ func (c *muxQUICConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 	return c.m.conn.WriteTo(b, addr)
 }
 
-func (c *muxQUICConn) Close() error {
-	return nil // quic.Transport closes the logical conn; UDP owned by UDPMux
-}
-
-func (c *muxQUICConn) LocalAddr() net.Addr {
-	return c.m.conn.LocalAddr()
-}
+func (c *muxQUICConn) Close() error   { return nil }
+func (c *muxQUICConn) LocalAddr() net.Addr { return c.m.conn.LocalAddr() }
 
 func (c *muxQUICConn) SetDeadline(t time.Time) error {
 	_ = c.SetReadDeadline(t)

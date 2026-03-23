@@ -1,10 +1,9 @@
-﻿// Copyright 2026 The A2AL Authors. All rights reserved.
+// Copyright 2026 The A2AL Authors. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
 package dht
 
 import (
-	"encoding/binary"
 	"net"
 
 	"github.com/a2al/a2al"
@@ -15,20 +14,13 @@ import (
 func ObservedAddr(from net.Addr) []byte {
 	switch a := from.(type) {
 	case *net.UDPAddr:
-		if ip4 := a.IP.To4(); ip4 != nil {
-			out := make([]byte, 0, 6)
-			out = append(out, ip4...)
-			return binary.BigEndian.AppendUint16(out, uint16(a.Port))
+		b, err := protocol.FormatObservedUDP(a.IP, uint16(a.Port))
+		if err == nil {
+			return b
 		}
-		ip16 := a.IP.To16()
-		out := make([]byte, 0, 18)
-		out = append(out, ip16...)
-		return binary.BigEndian.AppendUint16(out, uint16(a.Port))
-	default:
-		// Mem transport and other logical addrs: placeholder loopback.
-		out := net.IPv4(127, 0, 0, 1).To4()
-		return append(append([]byte(nil), out...), 0, 0)
 	}
+	b, _ := protocol.FormatObservedUDP(net.IPv4(127, 0, 0, 1), 0)
+	return b
 }
 
 func nodeIDKey(id a2al.NodeID) string {

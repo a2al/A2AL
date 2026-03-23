@@ -23,6 +23,11 @@ import (
 type Config struct {
 	Transport transport.Transport
 	Keystore  crypto.KeyStore
+	// OnObservedAddr is called whenever a DHT response carries an observed_addr
+	// (PONG, FIND_NODE_RESP, FIND_VALUE_RESP). reporter is the responding node's
+	// NodeID; wire is the raw observed_addr bytes (6 or 18 bytes).
+	// May be nil.
+	OnObservedAddr func(reporter a2al.NodeID, wire []byte)
 }
 
 // Node is a single DHT participant (routing + local store + wire handler).
@@ -46,6 +51,8 @@ type Node struct {
 	wg       sync.WaitGroup
 
 	tabMu sync.RWMutex // routing.Table (Add / NearestN)
+
+	onObservedAddr func(reporter a2al.NodeID, wire []byte)
 
 	statsRx  atomic.Uint64
 	statsTx  atomic.Uint64
@@ -80,8 +87,9 @@ func NewNode(cfg Config) (*Node, error) {
 		store:  NewStore(),
 		ctx:    ctx,
 		cancel: cancel,
-		wait:   make(map[string]*waitEntry),
-		peers:  make(map[string]net.Addr),
+		wait:           make(map[string]*waitEntry),
+		peers:          make(map[string]net.Addr),
+		onObservedAddr: cfg.OnObservedAddr,
 	}
 	n.table = routing.NewTable(nid, func(ni protocol.NodeInfo) bool {
 		pctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -307,6 +315,12 @@ func (n *Node) sendAndWait(ctx context.Context, to net.Addr, hdr protocol.Header
 	}
 }
 
+func (n *Node) notifyObserved(reporter a2al.NodeID, wire []byte) {
+	if n.onObservedAddr != nil && len(wire) > 0 {
+		n.onObservedAddr(reporter, wire)
+	}
+}
+
 // PeerIdentity holds the identity extracted from a PONG response.
 type PeerIdentity struct {
 	Address      a2al.Address
@@ -345,6 +359,7 @@ func (n *Node) PingIdentity(ctx context.Context, peer net.Addr) (*PeerIdentity, 
 	if len(pong.ObservedAddr) > 0 {
 		obs = append([]byte(nil), pong.ObservedAddr...)
 	}
+	n.notifyObserved(peerNID, obs)
 	return &PeerIdentity{Address: peerAddr, NodeID: peerNID, ObservedWire: obs}, nil
 }
 
@@ -368,6 +383,7 @@ func (n *Node) FindNode(ctx context.Context, peer net.Addr, target a2al.NodeID) 
 		return nil, err
 	}
 	br := dec.Body.(*protocol.BodyFindNodeResp)
+	n.notifyObserved(a2al.NodeIDFromAddress(dec.SenderAddr), br.ObservedAddr)
 	return br.Nodes, nil
 }
 
@@ -380,6 +396,7 @@ func (n *Node) FindValueWithNodes(ctx context.Context, peer net.Addr, key a2al.N
 		return nil, nil, err
 	}
 	br := dec.Body.(*protocol.BodyFindValueResp)
+	n.notifyObserved(a2al.NodeIDFromAddress(dec.SenderAddr), br.ObservedAddr)
 	if br.Record == nil {
 		return nil, br.Nodes, nil
 	}

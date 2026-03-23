@@ -52,56 +52,42 @@ func (m *memKS) List() ([]a2al.Address, error) {
 	return []a2al.Address{m.addr}, nil
 }
 
-func TestHost_quicTLSAndStream(t *testing.T) {
+func newHost(t *testing.T, ks *memKS) *Host {
+	t.Helper()
+	h, err := New(Config{
+		KeyStore: ks, ListenAddr: "127.0.0.1:0", QUICListenAddr: "127.0.0.1:0",
+		PrivateKey: ks.priv, MinObservedPeers: 1, FallbackHost: "127.0.0.1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { h.Close() })
+	return h
+}
+
+func TestHost_quicMutualTLS(t *testing.T) {
 	ksA, ksB := newMemKS(t), newMemKS(t)
-	ha, err := New(Config{
-		KeyStore: ksA, ListenAddr: "127.0.0.1:0", QUICListenAddr: "127.0.0.1:0",
-		PrivateKey: ksA.priv, MinObservedPeers: 1, FallbackHost: "127.0.0.1",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ha.Close()
-	hb, err := New(Config{
-		KeyStore: ksB, ListenAddr: "127.0.0.1:0", QUICListenAddr: "127.0.0.1:0",
-		PrivateKey: ksB.priv, MinObservedPeers: 1, FallbackHost: "127.0.0.1",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer hb.Close()
+	ha, hb := newHost(t, ksA), newHost(t, ksB)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	errCh := make(chan error, 1)
+	type acceptResult struct {
+		ac  *AgentConn
+		err error
+	}
+	aCh := make(chan acceptResult, 1)
 	go func() {
-		c, err := ha.Accept(ctx)
-		if err != nil {
-			errCh <- err
-			return
-		}
-		str, err := c.AcceptStream(ctx)
-		if err != nil {
-			errCh <- err
-			return
-		}
-		buf := make([]byte, 4)
-		if _, err := str.Read(buf); err != nil {
-			errCh <- err
-			return
-		}
-		if _, err := str.Write(buf); err != nil {
-			errCh <- err
-			return
-		}
-		errCh <- nil
+		ac, err := ha.Accept(ctx)
+		aCh <- acceptResult{ac, err}
 	}()
 
 	conn, err := hb.Connect(ctx, ha.Address(), ha.QUICLocalAddr())
 	if err != nil {
 		t.Fatal("Connect:", err)
 	}
+
+	// Connect already sent agent-route on stream 0; open stream 1 for app data.
 	str, err := conn.OpenStreamSync(ctx)
 	if err != nil {
 		t.Fatal("OpenStreamSync:", err)
@@ -109,14 +95,88 @@ func TestHost_quicTLSAndStream(t *testing.T) {
 	if _, err := str.Write([]byte("ping")); err != nil {
 		t.Fatal(err)
 	}
+
+	ar := <-aCh
+	if ar.err != nil {
+		t.Fatal("Accept:", ar.err)
+	}
+	if ar.ac.Local != ha.Address() {
+		t.Fatalf("Accept Local = %s, want %s", ar.ac.Local, ha.Address())
+	}
+	if ar.ac.Remote != hb.Address() {
+		t.Fatalf("Accept Remote = %s, want %s", ar.ac.Remote, hb.Address())
+	}
+
+	// Accept consumes the agent-route stream; next AcceptStream is the app stream.
+	sStr, err := ar.ac.AcceptStream(ctx)
+	if err != nil {
+		t.Fatal("AcceptStream:", err)
+	}
 	buf := make([]byte, 4)
-	if _, err := str.Read(buf); err != nil {
+	if _, err := sStr.Read(buf); err != nil {
 		t.Fatal(err)
 	}
-	if string(buf) != "ping" {
-		t.Fatalf("echo want ping got %q", buf)
+	if _, err := sStr.Write(buf); err != nil {
+		t.Fatal(err)
 	}
-	if err := <-errCh; err != nil {
-		t.Fatal("server:", err)
+
+	resp := make([]byte, 4)
+	if _, err := str.Read(resp); err != nil {
+		t.Fatal(err)
+	}
+	if string(resp) != "ping" {
+		t.Fatalf("echo want ping got %q", resp)
+	}
+}
+
+func TestHost_sniRouting(t *testing.T) {
+	ksA := newMemKS(t)
+	ha := newHost(t, ksA)
+
+	// Register a second agent on the same host.
+	_, agent2Priv, _ := ed25519.GenerateKey(rand.Reader)
+	agent2Addr, _ := crypto.AddressFromPublicKey(agent2Priv.Public().(ed25519.PublicKey))
+	if err := ha.RegisterAgent(agent2Addr, agent2Priv); err != nil {
+		t.Fatal(err)
+	}
+
+	ksB := newMemKS(t)
+	hb := newHost(t, ksB)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	type acceptResult struct {
+		ac  *AgentConn
+		err error
+	}
+	aCh := make(chan acceptResult, 1)
+	go func() {
+		ac, err := ha.Accept(ctx)
+		aCh <- acceptResult{ac, err}
+	}()
+
+	// Connect targeting agent2 specifically.
+	conn, err := hb.Connect(ctx, agent2Addr, ha.QUICLocalAddr())
+	if err != nil {
+		t.Fatal("Connect to agent2:", err)
+	}
+	str, err := conn.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := str.Write([]byte("hi")); err != nil {
+		t.Fatal(err)
+	}
+
+	ar := <-aCh
+	if ar.err != nil {
+		t.Fatal("Accept:", ar.err)
+	}
+	if ar.ac.Local != agent2Addr {
+		t.Fatalf("Accept Local = %s, want agent2 %s", ar.ac.Local, agent2Addr)
+	}
+	if ar.ac.Remote != hb.Address() {
+		t.Fatalf("Accept Remote = %s, want %s", ar.ac.Remote, hb.Address())
 	}
 }

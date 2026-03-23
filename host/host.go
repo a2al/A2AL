@@ -3,18 +3,26 @@
 
 // Package host is the Phase 2a SDK: DHT + QUIC, nat-sense, Publish/Resolve/Connect/Accept.
 //
-// When Config.QUICListenAddr is empty, DHT and QUIC share one UDP port via UDPMux (spec target; still maturing).
-// When QUICListenAddr is set (e.g. ":5002" or "127.0.0.1:0"), QUIC uses a separate socket — recommended for production until mux is hardened.
+// A Host manages the node-level resources (DHT, QUIC transport). One or more
+// agents (each identified by a unique Address) share the same QUIC listener
+// via TLS SNI routing (spec Phase 2a "mux" module).
+//
+// When Config.QUICListenAddr is empty, DHT and QUIC share one UDP port via
+// UDPMux (spec target). When QUICListenAddr is set, QUIC uses a separate
+// socket — recommended until mux is hardened on all platforms.
 package host
 
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -39,27 +47,49 @@ type Config struct {
 	KeyStore crypto.KeyStore
 	// ListenAddr is the DHT UDP bind address ("udp4"), e.g. ":5001".
 	ListenAddr string
-	// QUICListenAddr, if non-empty, is a separate UDP bind for QUIC. Use this for reliable stacks (tests, production)
-	// until single-port UDPMux is fully validated on all platforms.
+	// QUICListenAddr, if non-empty, is a separate UDP bind for QUIC.
 	QUICListenAddr string
-	PrivateKey     ed25519.PrivateKey
+	PrivateKey       ed25519.PrivateKey
 	MinObservedPeers int
 	FallbackHost     string
+}
+
+// agentRouteMagic is the 4-byte prefix of the agent-route control stream.
+// The client opens the first stream and writes: magic(4) + target_address(21).
+var agentRouteMagic = []byte{'a', '2', 'r', '1'}
+
+// AgentConn wraps a QUIC connection with the resolved peer and local agent identities.
+type AgentConn struct {
+	quic.Connection
+	// Local is the agent Address that was targeted (agent-route frame, or SNI fallback).
+	Local a2al.Address
+	// Remote is the connecting peer's Address (from mutual TLS client cert).
+	Remote a2al.Address
+}
+
+// agentEntry is a registered agent in the SNI router.
+type agentEntry struct {
+	addr a2al.Address
+	priv ed25519.PrivateKey
+	cert tls.Certificate
 }
 
 // Host is the Phase 2a runtime.
 type Host struct {
 	cfg     Config
-	addr    a2al.Address
+	addr    a2al.Address // default (first) agent address
 	priv    ed25519.PrivateKey
-	mux     *transport.UDPMux // nil when QUIC uses a separate socket
+	mux     *transport.UDPMux
 	node    *dht.Node
 	sense   *natsense.Sense
 	quicTr  *quic.Transport
 	qListen *quic.Listener
+
+	agentsMu sync.RWMutex
+	agents   map[a2al.Address]*agentEntry
 }
 
-// New listens on UDP and starts the DHT node and QUIC listener.
+// New creates a Host with one initial agent identity from cfg.KeyStore.
 func New(cfg Config) (*Host, error) {
 	if cfg.KeyStore == nil {
 		return nil, errors.New("a2al/host: KeyStore required")
@@ -89,9 +119,22 @@ func New(cfg Config) (*Host, error) {
 		return nil, errors.New("a2al/host: set Config.PrivateKey for QUIC (or use EncryptedKeyStore after Load)")
 	}
 
+	min := cfg.MinObservedPeers
+	if min == 0 {
+		min = 3
+	}
+	sense := natsense.NewSense(min)
+
 	dhtUDP, err := net.ResolveUDPAddr("udp4", cfg.ListenAddr)
 	if err != nil {
 		return nil, err
+	}
+
+	dhtCfg := dht.Config{
+		Keystore: cfg.KeyStore,
+		OnObservedAddr: func(reporter a2al.NodeID, wire []byte) {
+			sense.Record(reporter, wire)
+		},
 	}
 
 	var node *dht.Node
@@ -105,7 +148,8 @@ func New(cfg Config) (*Host, error) {
 		}
 		mux = transport.NewUDPMux(conn)
 		mux.StartReadLoop()
-		node, err = dht.NewNode(dht.Config{Transport: mux.DHTTransport(), Keystore: cfg.KeyStore})
+		dhtCfg.Transport = mux.DHTTransport()
+		node, err = dht.NewNode(dhtCfg)
 		if err != nil {
 			_ = conn.Close()
 			return nil, err
@@ -125,7 +169,8 @@ func New(cfg Config) (*Host, error) {
 			_ = dConn.Close()
 			return nil, err
 		}
-		node, err = dht.NewNode(dht.Config{Transport: transport.NewUDPTransport(dConn), Keystore: cfg.KeyStore})
+		dhtCfg.Transport = transport.NewUDPTransport(dConn)
+		node, err = dht.NewNode(dhtCfg)
 		if err != nil {
 			_ = dConn.Close()
 			_ = qConn.Close()
@@ -134,58 +179,103 @@ func New(cfg Config) (*Host, error) {
 		qt = &quic.Transport{Conn: qConn}
 	}
 
-	srvTLS, err := quicServerTLS(priv)
+	defaultCert, err := selfSignedEd25519Cert(priv)
 	if err != nil {
-		if mux != nil {
-			_ = mux.Close()
-		} else {
-			_ = node.Close()
-		}
-		return nil, err
-	}
-	qListen, err := qt.Listen(srvTLS, defaultQUICConfig())
-	if err != nil {
-		if mux != nil {
-			_ = mux.Close()
-		} else {
-			_ = node.Close()
-		}
+		closeAfterError(mux, node)
 		return nil, err
 	}
 
-	min := cfg.MinObservedPeers
-	if min == 0 {
-		min = 3
-	}
 	h := &Host{
-		cfg:     cfg,
-		addr:    myAddr,
-		priv:    priv,
-		mux:     mux,
-		node:    node,
-		sense:   natsense.NewSense(min),
-		quicTr:  qt,
-		qListen: qListen,
+		cfg:    cfg,
+		addr:   myAddr,
+		priv:   priv,
+		mux:    mux,
+		node:   node,
+		sense:  sense,
+		quicTr: qt,
+		agents: map[a2al.Address]*agentEntry{
+			myAddr: {addr: myAddr, priv: priv, cert: defaultCert},
+		},
 	}
+
+	srvTLS := quicServerTLSWithSNI(defaultCert, h.certForSNI)
+	qListen, err := qt.Listen(srvTLS, defaultQUICConfig())
+	if err != nil {
+		closeAfterError(mux, node)
+		return nil, err
+	}
+	h.qListen = qListen
+
 	node.Start()
 	return h, nil
 }
 
-func (h *Host) Node() *dht.Node { return h.node }
-func (h *Host) Sense() *natsense.Sense { return h.sense }
-func (h *Host) Address() a2al.Address { return h.addr }
+// certForSNI is the GetCertificate callback — selects agent cert by TLS SNI.
+func (h *Host) certForSNI(sni string) *tls.Certificate {
+	addr, err := a2al.ParseAddress(sni)
+	if err != nil {
+		return nil
+	}
+	h.agentsMu.RLock()
+	ag, ok := h.agents[addr]
+	h.agentsMu.RUnlock()
+	if !ok {
+		return nil
+	}
+	return &ag.cert
+}
 
-// DHTLocalAddr is the DHT/control UDP bind address (bootstrap, PING, STORE).
+// RegisterAgent adds an additional agent identity to this host's SNI router.
+// Incoming connections with TLS ServerName matching addr will be served with
+// the corresponding certificate. Returns an error if the address is already registered.
+func (h *Host) RegisterAgent(addr a2al.Address, priv ed25519.PrivateKey) error {
+	cert, err := selfSignedEd25519Cert(priv)
+	if err != nil {
+		return err
+	}
+	h.agentsMu.Lock()
+	defer h.agentsMu.Unlock()
+	if _, exists := h.agents[addr]; exists {
+		return fmt.Errorf("a2al/host: agent %s already registered", addr)
+	}
+	h.agents[addr] = &agentEntry{addr: addr, priv: priv, cert: cert}
+	return nil
+}
+
+// UnregisterAgent removes an agent from the SNI router (the default agent
+// created at New() cannot be unregistered).
+func (h *Host) UnregisterAgent(addr a2al.Address) {
+	if addr == h.addr {
+		return
+	}
+	h.agentsMu.Lock()
+	delete(h.agents, addr)
+	h.agentsMu.Unlock()
+}
+
+// RegisteredAgents returns the addresses of all registered agents.
+func (h *Host) RegisteredAgents() []a2al.Address {
+	h.agentsMu.RLock()
+	defer h.agentsMu.RUnlock()
+	out := make([]a2al.Address, 0, len(h.agents))
+	for a := range h.agents {
+		out = append(out, a)
+	}
+	return out
+}
+
+func (h *Host) Node() *dht.Node            { return h.node }
+func (h *Host) Sense() *natsense.Sense      { return h.sense }
+func (h *Host) Address() a2al.Address        { return h.addr }
+
 func (h *Host) DHTLocalAddr() *net.UDPAddr {
 	return h.node.LocalAddr().(*net.UDPAddr)
 }
 
-// QUICLocalAddr is the UDP address peers should use for QUIC Connect (published in endpoint records).
 func (h *Host) QUICLocalAddr() *net.UDPAddr {
 	return h.quicTr.Conn.LocalAddr().(*net.UDPAddr)
 }
 
-// LocalUDPAddr returns the DHT UDP address (same as DHTLocalAddr). For QUIC port when split, use QUICLocalAddr.
 func (h *Host) LocalUDPAddr() *net.UDPAddr { return h.DHTLocalAddr() }
 
 func (h *Host) ObserveFromPeers(ctx context.Context, seeds []net.Addr) {
@@ -198,7 +288,7 @@ func (h *Host) ObserveFromPeers(ctx context.Context, seeds []net.Addr) {
 	}
 }
 
-// BuildEndpointPayload builds udp:// for QUIC reachability (QUICLocalAddr port).
+// BuildEndpointPayload builds quic:// for QUIC reachability.
 func (h *Host) BuildEndpointPayload() (protocol.EndpointPayload, error) {
 	ua := h.QUICLocalAddr()
 	port := ua.Port
@@ -219,12 +309,20 @@ func (h *Host) BuildEndpointPayload() (protocol.EndpointPayload, error) {
 		}
 	}
 	if hostStr == "" {
-		return protocol.EndpointPayload{}, errors.New("a2al/host: no advertise host (set FallbackHost, MinObservedPeers=1 with seeds, or bind a specific IP)")
+		// Last resort: probe the OS-selected outbound IP (no packets sent).
+		// On a loopback-only machine this yields 127.0.0.1; on a routed machine
+		// it yields the primary outbound interface IP.
+		if ip := outboundIP(); ip != nil {
+			hostStr = ip.String()
+		}
 	}
-	ep := "udp://" + net.JoinHostPort(hostStr, strconv.Itoa(port))
+	if hostStr == "" {
+		return protocol.EndpointPayload{}, errors.New("a2al/host: cannot determine advertise host; set FallbackHost or bind a specific IP")
+	}
+	ep := "quic://" + net.JoinHostPort(hostStr, strconv.Itoa(port))
 	return protocol.EndpointPayload{
 		Endpoints: []string{ep},
-		NatType:   protocol.NATUnknown,
+		NatType:   h.sense.InferNATType(),
 	}, nil
 }
 
@@ -246,36 +344,119 @@ func (h *Host) Resolve(ctx context.Context, target a2al.Address) (*protocol.Endp
 	return q.Resolve(ctx, a2al.NodeIDFromAddress(target))
 }
 
+// Connect dials the remote agent over QUIC with mutual TLS.
+// After the QUIC handshake, it opens a control stream and sends the
+// agent-route frame (4-byte magic + 21-byte target Address) so the
+// server can route the connection even when TLS SNI is camouflaged.
 func (h *Host) Connect(ctx context.Context, expectRemote a2al.Address, udpAddr *net.UDPAddr) (quic.Connection, error) {
-	if h.mux != nil {
-		h.mux.MarkQUICPeer(udpAddr)
-	}
 	cliTLS, err := quicClientTLS(h.priv, expectRemote)
 	if err != nil {
-		if h.mux != nil {
-			h.mux.UnmarkQUICPeer(udpAddr)
-		}
 		return nil, err
 	}
-	c, err := h.quicTr.Dial(ctx, udpAddr, cliTLS, defaultQUICConfig())
+	conn, err := h.quicTr.Dial(ctx, udpAddr, cliTLS, defaultQUICConfig())
 	if err != nil {
-		if h.mux != nil {
-			h.mux.UnmarkQUICPeer(udpAddr)
-		}
 		return nil, err
 	}
-	return c, nil
+	str, err := conn.OpenStreamSync(ctx)
+	if err != nil {
+		_ = conn.CloseWithError(1, "agent-route stream failed")
+		return nil, fmt.Errorf("a2al/host: open agent-route stream: %w", err)
+	}
+	frame := append(agentRouteMagic, expectRemote[:]...)
+	if _, err := str.Write(frame); err != nil {
+		_ = conn.CloseWithError(1, "agent-route write failed")
+		return nil, fmt.Errorf("a2al/host: write agent-route frame: %w", err)
+	}
+	return conn, nil
 }
 
-func (h *Host) Accept(ctx context.Context) (quic.Connection, error) {
-	c, err := h.qListen.Accept(ctx)
+// Accept waits for an incoming QUIC connection and returns an AgentConn.
+//
+// Agent routing priority:
+//  1. Agent-route control stream (first stream: magic + 21-byte Address) — canonical.
+//  2. TLS SNI (Address hex) — fast-path hint when not camouflaged.
+//  3. Default to the host's own Address.
+//
+// Remote peer AID is extracted from the mutual TLS client certificate.
+func (h *Host) Accept(ctx context.Context) (*AgentConn, error) {
+	conn, err := h.qListen.Accept(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if h.mux != nil {
-		h.mux.MarkQUICPeer(c.RemoteAddr())
+	ac := &AgentConn{Connection: conn, Local: h.addr}
+
+	state := conn.ConnectionState().TLS
+	if remote, err := peerAddrFromTLSState(state); err == nil {
+		ac.Remote = remote
 	}
-	return c, nil
+
+	// Try agent-route control stream (canonical).
+	if target, err := readAgentRouteFrame(ctx, conn); err == nil {
+		h.agentsMu.RLock()
+		_, ok := h.agents[target]
+		h.agentsMu.RUnlock()
+		if ok {
+			ac.Local = target
+		}
+	} else if sni := state.ServerName; sni != "" {
+		// Fallback: TLS SNI.
+		if addr, err := a2al.ParseAddress(sni); err == nil {
+			h.agentsMu.RLock()
+			_, ok := h.agents[addr]
+			h.agentsMu.RUnlock()
+			if ok {
+				ac.Local = addr
+			}
+		}
+	}
+	return ac, nil
+}
+
+// readAgentRouteFrame reads the 25-byte agent-route frame (4 magic + 21 address)
+// from the first QUIC stream opened by the connecting peer.
+func readAgentRouteFrame(ctx context.Context, conn quic.Connection) (a2al.Address, error) {
+	str, err := conn.AcceptStream(ctx)
+	if err != nil {
+		return a2al.Address{}, err
+	}
+	const frameLen = 4 + 21
+	buf := make([]byte, frameLen)
+	n := 0
+	for n < frameLen {
+		r, err := str.Read(buf[n:])
+		n += r
+		if err != nil {
+			return a2al.Address{}, err
+		}
+	}
+	if string(buf[:4]) != string(agentRouteMagic) {
+		return a2al.Address{}, errors.New("a2al/host: bad agent-route magic")
+	}
+	var addr a2al.Address
+	copy(addr[:], buf[4:])
+	return addr, nil
+}
+
+// StartDebugHTTP listens on addr and serves /debug/* JSON for both DHT
+// and Phase 2 host state. Returns a stop function.
+func (h *Host) StartDebugHTTP(addr string) (stop func(), err error) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	srv := &http.Server{
+		Handler:           h.DebugHTTPHandler(),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+	}
+	go func() { _ = srv.Serve(ln) }()
+	return func() {
+		sctx, scancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer scancel()
+		_ = srv.Shutdown(sctx)
+		_ = ln.Close()
+	}, nil
 }
 
 func (h *Host) Close() error {
@@ -293,16 +474,46 @@ func (h *Host) Close() error {
 	return errors.Join(errs...)
 }
 
-func FirstUDPAddr(er *protocol.EndpointRecord) (*net.UDPAddr, error) {
+// FirstQUICAddr extracts the first quic:// (or legacy udp://) endpoint as a UDP address.
+func FirstQUICAddr(er *protocol.EndpointRecord) (*net.UDPAddr, error) {
 	if er == nil {
 		return nil, errors.New("a2al/host: nil endpoint record")
 	}
 	for _, e := range er.Endpoints {
 		u, err := url.Parse(e)
-		if err != nil || u.Scheme != "udp" || u.Host == "" {
+		if err != nil || (u.Scheme != "quic" && u.Scheme != "udp") || u.Host == "" {
 			continue
 		}
 		return net.ResolveUDPAddr("udp4", u.Host)
 	}
-	return nil, errors.New("a2al/host: no udp endpoint in record")
+	return nil, errors.New("a2al/host: no quic endpoint in record")
+}
+
+// ---------------------------------------------------------------------------
+// helpers
+// ---------------------------------------------------------------------------
+
+// outboundIP returns the preferred outbound IP without sending any packets.
+// It does this by connecting a UDP socket to a public address and reading
+// the local address the OS assigned.
+func outboundIP() net.IP {
+	conn, err := net.Dial("udp4", "8.8.8.8:80")
+	if err != nil {
+		return nil
+	}
+	defer conn.Close()
+	return conn.LocalAddr().(*net.UDPAddr).IP
+}
+
+func peerAddrFromTLSState(state tls.ConnectionState) (a2al.Address, error) {
+	return PeerAddressFromConn(state.PeerCertificates)
+}
+
+func closeAfterError(mux *transport.UDPMux, node *dht.Node) {
+	if mux != nil {
+		_ = mux.Close()
+	}
+	if node != nil {
+		_ = node.Close()
+	}
 }
