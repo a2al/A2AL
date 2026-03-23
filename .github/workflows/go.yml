@@ -47,6 +47,19 @@ jobs:
           name: phase1-node-${{ matrix.goos }}-${{ matrix.goarch }}
           path: examples/phase1-node/phase1-node-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
           retention-days: 7
+      - name: build phase2-chat
+        run: |
+          cd examples/phase2-chat
+          go build -o phase2-chat-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }} .
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: phase2-chat-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: examples/phase2-chat/phase2-chat-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
+          retention-days: 7
 
   cross-build-mobile:
     runs-on: ubuntu-latest

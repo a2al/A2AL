@@ -1,57 +1,87 @@
-# A2AL
+# A2AL — Agent-to-Agent Link Protocol
 
-**A2AL** (Agent-to-Agent Link Protocol) is a decentralized networking protocol for AI agents — providing cryptographic identity, service publishing, and endpoint discovery without central infrastructure.
+A2AL is a networking protocol that enables AI agents to publish themselves, discover each other, and establish secure connections — without relying on any central infrastructure.
 
-Each agent holds a unique address (AID) derived from its public key. It publishes its reachable endpoints to the network; any other agent can resolve that AID to a connectable address and establish a direct, authenticated connection. A2AL is a networking layer only — it is not in the data path.
+Each agent receives a globally unique, cryptographic address (AID). Once published to the network, any agent worldwide can resolve that AID and initiate an authenticated, encrypted connection — regardless of network topology, NAT boundaries, or IP changes.
 
 ```
-Agent A  ──publish──▶  A2AL Network  ◀──resolve──  Agent B
-                                                        │
-                                     Agent B connects directly to Agent A
+Your Agent  ──publish──▶  A2AL Network  ◀──discover──  Remote Agent
+                                                            │
+                                          direct authenticated connection
 ```
 
-Analogy: MCP gives agents tool-calling capability; A2AL gives agents addressing and interconnection capability.
+## The Problem
 
-## Integration
+AI agent interoperability protocols (MCP, A2A, ANP) define how agents communicate, but assume you already know where the other agent is. In practice:
 
-A2AL is designed to fit how you already work:
+- No standard, open mechanism exists for agents to announce their availability or discover peers — whether deployed in data centers, on edge infrastructure, or on personal devices
+- Agent connectivity depends on pre-configured endpoints, platform-specific registries, or manual coordination — none of which scale across organizational and network boundaries
+- Agents behind NAT or with dynamic IPs face additional reachability barriers that existing protocols do not address
 
-| Integration | Audience |
-|-------------|----------|
-| **Go library** | Go developers — embed directly |
-| **`a2ald` daemon + REST API** | Any language — call `localhost` HTTP |
-| **MCP Server** | AI agents — native tool calls (`publish`, `resolve`, `connect`) |
-| **`pip install a2al` / `npm install a2al`** | Python / JS — sidecar binary bundled, zero setup |
+A2AL addresses the missing infrastructure layer: **agent-level addressing, discovery, and connectivity**.
 
-## Features
+## What A2AL Does
 
-- **Decentralized** — no central registry or coordinator
-- **Cryptographic identity** — address is derived from public key; connections are authenticated by default
-- **NAT traversal** — hole-punching, QUIC tunneling, TURN relay fallback
-- **Multi-platform** — Linux / macOS / Windows / Android / iOS
-- **Web3 identity** — optionally anchor an AID to an Ethereum/Paralism address for on-chain reputation
+**Publish** — An agent announces its identity and reachable endpoints to a global peer-to-peer network. Endpoint records update automatically as network conditions change.
 
+**Discover** — Resolve any agent by its AID, or search by capability (e.g. "translation agents supporting zh-en legal domain"). Discovery is fully decentralized — no registry to operate or depend on.
 
-## Quick Start
+**Connect** — Establish a direct, end-to-end encrypted connection with mutual identity verification. A2AL handles NAT traversal transparently, ensuring agents behind firewalls and home networks are as reachable as cloud-hosted services.
 
-```bash
-go get github.com/a2al/a2al
-```
+## Getting Started
+
+**For agent operators** — Install the A2AL daemon (`a2ald`) and open the web management interface. Configure your agent, and it becomes globally discoverable. No port forwarding, domain names, or cloud infrastructure required.
+
+**For developers** — A2AL integrates into your existing stack:
+
+| Integration | Audience | How |
+|-------------|----------|-----|
+| **Go library** | Go developers | `import "github.com/a2al/a2al"` — embed directly |
+| **`a2ald` + REST API** | Any language | Local HTTP API for publish / discover / connect |
+| **MCP Server** | AI agents | Native tool calls — agents acquire networking capability on demand |
+| **`pip install a2al`** | Python developers | Bundled sidecar binary, zero infrastructure setup |
+
+### SDK (Go)
 
 ```go
-import "github.com/a2al/a2al"
-
 agent := a2al.New(a2al.Config{...})
 agent.Start()
 
+// Discover and connect to a remote agent
 conn, err := agent.Connect(targetAID)
 ```
 
-See [`doc/API.md`](doc/API.md) for the full API reference.
+### MCP Integration
+
+As an MCP Server, A2AL exposes tools (`publish`, `resolve`, `update`, `identity`) that any MCP-compatible agent can invoke directly — enabling agents to acquire networking capabilities without code-level integration.
+
+## Design Principles
+
+**Self-sovereign Identity** — Each agent's address is derived from its own key pair. No registration authority is involved. Identity is verifiable end-to-end: no agent can claim an AID it does not hold the private key for.
+
+**Zero-configuration Discovery** — Agents publish signed endpoint records to a distributed network. Any agent can resolve an AID to a live endpoint. The network operates at any scale — from a handful of nodes to millions.
+
+**Mutual Authentication** — Every connection cryptographically verifies both parties' identities. You always know the agent on the other end is who it claims to be.
+
+**Network-agnostic** — A2AL works across NAT, firewalls, and dynamic IPs. Agents on home machines, mobile devices, and corporate networks are first-class participants alongside cloud-hosted services.
+
+**Direct Communication** — A2AL resolves addresses and brokers the initial connection, then steps aside. Application data flows directly between agents, not through the protocol.
+
+**Web3 Compatible** — Ethereum and Paralism blockchain wallet addresses can serve as AIDs. Cross-key attestation allows an agent to prove ownership of both a native AID and a blockchain identity. Web3 integration is supported, not required.
+
+## Relationship to AI Protocols
+
+A2AL is complementary to existing agent communication standards — it provides the networking foundation they assume but do not include.
+
+| Protocol | Role | How A2AL fits in |
+|----------|------|-----------------|
+| **MCP** | Agent tool-calling interface | A2AL operates as an MCP-installable tool, giving agents networking capability |
+| **A2A** | Agent collaboration semantics | A2AL provides the discovery and connectivity layer A2A relies on |
+| **ANP** | Agent networking vision | A2AL implements the decentralized network layer ANP envisions |
 
 ## Try the Demo
 
-**Same machine:**
+**Discovery** (Demo 1 — DHT address resolution):
 
 ```bash
 cd examples/phase1-node
@@ -61,17 +91,24 @@ go run . -listen :5002 -bootstrap 127.0.0.1:5001 -debug :2635         # node 2
 go run . -listen :5003 -bootstrap 127.0.0.1:5001 -debug :2636         # node 3
 ```
 
-**Different machines** (specify the externally reachable IP with `-ip`):
+Type any node's AID to resolve its endpoint. Inspect network state at `http://127.0.0.1:2634/debug/routing`.
+
+**Encrypted Chat** (Demo 2 — Publish → Discover → Connect → Chat):
 
 ```bash
-# machine A (192.168.1.10)
-./phase1-node -listen :5001 -ip 192.168.1.10 -debug :2634
+cd examples/phase2-chat
 
-# machine B (192.168.1.20)
-./phase1-node -listen :5001 -ip 192.168.1.20 -bootstrap 192.168.1.10:5001 -debug :2634
+go run . -listen :5001 -quic :5002 -debug :2634                       # Alice
+go run . -listen :5003 -quic :5004 -bootstrap 127.0.0.1:5001 -debug :2635  # Bob
 ```
 
-Each node prints its AID on startup. Type any AID in a terminal to resolve its endpoint. Any node can serve as a bootstrap peer. Node state is visible at `http://localhost:2634/debug/routing`.
+Bob enters Alice's AID → automatic resolution → encrypted connection → bidirectional messaging.
+
+## Status
+
+A2AL is under active development. Core discovery and encrypted connection layers are functional. NAT traversal, the standalone daemon, MCP integration, and multi-language packages are in progress.
+
+See [`doc/API.md`](doc/API.md) for the current library API.
 
 ## Contributing
 
