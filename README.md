@@ -81,7 +81,7 @@ A2AL is complementary to existing agent communication standards — it provides 
 
 ## Try the Demo
 
-**Discovery** (Demo 1 — DHT address resolution):
+**Discovery** (Demo 1 — AID address resolution):
 
 ```bash
 cd examples/phase1-node
