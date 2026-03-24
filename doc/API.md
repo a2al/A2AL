@@ -1,88 +1,148 @@
-# A2AL Go 库 — 调用说明（Phase 1）
+# A2AL Go library — API reference
 
-## 库与验证程序
+This document describes the **public surfaces** intended for application developers: discovery, signed endpoint records, and QUIC sessions. It reflects the current repository layout (`module github.com/a2al/a2al`).
 
-- **库**：仓库根目录 `go.mod`（`module github.com/a2al/a2al`），各子包供应用 `import`。
-- **验证程序**：`examples/phase1-node/`（独立 `go.mod`），单一 DHT 节点：启动即发布，交互式按 Address 查询。
+## Integration levels
 
-## 快速上手
+| Level | Package | Use when |
+|--------|---------|----------|
+| **Node runtime** | `github.com/a2al/a2al/host` | You want DHT + QUIC on one or two UDP ports, mutual TLS between agents, and helpers to publish/resolve endpoints. |
+| **DHT only** | `github.com/a2al/a2al/dht` | You supply your own transport and only need routing, bootstrap, and iterative `FIND_VALUE` / `STORE`. |
 
-```bash
-cd examples/phase1-node
+Lower-level packages (`transport`, `routing`, internal mux details) are building blocks; most applications should depend on `host` or `dht` only.
 
-# 终端1：第一个节点
-go run . -listen :5001 -debug :2634
+---
 
-# 终端2：第二个节点，bootstrap 到第一个
-go run . -listen :5002 -bootstrap 127.0.0.1:5001 -debug :2635
+## `host` — `Host`
 
-# 终端3：第三个节点
-go run . -listen :5003 -bootstrap 127.0.0.1:5001 -debug :2636
-```
+A `Host` runs a DHT `Node`, optional UDP demux for DHT+QUIC on a single port, a QUIC listener, and NAT/reflection hints via `natsense.Sense`.
 
-每个节点启动后打印自己的 Address。在任一终端输入另一个节点的 Address，按回车，即可解析出对方的端点信息。
+### Configuration (`host.Config`)
 
-## 浏览器看状态
+| Field | Meaning |
+|-------|---------|
+| `KeyStore` | Required. Must list **exactly one** `Address` (see `crypto.KeyStore`). |
+| `ListenAddr` | DHT UDP bind, e.g. `":5001"`. |
+| `QUICListenAddr` | If non-empty, QUIC binds here **separately** from DHT. If empty, QUIC shares the DHT UDP socket (mux). |
+| `PrivateKey` | Ed25519 key for QUIC/TLS. If nil, `EncryptedKeyStore.Ed25519PrivateKey` is used when available; otherwise set explicitly. |
+| `MinObservedPeers` | Minimum distinct peers that must report the same reflected address before `Sense` treats it as trusted (default 3 if ≤0). |
+| `FallbackHost` | Optional advertised host when bind address and reflection data are ambiguous (e.g. `0.0.0.0`). |
 
-默认 Debug HTTP 地址由 `-debug` 参数指定（库常量 `dht.DebugHTTPAddr` = `127.0.0.1:2634`）。
+### Lifecycle
 
-| URL | 内容 |
-|-----|------|
-| `http://127.0.0.1:2634/debug/identity` | 本节点 Address、NodeID、监听地址 |
-| `http://127.0.0.1:2634/debug/routing` | 路由表快照 |
-| `http://127.0.0.1:2634/debug/store` | 本地存储记录 |
-| `http://127.0.0.1:2634/debug/stats` | 收发包 / RPC 计数 |
+1. `host.New(cfg)` — starts the DHT receive loop and QUIC listener.  
+2. `h.Node().BootstrapAddrs(ctx, []net.Addr{...})` (or `StartWithBootstrap` on a bare `Node`).  
+3. Optionally `h.ObserveFromPeers(ctx, seeds)` to seed observed-address sampling.  
+4. `h.PublishEndpoint`, `h.Resolve`, `h.Connect`, `h.Accept` as needed.  
+5. `h.Close()`
 
-多节点时每个用不同端口（如 `:2634`、`:2635`、`:2636`）。
+### Primary methods
 
-## Bootstrap：只需要 ip:port
+| Method | Role |
+|--------|------|
+| `PublishEndpoint(ctx, seq, ttl)` | Builds `quic://` endpoint payload (NAT hint, optional reflection), signs, stores on the DHT. |
+| `Resolve(ctx, target Address)` | Iterative lookup; returns `*protocol.EndpointRecord`. |
+| `Connect(ctx, expectRemote Address, udpAddr)` | QUIC dial with mutual TLS; opens first stream and sends **agent-route** frame (see below). Returns `quic.Connection`. |
+| `Accept(ctx)` | Blocks for inbound QUIC; returns `*AgentConn` with `Local` / `Remote` addresses. |
+| `FirstQUICAddr(er)` | Parses first `quic://` or legacy `udp://` entry from an `EndpointRecord` to `*net.UDPAddr`. |
+| `BuildEndpointPayload()` | Same addressing logic as publish, without signing or storing. |
+| `RegisterAgent` / `UnregisterAgent` / `RegisteredAgents` | Extra agent identities on the same QUIC listener (TLS SNI + agent-route). |
+| `Address`, `DHTLocalAddr`, `QUICLocalAddr` | Introspection. |
+| `Node()`, `Sense()` | Access underlying DHT node or NAT/reflection state. |
+| `ObserveFromPeers` | Triggers ping/bootstrap-style contact to collect `observed_addr` for `Sense`. |
+| `StartDebugHTTP(addr)` / `DebugHTTPHandler()` | Read-only JSON (see Debug HTTP). |
+| `Close()` | Shuts down QUIC, mux, and DHT. |
 
-调用 **`node.BootstrapAddrs(ctx, []net.Addr{udpAddr})`** 即可。库会自动向裸地址发 PING，从 PONG 中提取对方 Address / NodeID，注册拨号地址并加入路由表。**应用无需提前知道种子的密码学身份。**
+### `AgentConn`
 
-旧接口 `Bootstrap(ctx, []BootstrapSeed)` 仍可用（需预知对方 NodeInfo），但推荐使用 `BootstrapAddrs`。
+Embeds `quic.Connection`. Fields:
 
-## 包职责
+- `Local` — agent `Address` selected for this connection (agent-route frame, else SNI, else default).  
+- `Remote` — peer `Address` from the mutual TLS client certificate (inbound).
 
-| 包 | 作用 |
-|----|------|
-| `github.com/a2al/a2al` | `Address` / `NodeID`、`Storage`、`MemStorage` |
-| `github.com/a2al/a2al/crypto` | `KeyStore` 接口、`EncryptedKeyStore` |
-| `github.com/a2al/a2al/protocol` | 消息、编解码、`SignEndpointRecord` |
-| `github.com/a2al/a2al/transport` | `Transport` 接口、`MemTransport`、`UDPTransport` |
-| `github.com/a2al/a2al/dht` | `Node`、`Query`、bootstrap、Debug HTTP |
-| `github.com/a2al/a2al/routing` | K-bucket 路由表 |
+### QUIC agent-route (interoperability)
 
-## `dht.Node` 生命周期
+After the TLS handshake, the **client** MUST open a stream and write **25 bytes**: prefix `a2r1` (ASCII) followed by the 21-byte binary `Address` of the intended server agent. The server uses this for routing when multiple agents share one listener; TLS SNI is a secondary hint.
 
-1. `NewNode(Config{Transport, Keystore})`
-2. `Start()` — 收包循环
-3. `BootstrapAddrs(ctx, addrs)` — 只需 ip:port
-4. `PublishEndpointRecord(ctx, rec)` — 发布自己
-5. `NewQuery(node).Resolve(ctx, targetNodeID)` — 按 Address 查询
-6. `Close()`
+---
 
-## 常用 API
+## `dht` — `Node`
 
-| 方法 | 说明 |
+Use when you implement your own stack but need Kademlia-style RPCs and storage.
+
+### Lifecycle
+
+1. `dht.NewNode(dht.Config{Transport, Keystore})` — keystore must list exactly one identity  
+2. `Start()`  
+3. `BootstrapAddrs` / `Bootstrap` / `StartWithBootstrap`  
+4. `PublishEndpointRecord` or `NewQuery(n).Resolve` / `FindNode`  
+5. `Close()`
+
+### Common methods
+
+| Method | Role |
+|--------|------|
+| `BootstrapAddrs(ctx, []net.Addr)` | Recommended bootstrap: only `ip:port` required; identity learned from PONG. |
+| `PingIdentity(ctx, addr)` | Returns `PeerIdentity{Address, NodeID}`. |
+| `PublishEndpointRecord(ctx, rec)` | STORE signed record to closest peers. |
+| `NewQuery(n).Resolve(ctx, NodeID)` | Iterative endpoint fetch. |
+| `NewQuery(n).FindNode(ctx, NodeID)` | Iterative `FIND_NODE`. |
+| `StartDebugHTTP` / `DebugHTTPHandler()` | Same DHT JSON as under `Host` (no `/debug/host`). |
+
+`Config.OnObservedAddr` exists for custom wiring; `Host` sets it automatically when using the bundled node.
+
+---
+
+## Identity and signing
+
+| Package | Items |
+|---------|--------|
+| `github.com/a2al/a2al` | `Address`, `NodeID`, `ParseAddress`, `NodeIDFromAddress` |
+| `github.com/a2al/a2al/crypto` | `KeyStore`, `EncryptedKeyStore` (optional `Ed25519PrivateKey` for QUIC) |
+| `github.com/a2al/a2al/crypto` | `AddressFromPublicKey`, `GenerateEd25519`, detached sign/verify helpers |
+
+---
+
+## Endpoint records (`protocol`)
+
+| Item | Role |
 |------|------|
-| `BootstrapAddrs(ctx, []net.Addr)` | **推荐**：只需 ip:port，自动握手入表 |
-| `PingIdentity(ctx, addr)` | Ping 并返回对方 `PeerIdentity{Address, NodeID}` |
-| `PublishEndpointRecord(ctx, rec)` | 向 DHT 近邻 STORE |
-| `NewQuery(n).Resolve(ctx, nodeID)` | 迭代 FIND_VALUE |
-| `NewQuery(n).FindNode(ctx, nodeID)` | 迭代 FIND_NODE |
-| `StartDebugHTTP(addr)` / `DebugHTTPHandler()` | 只读 JSON |
-| `Ping` / `FindNode` / `FindValue` / `StoreAt` | 单跳 RPC |
+| `EndpointPayload` | `Endpoints []string` (use `quic://host:port`), `NatType uint8` |
+| `EndpointRecord` | Decoded view after verify (`Address`, `Endpoints`, `NatType`, `Seq`, `Timestamp`, `TTL`) |
+| `SignEndpointRecord(priv, addr, payload, seq, timestamp, ttl)` | Build `SignedRecord` for DHT store |
+| `ParseEndpointRecord(sr)` | Verify and decode to `EndpointRecord` |
+| NAT constants | `NATUnknown`, `NATFullCone`, `NATRestricted`, `NATPortRestricted`, `NATSymmetric` |
 
-## 端点记录
+`timestamp` + `TTL` must cover “now” or verification/storage fails.
 
-```go
-rec, err := protocol.SignEndpointRecord(priv, addr, EndpointPayload{...}, seq, timestampUnix, ttlSec)
-```
+---
 
-`timestamp + TTL` 需覆盖当前时间，否则验证 / 存储会失败。
+## Debug HTTP
 
-## 库测试
+Constant `dht.DebugHTTPAddr` is a suggested default (`127.0.0.1:2634`).
+
+| Path | Provided by |
+|------|----------------|
+| `/debug/identity`, `/debug/routing`, `/debug/store`, `/debug/stats` | `dht.Node` (and `Host` via combined handler) |
+| `/debug/host` | `Host` only — QUIC bind, registered agents, NAT/reflection summary |
+
+All responses are read-only JSON.
+
+---
+
+## `natsense` — optional reads
+
+When using `Host`, `Sense()` exposes consensus over reflected UDP endpoints:
+
+- `MinAgreeing` / `SetMinAgreeing` — lower to `1` for small test networks.  
+- `TrustedUDP` / `TrustedWire` / `InferNATType` — read trusted reflection and coarse NAT classification used when building published payloads.
+
+---
+
+## Tests
 
 ```bash
 go test -vet=off -count=1 ./...
 ```
+
+Example programs under `examples/` use separate `go.mod` files and import the parent module via `replace`.
