@@ -1,10 +1,10 @@
 // Copyright 2026 The A2AL Authors. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// phase2-chat: 双节点加密聊天，覆盖 Phase 2a 全部核心能力。
+// phase2-chat: 双节点加密聊天，覆盖 Phase 2 核心能力（含 2b 多候选 + Happy Eyeballs）。
 //
 // 功能覆盖:
-//   Publish / Resolve / Connect / Accept / 双向 TLS / agent-route 控制帧 / nat-sense
+//   Publish / Resolve / ConnectFromRecord / Accept / 双向 TLS / agent-route / nat-sense / UPnP(可选)
 //
 // 测试步骤 (同一台机器, 两个终端, 无需指定 -ip):
 //
@@ -51,6 +51,7 @@ func main() {
 	debugAddr := flag.String("debug", "", "debug HTTP address")
 	extIP := flag.String("ip", "", "advertise host (fallback)")
 	minObs := flag.Int("min-observed", 1, "nat-sense threshold")
+	noUPnP := flag.Bool("no-upnp", false, "disable UPnP port mapping (Phase 2b)")
 	flag.Parse()
 
 	ks, err := newSimpleKS()
@@ -65,6 +66,7 @@ func main() {
 		PrivateKey:       ks.priv,
 		MinObservedPeers: *minObs,
 		FallbackHost:     *extIP,
+		DisableUPnP:      *noUPnP,
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -112,6 +114,9 @@ func main() {
 	natStr := natLabels[0]
 	if t := h.Sense().InferNATType(); int(t) < len(natLabels) {
 		natStr = natLabels[t]
+	}
+	if hint := h.SymmetricNATReachabilityHint(); hint != "" {
+		fmt.Println("Note:", hint)
 	}
 	fmt.Println()
 	fmt.Println("═══════════════════════════════════════════")
@@ -228,15 +233,11 @@ func main() {
 				prompt()
 				continue
 			}
-			udpAddr, err := host.FirstQUICAddr(er)
-			if err != nil {
-				fmt.Println("no QUIC endpoint:", err)
-				prompt()
-				continue
+			if len(er.Endpoints) > 0 {
+				fmt.Printf("Resolved → %d QUIC candidate(s), connecting...\n", len(er.Endpoints))
 			}
-			fmt.Printf("Resolved → %s, connecting...\n", udpAddr)
 			cctx, ccancel := context.WithTimeout(ctx, 30*time.Second)
-			conn, err := h.Connect(cctx, addr, udpAddr)
+			conn, err := h.ConnectFromRecord(cctx, addr, er)
 			ccancel()
 			if err != nil {
 				fmt.Println("connect failed:", err)
