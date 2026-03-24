@@ -1,7 +1,8 @@
 // Copyright 2026 The A2AL Authors. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package host is the Phase 2a SDK: DHT + QUIC, nat-sense, Publish/Resolve/Connect/Accept.
+// Package host is the Phase 2 SDK: DHT + QUIC, nat-sense, multi-candidate endpoints (2b),
+// optional UPnP, Happy Eyeballs dial, Publish/Resolve/Connect/Accept.
 //
 // A Host manages the node-level resources (DHT, QUIC transport). One or more
 // agents (each identified by a unique Address) share the same QUIC listener
@@ -20,8 +21,6 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"net/url"
-	"strconv"
 	"sync"
 	"time"
 
@@ -30,6 +29,7 @@ import (
 	"github.com/a2al/a2al"
 	"github.com/a2al/a2al/crypto"
 	"github.com/a2al/a2al/dht"
+	"github.com/a2al/a2al/natmap"
 	"github.com/a2al/a2al/natsense"
 	"github.com/a2al/a2al/protocol"
 	"github.com/a2al/a2al/transport"
@@ -42,16 +42,27 @@ func defaultQUICConfig() *quic.Config {
 	}
 }
 
-// Config wires DHT + QUIC (Phase 2a).
+// Config wires DHT + QUIC.
+//
+// IPv6 note: currently Host binds udp4 sockets only. The Transport interface,
+// protocol wire format (NodeInfo.IP 4/16 bytes, observed_addr 6/18 bytes), and
+// endpoint URL model ("quic://[v6]:port") are all IPv6-ready. Dual-stack
+// requires changing the socket setup in New() — either "udp" dual-stack or
+// separate v4+v6 listeners — and adding v6 candidate collection in candidates.go.
+// No interface or data-model changes are expected.
 type Config struct {
 	KeyStore crypto.KeyStore
-	// ListenAddr is the DHT UDP bind address ("udp4"), e.g. ":5001".
+	// ListenAddr is the DHT UDP bind address, e.g. ":5001".
+	// Currently resolved as udp4; dual-stack (udp / "[::]:port") is planned.
 	ListenAddr string
 	// QUICListenAddr, if non-empty, is a separate UDP bind for QUIC.
+	// Same udp4 constraint as ListenAddr.
 	QUICListenAddr string
 	PrivateKey       ed25519.PrivateKey
 	MinObservedPeers int
 	FallbackHost     string
+	// DisableUPnP skips IGD port mapping for the QUIC UDP port (Phase 2b). TURN is deferred.
+	DisableUPnP bool
 }
 
 // agentRouteMagic is the 4-byte prefix of the agent-route control stream.
@@ -87,6 +98,11 @@ type Host struct {
 
 	agentsMu sync.RWMutex
 	agents   map[a2al.Address]*agentEntry
+
+	upnpMu             sync.Mutex
+	upnpURL            string
+	upnpCleanup        func()
+	upnpFailRetryAfter time.Time
 }
 
 // New creates a Host with one initial agent identity from cfg.KeyStore.
@@ -288,46 +304,72 @@ func (h *Host) ObserveFromPeers(ctx context.Context, seeds []net.Addr) {
 	}
 }
 
-// BuildEndpointPayload builds quic:// for QUIC reachability.
-func (h *Host) BuildEndpointPayload() (protocol.EndpointPayload, error) {
-	ua := h.QUICLocalAddr()
-	port := ua.Port
-	hostStr := h.cfg.FallbackHost
-	if th, _, ok := h.sense.TrustedUDP(); ok {
-		hostStr = th
+// BuildEndpointPayload builds ordered, deduplicated quic:// candidates (Phase 2b).
+// When UPnP is enabled, ctx bounds discovery and AddPortMapping latency.
+func (h *Host) BuildEndpointPayload(ctx context.Context) (protocol.EndpointPayload, error) {
+	up := h.ensureUPnP(ctx)
+	eps, err := h.orderedQUICEndpointStrings(up)
+	if err != nil {
+		return protocol.EndpointPayload{}, err
 	}
-	if hostStr == "" {
-		ip := ua.IP
-		if ip4 := ip.To4(); ip4 != nil && !ip.IsUnspecified() {
-			hostStr = ip4.String()
-		}
-	}
-	if hostStr == "" {
-		ip := h.DHTLocalAddr().IP
-		if ip4 := ip.To4(); ip4 != nil && !ip.IsUnspecified() {
-			hostStr = ip4.String()
-		}
-	}
-	if hostStr == "" {
-		// Last resort: probe the OS-selected outbound IP (no packets sent).
-		// On a loopback-only machine this yields 127.0.0.1; on a routed machine
-		// it yields the primary outbound interface IP.
-		if ip := outboundIP(); ip != nil {
-			hostStr = ip.String()
-		}
-	}
-	if hostStr == "" {
-		return protocol.EndpointPayload{}, errors.New("a2al/host: cannot determine advertise host; set FallbackHost or bind a specific IP")
-	}
-	ep := "quic://" + net.JoinHostPort(hostStr, strconv.Itoa(port))
 	return protocol.EndpointPayload{
-		Endpoints: []string{ep},
+		Endpoints: eps,
 		NatType:   h.sense.InferNATType(),
 	}, nil
 }
 
+func (h *Host) ensureUPnP(ctx context.Context) string {
+	if h.cfg.DisableUPnP {
+		return ""
+	}
+	h.upnpMu.Lock()
+	if h.upnpURL != "" {
+		u := h.upnpURL
+		h.upnpMu.Unlock()
+		return u
+	}
+	if time.Now().Before(h.upnpFailRetryAfter) {
+		h.upnpMu.Unlock()
+		return ""
+	}
+	h.upnpMu.Unlock()
+
+	lan := natmap.LocalIPv4ForUPnP()
+	if lan == "" {
+		h.upnpMu.Lock()
+		h.upnpFailRetryAfter = time.Now().Add(60 * time.Second)
+		h.upnpMu.Unlock()
+		return ""
+	}
+	port := h.QUICLocalAddr().Port
+	extIP, extPort, cleanup, err := natmap.MapUDPPort(ctx, port, lan)
+
+	h.upnpMu.Lock()
+	defer h.upnpMu.Unlock()
+	if err != nil {
+		h.upnpFailRetryAfter = time.Now().Add(60 * time.Second)
+		return ""
+	}
+	if h.upnpURL != "" {
+		cleanup()
+		return h.upnpURL
+	}
+	h.upnpCleanup = cleanup
+	h.upnpURL = natmap.QUICURL(extIP, extPort)
+	return h.upnpURL
+}
+
+// SymmetricNATReachabilityHint returns a user-facing note when NAT looks symmetric.
+// Phase 2b does not guarantee inbound QUIC from arbitrary peers; TURN is deferred.
+func (h *Host) SymmetricNATReachabilityHint() string {
+	if h.sense.InferNATType() != protocol.NATSymmetric {
+		return ""
+	}
+	return "NAT appears symmetric: inbound QUIC from arbitrary internet peers is not guaranteed without relay (TURN planned for Phase 3). Outbound connects or peers behind compatible NATs may still work; coordinated hole punching may use DHT signaling in a later phase."
+}
+
 func (h *Host) PublishEndpoint(ctx context.Context, seq uint64, ttl uint32) error {
-	ep, err := h.BuildEndpointPayload()
+	ep, err := h.BuildEndpointPayload(ctx)
 	if err != nil {
 		return err
 	}
@@ -349,6 +391,10 @@ func (h *Host) Resolve(ctx context.Context, target a2al.Address) (*protocol.Endp
 // agent-route frame (4-byte magic + 21-byte target Address) so the
 // server can route the connection even when TLS SNI is camouflaged.
 func (h *Host) Connect(ctx context.Context, expectRemote a2al.Address, udpAddr *net.UDPAddr) (quic.Connection, error) {
+	return h.dialAndAgentRoute(ctx, expectRemote, udpAddr)
+}
+
+func (h *Host) dialAndAgentRoute(ctx context.Context, expectRemote a2al.Address, udpAddr *net.UDPAddr) (quic.Connection, error) {
 	cliTLS, err := quicClientTLS(h.priv, expectRemote)
 	if err != nil {
 		return nil, err
@@ -460,6 +506,15 @@ func (h *Host) StartDebugHTTP(addr string) (stop func(), err error) {
 }
 
 func (h *Host) Close() error {
+	h.upnpMu.Lock()
+	if h.upnpCleanup != nil {
+		h.upnpCleanup()
+		h.upnpCleanup = nil
+	}
+	h.upnpURL = ""
+	h.upnpFailRetryAfter = time.Time{}
+	h.upnpMu.Unlock()
+
 	var errs []error
 	if h.qListen != nil {
 		errs = append(errs, h.qListen.Close())
@@ -474,19 +529,13 @@ func (h *Host) Close() error {
 	return errors.Join(errs...)
 }
 
-// FirstQUICAddr extracts the first quic:// (or legacy udp://) endpoint as a UDP address.
+// FirstQUICAddr returns the first quic:// (or legacy udp://) endpoint as a UDP address.
 func FirstQUICAddr(er *protocol.EndpointRecord) (*net.UDPAddr, error) {
-	if er == nil {
-		return nil, errors.New("a2al/host: nil endpoint record")
+	addrs, err := QUICDialTargets(er)
+	if err != nil {
+		return nil, err
 	}
-	for _, e := range er.Endpoints {
-		u, err := url.Parse(e)
-		if err != nil || (u.Scheme != "quic" && u.Scheme != "udp") || u.Host == "" {
-			continue
-		}
-		return net.ResolveUDPAddr("udp4", u.Host)
-	}
-	return nil, errors.New("a2al/host: no quic endpoint in record")
+	return addrs[0], nil
 }
 
 // ---------------------------------------------------------------------------
