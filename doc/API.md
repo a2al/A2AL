@@ -27,25 +27,29 @@ A `Host` runs a DHT `Node`, optional UDP demux for DHT+QUIC on a single port, a 
 | `PrivateKey` | Ed25519 key for QUIC/TLS. If nil, `EncryptedKeyStore.Ed25519PrivateKey` is used when available; otherwise set explicitly. |
 | `MinObservedPeers` | Minimum distinct peers that must report the same reflected address before `Sense` treats it as trusted (default 3 if ≤0). |
 | `FallbackHost` | Optional advertised host when bind address and reflection data are ambiguous (e.g. `0.0.0.0`). |
+| `DisableUPnP` | If true, skips IGD UDP port mapping for the QUIC listen port (Phase 2b). TURN remains deferred. |
 
 ### Lifecycle
 
 1. `host.New(cfg)` — starts the DHT receive loop and QUIC listener.  
 2. `h.Node().BootstrapAddrs(ctx, []net.Addr{...})` (or `StartWithBootstrap` on a bare `Node`).  
 3. Optionally `h.ObserveFromPeers(ctx, seeds)` to seed observed-address sampling.  
-4. `h.PublishEndpoint`, `h.Resolve`, `h.Connect`, `h.Accept` as needed.  
-5. `h.Close()`
+4. `h.PublishEndpoint`, `h.Resolve`, `h.Connect` / `h.ConnectFromRecord`, `h.Accept` as needed.  
+5. `h.Close()` — also removes any UPnP mapping created for QUIC.
 
 ### Primary methods
 
 | Method | Role |
 |--------|------|
-| `PublishEndpoint(ctx, seq, ttl)` | Builds `quic://` endpoint payload (NAT hint, optional reflection), signs, stores on the DHT. |
+| `PublishEndpoint(ctx, seq, ttl)` | Builds multi-candidate `quic://` payload (Phase 2b: reflection, public bind, fallback, optional UPnP), signs, stores on the DHT. |
 | `Resolve(ctx, target Address)` | Iterative lookup; returns `*protocol.EndpointRecord`. |
-| `Connect(ctx, expectRemote Address, udpAddr)` | QUIC dial with mutual TLS; opens first stream and sends **agent-route** frame (see below). Returns `quic.Connection`. |
+| `Connect(ctx, expectRemote Address, udpAddr)` | QUIC dial to one UDP address with mutual TLS + agent-route (see below). |
+| `ConnectFromRecord(ctx, expectRemote Address, er)` | Happy Eyeballs: staggered dials over every `quic://` / `udp://` in `er` (deduped); first success wins. |
 | `Accept(ctx)` | Blocks for inbound QUIC; returns `*AgentConn` with `Local` / `Remote` addresses. |
-| `FirstQUICAddr(er)` | Parses first `quic://` or legacy `udp://` entry from an `EndpointRecord` to `*net.UDPAddr`. |
-| `BuildEndpointPayload()` | Same addressing logic as publish, without signing or storing. |
+| `FirstQUICAddr(er)` | First `quic://` or legacy `udp://` entry as `*net.UDPAddr` (same order as `QUICDialTargets`). |
+| `QUICDialTargets(er)` | Ordered, deduplicated `[]*net.UDPAddr` from an `EndpointRecord`. |
+| `BuildEndpointPayload(ctx)` | Same candidate list as publish (includes UPnP attempt when enabled); does not sign or store. |
+| `SymmetricNATReachabilityHint()` | Non-empty user-facing note when inferred NAT is symmetric (no Phase 2b reachability guarantee). |
 | `RegisterAgent` / `UnregisterAgent` / `RegisteredAgents` | Extra agent identities on the same QUIC listener (TLS SNI + agent-route). |
 | `Address`, `DHTLocalAddr`, `QUICLocalAddr` | Introspection. |
 | `Node()`, `Sense()` | Access underlying DHT node or NAT/reflection state. |
