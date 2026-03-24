@@ -67,7 +67,7 @@ As an MCP Server, A2AL exposes tools (`publish`, `resolve`, `update`, `identity`
 
 **Direct Communication** — A2AL resolves addresses and brokers the initial connection, then steps aside. Application data flows directly between agents, not through the protocol.
 
-**Web3 Compatible** — Ethereum and other blockchain wallet addresses can serve as AIDs. Cross-key attestation allows an agent to prove ownership of both a native AID and a blockchain identity. Web3 integration is supported, not required.
+**Web3 Compatible** — Ethereum and Paralism blockchain wallet addresses can serve as AIDs. Cross-key attestation allows an agent to prove ownership of both a native AID and a blockchain identity. Web3 integration is supported, not required.
 
 ## Relationship to AI Protocols
 
