@@ -5,6 +5,7 @@ package host
 
 import (
 	"context"
+	"crypto/ed25519"
 	"errors"
 	"fmt"
 	"net"
@@ -51,15 +52,31 @@ func QUICDialTargets(er *protocol.EndpointRecord) ([]*net.UDPAddr, error) {
 }
 
 // ConnectFromRecord dials expectRemote using Happy Eyeballs over all QUIC targets in er.
+// The host's default agent identity is used for mutual TLS.
 func (h *Host) ConnectFromRecord(ctx context.Context, expectRemote a2al.Address, er *protocol.EndpointRecord) (quic.Connection, error) {
 	targets, err := QUICDialTargets(er)
 	if err != nil {
 		return nil, err
 	}
-	return h.connectHappy(ctx, expectRemote, targets, DefaultConnectStagger)
+	return h.connectHappy(ctx, h.priv, expectRemote, targets, DefaultConnectStagger)
 }
 
-func (h *Host) connectHappy(ctx context.Context, expectRemote a2al.Address, targets []*net.UDPAddr, stagger time.Duration) (quic.Connection, error) {
+// ConnectFromRecordFor dials as localAgent (must be registered) toward expectRemote.
+func (h *Host) ConnectFromRecordFor(ctx context.Context, localAgent, expectRemote a2al.Address, er *protocol.EndpointRecord) (quic.Connection, error) {
+	h.agentsMu.RLock()
+	ag, ok := h.agents[localAgent]
+	h.agentsMu.RUnlock()
+	if !ok {
+		return nil, fmt.Errorf("a2al/host: unknown agent %s", localAgent)
+	}
+	targets, err := QUICDialTargets(er)
+	if err != nil {
+		return nil, err
+	}
+	return h.connectHappy(ctx, ag.priv, expectRemote, targets, DefaultConnectStagger)
+}
+
+func (h *Host) connectHappy(ctx context.Context, localPriv ed25519.PrivateKey, expectRemote a2al.Address, targets []*net.UDPAddr, stagger time.Duration) (quic.Connection, error) {
 	if len(targets) == 0 {
 		return nil, errors.New("a2al/host: no dial targets")
 	}
@@ -93,7 +110,7 @@ func (h *Host) connectHappy(ctx context.Context, expectRemote a2al.Address, targ
 			if gctx.Err() != nil {
 				return
 			}
-			c, err := h.dialAndAgentRoute(gctx, expectRemote, addr)
+			c, err := h.dialAndAgentRoute(gctx, localPriv, expectRemote, addr)
 			resCh <- dialRes{c, err}
 		}()
 	}

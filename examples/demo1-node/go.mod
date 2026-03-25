@@ -1,4 +1,4 @@
-module github.com/a2al/a2al/examples/phase1-node
+module github.com/a2al/a2al/examples/demo1-node
 
 go 1.22
 

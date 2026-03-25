@@ -1,4 +1,4 @@
-﻿// Copyright 2026 The A2AL Authors. All rights reserved.
+// Copyright 2026 The A2AL Authors. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
 package protocol
@@ -112,12 +112,41 @@ func TestStoreMessage_carriesSignedRecord(t *testing.T) {
 	}
 }
 
-func TestSign_addressKeyMismatch(t *testing.T) {
+// TestSignVerify_delegatedEndpoint verifies that SignEndpointRecordDelegated produces
+// a record whose signature passes VerifySignedRecord (cryptographic integrity only;
+// authority is checked separately via dht.Config.RecordAuth at the store layer).
+func TestSignVerify_delegatedEndpoint(t *testing.T) {
+	_, opPriv, _ := ed25519.GenerateKey(rand.Reader)
+	masterPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	agentAddr, _ := acrypto.AddressFromPublicKey(masterPub)
+	now := time.Unix(1700000000, 0)
+
+	fakeDel := []byte("placeholder-proof") // authority not checked here
+	sr, err := SignEndpointRecordDelegated(opPriv, fakeDel, agentAddr, EndpointPayload{Endpoints: []string{"quic://x:1"}, NatType: NATUnknown}, 1, uint64(now.Unix()), 60)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifySignedRecord(sr, now); err != nil {
+		t.Fatal(err)
+	}
+	er, err := ParseEndpointRecord(sr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if er.Address != agentAddr {
+		t.Fatal(er.Address)
+	}
+	if string(sr.Delegation) != "placeholder-proof" {
+		t.Fatal("delegation not embedded")
+	}
+}
+
+func TestSign_selfSignedNoMismatch(t *testing.T) {
 	_, priv, _ := ed25519.GenerateKey(rand.Reader)
-	pub2, _, _ := ed25519.GenerateKey(rand.Reader)
-	wrongAddr, _ := acrypto.AddressFromPublicKey(pub2)
-	_, err := SignEndpointRecord(priv, wrongAddr, EndpointPayload{}, 1, 1, 60)
+	masterPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	wrongAddr, _ := acrypto.AddressFromPublicKey(masterPub)
+	_, err := SignEndpointRecord(priv, wrongAddr, EndpointPayload{}, 1, 1700000000, 60)
 	if err == nil {
-		t.Fatal("expected error")
+		t.Fatal("expected address/key mismatch error")
 	}
 }

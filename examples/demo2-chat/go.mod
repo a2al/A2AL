@@ -1,4 +1,4 @@
-module github.com/a2al/a2al/examples/phase2-chat
+module github.com/a2al/a2al/examples/demo2-chat
 
 go 1.22
 

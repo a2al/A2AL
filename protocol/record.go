@@ -1,4 +1,4 @@
-﻿// Copyright 2026 The A2AL Authors. All rights reserved.
+// Copyright 2026 The A2AL Authors. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
 package protocol
@@ -73,7 +73,8 @@ type recordSignFields struct {
 	TTL       uint32 `cbor:"6,keyasint"`
 }
 
-// SignEndpointRecord builds a SignedRecord for an endpoint advertisement.
+// SignEndpointRecord builds a SignedRecord for a self-signed endpoint advertisement.
+// The signing key must derive the same Address as addr (Phase 1/2 path).
 func SignEndpointRecord(priv ed25519.PrivateKey, addr a2al.Address, ep EndpointPayload, seq, timestamp uint64, ttl uint32) (SignedRecord, error) {
 	if len(priv) != ed25519.PrivateKeySize {
 		return SignedRecord{}, fmt.Errorf("%w: private key", ErrInvalidRecord)
@@ -88,6 +89,29 @@ func SignEndpointRecord(priv ed25519.PrivateKey, addr a2al.Address, ep EndpointP
 	if want != addr {
 		return SignedRecord{}, fmt.Errorf("%w: address/key mismatch", ErrInvalidRecord)
 	}
+	return buildEndpointRecord(priv, addr, ep, seq, timestamp, ttl, nil)
+}
+
+// SignEndpointRecordDelegated builds a SignedRecord where an operational key signs on behalf
+// of a master-derived AID (Phase 3 delegation path).
+// delegationCBOR is embedded verbatim in the record and will be verified by
+// receivers via the RecordAuth policy injected into the DHT store.
+// Callers must ensure delegationCBOR is a valid DelegationProof for addr authorized to opPriv.
+func SignEndpointRecordDelegated(opPriv ed25519.PrivateKey, delegationCBOR []byte, addr a2al.Address, ep EndpointPayload, seq, timestamp uint64, ttl uint32) (SignedRecord, error) {
+	if len(opPriv) != ed25519.PrivateKeySize {
+		return SignedRecord{}, fmt.Errorf("%w: op private key", ErrInvalidRecord)
+	}
+	if ttl == 0 {
+		return SignedRecord{}, fmt.Errorf("%w: ttl", ErrInvalidRecord)
+	}
+	if len(delegationCBOR) == 0 {
+		return SignedRecord{}, fmt.Errorf("%w: delegation required", ErrInvalidRecord)
+	}
+	return buildEndpointRecord(opPriv, addr, ep, seq, timestamp, ttl, delegationCBOR)
+}
+
+// buildEndpointRecord is the shared signing implementation.
+func buildEndpointRecord(priv ed25519.PrivateKey, addr a2al.Address, ep EndpointPayload, seq, timestamp uint64, ttl uint32, delegation []byte) (SignedRecord, error) {
 	payloadCBOR, err := recordCanonical.Marshal(ep)
 	if err != nil {
 		return SignedRecord{}, err
@@ -108,30 +132,25 @@ func SignEndpointRecord(priv ed25519.PrivateKey, addr a2al.Address, ep EndpointP
 	sig := ed25519.Sign(priv, msg)
 	pub := priv.Public().(ed25519.PublicKey)
 	return SignedRecord{
-		Address:   addr[:],
-		RecType:   RecTypeEndpoint,
-		Payload:   payloadCBOR,
-		Seq:       seq,
-		Timestamp: timestamp,
-		TTL:       ttl,
-		Pubkey:    pub,
-		Signature: sig,
+		Address:    addr[:],
+		RecType:    RecTypeEndpoint,
+		Payload:    payloadCBOR,
+		Seq:        seq,
+		Timestamp:  timestamp,
+		TTL:        ttl,
+		Pubkey:     pub,
+		Signature:  sig,
+		Delegation: delegation,
 	}, nil
 }
 
-// VerifySignedRecord checks signature, pubkey↔address, binding, optional endpoint payload shape, and expiry.
+// VerifySignedRecord checks cryptographic integrity: signature validity, endpoint payload
+// shape, and expiry. It does NOT enforce pubkey↔address authority (whether the signing
+// key is allowed to publish for the given Address). Authority is a deployment policy;
+// inject it via dht.Config.RecordAuth at the storage layer.
 func VerifySignedRecord(sr SignedRecord, now time.Time) error {
 	if err := signedRecordCheck(sr); err != nil {
 		return err
-	}
-	addr, err := acrypto.AddressFromPublicKey(sr.Pubkey)
-	if err != nil {
-		return err
-	}
-	var recAddr a2al.Address
-	copy(recAddr[:], sr.Address)
-	if addr != recAddr {
-		return ErrInvalidRecord
 	}
 	fields := recordSignFields{
 		Address:   sr.Address,

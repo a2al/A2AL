@@ -1,4 +1,4 @@
-﻿// Copyright 2026 The A2AL Authors. All rights reserved.
+// Copyright 2026 The A2AL Authors. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
 package dht
@@ -328,7 +328,13 @@ func (q *Query) Resolve(ctx context.Context, target a2al.NodeID) (*protocol.Endp
 		}()
 		for r := range ch {
 			if r.rec != nil {
-				if err := protocol.VerifySignedRecord(*r.rec, time.Now()); err == nil {
+				now := time.Now()
+				if err := protocol.VerifySignedRecord(*r.rec, now); err == nil {
+					if q.n.auth != nil {
+						if err := q.n.auth(*r.rec, now); err != nil {
+							continue
+						}
+					}
 					er, err := protocol.ParseEndpointRecord(*r.rec)
 					if err == nil {
 						return &er, nil

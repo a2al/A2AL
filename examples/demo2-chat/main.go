@@ -1,7 +1,7 @@
 // Copyright 2026 The A2AL Authors. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// phase2-chat: 双节点加密聊天，覆盖 Phase 2 核心能力（含 2b 多候选 + Happy Eyeballs）。
+// demo2-chat: 双节点加密聊天，覆盖 Phase 2 核心能力（含 2b 多候选 + Happy Eyeballs）。
 //
 // 功能覆盖:
 //   Publish / Resolve / ConnectFromRecord / Accept / 双向 TLS / agent-route / nat-sense / UPnP(可选)

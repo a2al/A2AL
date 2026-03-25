@@ -1,0 +1,1014 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>a2ald</title>
+<style>
+:root {
+  --accent: #2563eb;
+  --accent-h: #1d4ed8;
+  --bg: #f3f4f6;
+  --surface: #fff;
+  --border: #e5e7eb;
+  --text: #111827;
+  --muted: #6b7280;
+  --success: #16a34a;
+  --error: #dc2626;
+  --warn: #d97706;
+  --radius: 8px;
+  --sh: 0 1px 3px rgb(0 0 0/.1),0 1px 2px -1px rgb(0 0 0/.1);
+  --sh-md: 0 4px 6px -1px rgb(0 0 0/.1),0 2px 4px -2px rgb(0 0 0/.1);
+  font-family: system-ui,-apple-system,sans-serif;
+  font-size: 14px;
+  color: var(--text);
+}
+*,*::before,*::after { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); min-height: 100vh; }
+h1,h2,h3 { margin: 0; font-weight: 600; }
+p { margin: 0; }
+button { cursor: pointer; border: none; font: inherit; }
+input,textarea,select { font: inherit; border: 1px solid var(--border); border-radius: 6px; padding: .375rem .625rem; outline: none; color: var(--text); background: var(--surface); }
+input:focus,textarea:focus,select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgb(37 99 235/.15); }
+
+/* App shell */
+.app-header {
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  padding: .75rem 1.5rem;
+  display: flex; align-items: center; gap: 1rem; flex-wrap: wrap;
+}
+.app-header h1 { font-size: 1rem; letter-spacing: -.02em; display: flex; align-items: center; gap: .5rem; }
+.status-dot { width: 8px; height: 8px; border-radius: 50%; background: #d1d5db; flex-shrink: 0; transition: background .3s; }
+.status-dot.ok  { background: var(--success); }
+.status-dot.err { background: var(--error); }
+.header-meta { display: flex; gap: 1.25rem; flex-wrap: wrap; font-size: .78rem; color: var(--muted); flex: 1; }
+.meta-item { display: flex; align-items: center; gap: .3rem; }
+.meta-label { font-weight: 500; color: var(--text); }
+.main { max-width: 68rem; margin: 1.25rem auto; padding: 0 1rem; display: grid; gap: 1rem; }
+
+/* Card */
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--sh); overflow: hidden; }
+.card-header { padding: .75rem 1.25rem; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; gap: .75rem; flex-wrap: wrap; }
+.card-header h2 { font-size: .9rem; }
+.card-body { padding: 1.125rem 1.25rem; }
+
+/* Buttons */
+.btn { display: inline-flex; align-items: center; gap: .3rem; padding: .375rem .875rem; border-radius: 6px; font-size: .83rem; font-weight: 500; transition: background .15s,opacity .15s; white-space: nowrap; line-height: 1.4; }
+.btn:disabled { opacity: .5; cursor: not-allowed; }
+.btn-primary  { background: var(--accent); color: #fff; }
+.btn-primary:hover:not(:disabled) { background: var(--accent-h); }
+.btn-secondary { background: var(--bg); color: var(--text); border: 1px solid var(--border); }
+.btn-secondary:hover:not(:disabled) { background: #e5e7eb; }
+.btn-ghost { background: transparent; color: var(--muted); padding: .2rem .4rem; }
+.btn-ghost:hover:not(:disabled) { background: var(--bg); color: var(--text); }
+.btn-danger { background: #fef2f2; color: var(--error); border: 1px solid #fecaca; }
+.btn-danger:hover:not(:disabled) { background: #fee2e2; }
+.btn-sm { padding: .2rem .55rem; font-size: .78rem; border-radius: 4px; }
+
+/* Badges */
+.badge { display: inline-flex; align-items: center; font-size: .71rem; font-weight: 600; padding: .15rem .45rem; border-radius: 9999px; }
+.b-green  { background: #dcfce7; color: #15803d; }
+.b-red    { background: #fee2e2; color: #b91c1c; }
+.b-gray   { background: #f3f4f6; color: #4b5563; }
+.b-yellow { background: #fef9c3; color: #a16207; }
+.b-blue   { background: #dbeafe; color: #1d4ed8; }
+
+/* Table */
+.t-wrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: .83rem; }
+th { text-align: left; padding: .5rem 1rem; font-size: .72rem; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); background: #f9fafb; border-bottom: 1px solid var(--border); }
+td { padding: .6rem 1rem; border-bottom: 1px solid #f3f4f6; vertical-align: middle; }
+tr:last-child td { border-bottom: none; }
+tr:hover td { background: #fafafa; }
+
+/* Form */
+.f-grid { display: grid; gap: .75rem; }
+.f-grid-2 { grid-template-columns: 1fr 1fr; }
+@media (max-width: 600px) { .f-grid-2 { grid-template-columns: 1fr; } }
+.f-group { display: grid; gap: .3rem; }
+.f-label { font-size: .79rem; font-weight: 500; display: flex; align-items: center; gap: .4rem; }
+.restart-tag { font-size: .66rem; background: #fef3c7; color: #92400e; padding: .1rem .3rem; border-radius: 3px; font-weight: 500; }
+.f-hint { font-size: .74rem; color: var(--muted); }
+
+/* Mono / AID */
+.mono { font-family: ui-monospace,monospace; font-size: .79rem; }
+.aid-wrap { display: flex; align-items: center; gap: .35rem; }
+.aid-text { font-family: ui-monospace,monospace; font-size: .76rem; color: var(--muted); max-width: 14rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Modal */
+.overlay { position: fixed; inset: 0; background: rgb(0 0 0/.4); display: flex; align-items: center; justify-content: center; z-index: 100; padding: 1rem; }
+.overlay.hidden { display: none; }
+.modal { background: var(--surface); border-radius: var(--radius); box-shadow: var(--sh-md); width: 100%; max-width: 34rem; max-height: 90vh; overflow-y: auto; }
+.modal-hd { padding: .875rem 1.25rem; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; }
+.modal-hd h3 { font-size: .9rem; }
+.modal-bd { padding: 1.125rem 1.25rem; display: grid; gap: .75rem; }
+.modal-ft { padding: .75rem 1.25rem; border-top: 1px solid var(--border); display: flex; justify-content: flex-end; gap: .5rem; }
+
+/* Resolve result card */
+.res-card { border: 1px solid var(--border); border-radius: 6px; padding: .875rem; display: grid; gap: .55rem; margin-top: .5rem; }
+.res-row { display: flex; align-items: center; gap: .5rem; font-size: .82rem; }
+.res-row-label { color: var(--muted); width: 5.5rem; flex-shrink: 0; }
+.ep-list { list-style: none; padding: 0; margin: 0; display: grid; gap: .25rem; }
+.ep-list li { font-family: ui-monospace,monospace; font-size: .77rem; padding: .3rem .55rem; background: #f9fafb; border: 1px solid var(--border); border-radius: 4px; }
+
+/* Token bar */
+.tok-bar { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: .625rem 1.25rem; display: flex; align-items: center; gap: .75rem; flex-wrap: wrap; }
+
+/* Warning box */
+.warn-box { background: #fffbeb; border: 1px solid #fde68a; border-radius: 6px; padding: .75rem; font-size: .8rem; color: #78350f; display: grid; gap: .4rem; }
+
+/* Toast */
+#toasts { position: fixed; bottom: 1.25rem; right: 1.25rem; display: grid; gap: .5rem; z-index: 200; pointer-events: none; }
+.toast { padding: .6rem .9rem; border-radius: 6px; font-size: .81rem; font-weight: 500; box-shadow: var(--sh-md); max-width: 22rem; pointer-events: auto; transition: opacity .3s; }
+.t-ok   { background: #14532d; color: #fff; }
+.t-err  { background: #7f1d1d; color: #fff; }
+.t-warn { background: #78350f; color: #fff; }
+.t-info { background: #1e3a5f; color: #fff; }
+.toast.fade { opacity: 0; }
+
+/* Spinner */
+.spin { display: inline-block; width: 11px; height: 11px; border: 2px solid currentColor; border-top-color: transparent; border-radius: 50%; animation: sp .6s linear infinite; }
+@keyframes sp { to { transform: rotate(360deg); } }
+
+/* Util */
+.hidden { display: none !important; }
+.muted  { color: var(--muted); }
+.flex   { display: flex; align-items: center; gap: .5rem; }
+.gap-s  { gap: .35rem; }
+.mt-xs  { margin-top: .4rem; }
+.mt-s   { margin-top: .6rem; }
+.w-full { width: 100%; }
+.text-sm { font-size: .8rem; }
+.empty { padding: 2.5rem 1rem; text-align: center; color: var(--muted); font-size: .83rem; }
+.empty .ico { font-size: 1.5rem; margin-bottom: .4rem; }
+/* Config read-only table */
+.cfg-table { width: 100%; border-collapse: collapse; font-size: .83rem; }
+.cfg-table tr:not(:last-child) td { border-bottom: 1px solid #f3f4f6; }
+.cfg-table td { padding: .5rem .25rem; vertical-align: baseline; }
+.cfg-table .cfg-key { width: 11rem; color: var(--muted); font-weight: 500; white-space: nowrap; padding-right: .75rem; }
+.cfg-table .cfg-val { font-family: ui-monospace,monospace; font-size: .8rem; word-break: break-all; }
+.cfg-table .cfg-val.empty-val { color: var(--muted); font-family: inherit; font-size: .8rem; }
+.cfg-table .cfg-actions { text-align: right; white-space: nowrap; }
+.default-tag { font-size: .66rem; background: #f0f9ff; color: #0369a1; padding: .1rem .3rem; border-radius: 3px; font-weight: 500; margin-left: .3rem; }
+</style>
+</head>
+<body>
+
+<div id="toasts"></div>
+
+<header class="app-header">
+  <h1>
+    <span class="status-dot" id="statusDot"></span>
+    a2ald
+  </h1>
+  <div class="header-meta" id="headerMeta">
+    <span class="muted" style="font-size:.78rem">Connecting…</span>
+  </div>
+  <button class="btn btn-secondary btn-sm" id="refreshBtn">↺ Refresh</button>
+</header>
+
+<div class="main">
+
+  <!-- Agents ------------------------------------------------------------------>
+  <div class="card">
+    <div class="card-header">
+      <h2>Agents</h2>
+      <div class="flex gap-s">
+        <button class="btn btn-secondary btn-sm" id="refAgBtn">↺</button>
+        <button class="btn btn-primary btn-sm" id="newAgentBtn">+ Register Agent</button>
+      </div>
+    </div>
+    <div id="agentsWrap">
+      <div class="empty"><div class="ico">…</div><p>Loading…</p></div>
+    </div>
+  </div>
+
+  <!-- Discover ---------------------------------------------------------------->
+  <div class="card">
+    <div class="card-header"><h2>Discover</h2></div>
+    <div class="card-body">
+      <div class="flex">
+        <input type="text" id="resolveAid" class="w-full mono" placeholder="Enter AID…" style="font-size:.8rem">
+        <button class="btn btn-primary" id="resBtn">Resolve</button>
+      </div>
+      <div id="resolveOut"></div>
+    </div>
+  </div>
+
+  <!-- Config ------------------------------------------------------------------>
+  <div class="card">
+    <div class="card-header">
+      <h2>Config</h2>
+      <div class="flex gap-s" id="cfgBtns">
+        <button class="btn btn-secondary btn-sm" id="refreshCfgBtn">↺ Refresh</button>
+        <button class="btn btn-primary   btn-sm" id="editCfgBtn">Edit</button>
+      </div>
+      <div class="flex gap-s hidden" id="cfgEditBtns">
+        <button class="btn btn-secondary btn-sm" id="cancelCfgBtn">Cancel</button>
+        <button class="btn btn-primary   btn-sm" id="saveCfgBtn">Save</button>
+      </div>
+    </div>
+    <div class="card-body">
+      <!-- read-only view -->
+      <div id="cfgView"><span class="muted text-sm">Loading…</span></div>
+      <!-- editable form (hidden until Edit clicked) -->
+      <div id="cfgForm" class="f-grid f-grid-2 hidden"></div>
+      <p id="cfgMsg" class="mt-s text-sm"></p>
+    </div>
+  </div>
+
+  <!-- API Token --------------------------------------------------------------->
+  <div class="tok-bar">
+    <span class="muted" style="font-size:.77rem;white-space:nowrap">API Token</span>
+    <input type="password" id="token" placeholder="(none — localhost is open by default)" style="flex:1;min-width:0;font-size:.82rem" autocomplete="off">
+    <button class="btn btn-secondary btn-sm" id="saveTok">Save to session</button>
+    <span id="tokMsg" class="muted text-sm"></span>
+  </div>
+
+</div>
+
+<!-- Register Agent Modal ----------------------------------------------------->
+<div class="overlay hidden" id="regModal">
+  <div class="modal">
+    <div class="modal-hd">
+      <h3>Register Agent</h3>
+      <button class="btn btn-ghost btn-sm" id="regClose">✕</button>
+    </div>
+    <div class="modal-bd" id="regBody">
+
+      <!-- Step 1: choose path -->
+      <div id="regStep1">
+        <p class="text-sm muted" style="margin-bottom:.75rem">
+          Generate a fresh identity or provide existing credentials.
+        </p>
+        <div style="display:grid;gap:.5rem">
+          <button class="btn btn-primary w-full" id="genBtn">⚡ Generate new identity</button>
+          <button class="btn btn-secondary w-full" id="manualBtn">Enter existing credentials</button>
+        </div>
+      </div>
+
+      <!-- Step 2: fields (hidden until step 1 chosen) -->
+      <div id="regStep2" class="hidden" style="display:grid;gap:.75rem">
+
+        <!-- Master key warning (shown only after generate) -->
+        <div id="masterWarn" class="warn-box hidden">
+          <strong>⚠ Save your master private key now</strong>
+          <span>This is the only time it is shown. Losing it means losing ownership of the AID permanently.</span>
+          <div class="flex gap-s mt-xs">
+            <input type="text" id="masterDisp" class="w-full mono" readonly style="font-size:.72rem;background:#fef3c7;border-color:#fde68a">
+            <button class="btn btn-sm btn-secondary" id="copyMasterBtn">Copy</button>
+          </div>
+        </div>
+
+        <div class="f-group">
+          <label class="f-label">AID</label>
+          <span id="aidPreview" class="mono muted" style="font-size:.78rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
+        </div>
+
+        <div class="f-group">
+          <label class="f-label" for="regOpKey">Operational private key (hex)</label>
+          <input id="regOpKey" class="w-full mono" style="font-size:.77rem" placeholder="64-byte ed25519 key hex">
+        </div>
+
+        <div class="f-group">
+          <label class="f-label" for="regDelProof">Delegation proof (hex)</label>
+          <input id="regDelProof" class="w-full mono" style="font-size:.77rem" placeholder="CBOR DelegationProof hex">
+        </div>
+
+        <div class="f-group">
+          <label class="f-label" for="regSvcTCP">Service TCP <span style="color:var(--error)">*</span></label>
+          <input id="regSvcTCP" class="w-full" placeholder="127.0.0.1:9000">
+          <span class="f-hint">TCP address the daemon forwards inbound connections to. Must be reachable locally.</span>
+        </div>
+
+      </div>
+
+    </div>
+    <div class="modal-ft">
+      <button class="btn btn-secondary" id="regCancel">Cancel</button>
+      <button class="btn btn-primary hidden" id="regSubmit">Register</button>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+'use strict';
+
+// ─── Escape ───────────────────────────────────────────────────────────────────
+function esc(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// ─── API fetch ────────────────────────────────────────────────────────────────
+function getToken() { return sessionStorage.getItem('a2al_token') || ''; }
+
+async function api(path, opt) {
+  const method = (opt && opt.method) || 'GET';
+  const isRead = method === 'GET' || method === 'HEAD';
+  const heads = {};
+  const tok = getToken();
+  if (tok) heads['Authorization'] = 'Bearer ' + tok;
+  if (!isRead) heads['Content-Type'] = 'application/json';
+  const resp = await fetch(path, Object.assign({}, opt, { headers: heads }));
+  const txt = await resp.text();
+  let body;
+  try { body = JSON.parse(txt); } catch (_) { body = txt; }
+  if (!resp.ok) {
+    const msg = (body && typeof body === 'object' && body.error)
+      ? body.error : (resp.status + ' ' + txt.slice(0, 200));
+    throw new Error(msg);
+  }
+  return body;
+}
+
+// ─── Toast ────────────────────────────────────────────────────────────────────
+function toast(msg, type, dur) {
+  type = type || 'info';
+  dur  = dur  || 3200;
+  const c = document.getElementById('toasts');
+  const el = document.createElement('div');
+  el.className = 'toast t-' + type;
+  el.textContent = msg;
+  c.appendChild(el);
+  setTimeout(() => { el.classList.add('fade'); setTimeout(() => el.remove(), 350); }, dur);
+}
+
+// ─── Button loading state ─────────────────────────────────────────────────────
+function setLoading(btn, on) {
+  if (on) { btn._html = btn.innerHTML; btn.innerHTML = '<span class="spin"></span>'; btn.disabled = true; }
+  else    { btn.innerHTML = btn._html || ''; btn.disabled = false; }
+}
+
+// ─── Copy to clipboard ────────────────────────────────────────────────────────
+function copyText(s) {
+  navigator.clipboard.writeText(s).then(() => toast('Copied!', 'ok', 1200));
+}
+
+function mkCopyBtn(text) {
+  const b = document.createElement('button');
+  b.className = 'btn btn-ghost btn-sm';
+  b.textContent = '⧉';
+  b.title = 'Copy';
+  b.onclick = (e) => { e.stopPropagation(); copyText(text); };
+  return b;
+}
+
+// ─── NAT info ─────────────────────────────────────────────────────────────────
+const NAT = {
+  full_cone:       { label: 'Full Cone',       cls: 'b-green',  title: 'Good reachability' },
+  restricted:      { label: 'Restricted',      cls: 'b-yellow', title: 'Moderate reachability' },
+  port_restricted: { label: 'Port Restricted', cls: 'b-yellow', title: 'Moderate reachability' },
+  symmetric:       { label: 'Symmetric',       cls: 'b-red',    title: 'Low reachability — relay recommended' },
+  unknown:         { label: 'Unknown',         cls: 'b-gray',   title: '' },
+};
+function natBadge(label) {
+  const info = NAT[label] || NAT.unknown;
+  const s = document.createElement('span');
+  s.className = 'badge ' + info.cls;
+  s.textContent = info.label;
+  s.title = info.title;
+  return s;
+}
+
+// ─── Header / status ──────────────────────────────────────────────────────────
+async function refreshStatus() {
+  const dot  = document.getElementById('statusDot');
+  const meta = document.getElementById('headerMeta');
+  try {
+    const [host, stats] = await Promise.all([
+      api('/debug/host'),
+      api('/debug/stats'),
+    ]);
+    dot.className = 'status-dot ok';
+    meta.innerHTML = '';
+
+    function addMeta(label, content) {
+      const d = document.createElement('div');
+      d.className = 'meta-item';
+      const lbl = document.createElement('span');
+      lbl.className = 'meta-label';
+      lbl.textContent = label;
+      d.appendChild(lbl);
+      if (typeof content === 'string') {
+        const s = document.createElement('span');
+        s.textContent = ' ' + content;
+        d.appendChild(s);
+      } else {
+        d.appendChild(content);
+      }
+      meta.appendChild(d);
+    }
+
+    // Node AID (truncated with copy)
+    const aidWrap = document.createElement('div');
+    aidWrap.className = 'aid-wrap';
+    const aidSpan = document.createElement('span');
+    aidSpan.className = 'aid-text';
+    aidSpan.textContent = host.address;
+    aidSpan.title = host.address;
+    aidWrap.appendChild(aidSpan);
+    aidWrap.appendChild(mkCopyBtn(host.address));
+    const aidItem = document.createElement('div');
+    aidItem.className = 'meta-item';
+    const aidLbl = document.createElement('span');
+    aidLbl.className = 'meta-label';
+    aidLbl.textContent = 'Node AID';
+    aidItem.appendChild(aidLbl);
+    aidItem.appendChild(aidWrap);
+    meta.appendChild(aidItem);
+
+    addMeta('DHT',  host.dht_addr);
+    addMeta('QUIC', host.quic_addr);
+
+    const natItem = document.createElement('div');
+    natItem.className = 'meta-item';
+    const natLbl = document.createElement('span');
+    natLbl.className = 'meta-label';
+    natLbl.textContent = 'NAT';
+    natItem.appendChild(natLbl);
+    natItem.appendChild(natBadge(host.nat_type_label));
+    meta.appendChild(natItem);
+
+    if (host.observed_host) {
+      addMeta('Observed', host.observed_host + ':' + host.observed_port);
+    }
+    addMeta('Peers', String(stats.total_peers || 0));
+
+  } catch (e) {
+    dot.className = 'status-dot err';
+    meta.innerHTML = '<span class="muted" style="font-size:.78rem">Unavailable — ' + esc(e.message) + '</span>';
+  }
+}
+
+// ─── Agents table ─────────────────────────────────────────────────────────────
+async function refreshAgents() {
+  const wrap = document.getElementById('agentsWrap');
+  try {
+    const { agents } = await api('/agents');
+    if (!agents || agents.length === 0) {
+      wrap.innerHTML = '<div class="empty"><div class="ico">📭</div><p>No agents registered.</p><p class="mt-xs" style="font-size:.77rem">Click <strong>Register Agent</strong> to get started.</p></div>';
+      return;
+    }
+    const details = await Promise.all(
+      agents.map(a => api('/agents/' + encodeURIComponent(a.aid)).catch(() => null))
+    );
+
+    const div = document.createElement('div');
+    div.className = 't-wrap';
+    const tbl = document.createElement('table');
+    tbl.innerHTML = `<thead><tr>
+      <th>AID</th><th>Service TCP</th><th>TCP</th><th>DHT</th><th>Seq</th><th></th>
+    </tr></thead>`;
+    const tbody = document.createElement('tbody');
+
+    agents.forEach((ag, i) => {
+      const d = details[i];
+      const tr = document.createElement('tr');
+
+      // AID
+      const td0 = document.createElement('td');
+      td0.className = 'aid-wrap';
+      const aidSpan = document.createElement('span');
+      aidSpan.className = 'aid-text';
+      aidSpan.textContent = ag.aid;
+      aidSpan.title = ag.aid;
+      td0.appendChild(aidSpan);
+      td0.appendChild(mkCopyBtn(ag.aid));
+      tr.appendChild(td0);
+
+      // Service TCP
+      const td1 = document.createElement('td');
+      td1.innerHTML = '<span class="mono">' + esc(ag.service_tcp) + '</span>';
+      tr.appendChild(td1);
+
+      // TCP reachable
+      const td2 = document.createElement('td');
+      if (d !== null) {
+        const b = document.createElement('span');
+        b.className = 'badge ' + (d.service_tcp_ok ? 'b-green' : 'b-red');
+        b.textContent = d.service_tcp_ok ? '✓ OK' : '✗ Down';
+        td2.appendChild(b);
+      } else {
+        td2.innerHTML = '<span class="badge b-gray">—</span>';
+      }
+      tr.appendChild(td2);
+
+      // Published
+      const td3 = document.createElement('td');
+      if (d !== null) {
+        const b = document.createElement('span');
+        b.className = 'badge ' + (d.published_to_dht ? 'b-blue' : 'b-gray');
+        b.textContent = d.published_to_dht ? '✓ Published' : 'Unpublished';
+        td3.appendChild(b);
+      } else {
+        td3.innerHTML = '<span class="badge b-gray">—</span>';
+      }
+      tr.appendChild(td3);
+
+      // Seq
+      const td4 = document.createElement('td');
+      td4.className = 'muted mono';
+      td4.textContent = ag.seq != null ? ag.seq : '—';
+      tr.appendChild(td4);
+
+      // Actions
+      const td5 = document.createElement('td');
+      td5.style.whiteSpace = 'nowrap';
+      const pubB = document.createElement('button');
+      pubB.className = 'btn btn-secondary btn-sm';
+      pubB.textContent = 'Publish';
+      pubB.onclick = () => doPublish(ag.aid, pubB);
+      const delB = document.createElement('button');
+      delB.className = 'btn btn-danger btn-sm';
+      delB.textContent = 'Delete';
+      delB.style.marginLeft = '.35rem';
+      delB.onclick = () => doDelete(ag.aid, delB);
+      td5.appendChild(pubB);
+      td5.appendChild(delB);
+      tr.appendChild(td5);
+
+      tbody.appendChild(tr);
+    });
+
+    tbl.appendChild(tbody);
+    div.appendChild(tbl);
+    wrap.innerHTML = '';
+    wrap.appendChild(div);
+  } catch (e) {
+    wrap.innerHTML = '<div class="empty"><div class="ico">⚠</div><p>' + esc(e.message) + '</p></div>';
+  }
+}
+
+async function doPublish(aid, btn) {
+  setLoading(btn, true);
+  try {
+    const r = await api('/agents/' + encodeURIComponent(aid) + '/publish', { method: 'POST', body: '{}' });
+    toast('Published (seq ' + r.seq + ')', 'ok');
+    refreshAgents();
+  } catch (e) {
+    toast('Publish failed: ' + e.message, 'err');
+  } finally {
+    setLoading(btn, false);
+  }
+}
+
+async function doDelete(aid, btn) {
+  if (!confirm('Delete agent ' + aid + '?')) return;
+  setLoading(btn, true);
+  try {
+    await api('/agents/' + encodeURIComponent(aid), { method: 'DELETE', body: '{}' });
+    toast('Agent deleted.', 'ok');
+    refreshAgents();
+  } catch (e) {
+    toast('Delete failed: ' + e.message, 'err');
+  } finally {
+    setLoading(btn, false);
+  }
+}
+
+// ─── Register modal ───────────────────────────────────────────────────────────
+function openRegModal() {
+  ['regStep2','masterWarn','regSubmit'].forEach(id => document.getElementById(id).classList.add('hidden'));
+  document.getElementById('regStep1').classList.remove('hidden');
+  ['regOpKey','regDelProof','regSvcTCP'].forEach(id => { document.getElementById(id).value = ''; });
+  document.getElementById('masterDisp').value = '';
+  document.getElementById('aidPreview').textContent = '';
+  document.getElementById('regModal').classList.remove('hidden');
+}
+function closeRegModal() { document.getElementById('regModal').classList.add('hidden'); }
+
+document.getElementById('newAgentBtn').onclick = openRegModal;
+document.getElementById('regClose').onclick = closeRegModal;
+document.getElementById('regCancel').onclick = closeRegModal;
+document.getElementById('regModal').addEventListener('click', e => {
+  if (e.target === document.getElementById('regModal')) closeRegModal();
+});
+
+document.getElementById('genBtn').onclick = async function () {
+  const btn = this;
+  setLoading(btn, true);
+  try {
+    const ident = await api('/identity/generate', { method: 'POST', body: '{}' });
+    document.getElementById('regOpKey').value   = ident.operational_private_key_hex;
+    document.getElementById('regDelProof').value = ident.delegation_proof_hex;
+    document.getElementById('aidPreview').textContent = ident.aid;
+    document.getElementById('masterDisp').value = ident.master_private_key_hex;
+    document.getElementById('masterWarn').classList.remove('hidden');
+    document.getElementById('regStep1').classList.add('hidden');
+    document.getElementById('regStep2').classList.remove('hidden');
+    document.getElementById('regSubmit').classList.remove('hidden');
+    toast('Identity generated — save master key now!', 'warn', 6000);
+  } catch (e) {
+    toast('Generate failed: ' + e.message, 'err');
+  } finally {
+    setLoading(btn, false);
+  }
+};
+
+document.getElementById('manualBtn').onclick = function () {
+  document.getElementById('regStep1').classList.add('hidden');
+  document.getElementById('masterWarn').classList.add('hidden');
+  document.getElementById('regStep2').classList.remove('hidden');
+  document.getElementById('regSubmit').classList.remove('hidden');
+};
+
+document.getElementById('copyMasterBtn').onclick = () =>
+  copyText(document.getElementById('masterDisp').value);
+
+document.getElementById('regSubmit').onclick = async function () {
+  const btn = this;
+  const opKey   = document.getElementById('regOpKey').value.trim();
+  const delProof= document.getElementById('regDelProof').value.trim();
+  const svcTCP  = document.getElementById('regSvcTCP').value.trim();
+  if (!opKey || !delProof || !svcTCP) { toast('All fields are required.', 'err'); return; }
+  setLoading(btn, true);
+  try {
+    const r = await api('/agents', {
+      method: 'POST',
+      body: JSON.stringify({
+        operational_private_key_hex: opKey,
+        delegation_proof_hex: delProof,
+        service_tcp: svcTCP,
+      }),
+    });
+    toast('Agent registered: ' + r.aid, 'ok', 4000);
+    closeRegModal();
+    refreshAgents();
+    // Auto-publish
+    try {
+      const p = await api('/agents/' + encodeURIComponent(r.aid) + '/publish', { method: 'POST', body: '{}' });
+      toast('Endpoint published to DHT (seq ' + p.seq + ').', 'ok');
+      refreshAgents();
+    } catch (_) { /* non-fatal */ }
+  } catch (e) {
+    toast('Register failed: ' + e.message, 'err', 5000);
+  } finally {
+    setLoading(btn, false);
+  }
+};
+
+// ─── Discover ─────────────────────────────────────────────────────────────────
+document.getElementById('resBtn').onclick = async function () {
+  const btn = this;
+  const aid = document.getElementById('resolveAid').value.trim();
+  const out = document.getElementById('resolveOut');
+  if (!aid) { toast('Enter an AID.', 'warn'); return; }
+  setLoading(btn, true);
+  out.innerHTML = '<span class="muted text-sm mt-xs" style="display:block">Resolving…</span>';
+  try {
+    const r = await api('/resolve/' + encodeURIComponent(aid), { method: 'POST', body: '{}' });
+    const natNames = ['unknown','full_cone','restricted','port_restricted','symmetric'];
+    const natLabel = natNames[r.nat_type] || 'unknown';
+    const card = document.createElement('div');
+    card.className = 'res-card';
+
+    function resRow(label, content) {
+      const row = document.createElement('div');
+      row.className = 'res-row';
+      const lbl = document.createElement('span');
+      lbl.className = 'res-row-label';
+      lbl.textContent = label;
+      row.appendChild(lbl);
+      if (typeof content === 'string') {
+        const s = document.createElement('span');
+        s.textContent = content;
+        row.appendChild(s);
+      } else {
+        row.appendChild(content);
+      }
+      return row;
+    }
+
+    // AID
+    const aidWrap = document.createElement('span');
+    aidWrap.className = 'flex gap-s';
+    const aidMono = document.createElement('span');
+    aidMono.className = 'mono';
+    aidMono.style.fontSize = '.77rem';
+    aidMono.textContent = r.address;
+    aidWrap.appendChild(aidMono);
+    aidWrap.appendChild(mkCopyBtn(r.address));
+    card.appendChild(resRow('AID', aidWrap));
+    card.appendChild(resRow('NAT', natBadge(natLabel)));
+    card.appendChild(resRow('Seq / TTL', r.seq + ' / ' + r.ttl + 's'));
+
+    // Endpoints
+    const epLbl = document.createElement('span');
+    epLbl.className = 'res-row-label';
+    epLbl.textContent = 'Endpoints';
+    const epList = document.createElement('ul');
+    epList.className = 'ep-list';
+    (r.endpoints || []).forEach(ep => {
+      const li = document.createElement('li');
+      li.textContent = ep;
+      epList.appendChild(li);
+    });
+    if (!r.endpoints || r.endpoints.length === 0) {
+      const li = document.createElement('li');
+      li.className = 'muted';
+      li.textContent = '(none)';
+      epList.appendChild(li);
+    }
+    const epWrap = document.createElement('div');
+    epWrap.style.cssText = 'display:grid;gap:.3rem';
+    epWrap.appendChild(epLbl);
+    epWrap.appendChild(epList);
+    card.appendChild(epWrap);
+
+    out.innerHTML = '';
+    out.appendChild(card);
+  } catch (e) {
+    out.innerHTML = '<span class="text-sm mt-xs" style="display:block;color:var(--error)">✗ ' + esc(e.message) + '</span>';
+  } finally {
+    setLoading(btn, false);
+  }
+};
+document.getElementById('resolveAid').addEventListener('keydown', e => {
+  if (e.key === 'Enter') document.getElementById('resBtn').click();
+});
+
+// ─── Config ───────────────────────────────────────────────────────────────────
+const RESTART_FIELDS = new Set([
+  'listen_addr','quic_listen_addr','bootstrap','disable_upnp',
+  'fallback_host','min_observed_peers','api_addr','key_dir',
+]);
+
+// Defaults matching config.go Default()
+const CFG_DEFAULTS = {
+  listen_addr: ':5001', quic_listen_addr: '', bootstrap: [],
+  disable_upnp: false, fallback_host: '', min_observed_peers: 3,
+  api_addr: '127.0.0.1:8520', api_token: '', key_dir: '',
+  log_format: 'text', log_level: 'info',
+};
+// Human-readable note when a field is empty/zero (its semantic meaning)
+const CFG_EMPTY_NOTES = {
+  quic_listen_addr: 'shared with DHT port',
+  fallback_host:    'disabled',
+  key_dir:          '<data-dir>/keys/',
+  api_token:        'no authentication',
+};
+
+let cfgSchema = {};
+let cfgLast   = {};    // last successfully loaded config
+let cfgEditing = false;
+
+function cfgIsEmpty(k, val) {
+  if (Array.isArray(val)) return val.length === 0;
+  if (typeof val === 'boolean') return val === false;
+  return val === '' || val === null || val === undefined;
+}
+
+function cfgIsDefault(k, val) {
+  const def = CFG_DEFAULTS[k];
+  if (Array.isArray(def)) return Array.isArray(val) && val.length === 0;
+  return val === def;
+}
+
+// Render read-only view
+function renderCfgView(schema, cfg) {
+  const view = document.getElementById('cfgView');
+  view.innerHTML = '';
+  const tbl = document.createElement('table');
+  tbl.className = 'cfg-table';
+  const tbody = document.createElement('tbody');
+
+  for (const k of Object.keys(schema.properties || {})) {
+    const val = cfg[k];
+    const tr = document.createElement('tr');
+
+    // Key cell
+    const keyTd = document.createElement('td');
+    keyTd.className = 'cfg-key';
+    keyTd.textContent = k;
+    tr.appendChild(keyTd);
+
+    // Value cell
+    const valTd = document.createElement('td');
+    valTd.className = 'cfg-val';
+
+    if (k === 'api_token' && val === '***') {
+      valTd.innerHTML = '<span class="badge b-blue" style="font-size:.72rem">set</span>';
+    } else if (cfgIsEmpty(k, val)) {
+      const note = CFG_EMPTY_NOTES[k];
+      if (note) {
+        valTd.className = 'cfg-val empty-val';
+        valTd.textContent = '— (' + note + ')';
+      } else if (Array.isArray(val) || (Array.isArray(CFG_DEFAULTS[k]))) {
+        valTd.className = 'cfg-val empty-val';
+        valTd.textContent = '(none)';
+      } else if (typeof val === 'boolean') {
+        valTd.textContent = 'false';
+        if (cfgIsDefault(k, val)) {
+          const tag = document.createElement('span');
+          tag.className = 'default-tag'; tag.textContent = 'default';
+          valTd.appendChild(tag);
+        }
+      } else {
+        valTd.className = 'cfg-val empty-val';
+        valTd.textContent = '—';
+      }
+    } else if (Array.isArray(val)) {
+      valTd.textContent = val.join(', ');
+    } else {
+      valTd.textContent = String(val);
+      if (cfgIsDefault(k, val)) {
+        const tag = document.createElement('span');
+        tag.className = 'default-tag'; tag.textContent = 'default';
+        valTd.appendChild(tag);
+      }
+    }
+    tr.appendChild(valTd);
+
+    // Restart badge
+    const actTd = document.createElement('td');
+    actTd.className = 'cfg-actions';
+    if (RESTART_FIELDS.has(k)) {
+      const tag = document.createElement('span');
+      tag.className = 'restart-tag'; tag.textContent = 'restart';
+      actTd.appendChild(tag);
+    }
+    tr.appendChild(actTd);
+
+    tbody.appendChild(tr);
+  }
+  tbl.appendChild(tbody);
+  view.appendChild(tbl);
+}
+
+// Render editable form
+function renderCfgForm(schema, cfg) {
+  const form = document.getElementById('cfgForm');
+  form.innerHTML = '';
+  for (const k of Object.keys(schema.properties || {})) {
+    const p = schema.properties[k];
+    const val = cfg[k];
+    const grp = document.createElement('div');
+    grp.className = 'f-group';
+
+    const lbl = document.createElement('label');
+    lbl.className = 'f-label';
+    lbl.textContent = k;
+    if (RESTART_FIELDS.has(k)) {
+      const tag = document.createElement('span');
+      tag.className = 'restart-tag'; tag.textContent = 'restart';
+      lbl.appendChild(tag);
+    }
+    grp.appendChild(lbl);
+
+    let inp;
+    if (p.type === 'boolean') {
+      inp = document.createElement('input');
+      inp.type = 'checkbox'; inp.checked = !!val;
+      inp.dataset.k = k; inp.dataset.t = 'boolean';
+      inp.style.cssText = 'width:1rem;height:1rem;cursor:pointer;accent-color:var(--accent)';
+    } else if (p.type === 'array') {
+      inp = document.createElement('textarea');
+      inp.rows = 3; inp.className = 'w-full';
+      inp.value = Array.isArray(val) ? val.join('\n') : '';
+      inp.dataset.k = k; inp.dataset.t = 'array';
+      inp.placeholder = 'One entry per line';
+    } else if (p.type === 'integer') {
+      inp = document.createElement('input');
+      inp.type = 'number'; inp.style.width = '7rem';
+      inp.value = val != null ? val : CFG_DEFAULTS[k] || '';
+      inp.dataset.k = k; inp.dataset.t = 'integer';
+    } else {
+      inp = document.createElement('input');
+      inp.type = k.includes('token') ? 'password' : 'text';
+      inp.className = 'w-full';
+      inp.value = (val === '***') ? '' : (val != null ? val : '');
+      if (val === '***') inp.placeholder = '(set — leave blank to keep, enter new value to replace)';
+      else if (CFG_DEFAULTS[k] !== undefined && CFG_DEFAULTS[k] !== '') inp.placeholder = 'default: ' + CFG_DEFAULTS[k];
+      else if (CFG_EMPTY_NOTES[k]) inp.placeholder = '(' + CFG_EMPTY_NOTES[k] + ')';
+      inp.dataset.k = k; inp.dataset.t = 'string';
+    }
+    grp.appendChild(inp);
+    if (p.enum) {
+      const hint = document.createElement('span');
+      hint.className = 'f-hint';
+      hint.textContent = 'Options: ' + p.enum.join(', ');
+      grp.appendChild(hint);
+    }
+    form.appendChild(grp);
+  }
+}
+
+function cfgEnterEdit() {
+  cfgEditing = true;
+  document.getElementById('cfgView').classList.add('hidden');
+  document.getElementById('cfgForm').classList.remove('hidden');
+  document.getElementById('cfgBtns').classList.add('hidden');
+  document.getElementById('cfgEditBtns').classList.remove('hidden');
+  document.getElementById('cfgMsg').textContent = '';
+}
+
+function cfgLeaveEdit() {
+  cfgEditing = false;
+  document.getElementById('cfgForm').classList.add('hidden');
+  document.getElementById('cfgView').classList.remove('hidden');
+  document.getElementById('cfgEditBtns').classList.add('hidden');
+  document.getElementById('cfgBtns').classList.remove('hidden');
+}
+
+async function loadConfig() {
+  const view = document.getElementById('cfgView');
+  try {
+    const [schema, cfg] = await Promise.all([api('/config/schema'), api('/config')]);
+    cfgSchema = schema;
+    cfgLast   = cfg;
+    renderCfgView(schema, cfg);
+    renderCfgForm(schema, cfg);   // pre-render form so it's ready when Edit clicked
+    if (cfgEditing) {
+      // If we were editing and refresh was triggered, re-render form with fresh data
+      renderCfgForm(schema, cfg);
+    }
+  } catch (e) {
+    view.innerHTML = '<span class="muted text-sm">Config unavailable: ' + esc(e.message) + '</span>';
+  }
+}
+
+document.getElementById('editCfgBtn').onclick = function () {
+  renderCfgForm(cfgSchema, cfgLast); // ensure form has current data
+  cfgEnterEdit();
+};
+
+document.getElementById('cancelCfgBtn').onclick = function () {
+  renderCfgForm(cfgSchema, cfgLast); // discard edits
+  cfgLeaveEdit();
+  document.getElementById('cfgMsg').textContent = '';
+};
+
+document.getElementById('refreshCfgBtn').onclick = async function () {
+  const btn = this;
+  setLoading(btn, true);
+  cfgLeaveEdit();
+  document.getElementById('cfgMsg').textContent = '';
+  await loadConfig();
+  setLoading(btn, false);
+  toast('Config reloaded.', 'ok', 1800);
+};
+
+document.getElementById('saveCfgBtn').onclick = async function () {
+  const btn = this;
+  const patch = {};
+  document.querySelectorAll('#cfgForm [data-k]').forEach(el => {
+    const k = el.dataset.k, t = el.dataset.t;
+    if (t === 'boolean') patch[k] = el.checked;
+    else if (t === 'array') patch[k] = el.value.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+    else if (t === 'integer') { const n = parseInt(el.value, 10); if (!isNaN(n)) patch[k] = n; }
+    else { const v = el.value.trim(); if (v) patch[k] = v; }
+  });
+  const msg = document.getElementById('cfgMsg');
+  setLoading(btn, true);
+  try {
+    const out = await api('/config', { method: 'PATCH', body: JSON.stringify(patch) });
+    const need = out.restart_required && out.restart_required.length > 0;
+    toast(need ? 'Saved — restart required for some settings.' : 'Config saved.', need ? 'warn' : 'ok');
+    // Reload fresh values and return to read-only view
+    await loadConfig();
+    cfgLeaveEdit();
+    if (need) {
+      msg.textContent = '⚠ Restart required for: ' + out.restart_required.join(', ');
+      msg.style.color = 'var(--warn)';
+    } else {
+      msg.textContent = '';
+    }
+  } catch (e) {
+    msg.textContent = '✗ ' + e.message;
+    msg.style.color = 'var(--error)';
+    toast('Save failed: ' + e.message, 'err');
+  } finally {
+    setLoading(btn, false);
+  }
+};
+
+// ─── Token ────────────────────────────────────────────────────────────────────
+const tokInput = document.getElementById('token');
+if (getToken()) tokInput.value = getToken();
+document.getElementById('saveTok').onclick = () => {
+  sessionStorage.setItem('a2al_token', tokInput.value.trim());
+  const s = document.getElementById('tokMsg');
+  s.textContent = 'Saved.';
+  s.style.color = 'var(--success)';
+  setTimeout(() => { s.textContent = ''; }, 2000);
+};
+
+// ─── Boot ─────────────────────────────────────────────────────────────────────
+async function refreshAll() {
+  await Promise.allSettled([refreshStatus(), refreshAgents()]);
+}
+
+document.getElementById('refreshBtn').onclick = refreshAll;
+document.getElementById('refAgBtn').onclick = refreshAgents;
+
+setInterval(refreshAll, 12000);
+
+refreshAll();
+loadConfig();
+
+})();
+</script>
+</body>
+</html>

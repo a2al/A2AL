@@ -1,4 +1,4 @@
-﻿// Copyright 2026 The A2AL Authors. All rights reserved.
+// Copyright 2026 The A2AL Authors. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
 package dht
@@ -14,13 +14,14 @@ import (
 
 // Store is an in-memory record map keyed by publisher NodeID (spec Step 7).
 type Store struct {
-	mu sync.Mutex
-	m  map[string][]protocol.SignedRecord
+	mu   sync.Mutex
+	m    map[string][]protocol.SignedRecord
+	auth func(protocol.SignedRecord, time.Time) error // nil → no authority check
 }
 
-// NewStore creates an empty Store.
-func NewStore() *Store {
-	return &Store{m: make(map[string][]protocol.SignedRecord)}
+// NewStore creates an empty Store. auth is an optional authority policy (see Config.RecordAuth).
+func NewStore(auth func(protocol.SignedRecord, time.Time) error) *Store {
+	return &Store{m: make(map[string][]protocol.SignedRecord), auth: auth}
 }
 
 func recordKeyForSigned(rec protocol.SignedRecord) a2al.NodeID {
@@ -30,9 +31,15 @@ func recordKeyForSigned(rec protocol.SignedRecord) a2al.NodeID {
 }
 
 // Put verifies and stores a signed record (replaces same-address entry if newer).
+// It checks cryptographic integrity via VerifySignedRecord, then authority via s.auth (if set).
 func (s *Store) Put(rec protocol.SignedRecord, now time.Time) error {
 	if err := protocol.VerifySignedRecord(rec, now); err != nil {
 		return err
+	}
+	if s.auth != nil {
+		if err := s.auth(rec, now); err != nil {
+			return err
+		}
 	}
 	key := nodeIDKey(recordKeyForSigned(rec))
 	s.mu.Lock()
