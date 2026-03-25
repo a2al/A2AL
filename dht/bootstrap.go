@@ -1,4 +1,4 @@
-﻿// Copyright 2026 The A2AL Authors. All rights reserved.
+// Copyright 2026 The A2AL Authors. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
 package dht
@@ -74,7 +74,9 @@ func (n *Node) PublishEndpointRecord(ctx context.Context, rec protocol.SignedRec
 		return errors.New("dht: nil node")
 	}
 	// Always store locally first so the record is discoverable regardless of routing table state.
-	n.store.Put(rec, time.Now())
+	if err := n.store.Put(a2al.NodeID{}, rec, time.Now()); err != nil {
+		return err
+	}
 
 	var pubAddr a2al.Address
 	copy(pubAddr[:], rec.Address)
@@ -99,9 +101,63 @@ func (n *Node) PublishEndpointRecord(ctx context.Context, rec protocol.SignedRec
 		if !ok {
 			continue
 		}
-		if _, err := n.StoreAt(ctx, addr, rec); err != nil {
+		if _, err := n.StoreAt(ctx, addr, a2al.NodeID{}, rec); err != nil {
 			lastErr = err
 		}
 	}
 	return lastErr
+}
+
+// publishKeyedRecord stores rec at storeKey locally then replicates to every
+// k-closest reachable peer via FIND_NODE + STORE. Used by both mailbox and
+// topic publish paths.
+func (n *Node) publishKeyedRecord(ctx context.Context, storeKey a2al.NodeID, rec protocol.SignedRecord) error {
+	if err := n.store.Put(storeKey, rec, time.Now()); err != nil {
+		return err
+	}
+	q := NewQuery(n)
+	if _, err := q.FindNode(ctx, storeKey); err != nil {
+		return err
+	}
+	peers := n.tabNearest(storeKey, routing.K)
+	var lastErr error
+	for i := 0; i < len(peers); i++ {
+		var id a2al.NodeID
+		copy(id[:], peers[i].NodeID)
+		if id == n.nid {
+			continue
+		}
+		addr, ok := n.lookupPeer(id)
+		if !ok {
+			continue
+		}
+		if _, err := n.StoreAt(ctx, addr, storeKey, rec); err != nil {
+			lastErr = err
+		}
+	}
+	return lastErr
+}
+
+// PublishMailboxRecord stores the mailbox record at storeKey (recipient NodeID) locally and
+// replicates to every k-closest reachable peer via FIND_NODE + STORE (spec §4.4).
+func (n *Node) PublishMailboxRecord(ctx context.Context, storeKey a2al.NodeID, rec protocol.SignedRecord) error {
+	if n == nil {
+		return errors.New("dht: nil node")
+	}
+	if protocol.RecordCategory(rec.RecType) != protocol.CategoryMailbox {
+		return errors.New("dht: not a mailbox record")
+	}
+	return n.publishKeyedRecord(ctx, storeKey, rec)
+}
+
+// PublishTopicRecord stores the topic record at storeKey (SHA-256("topic:"+topic)) locally and
+// replicates to every k-closest reachable peer (spec §5.4).
+func (n *Node) PublishTopicRecord(ctx context.Context, storeKey a2al.NodeID, rec protocol.SignedRecord) error {
+	if n == nil {
+		return errors.New("dht: nil node")
+	}
+	if protocol.RecordCategory(rec.RecType) != protocol.CategoryTopic {
+		return errors.New("dht: not a topic record")
+	}
+	return n.publishKeyedRecord(ctx, storeKey, rec)
 }

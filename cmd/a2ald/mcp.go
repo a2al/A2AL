@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -60,6 +61,16 @@ func buildMCPServer(d *daemon) *mcp.Server {
 	}, d.mcpAgentPublish)
 
 	mcp.AddTool(s, &mcp.Tool{
+		Name:        "a2al_agent_publish_record",
+		Description: "Publish sovereign custom DHT record RecType 0x02-0x0f (POST /agents/{aid}/records).",
+	}, d.mcpAgentPublishRecord)
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "a2al_resolve_records",
+		Description: "List signed records for a remote AID (GET /resolve/{aid}/records?type=; type 0 = all).",
+	}, d.mcpResolveRecords)
+
+	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_resolve",
 		Description: "Resolve an AID to signed endpoint record (POST /resolve/{aid}).",
 	}, d.mcpResolve)
@@ -68,6 +79,31 @@ func buildMCPServer(d *daemon) *mcp.Server {
 		Name:        "a2al_connect",
 		Description: "Open local TCP tunnel to remote agent via QUIC (POST /connect/{aid}); optional local_aid.",
 	}, d.mcpConnect)
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "a2al_mailbox_send",
+		Description: "Send encrypted DHT mailbox message (POST /agents/{aid}/mailbox/send).",
+	}, d.mcpMailboxSend)
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "a2al_mailbox_poll",
+		Description: "Poll and decrypt mailbox for a registered agent (POST /agents/{aid}/mailbox/poll).",
+	}, d.mcpMailboxPoll)
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "a2al_topic_register",
+		Description: "Register DHT topic discovery entries for an agent (POST /agents/{aid}/topics).",
+	}, d.mcpTopicRegister)
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "a2al_topic_unregister",
+		Description: "Remove a topic from agent renewal list (DELETE /agents/{aid}/topics/{topic}); DHT TTL expires naturally.",
+	}, d.mcpTopicUnregister)
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "a2al_discover",
+		Description: "Search agents by topic(s) on the DHT (POST /discover).",
+	}, d.mcpDiscover)
 
 	return s
 }
@@ -173,6 +209,42 @@ func (d *daemon) mcpAgentPublish(ctx context.Context, _ *mcp.ServerSession, para
 	}, nil
 }
 
+type mcpPublishRecordArgs struct {
+	AID           string `json:"aid"`
+	RecType       uint8  `json:"rec_type"`
+	PayloadBase64 string `json:"payload_base64"`
+	TTL           uint32 `json:"ttl,omitempty"`
+}
+
+func (d *daemon) mcpAgentPublishRecord(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[mcpPublishRecordArgs]) (*mcp.CallToolResultFor[map[string]any], error) {
+	tctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	req := agentPublishRecordReq{
+		RecType:       params.Arguments.RecType,
+		PayloadBase64: params.Arguments.PayloadBase64,
+		TTL:           params.Arguments.TTL,
+	}
+	if err := d.execAgentPublishRecord(tctx, params.Arguments.AID, req); err != nil {
+		return nil, err
+	}
+	return &mcp.CallToolResultFor[map[string]any]{StructuredContent: map[string]any{"ok": true}}, nil
+}
+
+type mcpResolveRecordsArgs struct {
+	AID  string `json:"aid"`
+	Type uint8  `json:"type"`
+}
+
+func (d *daemon) mcpResolveRecords(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[mcpResolveRecordsArgs]) (*mcp.CallToolResultFor[map[string]any], error) {
+	rctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	records, err := d.execResolveRecords(rctx, params.Arguments.AID, params.Arguments.Type)
+	if err != nil {
+		return nil, err
+	}
+	return &mcp.CallToolResultFor[map[string]any]{StructuredContent: map[string]any{"records": records}}, nil
+}
+
 func (d *daemon) mcpResolve(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[mcpAIDArgs]) (*mcp.CallToolResultFor[map[string]any], error) {
 	rctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
@@ -198,6 +270,101 @@ func (d *daemon) mcpConnect(ctx context.Context, _ *mcp.ServerSession, params *m
 	}
 	return &mcp.CallToolResultFor[map[string]any]{
 		StructuredContent: map[string]any{"tunnel": tun},
+	}, nil
+}
+
+type mcpMailboxSendArgs struct {
+	AID         string `json:"aid"`
+	Recipient   string `json:"recipient"`
+	MsgType     uint8  `json:"msg_type"`
+	BodyBase64  string `json:"body_base64"`
+}
+
+func (d *daemon) mcpMailboxSend(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[mcpMailboxSendArgs]) (*mcp.CallToolResultFor[map[string]any], error) {
+	if params.Arguments.Recipient == "" {
+		return nil, errors.New("recipient required")
+	}
+	raw, err := base64.StdEncoding.DecodeString(params.Arguments.BodyBase64)
+	if err != nil {
+		return nil, err
+	}
+	sctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	if err := d.execMailboxSend(sctx, params.Arguments.AID, params.Arguments.Recipient, params.Arguments.MsgType, raw); err != nil {
+		return nil, err
+	}
+	return &mcp.CallToolResultFor[map[string]any]{
+		StructuredContent: map[string]any{"ok": true},
+	}, nil
+}
+
+func (d *daemon) mcpMailboxPoll(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[mcpAIDArgs]) (*mcp.CallToolResultFor[map[string]any], error) {
+	pctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	msgs, err := d.execMailboxPoll(pctx, params.Arguments.AID)
+	if err != nil {
+		return nil, err
+	}
+	return &mcp.CallToolResultFor[map[string]any]{
+		StructuredContent: map[string]any{"messages": msgs},
+	}, nil
+}
+
+type mcpTopicRegisterArgs struct {
+	AID       string         `json:"aid"`
+	Topics    []string       `json:"topics"`
+	Name      string         `json:"name"`
+	Protocols []string       `json:"protocols"`
+	Tags      []string       `json:"tags"`
+	Brief     string         `json:"brief"`
+	Meta      map[string]any `json:"meta,omitempty"`
+	TTL       uint32         `json:"ttl"`
+}
+
+func (d *daemon) mcpTopicRegister(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[mcpTopicRegisterArgs]) (*mcp.CallToolResultFor[map[string]any], error) {
+	tctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	a := params.Arguments
+	req := topicRegisterReq{
+		Topics:    a.Topics,
+		Name:      a.Name,
+		Protocols: a.Protocols,
+		Tags:      a.Tags,
+		Brief:     a.Brief,
+		Meta:      a.Meta,
+		TTL:       a.TTL,
+	}
+	if err := d.execTopicRegister(tctx, a.AID, req); err != nil {
+		return nil, err
+	}
+	return &mcp.CallToolResultFor[map[string]any]{StructuredContent: map[string]any{"ok": true}}, nil
+}
+
+type mcpTopicUnregisterArgs struct {
+	AID   string `json:"aid"`
+	Topic string `json:"topic"`
+}
+
+func (d *daemon) mcpTopicUnregister(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[mcpTopicUnregisterArgs]) (*mcp.CallToolResultFor[map[string]any], error) {
+	_ = ctx
+	if params.Arguments.Topic == "" {
+		return nil, errors.New("topic required")
+	}
+	if err := d.execTopicUnregister(params.Arguments.AID, params.Arguments.Topic); err != nil {
+		return nil, err
+	}
+	return &mcp.CallToolResultFor[map[string]any]{StructuredContent: map[string]any{"ok": true}}, nil
+}
+
+func (d *daemon) mcpDiscover(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[discoverReq]) (*mcp.CallToolResultFor[map[string]any], error) {
+	dctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	entries, err := d.execDiscover(dctx, params.Arguments)
+	if err != nil {
+		return nil, err
+	}
+	return &mcp.CallToolResultFor[map[string]any]{
+		StructuredContent: map[string]any{"entries": entries},
 	}, nil
 }
 

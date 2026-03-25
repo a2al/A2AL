@@ -1,4 +1,4 @@
-﻿// Copyright 2026 The A2AL Authors. All rights reserved.
+// Copyright 2026 The A2AL Authors. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
 package dht
@@ -76,7 +76,7 @@ func TestBootstrap_iterativeResolveMem(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ok, err := A.n.StoreAt(ctx, R.tr.LocalAddr(), rec)
+	ok, err := A.n.StoreAt(ctx, R.tr.LocalAddr(), a2al.NodeID{}, rec)
 	if err != nil || !ok {
 		t.Fatalf("store at R: ok=%v err=%v", ok, err)
 	}
@@ -200,7 +200,7 @@ func TestTenNodes_memMultiHop(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ok, err := pub.n.StoreAt(ctx, hub.tr.LocalAddr(), rec)
+	ok, err := pub.n.StoreAt(ctx, hub.tr.LocalAddr(), a2al.NodeID{}, rec)
 	if err != nil || !ok {
 		t.Fatalf("store: ok=%v err=%v", ok, err)
 	}

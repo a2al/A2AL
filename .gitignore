@@ -1,3 +1,4 @@
 doc-local/
 *.exe
 *.exe~
+identity-*.json

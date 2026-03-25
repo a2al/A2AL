@@ -7,8 +7,8 @@
 // 然后等待用户在 stdin 输入 Address 进行解析查询。
 //
 // 用法:
-//   go run . -listen :5001 -ip 1.2.3.4 -debug :2634
-//   go run . -listen :5002 -ip 1.2.3.5 -bootstrap 1.2.3.4:5001 -debug :2635
+//   go run . -listen :4121 -ip 1.2.3.4 -debug :2634
+//   go run . -listen :4122 -ip 1.2.3.5 -bootstrap 1.2.3.4:4121 -debug :2635
 //
 // 浏览器查看节点状态:
 //   http://127.0.0.1:2634/debug/identity
@@ -35,8 +35,8 @@ import (
 )
 
 func main() {
-	listen := flag.String("listen", ":5001", "UDP listen address")
-	bootstrapAddr := flag.String("bootstrap", "", "seed node UDP address (e.g. 127.0.0.1:5001)")
+	listen := flag.String("listen", ":4121", "UDP listen address")
+	bootstrapAddr := flag.String("bootstrap", "", "seed node UDP address (e.g. 127.0.0.1:4121)")
 	debugAddr := flag.String("debug", "", "debug HTTP address (e.g. 127.0.0.1:2634)")
 	extIP := flag.String("ip", "", "external IP for endpoint record (e.g. 1.2.3.4)")
 	flag.Parse()

@@ -1,4 +1,4 @@
-﻿// Copyright 2026 The A2AL Authors. All rights reserved.
+// Copyright 2026 The A2AL Authors. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
 package dht
@@ -31,9 +31,10 @@ type debugRoutingJSON struct {
 
 // debugStatsJSON is the payload for GET /debug/stats (spec §3.6).
 type debugStatsJSON struct {
-	RxPackets uint64 `json:"rx_packets_verified"`
-	TxPackets uint64 `json:"tx_packets"`
-	RPCOK     uint64 `json:"rpc_completed"`
+	RxPackets  uint64 `json:"rx_packets_verified"`
+	TxPackets  uint64 `json:"tx_packets"`
+	RPCOK      uint64 `json:"rpc_completed"`
+	TotalPeers int    `json:"total_peers"`
 }
 
 func (n *Node) tabDebugPeers() []routing.PeerDebugRow {
@@ -106,15 +107,19 @@ func (n *Node) serveDebugStats(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
+	peers := n.tabDebugPeers()
 	_ = enc.Encode(debugStatsJSON{
-		RxPackets: n.statsRx.Load(),
-		TxPackets: n.statsTx.Load(),
-		RPCOK:     n.statsRPC.Load(),
+		RxPackets:  n.statsRx.Load(),
+		TxPackets:  n.statsTx.Load(),
+		RPCOK:      n.statsRPC.Load(),
+		TotalPeers: len(peers),
 	})
 }
 
 // StartDebugHTTP listens on addr and serves read-only /debug/* JSON (spec §3.6).
-// Typical addr: "127.0.0.1:2634". stop shuts the server down (idempotent).
+// When using the a2ald daemon the /debug/* routes are served on the API port (default
+// 127.0.0.1:2121) and this method is not needed. Use it only when embedding the dht
+// package directly without the daemon. stop shuts the server down (idempotent).
 func (n *Node) StartDebugHTTP(addr string) (stop func(), err error) {
 	if n == nil {
 		return nil, errors.New("dht: nil node")
@@ -138,5 +143,6 @@ func (n *Node) StartDebugHTTP(addr string) (stop func(), err error) {
 	}, nil
 }
 
-// DebugHTTPAddr is a convenience for "127.0.0.1:2634" (spec §3.6).
+// DebugHTTPAddr is a suggested address for StartDebugHTTP when embedding the dht
+// package directly (without a2ald). The daemon serves /debug/* on its own API port.
 const DebugHTTPAddr = "127.0.0.1:2634"

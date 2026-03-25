@@ -12,7 +12,7 @@
 // 【Bootstrap 节点】
 // a2ald 需要至少一个已知节点来加入 DHT 网络。有三种方式：
 //  1. 默认：自动解析公共种子节点
-//  2. 显式指定：--bootstrap 127.0.0.1:5001（可多个，逗号分隔）
+//  2. 显式指定：--bootstrap 127.0.0.1:4121（可多个，逗号分隔）
 //  3. 配置文件：在 config.toml 中设置 bootstrap 列表
 //
 // 本机两实例测试时，让 Bob 的 a2ald 用 --bootstrap 指向 Alice（或反向），
@@ -23,18 +23,18 @@
 // --fallback-host 告知 a2ald 用哪个地址对外可达：
 //
 //	Terminal 1 (Alice a2ald):
-//	  a2ald --data-dir /tmp/a2ald-alice --listen :5001 --fallback-host 127.0.0.1
+//	  a2ald --data-dir /tmp/a2ald-alice --listen :4121 --fallback-host 127.0.0.1
 //	（Windows 可把目录换成例如 C:\tmp\a2ald-alice）
 //
 //	Terminal 2 (Alice chat):
-//	  go run . --api 127.0.0.1:8520
+//	  go run . --api 127.0.0.1:2121
 //
 //	Terminal 3 (Bob a2ald):
-//	  a2ald --data-dir /tmp/a2ald-bob --listen :5002 --api-addr 127.0.0.1:8521 \
-//	        --fallback-host 127.0.0.1 --bootstrap 127.0.0.1:5001
+//	  a2ald --data-dir /tmp/a2ald-bob --listen :4122 --api-addr 127.0.0.1:2122 \
+//	        --fallback-host 127.0.0.1 --bootstrap 127.0.0.1:4121
 //
 //	Terminal 4 (Bob chat):
-//	  go run . --api 127.0.0.1:8521
+//	  go run . --api 127.0.0.1:2122
 //
 //	Bob 终端输入 Alice 打印的 AID，即可开始聊天。
 //
@@ -42,14 +42,14 @@
 // 更新 service_tcp（每次随机端口），一般无需删身份文件。
 //
 // 【跨机器 LAN 测试】把 --fallback-host 换成本机 LAN IP（如 192.168.1.10），
-// --bootstrap 指向对方机器的 ip:port（如 192.168.1.10:5001）。
+// --bootstrap 指向对方机器的 ip:port（如 192.168.1.10:4121）。
 //
 // 【公网部署】a2ald 能自动检测公网 IP / UPnP，无需 --fallback-host；
 // 公共种子节点可达时也无需 --bootstrap。
 //
 // 如果 a2ald 有 api_token，添加 --token 参数：
 //
-//	go run . --api 127.0.0.1:8520 --token mysecret
+//	go run . --api 127.0.0.1:2121 --token mysecret
 package main
 
 import (
@@ -252,7 +252,7 @@ func loadOrCreateIdentity(path string, c *client) (*savedIdentity, error) {
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 func main() {
-	apiAddr := "127.0.0.1:8520"
+	apiAddr := "127.0.0.1:2121"
 	token := ""
 	idPath := ""
 	for i := 1; i < len(os.Args); i++ {

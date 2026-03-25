@@ -86,9 +86,9 @@ A2AL is complementary to existing agent communication standards — it provides 
 ```bash
 cd examples/demo1-node
 
-go run . -listen :5001 -debug :2634                                    # node 1
-go run . -listen :5002 -bootstrap 127.0.0.1:5001 -debug :2635         # node 2
-go run . -listen :5003 -bootstrap 127.0.0.1:5001 -debug :2636         # node 3
+go run . -listen :4121 -debug :2634                                    # node 1
+go run . -listen :4122 -bootstrap 127.0.0.1:4121 -debug :2635         # node 2
+go run . -listen :4123 -bootstrap 127.0.0.1:4121 -debug :2636         # node 3
 ```
 
 Type any node's AID to resolve its endpoint. Inspect network state at `http://127.0.0.1:2634/debug/routing`.
@@ -98,8 +98,8 @@ Type any node's AID to resolve its endpoint. Inspect network state at `http://12
 ```bash
 cd examples/demo2-chat
 
-go run . -listen :5001 -quic :5002 -debug :2634                       # Alice
-go run . -listen :5003 -quic :5004 -bootstrap 127.0.0.1:5001 -debug :2635  # Bob
+go run . -listen :4121 -quic :4122 -debug :2634                       # Alice
+go run . -listen :4123 -quic :4124 -bootstrap 127.0.0.1:4121 -debug :2635  # Bob
 ```
 
 Bob enters Alice's AID → automatic resolution → encrypted connection → bidirectional messaging.

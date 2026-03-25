@@ -7,15 +7,20 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"net"
+	"slices"
+	"strconv"
 	"time"
 
 	"github.com/a2al/a2al"
 	"github.com/a2al/a2al/cmd/a2ald/internal/registry"
 	"github.com/a2al/a2al/crypto"
+	"github.com/a2al/a2al/dht"
 	"github.com/a2al/a2al/identity"
+	"github.com/a2al/a2al/protocol"
 )
 
 func (d *daemon) execIdentityGenerate() (identityGenResp, error) {
@@ -130,7 +135,7 @@ func (d *daemon) execAgentGet(ctx context.Context, aidStr string) (map[string]an
 		"service_tcp":         e.ServiceTCP,
 		"seq":                 e.Seq,
 		"service_tcp_ok":      probeTCP(e.ServiceTCP, 2*time.Second),
-		"published_to_dht":    e.Seq > 1,
+		"published_to_dht":    e.Seq > 0,
 		"published_endpoints": nil,
 		"published_nat_type":  nil,
 		"published_record_seq": nil,
@@ -295,6 +300,293 @@ func (d *daemon) execConnect(ctx context.Context, remoteAidStr string, body conn
 	return ln.Addr().String(), nil
 }
 
+func (d *daemon) execMailboxSend(ctx context.Context, localAidStr, recipientStr string, msgType uint8, body []byte) error {
+	aid, err := a2al.ParseAddress(localAidStr)
+	if err != nil {
+		return errBadAID
+	}
+	recipient, err := a2al.ParseAddress(recipientStr)
+	if err != nil {
+		return errBadAID
+	}
+	d.regMu.RLock()
+	e := d.reg.Get(aid)
+	d.regMu.RUnlock()
+	if e == nil {
+		return errNotFound
+	}
+	return d.h.SendMailboxForAgent(ctx, aid, recipient, msgType, body)
+}
+
+func (d *daemon) execMailboxPoll(ctx context.Context, aidStr string) ([]map[string]any, error) {
+	aid, err := a2al.ParseAddress(aidStr)
+	if err != nil {
+		return nil, errBadAID
+	}
+	d.regMu.RLock()
+	e := d.reg.Get(aid)
+	d.regMu.RUnlock()
+	if e == nil {
+		return nil, errNotFound
+	}
+	msgs, err := d.h.PollMailboxForAgent(ctx, aid)
+	if err != nil {
+		return nil, err
+	}
+
+	// Deduplicate: filter messages already returned in this daemon session.
+	// DHT records persist until TTL expiry; without this, repeated polls return
+	// the same messages until they expire (~1 hour by default).
+	d.mailboxSeenMu.Lock()
+	if d.mailboxSeen == nil {
+		d.mailboxSeen = make(map[string]map[string]struct{})
+	}
+	seen := d.mailboxSeen[aidStr]
+	if seen == nil {
+		seen = make(map[string]struct{})
+		d.mailboxSeen[aidStr] = seen
+	}
+	out := make([]map[string]any, 0, len(msgs))
+	for _, m := range msgs {
+		key := mailboxMsgKey(m)
+		if _, already := seen[key]; already {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, map[string]any{
+			"sender":      m.Sender.String(),
+			"msg_type":    m.MsgType,
+			"body_base64": base64.StdEncoding.EncodeToString(m.Body),
+		})
+	}
+	d.mailboxSeenMu.Unlock()
+	return out, nil
+}
+
+// mailboxMsgKey returns a string that uniquely identifies a MailboxMessage
+// within a sender's sequence space. Using (sender, seq) rather than content
+// ensures that a sender can legitimately re-send the same message body and
+// have it delivered again (new Seq = new record).
+func mailboxMsgKey(m protocol.MailboxMessage) string {
+	return hex.EncodeToString(m.Sender[:]) + ":" + strconv.FormatUint(m.Seq, 10)
+}
+
+type topicRegisterReq struct {
+	Topics    []string       `json:"topics"`
+	Name      string         `json:"name"`
+	Protocols []string       `json:"protocols"`
+	Tags      []string       `json:"tags"`
+	Brief     string         `json:"brief"`
+	Meta      map[string]any `json:"meta,omitempty"`
+	TTL       uint32         `json:"ttl"`
+}
+
+type discoverReq struct {
+	Topics []string                 `json:"topics"`
+	Filter *protocol.DiscoverFilter `json:"filter,omitempty"`
+}
+
+func topicEntryToMap(e protocol.TopicEntry) map[string]any {
+	return map[string]any{
+		"aid":       e.Address.String(),
+		"seq":       e.Seq,
+		"timestamp": e.Timestamp,
+		"ttl":       e.TTL,
+		"version":   e.Version,
+		"topic":     e.Topic,
+		"name":      e.Name,
+		"protocols": e.Protocols,
+		"tags":      e.Tags,
+		"brief":     e.Brief,
+		"meta":      e.Meta,
+	}
+}
+
+func (d *daemon) execTopicRegister(ctx context.Context, aidStr string, req topicRegisterReq) error {
+	aid, err := a2al.ParseAddress(aidStr)
+	if err != nil {
+		return errBadAID
+	}
+	if len(req.Topics) == 0 {
+		return errTopicsRequired
+	}
+	d.regMu.RLock()
+	e := d.reg.Get(aid)
+	d.regMu.RUnlock()
+	if e == nil {
+		return errNotFound
+	}
+	base := protocol.TopicPayload{
+		Name:      req.Name,
+		Protocols: req.Protocols,
+		Tags:      req.Tags,
+		Brief:     req.Brief,
+		Meta:      req.Meta,
+	}
+	if err := d.h.RegisterTopicsForAgent(ctx, aid, req.Topics, base, req.TTL); err != nil {
+		return err
+	}
+	d.regMu.Lock()
+	defer d.regMu.Unlock()
+	e = d.reg.Get(aid)
+	if e == nil {
+		return errNotFound
+	}
+	seen := make(map[string]struct{}, len(e.Topics)+len(req.Topics))
+	for _, t := range e.Topics {
+		seen[t] = struct{}{}
+	}
+	for _, t := range req.Topics {
+		seen[t] = struct{}{}
+	}
+	next := make([]string, 0, len(seen))
+	for t := range seen {
+		next = append(next, t)
+	}
+	slices.Sort(next)
+	e.Topics = next
+	return d.reg.Put(e)
+}
+
+func (d *daemon) execTopicUnregister(aidStr, topic string) error {
+	aid, err := a2al.ParseAddress(aidStr)
+	if err != nil {
+		return errBadAID
+	}
+	d.regMu.Lock()
+	defer d.regMu.Unlock()
+	e := d.reg.Get(aid)
+	if e == nil {
+		return errNotFound
+	}
+	out := make([]string, 0, len(e.Topics))
+	for _, t := range e.Topics {
+		if t != topic {
+			out = append(out, t)
+		}
+	}
+	e.Topics = out
+	return d.reg.Put(e)
+}
+
+func (d *daemon) execDiscover(ctx context.Context, req discoverReq) ([]map[string]any, error) {
+	if len(req.Topics) == 0 {
+		return nil, errTopicsRequired
+	}
+	var entries []protocol.TopicEntry
+	var err error
+	if len(req.Topics) == 1 {
+		entries, err = d.h.SearchTopic(ctx, req.Topics[0])
+	} else {
+		entries, err = d.h.SearchTopics(ctx, req.Topics)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if req.Filter != nil {
+		entries = protocol.FilterTopicEntries(entries, req.Filter)
+	}
+	out := make([]map[string]any, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, topicEntryToMap(e))
+	}
+	return out, nil
+}
+
+// agentPublishRecordReq is the body for POST /agents/{aid}/records (spec §3.3).
+type agentPublishRecordReq struct {
+	RecType       uint8  `json:"rec_type"`
+	PayloadBase64 string `json:"payload_base64"`
+	TTL           uint32 `json:"ttl"`
+}
+
+func sovereignCustomRecType(t uint8) bool {
+	return t >= 0x02 && t <= 0x0f
+}
+
+func signedRecordToAPI(sr protocol.SignedRecord) (map[string]any, error) {
+	var addr a2al.Address
+	if len(sr.Address) != len(addr) {
+		return nil, errors.New("bad record address length")
+	}
+	copy(addr[:], sr.Address)
+	m := map[string]any{
+		"aid":              addr.String(),
+		"rec_type":         sr.RecType,
+		"payload_base64":   base64.StdEncoding.EncodeToString(sr.Payload),
+		"seq":              sr.Seq,
+		"timestamp":        sr.Timestamp,
+		"ttl":              sr.TTL,
+		"pubkey_base64":    base64.StdEncoding.EncodeToString(sr.Pubkey),
+		"signature_base64": base64.StdEncoding.EncodeToString(sr.Signature),
+	}
+	if len(sr.Delegation) > 0 {
+		m["delegation_base64"] = base64.StdEncoding.EncodeToString(sr.Delegation)
+	}
+	return m, nil
+}
+
+func (d *daemon) execAgentPublishRecord(ctx context.Context, aidStr string, req agentPublishRecordReq) error {
+	aid, err := a2al.ParseAddress(aidStr)
+	if err != nil {
+		return errBadAID
+	}
+	if !sovereignCustomRecType(req.RecType) {
+		return errBadRecType
+	}
+	if req.TTL == 0 {
+		return errTTLRequired
+	}
+	payload, err := base64.StdEncoding.DecodeString(req.PayloadBase64)
+	if err != nil {
+		return errBadPayloadB64
+	}
+	d.regMu.RLock()
+	e := d.reg.Get(aid)
+	d.regMu.RUnlock()
+	if e == nil {
+		return errNotFound
+	}
+	if len(e.DelegationCBOR) == 0 {
+		return errNoDelegation
+	}
+	now := time.Now()
+	seq := uint64(now.UnixNano())
+	ts := uint64(now.Unix())
+	rec, err := protocol.SignRecordDelegated(e.OpPriv, e.DelegationCBOR, aid, req.RecType, payload, seq, ts, req.TTL)
+	if err != nil {
+		return err
+	}
+	return d.h.PublishRecord(ctx, rec)
+}
+
+func (d *daemon) execResolveRecords(ctx context.Context, aidStr string, recType uint8) ([]map[string]any, error) {
+	aid, err := a2al.ParseAddress(aidStr)
+	if err != nil {
+		return nil, errBadAID
+	}
+	recs, err := d.h.FindRecords(ctx, aid, recType)
+	if err != nil {
+		if errors.Is(err, dht.ErrNoMatchingRecords) {
+			return []map[string]any{}, nil
+		}
+		return nil, err
+	}
+	now := time.Now()
+	out := make([]map[string]any, 0, len(recs))
+	for _, sr := range recs {
+		if err := protocol.VerifySignedRecord(sr, now); err != nil {
+			continue
+		}
+		m, err := signedRecordToAPI(sr)
+		if err != nil {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out, nil
+}
+
 var (
 	errBadDelegationHex      = errors.New("bad delegation_proof_hex")
 	errDelegationParse     = errors.New("delegation parse")
@@ -313,4 +605,9 @@ var (
 	errListen              = errors.New("listen failed")
 	errConnectQUIC         = errors.New("quic connect failed")
 	errOpKeyMismatch       = errors.New("operational key mismatch")
+	errTopicsRequired      = errors.New("topics required")
+	errBadRecType          = errors.New("rec_type must be sovereign custom 0x02-0x0f")
+	errTTLRequired         = errors.New("ttl required")
+	errBadPayloadB64       = errors.New("invalid payload_base64")
+	errNoDelegation        = errors.New("delegation required")
 )

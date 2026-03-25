@@ -34,31 +34,31 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.22"
-      - name: build phase1-node
-        run: |
-          cd examples/phase1-node
-          go build -o phase1-node-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }} .
+
+      - name: build a2ald
+        run: go build -o a2ald-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }} ./cmd/a2ald
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: "0"
       - uses: actions/upload-artifact@v4
         with:
-          name: phase1-node-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: examples/phase1-node/phase1-node-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
+          name: a2ald-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: a2ald-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
           retention-days: 7
-      - name: build phase2-chat
+
+      - name: build demo4-marketplace
         run: |
-          cd examples/phase2-chat
-          go build -o phase2-chat-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }} .
+          cd examples/demo4-marketplace
+          go build -o demo4-marketplace-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }} .
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: "0"
       - uses: actions/upload-artifact@v4
         with:
-          name: phase2-chat-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: examples/phase2-chat/phase2-chat-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
+          name: demo4-marketplace-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: examples/demo4-marketplace/demo4-marketplace-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
           retention-days: 7
 
   cross-build-mobile:
@@ -81,7 +81,9 @@ jobs:
           CGO_ENABLED: "0"
 
   cross-build-ios:
+    # iOS requires CGO (platform constraint); tracked separately pending gomobile integration.
     runs-on: macos-latest
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5

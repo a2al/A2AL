@@ -116,10 +116,53 @@ func buildEndpointRecord(priv ed25519.PrivateKey, addr a2al.Address, ep Endpoint
 	if err != nil {
 		return SignedRecord{}, err
 	}
+	return signRecordCore(priv, addr, RecTypeEndpoint, payloadCBOR, seq, timestamp, ttl, delegation)
+}
+
+func recTypeSignable(recType uint8) bool {
+	return (recType >= 0x02 && recType <= 0x0f) ||
+		(recType >= 0x10 && recType <= 0x1f) ||
+		(recType >= 0x80 && recType <= 0x8f)
+}
+
+// SignRecord builds a signed record for RecType sovereign custom (0x02–0x0F), topic (0x10–0x1F), or mailbox (0x80–0x8F).
+// payload must be CBOR-encoded bytes.
+func SignRecord(priv ed25519.PrivateKey, addr a2al.Address, recType uint8, payload []byte, seq, timestamp uint64, ttl uint32) (SignedRecord, error) {
+	if !recTypeSignable(recType) {
+		return SignedRecord{}, fmt.Errorf("%w: unsupported RecType for SignRecord", ErrInvalidRecord)
+	}
+	if ttl == 0 {
+		return SignedRecord{}, fmt.Errorf("%w: ttl", ErrInvalidRecord)
+	}
+	want, err := acrypto.AddressFromPublicKey(priv.Public().(ed25519.PublicKey))
+	if err != nil {
+		return SignedRecord{}, err
+	}
+	if want != addr {
+		return SignedRecord{}, fmt.Errorf("%w: address/key mismatch", ErrInvalidRecord)
+	}
+	return signRecordCore(priv, addr, recType, payload, seq, timestamp, ttl, nil)
+}
+
+// SignRecordDelegated is SignRecord with an operational key and DelegationProof.
+func SignRecordDelegated(opPriv ed25519.PrivateKey, delegationCBOR []byte, addr a2al.Address, recType uint8, payload []byte, seq, timestamp uint64, ttl uint32) (SignedRecord, error) {
+	if !recTypeSignable(recType) {
+		return SignedRecord{}, fmt.Errorf("%w: unsupported RecType for SignRecordDelegated", ErrInvalidRecord)
+	}
+	if ttl == 0 {
+		return SignedRecord{}, fmt.Errorf("%w: ttl", ErrInvalidRecord)
+	}
+	if len(delegationCBOR) == 0 {
+		return SignedRecord{}, fmt.Errorf("%w: delegation required", ErrInvalidRecord)
+	}
+	return signRecordCore(opPriv, addr, recType, payload, seq, timestamp, ttl, delegationCBOR)
+}
+
+func signRecordCore(priv ed25519.PrivateKey, addr a2al.Address, recType uint8, payload []byte, seq, timestamp uint64, ttl uint32, delegation []byte) (SignedRecord, error) {
 	fields := recordSignFields{
 		Address:   addr[:],
-		RecType:   RecTypeEndpoint,
-		Payload:   payloadCBOR,
+		RecType:   recType,
+		Payload:   payload,
 		Seq:       seq,
 		Timestamp: timestamp,
 		TTL:       ttl,
@@ -133,8 +176,8 @@ func buildEndpointRecord(priv ed25519.PrivateKey, addr a2al.Address, ep Endpoint
 	pub := priv.Public().(ed25519.PublicKey)
 	return SignedRecord{
 		Address:    addr[:],
-		RecType:    RecTypeEndpoint,
-		Payload:    payloadCBOR,
+		RecType:    recType,
+		Payload:    payload,
 		Seq:        seq,
 		Timestamp:  timestamp,
 		TTL:        ttl,
@@ -176,6 +219,17 @@ func VerifySignedRecord(sr SignedRecord, now time.Time) error {
 		if ep.NatType > NATSymmetric {
 			return ErrInvalidRecord
 		}
+	}
+	if sr.RecType == RecTypeTopic {
+		if len(sr.Payload) > MaxTopicPayloadCBOR {
+			return fmt.Errorf("%w: topic payload size", ErrInvalidRecord)
+		}
+		if _, err := ParseTopicRecord(sr); err != nil {
+			return err
+		}
+	}
+	if RecordCategory(sr.RecType) == CategoryMailbox && len(sr.Payload) > MaxMailboxPayloadCBOR {
+		return fmt.Errorf("%w: mailbox payload size", ErrInvalidRecord)
 	}
 	nowUnix := uint64(now.Unix())
 	if nowUnix < sr.Timestamp {

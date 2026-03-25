@@ -52,42 +52,70 @@ func appendCandidateUnique(seen map[string]struct{}, out *[]string, ep string) {
 }
 
 // orderedQUICEndpointStrings builds Phase 2b multi-candidate endpoints (deduped).
-// Order: trusted observed → QUIC bind (public) → outbound probe → FallbackHost → UPnP URL.
-// IPv6 candidates will be added here once Host supports dual-stack listeners (see Config doc).
-// upnpSnapshot is the result of ensureUPnP (avoid locking around slow IGD calls).
-func (h *Host) orderedQUICEndpointStrings(upnpSnapshot string) ([]string, error) {
+//
+// Priority order:
+//
+//	① trusted observed_addr (natsense consensus from DHT peers)
+//	② STUN external ip:port  (NAT-mapped address, most reliable for public internet)
+//	③ QUIC bind IP          (only if already a public WAN IP)
+//	④ outbound probe IP     (local route to 8.8.8.8; only valid on machines with direct WAN IP)
+//	⑤ FallbackHost          (explicit operator override; required for loopback/LAN tests)
+//	⑥ UPnP external URL    (IGD port-mapped address)
+//	⑦ HTTP public IP        (last resort: ip only → use local port)
+//
+// extipSnapshot is the result of ensureExternalIP (STUN "ip:port" or HTTP "ip").
+// upnpSnapshot is the result of ensureUPnP.
+// Both are pre-resolved outside this function to avoid holding locks during I/O.
+func (h *Host) orderedQUICEndpointStrings(extipSnapshot, upnpSnapshot string) ([]string, error) {
 	portStr := strconv.Itoa(h.QUICLocalAddr().Port)
 	seen := make(map[string]struct{})
 	var out []string
 
+	// ① observed_addr consensus
 	if host, _, ok := h.sense.TrustedUDP(); ok {
 		if ip := net.ParseIP(host); ip != nil && isPlausibleWANIP(ip) {
 			appendCandidateUnique(seen, &out, "quic://"+net.JoinHostPort(host, portStr))
 		}
 	}
 
+	// ② STUN / HTTP external IP
+	if extipSnapshot != "" {
+		if strings.Contains(extipSnapshot, ":") {
+			// STUN result includes port — use it directly.
+			appendCandidateUnique(seen, &out, "quic://"+extipSnapshot)
+		} else {
+			// HTTP result is IP only — pair with our local listen port.
+			appendCandidateUnique(seen, &out, "quic://"+net.JoinHostPort(extipSnapshot, portStr))
+		}
+	}
+
+	// ③ QUIC bind IP (direct public)
 	if ua := h.QUICLocalAddr(); ua != nil {
 		if ip4 := ua.IP.To4(); ip4 != nil && isPlausibleWANIP(ip4) {
 			appendCandidateUnique(seen, &out, "quic://"+net.JoinHostPort(ip4.String(), portStr))
 		}
 	}
 
+	// ④ outbound probe (valid only when machine has a direct WAN IP)
 	if ip := outboundIP(); ip != nil {
 		if ip4 := ip.To4(); ip4 != nil && isPlausibleWANIP(ip4) {
 			appendCandidateUnique(seen, &out, "quic://"+net.JoinHostPort(ip4.String(), portStr))
 		}
 	}
 
+	// ⑤ explicit FallbackHost override
 	if fh := strings.TrimSpace(h.cfg.FallbackHost); fh != "" {
 		appendCandidateUnique(seen, &out, "quic://"+net.JoinHostPort(fh, portStr))
 	}
 
+	// ⑥ UPnP port-mapped address
 	if upnpSnapshot != "" {
 		appendCandidateUnique(seen, &out, upnpSnapshot)
 	}
 
 	if len(out) == 0 {
-		return nil, errors.New("a2al/host: cannot determine advertise host; set FallbackHost, obtain observed_addr from peers, or enable UPnP")
+		return nil, errors.New("a2al/host: cannot determine advertise host; " +
+			"ensure internet connectivity for STUN/HTTP probing, or set FallbackHost for local/LAN tests")
 	}
 	return out, nil
 }

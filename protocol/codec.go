@@ -1,4 +1,4 @@
-﻿// Copyright 2026 The A2AL Authors. All rights reserved.
+// Copyright 2026 The A2AL Authors. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
 package protocol
@@ -241,6 +241,11 @@ func decodeBody(msgType uint8, raw cbor.RawMessage) (any, error) {
 				return nil, err
 			}
 		}
+		for i := range b.Records {
+			if err := signedRecordCheck(b.Records[i]); err != nil {
+				return nil, err
+			}
+		}
 		return &b, nil
 	case MsgStore:
 		var b BodyStore
@@ -249,6 +254,9 @@ func decodeBody(msgType uint8, raw cbor.RawMessage) (any, error) {
 		}
 		if err := signedRecordCheck(b.Record); err != nil {
 			return nil, err
+		}
+		if len(b.Key) != 0 && len(b.Key) != len(a2al.NodeID{}) {
+			return nil, ErrInvalidMessage
 		}
 		return &b, nil
 	case MsgStoreResp:
@@ -327,6 +335,11 @@ func bodyWireCheck(msgType uint8, body any) error {
 				return err
 			}
 		}
+		for i := range b.Records {
+			if err := signedRecordCheck(b.Records[i]); err != nil {
+				return err
+			}
+		}
 	case MsgStore:
 		b, ok := body.(*BodyStore)
 		if !ok {
@@ -334,6 +347,9 @@ func bodyWireCheck(msgType uint8, body any) error {
 		}
 		if err := signedRecordCheck(b.Record); err != nil {
 			return err
+		}
+		if len(b.Key) != 0 && len(b.Key) != len(a2al.NodeID{}) {
+			return ErrInvalidMessage
 		}
 	case MsgStoreResp:
 		_, ok := body.(*BodyStoreResp)
@@ -367,6 +383,21 @@ func signedRecordCheck(r SignedRecord) error {
 		return ErrInvalidMessage
 	}
 	return nil
+}
+
+// FindValueResponseWireSize returns the canonical CBOR size of a FIND_VALUE_RESP body (UDP trim, spec §3.7).
+func FindValueResponseWireSize(resp *BodyFindValueResp) (int, error) {
+	if resp == nil {
+		return 0, ErrInvalidMessage
+	}
+	if err := bodyWireCheck(MsgFindValueResp, resp); err != nil {
+		return 0, err
+	}
+	b, err := canonical.Marshal(resp)
+	if err != nil {
+		return 0, err
+	}
+	return len(b), nil
 }
 
 func senderMatchesBody(sender a2al.Address, msgType uint8, body any) error {

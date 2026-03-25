@@ -23,7 +23,7 @@ A `Host` runs a DHT `Node`, optional UDP demux for DHT+QUIC on a single port, a 
 | Field | Meaning |
 |-------|---------|
 | `KeyStore` | Required. Must list **exactly one** `Address` (see `crypto.KeyStore`). |
-| `ListenAddr` | DHT UDP bind, e.g. `":5001"`. Currently uses IPv4 UDP (`udp4`). |
+| `ListenAddr` | DHT UDP bind, e.g. `":4121"` (default). Currently uses IPv4 UDP (`udp4`). |
 | `QUICListenAddr` | If non-empty, QUIC binds here **separately** from DHT. If empty, QUIC shares the DHT UDP socket (mux). |
 | `PrivateKey` | Ed25519 key for QUIC/TLS. If nil, `EncryptedKeyStore.Ed25519PrivateKey` is used when available; otherwise set explicitly. |
 | `MinObservedPeers` | Minimum distinct peers that must report the same reflected address before `Sense` treats it as trusted (default 3 if ≤0). |
@@ -61,6 +61,11 @@ The DHT node created by `Host` sets `dht.Config.RecordAuth` so stored records mu
 | `Address`, `DHTLocalAddr`, `QUICLocalAddr` | Introspection. |
 | `Node()`, `Sense()` | Access underlying DHT node or NAT/reflection state. |
 | `ObserveFromPeers` | Triggers ping/bootstrap-style contact to collect `observed_addr` for `Sense`. |
+| `SendMailbox` / `PollMailbox` | DHT mailbox (Phase 4): encrypt/decrypt for the **default** host identity. |
+| `SendMailboxForAgent` / `PollMailboxForAgent` | Same for a **registered** agent address (self-sign or delegated). |
+| `RegisterTopic` / `RegisterTopics` | Topic rendezvous (Phase 4 B): publish RecType `0x10` at `SHA-256("topic:"+string)` for the default identity. |
+| `RegisterTopicForAgent` / `RegisterTopicsForAgent` | Same for a registered agent (delegation-aware). |
+| `SearchTopic` / `SearchTopics` | `AggregateRecords` on topic key; `SearchTopics` returns AIDs present in **all** listed topics. |
 | `StartDebugHTTP(addr)` / `DebugHTTPHandler()` | Read-only JSON (see Debug HTTP). |
 | `Close()` | Shuts down QUIC, mux, and DHT. |
 
@@ -105,6 +110,8 @@ Use when you implement your own stack but need Kademlia-style RPCs and storage.
 | `BootstrapAddrs(ctx, []net.Addr)` | Recommended bootstrap: only `ip:port` required; identity learned from PONG. |
 | `PingIdentity(ctx, addr)` | Returns `PeerIdentity{Address, NodeID}`. |
 | `PublishEndpointRecord(ctx, rec)` | STORE signed record to closest peers. |
+| `PublishMailboxRecord(ctx, storeKey, rec)` | STORE mailbox `SignedRecord` at recipient `NodeID` to k-closest peers (Phase 4). |
+| `PublishTopicRecord(ctx, storeKey, rec)` | STORE topic `SignedRecord` at `TopicNodeID` to k-closest peers (Phase 4 B). |
 | `NewQuery(n).Resolve(ctx, NodeID)` | Iterative endpoint fetch. |
 | `NewQuery(n).FindNode(ctx, NodeID)` | Iterative `FIND_NODE`. |
 | `StartDebugHTTP` / `DebugHTTPHandler()` | DHT JSON (no `/debug/host`; that is `Host`-only). |
@@ -136,11 +143,28 @@ Use when you implement your own stack but need Kademlia-style RPCs and storage.
 
 `timestamp` + `TTL` must cover “now” or verification/storage fails.
 
+### Mailbox (Phase 4)
+
+| Item | Role |
+|------|------|
+| `RecTypeMailbox` (0x80) | Stored at `NodeID(recipient)`; outer `SignedRecord.Address` = sender AID. |
+| `EncodeMailboxPayload`, `OpenMailboxRecord` | X25519 + HKDF + AES-256-GCM wire helpers. |
+| `MailboxMessage` | Decrypted view: `Sender`, `MsgType`, `Body`. |
+
+### Topic rendezvous (Phase 4 B)
+
+| Item | Role |
+|------|------|
+| `TopicNodeID(topic)` | `SHA-256("topic:" \|\| UTF-8 topic)` as DHT key. |
+| `RecTypeTopic` (0x10) | `TopicPayload` CBOR in `SignedRecord.payload` (≤512 B); `Address` = registrant AID. |
+| `TopicEntry` | Decoded listing: AID, `TopicPayload` fields, `Seq` / `Timestamp` / `TTL`. |
+| `DiscoverFilter`, `FilterTopicEntries` | Optional `protocols` / `tags` AND-style client filter. |
+
 ---
 
 ## `a2ald` — HTTP API
 
-Binds to `config.Config.APIAddr` (default `127.0.0.1:8520`). If `api_token` is set, requests must send `Authorization: Bearer <token>`. For mutating methods, use `Content-Type: application/json` (including `DELETE` with an empty JSON body `{}` where required).
+Binds to `config.Config.APIAddr` (default `127.0.0.1:2121`). If `api_token` is set, requests must send `Authorization: Bearer <token>`. For mutating methods, use `Content-Type: application/json` (including `DELETE` with an empty JSON body `{}` where required).
 
 | Method | Path | Role |
 |--------|------|------|
@@ -155,7 +179,14 @@ Binds to `config.Config.APIAddr` (default `127.0.0.1:8520`). If `api_token` is s
 | `GET` | `/agents/{aid}` | Agent status (reachability, publish info). |
 | `PATCH` | `/agents/{aid}` | Update `service_tcp` (requires operational key). |
 | `POST` | `/agents/{aid}/publish` | Publish/refresh DHT endpoint record. |
+| `POST` | `/agents/{aid}/records` | Sovereign custom record (RecType `0x02`–`0x0f`): `rec_type`, `payload_base64`, `ttl`; signed with operational key + delegation. |
+| `POST` | `/agents/{aid}/mailbox/send` | Encrypted mailbox: JSON `recipient`, `msg_type`, `body_base64` → `{"ok":true}`. |
+| `POST` | `/agents/{aid}/mailbox/poll` | Returns `{"messages":[{"sender","msg_type","body_base64"},...]}`. |
+| `POST` | `/agents/{aid}/topics` | Register topic(s): `topics`, `name`, `protocols`, `tags`, `brief`, optional `meta`, `ttl`. |
+| `DELETE` | `/agents/{aid}/topics/{topic...}` | Drop topic from daemon renewal list (send `Content-Type: application/json`, body `{}`); DHT entry expires by TTL. |
+| `POST` | `/discover` | `{"topics":["..."],"filter":{"protocols":[],"tags":[]}}` → `{"entries":[...]}`. |
 | `DELETE` | `/agents/{aid}` | Unregister agent. |
+| `GET` | `/resolve/{aid}/records?type={rec_type}` | List verified `SignedRecord`s for remote AID; omit `type` or `type=0` for all RecTypes. Response `records[]` with `payload_base64`, `pubkey_base64`, `signature_base64`, etc. |
 | `POST` | `/resolve/{aid}` | Resolve remote AID to endpoint record JSON. |
 | `POST` | `/connect/{aid}` | Outbound tunnel: returns `{"tunnel":"127.0.0.1:<port>"}`; optional JSON `{"local_aid":"..."}` if multiple local agents. |
 | `GET` | `/debug/...` | Same as `Host.DebugHTTPHandler()` (includes `/debug/host`). |
@@ -166,7 +197,7 @@ Binds to `config.Config.APIAddr` (default `127.0.0.1:8520`). If `api_token` is s
 - **Streamable HTTP**: mounted at `/mcp/` on the API server.  
 - **Stdio**: run `a2ald -mcp-stdio` (no HTTP API in that mode).
 
-Example tool names: `a2al_identity_generate`, `a2al_agents_list`, `a2al_agent_register`, `a2al_agent_get`, `a2al_agent_patch`, `a2al_agent_publish`, `a2al_resolve`, `a2al_connect`.
+Example tool names: `a2al_identity_generate`, `a2al_agents_list`, `a2al_agent_register`, `a2al_agent_get`, `a2al_agent_patch`, `a2al_agent_publish`, `a2al_agent_publish_record`, `a2al_resolve_records`, `a2al_resolve`, `a2al_connect`, `a2al_mailbox_send`, `a2al_mailbox_poll`, `a2al_topic_register`, `a2al_topic_unregister`, `a2al_discover`.
 
 ---
 
