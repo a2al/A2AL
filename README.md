@@ -84,7 +84,7 @@ A2AL is complementary to existing agent communication standards — it provides 
 **Discovery** (Demo 1 — AID address resolution):
 
 ```bash
-cd examples/phase1-node
+cd examples/demo1-node
 
 go run . -listen :5001 -debug :2634                                    # node 1
 go run . -listen :5002 -bootstrap 127.0.0.1:5001 -debug :2635         # node 2
@@ -93,10 +93,10 @@ go run . -listen :5003 -bootstrap 127.0.0.1:5001 -debug :2636         # node 3
 
 Type any node's AID to resolve its endpoint. Inspect network state at `http://127.0.0.1:2634/debug/routing`.
 
-**Encrypted Chat** (Demo 2 — Publish → Discover → Connect → Chat):
+**Encrypted Chat** (publish → discover → connect → chat):
 
 ```bash
-cd examples/phase2-chat
+cd examples/demo2-chat
 
 go run . -listen :5001 -quic :5002 -debug :2634                       # Alice
 go run . -listen :5003 -quic :5004 -bootstrap 127.0.0.1:5001 -debug :2635  # Bob
@@ -116,8 +116,12 @@ Contributions are welcome. Before your pull request can be merged, you must sign
 
 Please open an issue before starting significant work.
 
+## Author
+
+XG.Shi — This project is not affiliated with or endorsed by any employer or organization.
+
 ## License
 
-Copyright 2026 The A2AL Authors
+Copyright (c) 2026 The A2AL Authors
 
 Licensed under the [Apache License, Version 2.0](LICENSE).
