@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -106,6 +107,10 @@ type Host struct {
 	upnpURL            string
 	upnpCleanup        func()
 	upnpFailRetryAfter time.Time
+
+	extipMu   sync.Mutex
+	extipSnap string    // "ip:port" (STUN) or "ip" (HTTP); empty = not yet resolved
+	extipExp  time.Time // cache expiry
 }
 
 // New creates a Host with one initial agent identity from cfg.KeyStore.
@@ -326,10 +331,16 @@ func (h *Host) ObserveFromPeers(ctx context.Context, seeds []net.Addr) {
 }
 
 // BuildEndpointPayload builds ordered, deduplicated quic:// candidates (Phase 2b).
-// When UPnP is enabled, ctx bounds discovery and AddPortMapping latency.
+// UPnP discovery and external IP probing (STUN + HTTP) run concurrently.
 func (h *Host) BuildEndpointPayload(ctx context.Context) (protocol.EndpointPayload, error) {
-	up := h.ensureUPnP(ctx)
-	eps, err := h.orderedQUICEndpointStrings(up)
+	upCh := make(chan string, 1)
+	extCh := make(chan string, 1)
+	go func() { upCh <- h.ensureUPnP(ctx) }()
+	go func() { extCh <- h.ensureExternalIP(ctx) }()
+	up := <-upCh
+	ext := <-extCh
+
+	eps, err := h.orderedQUICEndpointStrings(ext, up)
 	if err != nil {
 		return protocol.EndpointPayload{}, err
 	}
@@ -337,6 +348,47 @@ func (h *Host) BuildEndpointPayload(ctx context.Context) (protocol.EndpointPaylo
 		Endpoints: eps,
 		NatType:   h.sense.InferNATType(),
 	}, nil
+}
+
+const extipCacheTTL = 5 * time.Minute
+
+// ensureExternalIP returns a cached or freshly probed external IP string.
+// It first tries STUN (returns "ip:port") then HTTP services (returns "ip").
+// Returns "" if both fail.
+func (h *Host) ensureExternalIP(ctx context.Context) string {
+	h.extipMu.Lock()
+	if h.extipSnap != "" && time.Now().Before(h.extipExp) {
+		snap := h.extipSnap
+		h.extipMu.Unlock()
+		return snap
+	}
+	h.extipMu.Unlock()
+
+	// STUN probe: 3-second budget.
+	sctx, scancel := context.WithTimeout(ctx, 3*time.Second)
+	stunIP, stunPort := probeSTUN(sctx)
+	scancel()
+
+	var snap string
+	if stunIP != nil && isPlausibleWANIP(stunIP) {
+		snap = net.JoinHostPort(stunIP.String(), strconv.Itoa(int(stunPort)))
+	} else {
+		// HTTP fallback: 5-second budget.
+		hctx, hcancel := context.WithTimeout(ctx, 5*time.Second)
+		httpIP := httpPublicIP(hctx)
+		hcancel()
+		if httpIP != nil && isPlausibleWANIP(httpIP) {
+			snap = httpIP.String()
+		}
+	}
+
+	if snap != "" {
+		h.extipMu.Lock()
+		h.extipSnap = snap
+		h.extipExp = time.Now().Add(extipCacheTTL)
+		h.extipMu.Unlock()
+	}
+	return snap
 }
 
 func (h *Host) ensureUPnP(ctx context.Context) string {
@@ -420,9 +472,25 @@ func (h *Host) PublishEndpointForAgent(ctx context.Context, agentAddr a2al.Addre
 	return h.node.PublishEndpointRecord(ctx, rec)
 }
 
+// PublishRecord pushes a signed sovereign record (RecType 0x01–0x0F) to the DHT.
+// Returns an error if rec is not a sovereign-category record; use
+// PublishTopicRecord / host mailbox APIs for other categories.
+func (h *Host) PublishRecord(ctx context.Context, rec protocol.SignedRecord) error {
+	if protocol.RecordCategory(rec.RecType) != protocol.CategorySovereign {
+		return errors.New("a2al/host: PublishRecord is for sovereign records only; use PublishTopicRecord/SendMailbox for other categories")
+	}
+	return h.node.PublishEndpointRecord(ctx, rec)
+}
+
 func (h *Host) Resolve(ctx context.Context, target a2al.Address) (*protocol.EndpointRecord, error) {
 	q := dht.NewQuery(h.node)
 	return q.Resolve(ctx, a2al.NodeIDFromAddress(target))
+}
+
+// FindRecords runs iterative FIND_VALUE for the given RecType filter (0 = all types).
+func (h *Host) FindRecords(ctx context.Context, target a2al.Address, recType uint8) ([]protocol.SignedRecord, error) {
+	q := dht.NewQuery(h.node)
+	return q.FindRecords(ctx, a2al.NodeIDFromAddress(target), recType)
 }
 
 // Connect dials the remote agent over QUIC with mutual TLS.
@@ -619,16 +687,21 @@ func closeAfterError(mux *transport.UDPMux, node *dht.Node) {
 }
 
 // recordAuthPolicy is the DHT store authority policy for a2ald hosts.
-// It enforces that the signing key (sr.Pubkey) is permitted to publish for sr.Address:
-//   - Self-signed: AddressFromPublicKey(Pubkey) == Address  (Phase 1/2)
-//   - Delegated:   sr.Delegation carries a valid DelegationProof  (Phase 3)
-func recordAuthPolicy(sr protocol.SignedRecord, now time.Time) error {
+// Phase 4: sovereign records must use key == NodeID(sr.Address); Topic/Mailbox skip address binding.
+func recordAuthPolicy(key a2al.NodeID, sr protocol.SignedRecord, now time.Time) error {
+	cat := protocol.RecordCategory(sr.RecType)
+	if cat == protocol.CategoryTopic || cat == protocol.CategoryMailbox {
+		return nil
+	}
+	var recAddr a2al.Address
+	copy(recAddr[:], sr.Address)
+	if key != a2al.NodeIDFromAddress(recAddr) {
+		return errors.New("a2al/host: sovereign record DHT key mismatch")
+	}
 	signerAddr, err := crypto.AddressFromPublicKey(sr.Pubkey)
 	if err != nil {
 		return err
 	}
-	var recAddr a2al.Address
-	copy(recAddr[:], sr.Address)
 	if signerAddr == recAddr {
 		return nil
 	}
