@@ -1,4 +1,4 @@
-﻿// Copyright 2026 The A2AL Authors. All rights reserved.
+// Copyright 2026 The A2AL Authors. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
 package routing
@@ -103,6 +103,31 @@ func (t *Table) NearestN(target a2al.NodeID, n int) []protocol.NodeInfo {
 // BucketIndexOf returns BucketIndex(t.self, peer).
 func (t *Table) BucketIndexOf(peer a2al.NodeID) int {
 	return BucketIndex(t.self, peer)
+}
+
+// AllPeers returns every distinct peer in the table (unordered). Excludes self.
+func (t *Table) AllPeers() []protocol.NodeInfo {
+	var out []protocol.NodeInfo
+	seen := make(map[string]struct{})
+	for bi := range t.b {
+		for _, node := range t.b[bi].nodes {
+			if len(node.NodeID) != len(t.self) {
+				continue
+			}
+			var nid a2al.NodeID
+			copy(nid[:], node.NodeID)
+			if nid == t.self {
+				continue
+			}
+			key := string(node.NodeID)
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			out = append(out, cloneNodeInfo(node))
+		}
+	}
+	return out
 }
 
 // Len returns the total number of stored peers.

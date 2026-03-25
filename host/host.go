@@ -14,6 +14,7 @@
 package host
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/tls"
@@ -29,6 +30,7 @@ import (
 	"github.com/a2al/a2al"
 	"github.com/a2al/a2al/crypto"
 	"github.com/a2al/a2al/dht"
+	"github.com/a2al/a2al/identity"
 	"github.com/a2al/a2al/natmap"
 	"github.com/a2al/a2al/natsense"
 	"github.com/a2al/a2al/protocol"
@@ -80,9 +82,10 @@ type AgentConn struct {
 
 // agentEntry is a registered agent in the SNI router.
 type agentEntry struct {
-	addr a2al.Address
-	priv ed25519.PrivateKey
-	cert tls.Certificate
+	addr           a2al.Address
+	priv           ed25519.PrivateKey
+	cert           tls.Certificate
+	delegationCBOR []byte // non-nil for Phase 3 delegated agents
 }
 
 // Host is the Phase 2a runtime.
@@ -151,6 +154,7 @@ func New(cfg Config) (*Host, error) {
 		OnObservedAddr: func(reporter a2al.NodeID, wire []byte) {
 			sense.Record(reporter, wire)
 		},
+		RecordAuth: recordAuthPolicy,
 	}
 
 	var node *dht.Node
@@ -255,6 +259,23 @@ func (h *Host) RegisterAgent(addr a2al.Address, priv ed25519.PrivateKey) error {
 		return fmt.Errorf("a2al/host: agent %s already registered", addr)
 	}
 	h.agents[addr] = &agentEntry{addr: addr, priv: priv, cert: cert}
+	return nil
+}
+
+// RegisterDelegatedAgent adds a Phase 3 agent whose operational key is authorized
+// by a DelegationProof (delegationCBOR). The proof is embedded in endpoint records
+// so DHT nodes can verify the authority of the operational key independently.
+func (h *Host) RegisterDelegatedAgent(addr a2al.Address, opPriv ed25519.PrivateKey, delegationCBOR []byte) error {
+	cert, err := selfSignedEd25519CertDelegated(opPriv, addr, delegationCBOR)
+	if err != nil {
+		return err
+	}
+	h.agentsMu.Lock()
+	defer h.agentsMu.Unlock()
+	if _, exists := h.agents[addr]; exists {
+		return fmt.Errorf("a2al/host: agent %s already registered", addr)
+	}
+	h.agents[addr] = &agentEntry{addr: addr, priv: opPriv, cert: cert, delegationCBOR: delegationCBOR}
 	return nil
 }
 
@@ -369,12 +390,30 @@ func (h *Host) SymmetricNATReachabilityHint() string {
 }
 
 func (h *Host) PublishEndpoint(ctx context.Context, seq uint64, ttl uint32) error {
+	return h.PublishEndpointForAgent(ctx, h.addr, seq, ttl)
+}
+
+// PublishEndpointForAgent publishes an endpoint record signed by the given registered agent.
+// For Phase 3 delegated agents (registered via RegisterDelegatedAgent), the record embeds
+// the DelegationProof so DHT nodes can verify the operational key's authority.
+func (h *Host) PublishEndpointForAgent(ctx context.Context, agentAddr a2al.Address, seq uint64, ttl uint32) error {
+	h.agentsMu.RLock()
+	ag, ok := h.agents[agentAddr]
+	h.agentsMu.RUnlock()
+	if !ok {
+		return fmt.Errorf("a2al/host: unknown agent %s", agentAddr)
+	}
 	ep, err := h.BuildEndpointPayload(ctx)
 	if err != nil {
 		return err
 	}
 	now := time.Now().Truncate(time.Second)
-	rec, err := protocol.SignEndpointRecord(h.priv, h.addr, ep, seq, uint64(now.Unix()), ttl)
+	var rec protocol.SignedRecord
+	if len(ag.delegationCBOR) > 0 {
+		rec, err = protocol.SignEndpointRecordDelegated(ag.priv, ag.delegationCBOR, agentAddr, ep, seq, uint64(now.Unix()), ttl)
+	} else {
+		rec, err = protocol.SignEndpointRecord(ag.priv, agentAddr, ep, seq, uint64(now.Unix()), ttl)
+	}
 	if err != nil {
 		return err
 	}
@@ -391,11 +430,11 @@ func (h *Host) Resolve(ctx context.Context, target a2al.Address) (*protocol.Endp
 // agent-route frame (4-byte magic + 21-byte target Address) so the
 // server can route the connection even when TLS SNI is camouflaged.
 func (h *Host) Connect(ctx context.Context, expectRemote a2al.Address, udpAddr *net.UDPAddr) (quic.Connection, error) {
-	return h.dialAndAgentRoute(ctx, expectRemote, udpAddr)
+	return h.dialAndAgentRoute(ctx, h.priv, expectRemote, udpAddr)
 }
 
-func (h *Host) dialAndAgentRoute(ctx context.Context, expectRemote a2al.Address, udpAddr *net.UDPAddr) (quic.Connection, error) {
-	cliTLS, err := quicClientTLS(h.priv, expectRemote)
+func (h *Host) dialAndAgentRoute(ctx context.Context, localPriv ed25519.PrivateKey, expectRemote a2al.Address, udpAddr *net.UDPAddr) (quic.Connection, error) {
+	cliTLS, err := quicClientTLS(localPriv, expectRemote)
 	if err != nil {
 		return nil, err
 	}
@@ -520,7 +559,19 @@ func (h *Host) Close() error {
 		errs = append(errs, h.qListen.Close())
 	}
 	if h.quicTr != nil {
-		errs = append(errs, h.quicTr.Close())
+		// quic.Transport.Close waits for active connections to drain (up to
+		// MaxIdleTimeout). Cap the wait at 3 s; on timeout force-close the
+		// underlying packet conn so the goroutine unblocks quickly.
+		done := make(chan struct{})
+		go func() {
+			_ = h.quicTr.Close()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			_ = h.quicTr.Conn.Close()
+		}
 	}
 	if h.mux != nil {
 		errs = append(errs, h.mux.Close())
@@ -565,4 +616,34 @@ func closeAfterError(mux *transport.UDPMux, node *dht.Node) {
 	if node != nil {
 		_ = node.Close()
 	}
+}
+
+// recordAuthPolicy is the DHT store authority policy for a2ald hosts.
+// It enforces that the signing key (sr.Pubkey) is permitted to publish for sr.Address:
+//   - Self-signed: AddressFromPublicKey(Pubkey) == Address  (Phase 1/2)
+//   - Delegated:   sr.Delegation carries a valid DelegationProof  (Phase 3)
+func recordAuthPolicy(sr protocol.SignedRecord, now time.Time) error {
+	signerAddr, err := crypto.AddressFromPublicKey(sr.Pubkey)
+	if err != nil {
+		return err
+	}
+	var recAddr a2al.Address
+	copy(recAddr[:], sr.Address)
+	if signerAddr == recAddr {
+		return nil
+	}
+	if len(sr.Delegation) == 0 {
+		return errors.New("a2al/host: record address/key mismatch and no delegation")
+	}
+	proof, err := identity.ParseDelegationProof(sr.Delegation)
+	if err != nil {
+		return fmt.Errorf("a2al/host: delegation: %w", err)
+	}
+	if !bytes.Equal(proof.OpPub, sr.Pubkey) {
+		return errors.New("a2al/host: delegation op key mismatch")
+	}
+	if !bytes.Equal(proof.AgentAddr, sr.Address) {
+		return errors.New("a2al/host: delegation address mismatch")
+	}
+	return identity.VerifyDelegation(proof, uint64(now.Unix()), nil)
 }
