@@ -1,7 +1,7 @@
 // Copyright 2026 The A2AL Authors. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// Phase1-node: 单一 A2AL DHT 节点。
+// demo1-node: 单一 A2AL DHT 节点。
 //
 // 启动后自动生成身份、监听 UDP、bootstrap（若提供种子）、发布自己的端点记录。
 // 然后等待用户在 stdin 输入 Address 进行解析查询。
