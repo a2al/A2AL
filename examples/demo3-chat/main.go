@@ -11,7 +11,7 @@
 //
 // 【Bootstrap 节点】
 // a2ald 需要至少一个已知节点来加入 DHT 网络。有三种方式：
-//  1. 默认：自动通过 DNS TXT(_a2al-bootstrap.a2al.org) 解析公共种子节点
+//  1. 默认：自动解析公共种子节点
 //  2. 显式指定：--bootstrap 127.0.0.1:5001（可多个，逗号分隔）
 //  3. 配置文件：在 config.toml 中设置 bootstrap 列表
 //
