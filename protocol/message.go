@@ -71,17 +71,20 @@ type BodyFindNodeResp struct {
 }
 
 type BodyFindValue struct {
-	Target []byte `cbor:"1,keyasint"`
+	Target  []byte `cbor:"1,keyasint"`
+	RecType uint8  `cbor:"2,keyasint,omitempty"` // 0 = all types
 }
 
 type BodyFindValueResp struct {
 	Nodes        []NodeInfo     `cbor:"1,keyasint"`
 	Record       *SignedRecord  `cbor:"2,keyasint,omitempty"`
 	ObservedAddr []byte         `cbor:"3,keyasint"`
+	Records      []SignedRecord `cbor:"4,keyasint,omitempty"`
 }
 
 type BodyStore struct {
 	Record SignedRecord `cbor:"1,keyasint"`
+	Key    []byte       `cbor:"2,keyasint,omitempty"` // 32-byte DHT key; omit = NodeID(Address)
 }
 
 type BodyStoreResp struct {
