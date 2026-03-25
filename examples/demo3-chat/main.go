@@ -9,6 +9,15 @@
 //
 // 使用前提：先在另一个终端启动 a2ald。
 //
+// 【Bootstrap 节点】
+// a2ald 需要至少一个已知节点来加入 DHT 网络。有三种方式：
+//  1. 默认：自动通过 DNS TXT(_a2al-bootstrap.a2al.org) 解析公共种子节点
+//  2. 显式指定：--bootstrap 127.0.0.1:5001（可多个，逗号分隔）
+//  3. 配置文件：在 config.toml 中设置 bootstrap 列表
+//
+// 本机两实例测试时，让 Bob 的 a2ald 用 --bootstrap 指向 Alice（或反向），
+// 二者即可互相发现。无需依赖公共种子节点。
+//
 // 【同一台机器两个实例测试】
 // a2ald 在发布端点时会过滤掉 loopback/私网 IP，本机测试须通过
 // --fallback-host 告知 a2ald 用哪个地址对外可达：
@@ -22,7 +31,7 @@
 //
 //	Terminal 3 (Bob a2ald):
 //	  a2ald --data-dir /tmp/a2ald-bob --listen :5002 --api-addr 127.0.0.1:8521 \
-//	        --fallback-host 127.0.0.1
+//	        --fallback-host 127.0.0.1 --bootstrap 127.0.0.1:5001
 //
 //	Terminal 4 (Bob chat):
 //	  go run . --api 127.0.0.1:8521
@@ -32,9 +41,11 @@
 // 同一 identity-*.json 多次启动本程序时，若 agent 已在 a2ald 注册过，会自动 PATCH
 // 更新 service_tcp（每次随机端口），一般无需删身份文件。
 //
-// 【跨机器 LAN 测试】把 --fallback-host 换成本机 LAN IP（如 192.168.1.10）。
+// 【跨机器 LAN 测试】把 --fallback-host 换成本机 LAN IP（如 192.168.1.10），
+// --bootstrap 指向对方机器的 ip:port（如 192.168.1.10:5001）。
 //
-// 【公网部署】a2ald 能自动检测公网 IP / UPnP，无需 --fallback-host。
+// 【公网部署】a2ald 能自动检测公网 IP / UPnP，无需 --fallback-host；
+// 公共种子节点可达时也无需 --bootstrap。
 //
 // 如果 a2ald 有 api_token，添加 --token 参数：
 //
