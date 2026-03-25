@@ -29,10 +29,9 @@ type Config struct {
 	// May be nil.
 	OnObservedAddr func(reporter a2al.NodeID, wire []byte)
 	// RecordAuth is an optional authority policy called by Store.Put after
-	// signature/expiry verification passes. It decides whether the signing key
-	// is permitted to publish for the record's Address (e.g. self-signed or
-	// delegation). If nil, no authority check is performed (useful in tests).
-	RecordAuth func(rec protocol.SignedRecord, now time.Time) error
+	// signature/expiry verification passes (Phase 4: includes DHT key).
+	// If nil, no authority check is performed (useful in tests).
+	RecordAuth RecordAuthFunc
 }
 
 // Node is a single DHT participant (routing + local store + wire handler).
@@ -58,7 +57,7 @@ type Node struct {
 	tabMu sync.RWMutex // routing.Table (Add / NearestN)
 
 	onObservedAddr func(reporter a2al.NodeID, wire []byte)
-	auth           func(protocol.SignedRecord, time.Time) error // nil → no check
+	auth           RecordAuthFunc // nil → no check
 
 	statsRx  atomic.Uint64
 	statsTx  atomic.Uint64
@@ -269,17 +268,36 @@ func (n *Node) onFindNode(from net.Addr, dec *protocol.DecodedMessage) {
 
 func (n *Node) onFindValue(from net.Addr, dec *protocol.DecodedMessage) {
 	n.remember(from, dec)
-	target := dec.Body.(*protocol.BodyFindValue).Target
+	body := dec.Body.(*protocol.BodyFindValue)
 	var tid a2al.NodeID
-	copy(tid[:], target)
-	rec := n.store.Get(tid, time.Now())
+	copy(tid[:], body.Target)
+	now := time.Now()
+	records := n.store.GetAll(tid, body.RecType, now)
+	best := n.store.Get(tid, now)
 	resp := &protocol.BodyFindValueResp{
 		Nodes:        n.tabNearest(tid, routing.K),
 		ObservedAddr: ObservedAddr(from),
+		Records:      records,
 	}
-	if rec != nil {
-		r := *rec
+	if best != nil {
+		r := *best
 		resp.Record = &r
+	}
+	const maxPayload = 1100
+	for {
+		sz, err := protocol.FindValueResponseWireSize(resp)
+		if err != nil || sz <= maxPayload {
+			break
+		}
+		if len(resp.Nodes) > 1 {
+			resp.Nodes = resp.Nodes[:len(resp.Nodes)-1]
+			continue
+		}
+		if len(resp.Records) > 1 {
+			resp.Records = resp.Records[:len(resp.Records)-1]
+			continue
+		}
+		break
 	}
 	n.reply(from, dec, protocol.MsgFindValueResp, resp)
 }
@@ -287,7 +305,12 @@ func (n *Node) onFindValue(from net.Addr, dec *protocol.DecodedMessage) {
 func (n *Node) onStore(from net.Addr, dec *protocol.DecodedMessage) {
 	n.remember(from, dec)
 	body := dec.Body.(*protocol.BodyStore)
-	ok := n.store.Put(body.Record, time.Now()) == nil
+	var key a2al.NodeID
+	if len(body.Key) == len(key) {
+		copy(key[:], body.Key)
+	}
+	err := n.store.Put(key, body.Record, time.Now())
+	ok := err == nil
 	n.reply(from, dec, protocol.MsgStoreResp, &protocol.BodyStoreResp{Stored: ok})
 }
 
@@ -370,10 +393,13 @@ func (n *Node) PingIdentity(ctx context.Context, peer net.Addr) (*PeerIdentity, 
 	return &PeerIdentity{Address: peerAddr, NodeID: peerNID, ObservedWire: obs}, nil
 }
 
-// StoreAt sends STORE to peer and waits for STORE_RESP.
-func (n *Node) StoreAt(ctx context.Context, peer net.Addr, rec protocol.SignedRecord) (bool, error) {
-	hdr := protocol.Header{Version: protocol.ProtocolVersion, MsgType: protocol.MsgStore}
+// StoreAt sends STORE to peer. storeKey zero omits BodyStore.Key (receiver derives key from rec.Address).
+func (n *Node) StoreAt(ctx context.Context, peer net.Addr, storeKey a2al.NodeID, rec protocol.SignedRecord) (bool, error) {
 	body := &protocol.BodyStore{Record: rec}
+	if storeKey != (a2al.NodeID{}) {
+		body.Key = storeKey[:]
+	}
+	hdr := protocol.Header{Version: protocol.ProtocolVersion, MsgType: protocol.MsgStore}
 	dec, err := n.sendAndWait(ctx, peer, hdr, body, protocol.MsgStoreResp)
 	if err != nil {
 		return false, err
@@ -394,27 +420,47 @@ func (n *Node) FindNode(ctx context.Context, peer net.Addr, target a2al.NodeID) 
 	return br.Nodes, nil
 }
 
-// FindValueWithNodes queries peer; returns optional record and closest nodes from the response.
-func (n *Node) FindValueWithNodes(ctx context.Context, peer net.Addr, key a2al.NodeID) (*protocol.SignedRecord, []protocol.NodeInfo, error) {
+// FindValueWithNodes queries peer. recType 0 requests all record types in the response.
+func (n *Node) FindValueWithNodes(ctx context.Context, peer net.Addr, key a2al.NodeID, recType uint8) ([]protocol.SignedRecord, []protocol.NodeInfo, error) {
 	hdr := protocol.Header{Version: protocol.ProtocolVersion, MsgType: protocol.MsgFindValue}
-	body := &protocol.BodyFindValue{Target: key[:]}
+	body := &protocol.BodyFindValue{Target: key[:], RecType: recType}
 	dec, err := n.sendAndWait(ctx, peer, hdr, body, protocol.MsgFindValueResp)
 	if err != nil {
 		return nil, nil, err
 	}
 	br := dec.Body.(*protocol.BodyFindValueResp)
 	n.notifyObserved(a2al.NodeIDFromAddress(dec.SenderAddr), br.ObservedAddr)
-	if br.Record == nil {
-		return nil, br.Nodes, nil
+	var out []protocol.SignedRecord
+	if len(br.Records) > 0 {
+		out = append(out, br.Records...)
+	} else if br.Record != nil {
+		out = append(out, *br.Record)
 	}
-	r := *br.Record
-	return &r, br.Nodes, nil
+	return out, br.Nodes, nil
 }
 
-// FindValue queries peer for a record at key NodeID.
+// FindValue queries peer for the best endpoint record at key NodeID (legacy helper).
 func (n *Node) FindValue(ctx context.Context, peer net.Addr, key a2al.NodeID) (*protocol.SignedRecord, error) {
-	rec, _, err := n.FindValueWithNodes(ctx, peer, key)
-	return rec, err
+	recs, _, err := n.FindValueWithNodes(ctx, peer, key, 0)
+	if err != nil {
+		return nil, err
+	}
+	var best *protocol.SignedRecord
+	now := time.Now()
+	for i := range recs {
+		r := recs[i]
+		if r.RecType != protocol.RecTypeEndpoint {
+			continue
+		}
+		if protocol.VerifySignedRecord(r, now) != nil {
+			continue
+		}
+		if best == nil || protocol.RecordIsNewer(r, *best) {
+			x := r
+			best = &x
+		}
+	}
+	return best, nil
 }
 
 // AddContact pins a peer's dial address and seeds the routing table.

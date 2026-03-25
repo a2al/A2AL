@@ -210,44 +210,83 @@ func (q *Query) FindNode(ctx context.Context, target a2al.NodeID) ([]protocol.No
 // ErrNoEndpoint is returned when iterative FIND_VALUE does not yield a valid endpoint record.
 var ErrNoEndpoint = errors.New("dht: no endpoint record")
 
-// Resolve runs iterative FIND_VALUE for target NodeID (publisher key) and returns a verified endpoint record.
-func (q *Query) Resolve(ctx context.Context, target a2al.NodeID) (*protocol.EndpointRecord, error) {
+// ErrNoMatchingRecords is returned when FindRecords finds nothing for the filter.
+var ErrNoMatchingRecords = errors.New("dht: no matching records")
+
+func filterRecordsAuth(n *Node, targetKey a2al.NodeID, recs []protocol.SignedRecord, now time.Time) []protocol.SignedRecord {
+	var out []protocol.SignedRecord
+	for _, r := range recs {
+		if err := protocol.VerifySignedRecord(r, now); err != nil {
+			continue
+		}
+		if n.auth != nil {
+			if err := n.auth(targetKey, r, now); err != nil {
+				continue
+			}
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+func aggregateDedupeKey(r protocol.SignedRecord) string {
+	c := protocol.RecordCategory(r.RecType)
+	if c == protocol.CategoryUnknown {
+		c = protocol.CategorySovereign
+	}
+	switch c {
+	case protocol.CategoryTopic:
+		return "t:" + string(r.Pubkey)
+	case protocol.CategoryMailbox:
+		return "m:" + string(r.Pubkey) + "\x00" + string(r.Payload)
+	default: // sovereign
+		return "s:" + string(r.Address) + "\x00" + string([]byte{r.RecType})
+	}
+}
+
+func mergeAggregate(into map[string]protocol.SignedRecord, recs []protocol.SignedRecord) {
+	for _, r := range recs {
+		k := aggregateDedupeKey(r)
+		prev, ok := into[k]
+		if !ok || protocol.RecordIsNewer(r, prev) {
+			into[k] = r
+		}
+	}
+}
+
+// FindRecords runs iterative FIND_VALUE (recType 0 = all). Returns on first batch that yields matching records after auth.
+func (q *Query) FindRecords(ctx context.Context, target a2al.NodeID, recType uint8) ([]protocol.SignedRecord, error) {
 	if q.n == nil {
 		return nil, errors.New("dht: nil node")
 	}
-	if rec := q.n.store.Get(target, time.Now()); rec != nil {
-		if err := protocol.VerifySignedRecord(*rec, time.Now()); err == nil {
-			if er, err := protocol.ParseEndpointRecord(*rec); err == nil {
-				return &er, nil
-			}
+	now := time.Now()
+	if local := q.n.store.GetAll(target, recType, now); len(local) > 0 {
+		out := filterRecordsAuth(q.n, target, local, now)
+		if len(out) > 0 {
+			return out, nil
 		}
 	}
 	alpha := q.alpha()
 	stagger := q.stagger()
-
 	candidates := make(map[string]protocol.NodeInfo)
 	queried := make(map[string]struct{})
-
 	for _, ni := range q.n.tabNearest(target, routing.K) {
 		if k := infoKey(ni); k != "" {
 			candidates[k] = cloneNI(ni)
 		}
 	}
-
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-
 		list := sortedByDistance(candidates, target)
 		if len(list) == 0 {
-			return nil, ErrNoEndpoint
+			return nil, ErrNoMatchingRecords
 		}
 		kClosest := list
 		if len(kClosest) > routing.K {
 			kClosest = kClosest[:routing.K]
 		}
-
 		allDone := true
 		for _, ni := range kClosest {
 			if _, ok := queried[infoKey(ni)]; !ok {
@@ -256,9 +295,8 @@ func (q *Query) Resolve(ctx context.Context, target a2al.NodeID) (*protocol.Endp
 			}
 		}
 		if allDone {
-			return nil, ErrNoEndpoint
+			return nil, ErrNoMatchingRecords
 		}
-
 		var batch []protocol.NodeInfo
 		for _, ni := range kClosest {
 			if len(batch) >= alpha {
@@ -283,11 +321,10 @@ func (q *Query) Resolve(ctx context.Context, target a2al.NodeID) (*protocol.Endp
 			batch = append(batch, ni)
 		}
 		if len(batch) == 0 {
-			return nil, ErrNoEndpoint
+			return nil, ErrNoMatchingRecords
 		}
-
 		type fvRes struct {
-			rec   *protocol.SignedRecord
+			recs  []protocol.SignedRecord
 			nodes []protocol.NodeInfo
 		}
 		ch := make(chan fvRes, len(batch))
@@ -314,12 +351,136 @@ func (q *Query) Resolve(ctx context.Context, target a2al.NodeID) (*protocol.Endp
 						return
 					}
 				}
-				rec, nodes, err := q.n.FindValueWithNodes(ctx, addr, target)
+				recs, nodes, err := q.n.FindValueWithNodes(ctx, addr, target, recType)
 				if err != nil {
 					ch <- fvRes{}
 					return
 				}
-				ch <- fvRes{rec: rec, nodes: nodes}
+				ch <- fvRes{recs: recs, nodes: nodes}
+			}(addr, d)
+		}
+		go func() {
+			wg.Wait()
+			close(ch)
+		}()
+		var batchMerged []protocol.SignedRecord
+		for r := range ch {
+			now := time.Now()
+			batchMerged = append(batchMerged, filterRecordsAuth(q.n, target, r.recs, now)...)
+			for _, x := range r.nodes {
+				k := infoKey(x)
+				if k == "" {
+					continue
+				}
+				candidates[k] = cloneNI(x)
+				q.n.absorbNodeInfo(x)
+			}
+		}
+		if len(batchMerged) > 0 {
+			return batchMerged, nil
+		}
+	}
+}
+
+// AggregateRecords queries until the k-closest set is exhausted, merges and deduplicates (Phase 4 Topic/Mailbox).
+func (q *Query) AggregateRecords(ctx context.Context, target a2al.NodeID, recType uint8) ([]protocol.SignedRecord, error) {
+	if q.n == nil {
+		return nil, errors.New("dht: nil node")
+	}
+	merged := make(map[string]protocol.SignedRecord)
+	now := time.Now()
+	mergeAggregate(merged, filterRecordsAuth(q.n, target, q.n.store.GetAll(target, recType, now), now))
+	alpha := q.alpha()
+	stagger := q.stagger()
+	candidates := make(map[string]protocol.NodeInfo)
+	queried := make(map[string]struct{})
+	for _, ni := range q.n.tabNearest(target, routing.K) {
+		if k := infoKey(ni); k != "" {
+			candidates[k] = cloneNI(ni)
+		}
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		list := sortedByDistance(candidates, target)
+		if len(list) == 0 {
+			break
+		}
+		kClosest := list
+		if len(kClosest) > routing.K {
+			kClosest = kClosest[:routing.K]
+		}
+		allDone := true
+		for _, ni := range kClosest {
+			if _, ok := queried[infoKey(ni)]; !ok {
+				allDone = false
+				break
+			}
+		}
+		if allDone {
+			break
+		}
+		var batch []protocol.NodeInfo
+		for _, ni := range kClosest {
+			if len(batch) >= alpha {
+				break
+			}
+			key := infoKey(ni)
+			if key == "" {
+				continue
+			}
+			if _, ok := queried[key]; ok {
+				continue
+			}
+			var peerID a2al.NodeID
+			copy(peerID[:], ni.NodeID)
+			if peerID == q.n.nid {
+				queried[key] = struct{}{}
+				continue
+			}
+			if _, ok := q.n.lookupPeer(peerID); !ok {
+				continue
+			}
+			batch = append(batch, ni)
+		}
+		if len(batch) == 0 {
+			break
+		}
+		type fvRes struct {
+			recs  []protocol.SignedRecord
+			nodes []protocol.NodeInfo
+		}
+		ch := make(chan fvRes, len(batch))
+		var wg sync.WaitGroup
+		for i := range batch {
+			ni := batch[i]
+			key := infoKey(ni)
+			queried[key] = struct{}{}
+			var peerID a2al.NodeID
+			copy(peerID[:], ni.NodeID)
+			addr, _ := q.n.lookupPeer(peerID)
+			d := time.Duration(i) * stagger
+			wg.Add(1)
+			go func(addr net.Addr, delay time.Duration) {
+				defer wg.Done()
+				if delay > 0 {
+					t := time.NewTimer(delay)
+					select {
+					case <-t.C:
+					case <-ctx.Done():
+						if !t.Stop() {
+							<-t.C
+						}
+						return
+					}
+				}
+				recs, nodes, err := q.n.FindValueWithNodes(ctx, addr, target, recType)
+				if err != nil {
+					ch <- fvRes{}
+					return
+				}
+				ch <- fvRes{recs: recs, nodes: nodes}
 			}(addr, d)
 		}
 		go func() {
@@ -327,20 +488,8 @@ func (q *Query) Resolve(ctx context.Context, target a2al.NodeID) (*protocol.Endp
 			close(ch)
 		}()
 		for r := range ch {
-			if r.rec != nil {
-				now := time.Now()
-				if err := protocol.VerifySignedRecord(*r.rec, now); err == nil {
-					if q.n.auth != nil {
-						if err := q.n.auth(*r.rec, now); err != nil {
-							continue
-						}
-					}
-					er, err := protocol.ParseEndpointRecord(*r.rec)
-					if err == nil {
-						return &er, nil
-					}
-				}
-			}
+			now := time.Now()
+			mergeAggregate(merged, filterRecordsAuth(q.n, target, r.recs, now))
 			for _, x := range r.nodes {
 				k := infoKey(x)
 				if k == "" {
@@ -351,4 +500,37 @@ func (q *Query) Resolve(ctx context.Context, target a2al.NodeID) (*protocol.Endp
 			}
 		}
 	}
+	if len(merged) == 0 {
+		return nil, ErrNoMatchingRecords
+	}
+	out := make([]protocol.SignedRecord, 0, len(merged))
+	for _, r := range merged {
+		out = append(out, r)
+	}
+	return out, nil
+}
+
+// Resolve runs iterative FIND_VALUE for target NodeID and returns a verified endpoint record.
+func (q *Query) Resolve(ctx context.Context, target a2al.NodeID) (*protocol.EndpointRecord, error) {
+	recs, err := q.FindRecords(ctx, target, protocol.RecTypeEndpoint)
+	if err != nil {
+		if errors.Is(err, ErrNoMatchingRecords) {
+			return nil, ErrNoEndpoint
+		}
+		return nil, err
+	}
+	now := time.Now()
+	for _, rec := range recs {
+		if rec.RecType != protocol.RecTypeEndpoint {
+			continue
+		}
+		if err := protocol.VerifySignedRecord(rec, now); err != nil {
+			continue
+		}
+		er, err := protocol.ParseEndpointRecord(rec)
+		if err == nil {
+			return &er, nil
+		}
+	}
+	return nil, ErrNoEndpoint
 }

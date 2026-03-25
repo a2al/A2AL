@@ -1,4 +1,4 @@
-﻿// Copyright 2026 The A2AL Authors. All rights reserved.
+// Copyright 2026 The A2AL Authors. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
 package dht
@@ -198,7 +198,7 @@ func TestNode_storeAndFindValue(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	ok, err := nodeA.StoreAt(ctx, trB.LocalAddr(), rec)
+	ok, err := nodeA.StoreAt(ctx, trB.LocalAddr(), a2al.NodeID{}, rec)
 	if err != nil || !ok {
 		t.Fatalf("store %v %v", ok, err)
 	}
