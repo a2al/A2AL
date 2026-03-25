@@ -36,6 +36,7 @@ type daemon struct {
 
 func (d *daemon) routes() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /{$}", d.handleWebUIRoot)
 	mux.HandleFunc("GET /health", d.handleHealth)
 	mux.HandleFunc("GET /config", d.handleGetConfig)
 	mux.HandleFunc("PATCH /config", d.handlePatchConfig)

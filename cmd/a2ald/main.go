@@ -168,7 +168,7 @@ func main() {
 		}
 	}()
 
-	log.Info("a2ald started", "api", cfg.APIAddr, "mcp", "/mcp/", "dht", cfg.ListenAddr, "node_aid", ks.Address().String())
+	log.Info("a2ald started", "api", cfg.APIAddr, "webui", "GET /", "mcp", "/mcp/", "dht", cfg.ListenAddr, "node_aid", ks.Address().String())
 
 	<-ctx.Done()
 	log.Info("shutting down")
