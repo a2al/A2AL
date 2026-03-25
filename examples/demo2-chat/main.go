@@ -9,10 +9,10 @@
 // 测试步骤 (同一台机器, 两个终端, 无需指定 -ip):
 //
 //   Terminal 1 (Alice):
-//     go run . -listen :5001 -quic :5002 -debug :2634
+//     go run . -listen :4121 -quic :4122 -debug :2634
 //
 //   Terminal 2 (Bob):
-//     go run . -listen :5003 -quic :5004 -bootstrap 127.0.0.1:5001 -debug :2635
+//     go run . -listen :4123 -quic :4124 -bootstrap 127.0.0.1:4121 -debug :2635
 //
 //   在 Bob 终端输入 Alice 的 AID → 自动 Resolve + QUIC Connect → 进入聊天。
 //   Alice 终端自动 Accept 入站连接。双方可互发消息。空行退出聊天模式。
@@ -45,7 +45,7 @@ import (
 )
 
 func main() {
-	listen := flag.String("listen", ":5001", "DHT UDP listen address")
+	listen := flag.String("listen", ":4121", "DHT UDP listen address")
 	quicListen := flag.String("quic", "", "QUIC UDP listen (empty = share DHT port)")
 	bootstrapAddr := flag.String("bootstrap", "", "seed DHT UDP address")
 	debugAddr := flag.String("debug", "", "debug HTTP address")
