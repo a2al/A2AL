@@ -31,13 +31,13 @@ type Config struct {
 // Default returns a copy with zero values filled to spec defaults.
 func Default() Config {
 	return Config{
-		ListenAddr:       ":5001",
+		ListenAddr:       ":4121",
 		QUICListenAddr:   "",
 		Bootstrap:        nil,
 		DisableUPnP:      false,
 		FallbackHost:     "",
 		MinObservedPeers: 3,
-		APIAddr:          "127.0.0.1:8520",
+		APIAddr:          "127.0.0.1:2121",
 		APIToken:         "",
 		KeyDir:           "",
 		LogFormat:        "text",

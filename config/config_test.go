@@ -12,10 +12,10 @@ import (
 
 func TestDefault(t *testing.T) {
 	c := Default()
-	if c.ListenAddr != ":5001" {
+	if c.ListenAddr != ":4121" {
 		t.Fatalf("ListenAddr: got %q", c.ListenAddr)
 	}
-	if c.APIAddr != "127.0.0.1:8520" {
+	if c.APIAddr != "127.0.0.1:2121" {
 		t.Fatalf("APIAddr: got %q", c.APIAddr)
 	}
 	if c.MinObservedPeers != 3 {
@@ -97,7 +97,7 @@ func TestLoadFile_mergeOverDefault(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.ListenAddr != ":5001" {
+	if c.ListenAddr != ":4121" {
 		t.Fatalf("merged default listen_addr: got %q", c.ListenAddr)
 	}
 	if c.APIAddr != "127.0.0.1:1" {
