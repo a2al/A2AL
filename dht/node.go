@@ -28,6 +28,11 @@ type Config struct {
 	// NodeID; wire is the raw observed_addr bytes (6 or 18 bytes).
 	// May be nil.
 	OnObservedAddr func(reporter a2al.NodeID, wire []byte)
+	// RecordAuth is an optional authority policy called by Store.Put after
+	// signature/expiry verification passes. It decides whether the signing key
+	// is permitted to publish for the record's Address (e.g. self-signed or
+	// delegation). If nil, no authority check is performed (useful in tests).
+	RecordAuth func(rec protocol.SignedRecord, now time.Time) error
 }
 
 // Node is a single DHT participant (routing + local store + wire handler).
@@ -53,6 +58,7 @@ type Node struct {
 	tabMu sync.RWMutex // routing.Table (Add / NearestN)
 
 	onObservedAddr func(reporter a2al.NodeID, wire []byte)
+	auth           func(protocol.SignedRecord, time.Time) error // nil → no check
 
 	statsRx  atomic.Uint64
 	statsTx  atomic.Uint64
@@ -84,12 +90,13 @@ func NewNode(cfg Config) (*Node, error) {
 		ks:     cfg.Keystore,
 		addr:   addr,
 		nid:    nid,
-		store:  NewStore(),
+		store:  NewStore(cfg.RecordAuth),
 		ctx:    ctx,
 		cancel: cancel,
 		wait:           make(map[string]*waitEntry),
 		peers:          make(map[string]net.Addr),
 		onObservedAddr: cfg.OnObservedAddr,
+		auth:           cfg.RecordAuth,
 	}
 	n.table = routing.NewTable(nid, func(ni protocol.NodeInfo) bool {
 		pctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -428,6 +435,52 @@ func (n *Node) Address() a2al.Address { return n.addr }
 
 // NodeID returns the DHT key for this node.
 func (n *Node) NodeID() a2al.NodeID { return n.nid }
+
+// BootstrapCandidateAddrs returns up to max UDP addresses for cold-start bootstrap
+// (routing table + remembered peer addrs). Best-effort for persisting peers.cache.
+func (n *Node) BootstrapCandidateAddrs(max int) []net.Addr {
+	if max <= 0 {
+		return nil
+	}
+	n.tabMu.RLock()
+	peers := n.table.AllPeers()
+	n.tabMu.RUnlock()
+	var out []net.Addr
+	seen := make(map[string]struct{})
+	for _, ni := range peers {
+		if len(ni.NodeID) != len(n.nid) {
+			continue
+		}
+		var id a2al.NodeID
+		copy(id[:], ni.NodeID)
+		if id == n.nid {
+			continue
+		}
+		n.peerMu.Lock()
+		a, ok := n.peers[nodeIDKey(id)]
+		n.peerMu.Unlock()
+		if ok {
+			if udp, ok := a.(*net.UDPAddr); ok && udp.Port != 0 {
+				k := udp.String()
+				if _, dup := seen[k]; !dup {
+					seen[k] = struct{}{}
+					out = append(out, udp)
+				}
+			}
+		} else if (len(ni.IP) == 4 || len(ni.IP) == 16) && ni.Port != 0 {
+			udp := &net.UDPAddr{IP: append([]byte(nil), ni.IP...), Port: int(ni.Port)}
+			k := udp.String()
+			if _, dup := seen[k]; !dup {
+				seen[k] = struct{}{}
+				out = append(out, udp)
+			}
+		}
+		if len(out) >= max {
+			break
+		}
+	}
+	return out
+}
 
 // Close stops the node, closes the transport, and waits for the receive loop to exit.
 func (n *Node) Close() error {
