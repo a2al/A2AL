@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -162,5 +163,62 @@ func TestAPI_identityGenerate(t *testing.T) {
 	}
 	if out.AID == "" || out.MasterPrivateKeyHex == "" || out.DelegationProofHex == "" {
 		t.Fatalf("incomplete response: %+v", out)
+	}
+}
+
+func TestAPI_mailboxPoll_notRegistered(t *testing.T) {
+	d := newTestDaemon(t)
+	srv := httptest.NewServer(d.routes())
+	defer srv.Close()
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/agents/"+d.nodeAddr.String()+"/mailbox/poll", bytes.NewBufferString(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("want 404, got %d", resp.StatusCode)
+	}
+}
+
+func TestAPI_agentRecords_notRegistered(t *testing.T) {
+	d := newTestDaemon(t)
+	srv := httptest.NewServer(d.routes())
+	defer srv.Close()
+	body := bytes.NewBufferString(`{"rec_type":2,"payload_base64":"oA==","ttl":3600}`)
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/agents/"+d.nodeAddr.String()+"/records", body)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("want 404, got %d", resp.StatusCode)
+	}
+}
+
+func TestAPI_resolveRecords_empty(t *testing.T) {
+	d := newTestDaemon(t)
+	srv := httptest.NewServer(d.routes())
+	defer srv.Close()
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/resolve/"+d.nodeAddr.String()+"/records", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("want 200, got %d", resp.StatusCode)
+	}
+	var out struct {
+		Records []any `json:"records"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Records == nil {
+		t.Fatal("want non-nil records slice")
 	}
 }

@@ -5,9 +5,11 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net"
+	"strconv"
 	"net/http"
 	"strings"
 	"sync"
@@ -32,6 +34,12 @@ type daemon struct {
 	regMu    sync.RWMutex // agent registry + Host.RegisterAgent consistency
 	mcpOnce sync.Once
 	mcpSrv  *mcp.Server
+
+	// mailboxSeenMu guards mailboxSeen: per-agent set of already-returned message
+	// fingerprints. Prevents duplicate delivery within a daemon session when the
+	// same DHT records are fetched repeatedly before TTL expiry.
+	mailboxSeenMu sync.Mutex
+	mailboxSeen   map[string]map[string]struct{} // aidStr → set of msgKey
 }
 
 func (d *daemon) routes() http.Handler {
@@ -47,7 +55,14 @@ func (d *daemon) routes() http.Handler {
 	mux.HandleFunc("GET /agents/{aid}", d.handleAgentsGet)
 	mux.HandleFunc("PATCH /agents/{aid}", d.handleAgentsPatch)
 	mux.HandleFunc("POST /agents/{aid}/publish", d.handleAgentsPublish)
+	mux.HandleFunc("POST /agents/{aid}/records", d.handleAgentsRecordsPost)
+	mux.HandleFunc("POST /agents/{aid}/mailbox/send", d.handleAgentsMailboxSend)
+	mux.HandleFunc("POST /agents/{aid}/mailbox/poll", d.handleAgentsMailboxPoll)
+	mux.HandleFunc("POST /agents/{aid}/topics", d.handleAgentsTopicsPost)
+	mux.HandleFunc("DELETE /agents/{aid}/topics/{topic...}", d.handleAgentsTopicsDelete)
+	mux.HandleFunc("POST /discover", d.handleDiscover)
 	mux.HandleFunc("DELETE /agents/{aid}", d.handleAgentsDelete)
+	mux.HandleFunc("GET /resolve/{aid}/records", d.handleResolveRecords)
 	mux.HandleFunc("POST /resolve/{aid}", d.handleResolve)
 	mux.HandleFunc("POST /connect/{aid}", d.handleConnect)
 	mux.Handle("/debug/", d.h.DebugHTTPHandler())
@@ -370,6 +385,185 @@ func (d *daemon) handleAgentsPublish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]any{"ok": true, "seq": seq})
+}
+
+func (d *daemon) handleAgentsRecordsPost(w http.ResponseWriter, r *http.Request) {
+	var req agentPublishRecordReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+	if err := d.execAgentPublishRecord(ctx, r.PathValue("aid"), req); err != nil {
+		switch {
+		case errors.Is(err, errBadAID):
+			http.Error(w, `{"error":"bad aid"}`, http.StatusBadRequest)
+		case errors.Is(err, errBadRecType):
+			http.Error(w, `{"error":"rec_type must be 0x02-0x0f"}`, http.StatusBadRequest)
+		case errors.Is(err, errTTLRequired):
+			http.Error(w, `{"error":"ttl required"}`, http.StatusBadRequest)
+		case errors.Is(err, errBadPayloadB64):
+			http.Error(w, `{"error":"invalid payload_base64"}`, http.StatusBadRequest)
+		case errors.Is(err, errNotFound):
+			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+		case errors.Is(err, errNoDelegation):
+			http.Error(w, `{"error":"delegation required"}`, http.StatusBadRequest)
+		default:
+			http.Error(w, `{"error":"publish failed"}`, http.StatusBadGateway)
+		}
+		return
+	}
+	writeJSON(w, map[string]bool{"ok": true})
+}
+
+func (d *daemon) handleResolveRecords(w http.ResponseWriter, r *http.Request) {
+	var recType uint8
+	if s := r.URL.Query().Get("type"); s != "" {
+		v, err := strconv.ParseUint(s, 10, 8)
+		if err != nil {
+			http.Error(w, `{"error":"bad type"}`, http.StatusBadRequest)
+			return
+		}
+		recType = uint8(v)
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+	records, err := d.execResolveRecords(ctx, r.PathValue("aid"), recType)
+	if err != nil {
+		if errors.Is(err, errBadAID) {
+			http.Error(w, `{"error":"bad aid"}`, http.StatusBadRequest)
+			return
+		}
+		http.Error(w, `{"error":"resolve failed"}`, http.StatusBadGateway)
+		return
+	}
+	writeJSON(w, map[string]any{"records": records})
+}
+
+type mailboxSendReq struct {
+	Recipient  string `json:"recipient"`
+	MsgType    uint8  `json:"msg_type"`
+	BodyBase64 string `json:"body_base64"`
+}
+
+func (d *daemon) handleAgentsMailboxSend(w http.ResponseWriter, r *http.Request) {
+	var req mailboxSendReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return
+	}
+	if req.Recipient == "" {
+		http.Error(w, `{"error":"recipient required"}`, http.StatusBadRequest)
+		return
+	}
+	body, err := base64.StdEncoding.DecodeString(req.BodyBase64)
+	if err != nil {
+		http.Error(w, `{"error":"invalid body_base64"}`, http.StatusBadRequest)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+	if err := d.execMailboxSend(ctx, r.PathValue("aid"), req.Recipient, req.MsgType, body); err != nil {
+		if errors.Is(err, errBadAID) {
+			http.Error(w, `{"error":"bad aid"}`, http.StatusBadRequest)
+			return
+		}
+		if errors.Is(err, errNotFound) {
+			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+			return
+		}
+		http.Error(w, `{"error":"mailbox send failed"}`, http.StatusBadGateway)
+		return
+	}
+	writeJSON(w, map[string]bool{"ok": true})
+}
+
+func (d *daemon) handleAgentsMailboxPoll(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+	msgs, err := d.execMailboxPoll(ctx, r.PathValue("aid"))
+	if err != nil {
+		if errors.Is(err, errBadAID) {
+			http.Error(w, `{"error":"bad aid"}`, http.StatusBadRequest)
+			return
+		}
+		if errors.Is(err, errNotFound) {
+			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+			return
+		}
+		http.Error(w, `{"error":"mailbox poll failed"}`, http.StatusBadGateway)
+		return
+	}
+	writeJSON(w, map[string]any{"messages": msgs})
+}
+
+func (d *daemon) handleAgentsTopicsPost(w http.ResponseWriter, r *http.Request) {
+	var req topicRegisterReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+	if err := d.execTopicRegister(ctx, r.PathValue("aid"), req); err != nil {
+		if errors.Is(err, errBadAID) {
+			http.Error(w, `{"error":"bad aid"}`, http.StatusBadRequest)
+			return
+		}
+		if errors.Is(err, errTopicsRequired) {
+			http.Error(w, `{"error":"topics required"}`, http.StatusBadRequest)
+			return
+		}
+		if errors.Is(err, errNotFound) {
+			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+			return
+		}
+		http.Error(w, `{"error":"topic register failed"}`, http.StatusBadGateway)
+		return
+	}
+	writeJSON(w, map[string]bool{"ok": true})
+}
+
+func (d *daemon) handleAgentsTopicsDelete(w http.ResponseWriter, r *http.Request) {
+	topic := r.PathValue("topic")
+	if topic == "" {
+		http.Error(w, `{"error":"topic required"}`, http.StatusBadRequest)
+		return
+	}
+	if err := d.execTopicUnregister(r.PathValue("aid"), topic); err != nil {
+		if errors.Is(err, errBadAID) {
+			http.Error(w, `{"error":"bad aid"}`, http.StatusBadRequest)
+			return
+		}
+		if errors.Is(err, errNotFound) {
+			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+			return
+		}
+		http.Error(w, `{"error":"persist"}`, http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]bool{"ok": true})
+}
+
+func (d *daemon) handleDiscover(w http.ResponseWriter, r *http.Request) {
+	var req discoverReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+	entries, err := d.execDiscover(ctx, req)
+	if err != nil {
+		if errors.Is(err, errTopicsRequired) {
+			http.Error(w, `{"error":"topics required"}`, http.StatusBadRequest)
+			return
+		}
+		http.Error(w, `{"error":"discover failed"}`, http.StatusBadGateway)
+		return
+	}
+	writeJSON(w, map[string]any{"entries": entries})
 }
 
 func (d *daemon) handleAgentsDelete(w http.ResponseWriter, r *http.Request) {

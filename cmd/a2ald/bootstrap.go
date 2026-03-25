@@ -107,6 +107,17 @@ func tryBootstrap(ctx context.Context, h *host.Host, addrs []net.Addr, log *slog
 	obctx, ocancel := context.WithTimeout(ctx, 10*time.Second)
 	defer ocancel()
 	h.ObserveFromPeers(obctx, addrs)
+
+	// Auto-lower the natsense consensus threshold when the network is small
+	// (fewer peers than the default minimum of 3). This ensures that two-node
+	// deployments can still determine their external address via observed_addr.
+	peers := len(h.Node().BootstrapCandidateAddrs(10))
+	minAgree := h.Sense().MinAgreeing()
+	if peers > 0 && peers < minAgree {
+		h.Sense().SetMinAgreeing(peers)
+		log.Info("natsense threshold adjusted", "peers", peers, "new_min", peers)
+	}
+
 	log.Info("bootstrap ok", "source", src)
 	return true
 }

@@ -21,14 +21,17 @@ type Entry struct {
 	OpPriv         ed25519.PrivateKey
 	DelegationCBOR []byte
 	Seq            uint64
+	// Topics lists DHT topic strings this agent has registered (for renewal / unregister; spec §5.8).
+	Topics []string
 }
 
 type diskAgent struct {
-	AID                string `json:"aid"`
-	ServiceTCP         string `json:"service_tcp"`
-	OpPrivateKeyHex    string `json:"op_private_key_hex"`
-	DelegationProofHex string `json:"delegation_proof_hex"`
-	Seq                uint64 `json:"seq"`
+	AID                string   `json:"aid"`
+	ServiceTCP         string   `json:"service_tcp"`
+	OpPrivateKeyHex    string   `json:"op_private_key_hex"`
+	DelegationProofHex string   `json:"delegation_proof_hex"`
+	Seq                uint64   `json:"seq"`
+	Topics             []string `json:"topics,omitempty"`
 }
 
 type diskFile struct {
@@ -83,6 +86,7 @@ func Load(path string) (*Registry, error) {
 			OpPriv:         ed25519.PrivateKey(opRaw),
 			DelegationCBOR: proof,
 			Seq:            da.Seq,
+			Topics:         append([]string(nil), da.Topics...),
 		}
 	}
 	return r, nil
@@ -139,6 +143,7 @@ func (r *Registry) Save() error {
 			OpPrivateKeyHex:    hex.EncodeToString(e.OpPriv),
 			DelegationProofHex: hex.EncodeToString(e.DelegationCBOR),
 			Seq:                e.Seq,
+			Topics:             append([]string(nil), e.Topics...),
 		})
 	}
 	b, err := json.MarshalIndent(df, "", "  ")
