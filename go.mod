@@ -8,12 +8,27 @@ tool (
 )
 
 require (
+	github.com/coder/websocket v1.8.12
 	github.com/fxamacker/cbor/v2 v2.7.0
 	github.com/huin/goupnp v1.3.0
 	github.com/modelcontextprotocol/go-sdk v0.2.0
 	github.com/pelletier/go-toml/v2 v2.2.3
+	github.com/pion/ice/v3 v3.0.16
+	github.com/pion/stun/v2 v2.0.0
 	github.com/quic-go/quic-go v0.48.2
 	golang.org/x/crypto v0.39.0
+)
+
+require (
+	github.com/google/uuid v1.6.0 // indirect
+	github.com/pion/dtls/v2 v2.2.12 // indirect
+	github.com/pion/logging v0.2.2 // indirect
+	github.com/pion/mdns/v2 v2.0.7 // indirect
+	github.com/pion/randutil v0.1.0 // indirect
+	github.com/pion/transport/v2 v2.2.4 // indirect
+	github.com/pion/transport/v3 v3.0.7 // indirect
+	github.com/pion/turn/v3 v3.0.3 // indirect
+	github.com/wlynxg/anet v0.0.3 // indirect
 )
 
 require (

@@ -19,6 +19,13 @@ const (
 	recordSignPrefix = "a2al-rec\x00"
 	// RecTypeEndpoint is the Phase 1 endpoint advertisement (spec §7.6).
 	RecTypeEndpoint uint8 = 0x01
+
+	// MaxEndpointSignalURLLen caps EndpointPayload.Signal (WebSocket ICE signaling base URL).
+	MaxEndpointSignalURLLen = 2048
+	// MaxTurnURLs caps EndpointPayload.Turns entry count (credential-free relay hints for DHT).
+	MaxTurnURLs = 16
+	// MaxTurnURLEntryLen caps each turn:// string length in Turns.
+	MaxTurnURLEntryLen = 512
 )
 
 // NAT types for EndpointPayload (spec §7.6).
@@ -51,6 +58,10 @@ func init() {
 type EndpointPayload struct {
 	Endpoints []string `cbor:"1,keyasint"`
 	NatType   uint8    `cbor:"2,keyasint"`
+	// Signal is an optional WebSocket base URL for ICE trickle signaling (no query; room is appended by peers).
+	Signal string `cbor:"3,keyasint,omitempty"`
+	// Turns lists optional turn:// URLs without credentials (public relay hints).
+	Turns []string `cbor:"4,keyasint,omitempty"`
 }
 
 // EndpointRecord is the decoded logical view (spec Step 4); no signature material.
@@ -58,6 +69,8 @@ type EndpointRecord struct {
 	Address   a2al.Address
 	Endpoints []string
 	NatType   uint8
+	Signal    string
+	Turns     []string
 	Timestamp uint64
 	Seq       uint64
 	TTL       uint32
@@ -219,6 +232,17 @@ func VerifySignedRecord(sr SignedRecord, now time.Time) error {
 		if ep.NatType > NATSymmetric {
 			return ErrInvalidRecord
 		}
+		if len(ep.Signal) > MaxEndpointSignalURLLen {
+			return fmt.Errorf("%w: signal url length", ErrInvalidRecord)
+		}
+		if len(ep.Turns) > MaxTurnURLs {
+			return fmt.Errorf("%w: turns count", ErrInvalidRecord)
+		}
+		for _, u := range ep.Turns {
+			if len(u) > MaxTurnURLEntryLen {
+				return fmt.Errorf("%w: turn url length", ErrInvalidRecord)
+			}
+		}
 	}
 	if sr.RecType == RecTypeTopic {
 		if len(sr.Payload) > MaxTopicPayloadCBOR {
@@ -252,10 +276,13 @@ func ParseEndpointRecord(sr SignedRecord) (EndpointRecord, error) {
 	}
 	var addr a2al.Address
 	copy(addr[:], sr.Address)
+	turns := append([]string(nil), ep.Turns...)
 	return EndpointRecord{
 		Address:   addr,
 		Endpoints: ep.Endpoints,
 		NatType:   ep.NatType,
+		Signal:    ep.Signal,
+		Turns:     turns,
 		Timestamp: sr.Timestamp,
 		Seq:       sr.Seq,
 		TTL:       sr.TTL,

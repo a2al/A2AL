@@ -6,6 +6,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,6 +27,11 @@ type Config struct {
 	KeyDir           string   `toml:"key_dir"`
 	LogFormat        string   `toml:"log_format"`
 	LogLevel         string   `toml:"log_level"`
+
+	ICESignalURL    string   `toml:"ice_signal_url"`
+	ICESTUNURLs     []string `toml:"ice_stun_urls"`
+	ICETURNURLs     []string `toml:"ice_turn_urls"`
+	ICEPublishTurns []string `toml:"ice_publish_turns"`
 }
 
 // Default returns a copy with zero values filled to spec defaults.
@@ -55,6 +61,20 @@ func (c *Config) Validate() error {
 	}
 	if c.LogFormat != "" && c.LogFormat != "text" && c.LogFormat != "json" {
 		return fmt.Errorf("config: log_format must be text or json")
+	}
+	if c.ICESignalURL != "" {
+		u, err := url.Parse(c.ICESignalURL)
+		if err != nil {
+			return fmt.Errorf("config: invalid ice_signal_url: %v", err)
+		}
+		if u.Scheme != "ws" && u.Scheme != "wss" {
+			return fmt.Errorf("config: ice_signal_url must use ws:// or wss:// scheme")
+		}
+	}
+	for _, t := range c.ICEPublishTurns {
+		if strings.Contains(t, "@") {
+			return fmt.Errorf("config: ice_publish_turns must not contain credentials (found '@' in %q)", t)
+		}
 	}
 	return nil
 }
@@ -118,10 +138,14 @@ func ApplyEnv(c *Config) {
 	if v := os.Getenv("A2AL_DISABLE_UPNP"); v != "" {
 		c.DisableUPnP = strings.EqualFold(v, "1") || strings.EqualFold(v, "true")
 	}
+	if v := os.Getenv("A2AL_ICE_SIGNAL_URL"); v != "" {
+		c.ICESignalURL = v
+	}
 }
 
 // RestartRequiredKeys lists config keys that need daemon restart after change.
 var RestartRequiredKeys = []string{
 	"listen_addr", "quic_listen_addr", "bootstrap", "api_addr", "key_dir",
 	"disable_upnp", "fallback_host", "min_observed_peers",
+	"ice_signal_url", "ice_stun_urls", "ice_turn_urls", "ice_publish_turns",
 }

@@ -23,6 +23,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -66,6 +67,15 @@ type Config struct {
 	FallbackHost     string
 	// DisableUPnP skips IGD port mapping for the QUIC UDP port (Phase 2b). TURN is deferred.
 	DisableUPnP bool
+
+	// ICESignalURL is the WebSocket base URL published in endpoint records for ICE trickle (optional).
+	ICESignalURL string
+	// ICESTUNURLs lists stun: URIs for ICE gathering; empty means default public STUN when no TURN is configured.
+	ICESTUNURLs []string
+	// ICETURNURLs lists turn: URIs (may include credentials) used locally for ICE relay; not published.
+	ICETURNURLs []string
+	// ICEPublishTurns lists credential-free turn: hints stored in EndpointPayload.Turns.
+	ICEPublishTurns []string
 }
 
 // agentRouteMagic is the 4-byte prefix of the agent-route control stream.
@@ -344,9 +354,18 @@ func (h *Host) BuildEndpointPayload(ctx context.Context) (protocol.EndpointPaylo
 	if err != nil {
 		return protocol.EndpointPayload{}, err
 	}
+	var turns []string
+	for _, t := range h.cfg.ICEPublishTurns {
+		if strings.Contains(t, "@") {
+			continue // never publish credentials to DHT (spec: "TURN凭证绝不进DHT")
+		}
+		turns = append(turns, t)
+	}
 	return protocol.EndpointPayload{
 		Endpoints: eps,
 		NatType:   h.sense.InferNATType(),
+		Signal:    h.cfg.ICESignalURL,
+		Turns:     turns,
 	}, nil
 }
 
@@ -501,6 +520,18 @@ func (h *Host) Connect(ctx context.Context, expectRemote a2al.Address, udpAddr *
 	return h.dialAndAgentRoute(ctx, h.priv, expectRemote, udpAddr)
 }
 
+func writeAgentRouteFrame(ctx context.Context, conn quic.Connection, target a2al.Address) error {
+	str, err := conn.OpenStreamSync(ctx)
+	if err != nil {
+		return fmt.Errorf("a2al/host: open agent-route stream: %w", err)
+	}
+	frame := append(agentRouteMagic, target[:]...)
+	if _, err := str.Write(frame); err != nil {
+		return fmt.Errorf("a2al/host: write agent-route frame: %w", err)
+	}
+	return nil
+}
+
 func (h *Host) dialAndAgentRoute(ctx context.Context, localPriv ed25519.PrivateKey, expectRemote a2al.Address, udpAddr *net.UDPAddr) (quic.Connection, error) {
 	cliTLS, err := quicClientTLS(localPriv, expectRemote)
 	if err != nil {
@@ -510,15 +541,9 @@ func (h *Host) dialAndAgentRoute(ctx context.Context, localPriv ed25519.PrivateK
 	if err != nil {
 		return nil, err
 	}
-	str, err := conn.OpenStreamSync(ctx)
-	if err != nil {
-		_ = conn.CloseWithError(1, "agent-route stream failed")
-		return nil, fmt.Errorf("a2al/host: open agent-route stream: %w", err)
-	}
-	frame := append(agentRouteMagic, expectRemote[:]...)
-	if _, err := str.Write(frame); err != nil {
-		_ = conn.CloseWithError(1, "agent-route write failed")
-		return nil, fmt.Errorf("a2al/host: write agent-route frame: %w", err)
+	if err := writeAgentRouteFrame(ctx, conn, expectRemote); err != nil {
+		_ = conn.CloseWithError(1, "agent-route failed")
+		return nil, err
 	}
 	return conn, nil
 }
@@ -536,7 +561,11 @@ func (h *Host) Accept(ctx context.Context) (*AgentConn, error) {
 	if err != nil {
 		return nil, err
 	}
-	ac := &AgentConn{Connection: conn, Local: h.addr}
+	return h.agentConnFromQUIC(ctx, conn, h.addr)
+}
+
+func (h *Host) agentConnFromQUIC(ctx context.Context, conn quic.Connection, fallbackLocal a2al.Address) (*AgentConn, error) {
+	ac := &AgentConn{Connection: conn, Local: fallbackLocal}
 
 	state := conn.ConnectionState().TLS
 	if remote, err := peerAddrFromTLSState(state); err == nil {
