@@ -116,6 +116,10 @@ func New(cfg Config) (*Daemon, error) {
 		MinObservedPeers: nodeCfg.MinObservedPeers,
 		FallbackHost:     nodeCfg.FallbackHost,
 		DisableUPnP:      nodeCfg.DisableUPnP,
+		ICESignalURL:     nodeCfg.ICESignalURL,
+		ICESTUNURLs:      nodeCfg.ICESTUNURLs,
+		ICETURNURLs:      nodeCfg.ICETURNURLs,
+		ICEPublishTurns:  nodeCfg.ICEPublishTurns,
 	})
 	if err != nil {
 		return nil, err
