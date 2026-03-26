@@ -61,36 +61,41 @@ jobs:
           path: examples/demo4-marketplace/demo4-marketplace-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
           retention-days: 7
 
-  cross-build-mobile:
+  gomobile-android:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { goos: android, goarch: amd64 }
-          - { goos: android, goarch: arm64 }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version: "1.22"
-      - run: go build ./...
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: "0"
+      - uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26d
+      - name: gomobile bind (android)
+        run: |
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          gomobile init
+          gomobile bind -target=android -o a2al.aar github.com/a2al/a2al/mobile
+      - uses: actions/upload-artifact@v4
+        with:
+          name: a2al-android-aar
+          path: a2al.aar
+          retention-days: 7
 
-  cross-build-ios:
-    # iOS requires CGO (platform constraint); tracked separately pending gomobile integration.
+  gomobile-ios:
     runs-on: macos-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version: "1.22"
-      - run: go build ./...
-        env:
-          GOOS: ios
-          GOARCH: arm64
-          CGO_ENABLED: "0"
+      - name: gomobile bind (ios)
+        run: |
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          gomobile init
+          gomobile bind -target=ios -o A2AL.xcframework github.com/a2al/a2al/mobile
+      - uses: actions/upload-artifact@v4
+        with:
+          name: a2al-ios-xcframework
+          path: A2AL.xcframework
+          retention-days: 7
