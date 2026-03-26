@@ -51,17 +51,39 @@ func QUICDialTargets(er *protocol.EndpointRecord) ([]*net.UDPAddr, error) {
 	return addrs, nil
 }
 
-// ConnectFromRecord dials expectRemote using Happy Eyeballs over all QUIC targets in er.
+// ConnectFromRecord dials expectRemote using the three-layer strategy:
+// ① Happy Eyeballs over quic:// candidates → ② ICE via signal (if record has Signal).
 // The host's default agent identity is used for mutual TLS.
 func (h *Host) ConnectFromRecord(ctx context.Context, expectRemote a2al.Address, er *protocol.EndpointRecord) (quic.Connection, error) {
-	targets, err := QUICDialTargets(er)
+	targets, terr := QUICDialTargets(er)
+	var happyErr error
+	if len(targets) > 0 {
+		c, err := h.connectHappy(ctx, h.priv, expectRemote, targets, DefaultConnectStagger)
+		if err == nil {
+			return c, nil
+		}
+		happyErr = err
+	} else {
+		happyErr = terr
+	}
+	if er == nil || er.Signal == "" {
+		if happyErr != nil {
+			return nil, happyErr
+		}
+		return nil, errors.New("a2al/host: no quic targets and no signal url")
+	}
+	iceConn, err := h.connectViaICESignal(ctx, h.priv, h.addr, expectRemote, er)
 	if err != nil {
+		if happyErr != nil {
+			return nil, errors.Join(happyErr, fmt.Errorf("ice: %w", err))
+		}
 		return nil, err
 	}
-	return h.connectHappy(ctx, h.priv, expectRemote, targets, DefaultConnectStagger)
+	return iceConn, nil
 }
 
 // ConnectFromRecordFor dials as localAgent (must be registered) toward expectRemote.
+// After Happy Eyeballs over quic:// candidates fails, if the record includes Signal, falls back to ICE+QUIC over WebSocket signaling.
 func (h *Host) ConnectFromRecordFor(ctx context.Context, localAgent, expectRemote a2al.Address, er *protocol.EndpointRecord) (quic.Connection, error) {
 	h.agentsMu.RLock()
 	ag, ok := h.agents[localAgent]
@@ -69,11 +91,31 @@ func (h *Host) ConnectFromRecordFor(ctx context.Context, localAgent, expectRemot
 	if !ok {
 		return nil, fmt.Errorf("a2al/host: unknown agent %s", localAgent)
 	}
-	targets, err := QUICDialTargets(er)
+	targets, terr := QUICDialTargets(er)
+	var happyErr error
+	if len(targets) > 0 {
+		c, err := h.connectHappy(ctx, ag.priv, expectRemote, targets, DefaultConnectStagger)
+		if err == nil {
+			return c, nil
+		}
+		happyErr = err
+	} else {
+		happyErr = terr
+	}
+	if er == nil || er.Signal == "" {
+		if happyErr != nil {
+			return nil, happyErr
+		}
+		return nil, errors.New("a2al/host: no quic targets and no signal url")
+	}
+	iceConn, err := h.connectViaICESignal(ctx, ag.priv, localAgent, expectRemote, er)
 	if err != nil {
+		if happyErr != nil {
+			return nil, errors.Join(happyErr, fmt.Errorf("ice: %w", err))
+		}
 		return nil, err
 	}
-	return h.connectHappy(ctx, ag.priv, expectRemote, targets, DefaultConnectStagger)
+	return iceConn, nil
 }
 
 func (h *Host) connectHappy(ctx context.Context, localPriv ed25519.PrivateKey, expectRemote a2al.Address, targets []*net.UDPAddr, stagger time.Duration) (quic.Connection, error) {
