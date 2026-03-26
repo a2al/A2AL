@@ -1,7 +1,7 @@
 // Copyright 2026 The A2AL Authors. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-package main
+package daemon
 
 import (
 	"context"
@@ -9,12 +9,11 @@ import (
 	"net"
 	"sync"
 
-	"github.com/a2al/a2al/cmd/a2ald/internal/registry"
 	"github.com/a2al/a2al/host"
 	"github.com/quic-go/quic-go"
 )
 
-func (d *daemon) gatewayAcceptLoop(ctx context.Context) {
+func (d *Daemon) gatewayAcceptLoop(ctx context.Context) {
 	for {
 		ac, err := d.h.Accept(ctx)
 		if err != nil {
@@ -28,7 +27,7 @@ func (d *daemon) gatewayAcceptLoop(ctx context.Context) {
 	}
 }
 
-func (d *daemon) serveGatewayConn(ctx context.Context, ac *host.AgentConn) {
+func (d *Daemon) serveGatewayConn(ctx context.Context, ac *host.AgentConn) {
 	d.regMu.RLock()
 	reg := d.reg.Get(ac.Local)
 	d.regMu.RUnlock()
@@ -43,14 +42,14 @@ func (d *daemon) serveGatewayConn(ctx context.Context, ac *host.AgentConn) {
 		if err != nil {
 			return
 		}
-		go d.bridgeInboundStream(ac, str, reg)
+		go d.bridgeInboundStream(ac, str, reg.ServiceTCP)
 	}
 }
 
-func (d *daemon) bridgeInboundStream(ac *host.AgentConn, str quic.Stream, reg *registry.Entry) {
-	tcp, err := net.Dial("tcp", reg.ServiceTCP)
+func (d *Daemon) bridgeInboundStream(ac *host.AgentConn, str quic.Stream, serviceTCP string) {
+	tcp, err := net.Dial("tcp", serviceTCP)
 	if err != nil {
-		d.log.Warn("gateway: tcp dial", "target", reg.ServiceTCP, "err", err)
+		d.log.Warn("gateway: tcp dial", "target", serviceTCP, "err", err)
 		_ = str.Close()
 		return
 	}
@@ -64,7 +63,6 @@ func (d *daemon) bridgeInboundStream(ac *host.AgentConn, str quic.Stream, reg *r
 	bridgeTCPQUICStream(str, tcp)
 }
 
-// bridgeTCPQUICStream copies both directions and propagates half-close (TCP CloseWrite + QUIC CancelWrite).
 func bridgeTCPQUICStream(str quic.Stream, tcp net.Conn) {
 	var wg sync.WaitGroup
 	wg.Add(2)

@@ -1,7 +1,7 @@
 // Copyright 2026 The A2AL Authors. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-package main
+package daemon
 
 import (
 	"context"
@@ -16,14 +16,14 @@ import (
 	"time"
 
 	"github.com/a2al/a2al"
-	"github.com/a2al/a2al/cmd/a2ald/internal/registry"
 	"github.com/a2al/a2al/crypto"
 	"github.com/a2al/a2al/dht"
 	"github.com/a2al/a2al/identity"
+	"github.com/a2al/a2al/internal/registry"
 	"github.com/a2al/a2al/protocol"
 )
 
-func (d *daemon) execIdentityGenerate() (identityGenResp, error) {
+func (d *Daemon) execIdentityGenerate() (identityGenResp, error) {
 	mPub, mPriv, err := ed25519.GenerateKey(nil)
 	if err != nil {
 		return identityGenResp{}, err
@@ -54,7 +54,7 @@ func (d *daemon) execIdentityGenerate() (identityGenResp, error) {
 	}, nil
 }
 
-func (d *daemon) execAgentRegister(req registerAgentReq) (a2al.Address, error) {
+func (d *Daemon) execAgentRegister(req registerAgentReq) (a2al.Address, error) {
 	d.regMu.Lock()
 	defer d.regMu.Unlock()
 	proofRaw, err := hex.DecodeString(req.DelegationProofHex)
@@ -104,7 +104,7 @@ func (d *daemon) execAgentRegister(req registerAgentReq) (a2al.Address, error) {
 	return aid, nil
 }
 
-func (d *daemon) execAgentsList() []map[string]any {
+func (d *Daemon) execAgentsList() []map[string]any {
 	d.regMu.RLock()
 	list := d.reg.List()
 	d.regMu.RUnlock()
@@ -119,7 +119,7 @@ func (d *daemon) execAgentsList() []map[string]any {
 	return out
 }
 
-func (d *daemon) execAgentGet(ctx context.Context, aidStr string) (map[string]any, error) {
+func (d *Daemon) execAgentGet(ctx context.Context, aidStr string) (map[string]any, error) {
 	aid, err := a2al.ParseAddress(aidStr)
 	if err != nil {
 		return nil, errBadAID
@@ -131,13 +131,13 @@ func (d *daemon) execAgentGet(ctx context.Context, aidStr string) (map[string]an
 		return nil, errNotFound
 	}
 	out := map[string]any{
-		"aid":                 e.AID.String(),
-		"service_tcp":         e.ServiceTCP,
-		"seq":                 e.Seq,
-		"service_tcp_ok":      probeTCP(e.ServiceTCP, 2*time.Second),
-		"published_to_dht":    e.Seq > 0,
-		"published_endpoints": nil,
-		"published_nat_type":  nil,
+		"aid":                  e.AID.String(),
+		"service_tcp":          e.ServiceTCP,
+		"seq":                  e.Seq,
+		"service_tcp_ok":       probeTCP(e.ServiceTCP, 2*time.Second),
+		"published_to_dht":     e.Seq > 0,
+		"published_endpoints":  nil,
+		"published_nat_type":   nil,
 		"published_record_seq": nil,
 	}
 	if e.Seq > 1 {
@@ -153,12 +153,11 @@ func (d *daemon) execAgentGet(ctx context.Context, aidStr string) (map[string]an
 	return out, nil
 }
 
-func (d *daemon) execAgentPublish(ctx context.Context, aidStr string) (uint64, error) {
+func (d *Daemon) execAgentPublish(ctx context.Context, aidStr string) (uint64, error) {
 	aid, err := a2al.ParseAddress(aidStr)
 	if err != nil {
 		return 0, errBadAID
 	}
-	// Read current seq under read lock only — do not hold write lock during network IO.
 	d.regMu.RLock()
 	e := d.reg.Get(aid)
 	d.regMu.RUnlock()
@@ -173,7 +172,6 @@ func (d *daemon) execAgentPublish(ctx context.Context, aidStr string) (uint64, e
 		d.log.Warn("publish endpoint", "aid", aid.String(), "err", err)
 		return 0, errPublish
 	}
-	// Persist updated seq under write lock.
 	d.regMu.Lock()
 	defer d.regMu.Unlock()
 	e = d.reg.Get(aid)
@@ -187,7 +185,7 @@ func (d *daemon) execAgentPublish(ctx context.Context, aidStr string) (uint64, e
 	return nextSeq, nil
 }
 
-func (d *daemon) execAgentDelete(aidStr string) error {
+func (d *Daemon) execAgentDelete(aidStr string) error {
 	aid, err := a2al.ParseAddress(aidStr)
 	if err != nil {
 		return errBadAID
@@ -204,8 +202,7 @@ func (d *daemon) execAgentDelete(aidStr string) error {
 	return nil
 }
 
-// execAgentPatch updates service_tcp after verifying the caller holds the registered operational key.
-func (d *daemon) execAgentPatch(aidStr string, req patchAgentReq) error {
+func (d *Daemon) execAgentPatch(aidStr string, req patchAgentReq) error {
 	aid, err := a2al.ParseAddress(aidStr)
 	if err != nil {
 		return errBadAID
@@ -218,7 +215,6 @@ func (d *daemon) execAgentPatch(aidStr string, req patchAgentReq) error {
 		return errBadOpKeyHex
 	}
 	opPriv := ed25519.PrivateKey(opPrivBytes)
-
 	d.regMu.Lock()
 	defer d.regMu.Unlock()
 	e := d.reg.Get(aid)
@@ -232,13 +228,10 @@ func (d *daemon) execAgentPatch(aidStr string, req patchAgentReq) error {
 		return errServiceTCPUnreachable
 	}
 	e.ServiceTCP = req.ServiceTCP
-	if err := d.reg.Put(e); err != nil {
-		return errPersist
-	}
-	return nil
+	return d.reg.Put(e)
 }
 
-func (d *daemon) execResolve(ctx context.Context, aidStr string) (map[string]any, error) {
+func (d *Daemon) execResolve(ctx context.Context, aidStr string) (map[string]any, error) {
 	aid, err := a2al.ParseAddress(aidStr)
 	if err != nil {
 		return nil, errBadAID
@@ -257,7 +250,7 @@ func (d *daemon) execResolve(ctx context.Context, aidStr string) (map[string]any
 	}, nil
 }
 
-func (d *daemon) execConnect(ctx context.Context, remoteAidStr string, body connectReq) (tunnel string, err error) {
+func (d *Daemon) execConnect(ctx context.Context, remoteAidStr string, body connectReq) (string, error) {
 	remote, err := a2al.ParseAddress(remoteAidStr)
 	if err != nil {
 		return "", errBadAID
@@ -300,7 +293,7 @@ func (d *daemon) execConnect(ctx context.Context, remoteAidStr string, body conn
 	return ln.Addr().String(), nil
 }
 
-func (d *daemon) execMailboxSend(ctx context.Context, localAidStr, recipientStr string, msgType uint8, body []byte) error {
+func (d *Daemon) execMailboxSend(ctx context.Context, localAidStr, recipientStr string, msgType uint8, body []byte) error {
 	aid, err := a2al.ParseAddress(localAidStr)
 	if err != nil {
 		return errBadAID
@@ -318,7 +311,7 @@ func (d *daemon) execMailboxSend(ctx context.Context, localAidStr, recipientStr 
 	return d.h.SendMailboxForAgent(ctx, aid, recipient, msgType, body)
 }
 
-func (d *daemon) execMailboxPoll(ctx context.Context, aidStr string) ([]map[string]any, error) {
+func (d *Daemon) execMailboxPoll(ctx context.Context, aidStr string) ([]map[string]any, error) {
 	aid, err := a2al.ParseAddress(aidStr)
 	if err != nil {
 		return nil, errBadAID
@@ -334,9 +327,6 @@ func (d *daemon) execMailboxPoll(ctx context.Context, aidStr string) ([]map[stri
 		return nil, err
 	}
 
-	// Deduplicate: filter messages already returned in this daemon session.
-	// DHT records persist until TTL expiry; without this, repeated polls return
-	// the same messages until they expire (~1 hour by default).
 	d.mailboxSeenMu.Lock()
 	if d.mailboxSeen == nil {
 		d.mailboxSeen = make(map[string]map[string]struct{})
@@ -363,10 +353,6 @@ func (d *daemon) execMailboxPoll(ctx context.Context, aidStr string) ([]map[stri
 	return out, nil
 }
 
-// mailboxMsgKey returns a string that uniquely identifies a MailboxMessage
-// within a sender's sequence space. Using (sender, seq) rather than content
-// ensures that a sender can legitimately re-send the same message body and
-// have it delivered again (new Seq = new record).
 func mailboxMsgKey(m protocol.MailboxMessage) string {
 	return hex.EncodeToString(m.Sender[:]) + ":" + strconv.FormatUint(m.Seq, 10)
 }
@@ -402,7 +388,7 @@ func topicEntryToMap(e protocol.TopicEntry) map[string]any {
 	}
 }
 
-func (d *daemon) execTopicRegister(ctx context.Context, aidStr string, req topicRegisterReq) error {
+func (d *Daemon) execTopicRegister(ctx context.Context, aidStr string, req topicRegisterReq) error {
 	aid, err := a2al.ParseAddress(aidStr)
 	if err != nil {
 		return errBadAID
@@ -448,7 +434,7 @@ func (d *daemon) execTopicRegister(ctx context.Context, aidStr string, req topic
 	return d.reg.Put(e)
 }
 
-func (d *daemon) execTopicUnregister(aidStr, topic string) error {
+func (d *Daemon) execTopicUnregister(aidStr, topic string) error {
 	aid, err := a2al.ParseAddress(aidStr)
 	if err != nil {
 		return errBadAID
@@ -469,7 +455,7 @@ func (d *daemon) execTopicUnregister(aidStr, topic string) error {
 	return d.reg.Put(e)
 }
 
-func (d *daemon) execDiscover(ctx context.Context, req discoverReq) ([]map[string]any, error) {
+func (d *Daemon) execDiscover(ctx context.Context, req discoverReq) ([]map[string]any, error) {
 	if len(req.Topics) == 0 {
 		return nil, errTopicsRequired
 	}
@@ -493,16 +479,13 @@ func (d *daemon) execDiscover(ctx context.Context, req discoverReq) ([]map[strin
 	return out, nil
 }
 
-// agentPublishRecordReq is the body for POST /agents/{aid}/records (spec §3.3).
 type agentPublishRecordReq struct {
 	RecType       uint8  `json:"rec_type"`
 	PayloadBase64 string `json:"payload_base64"`
 	TTL           uint32 `json:"ttl"`
 }
 
-func sovereignCustomRecType(t uint8) bool {
-	return t >= 0x02 && t <= 0x0f
-}
+func sovereignCustomRecType(t uint8) bool { return t >= 0x02 && t <= 0x0f }
 
 func signedRecordToAPI(sr protocol.SignedRecord) (map[string]any, error) {
 	var addr a2al.Address
@@ -526,7 +509,7 @@ func signedRecordToAPI(sr protocol.SignedRecord) (map[string]any, error) {
 	return m, nil
 }
 
-func (d *daemon) execAgentPublishRecord(ctx context.Context, aidStr string, req agentPublishRecordReq) error {
+func (d *Daemon) execAgentPublishRecord(ctx context.Context, aidStr string, req agentPublishRecordReq) error {
 	aid, err := a2al.ParseAddress(aidStr)
 	if err != nil {
 		return errBadAID
@@ -560,7 +543,7 @@ func (d *daemon) execAgentPublishRecord(ctx context.Context, aidStr string, req 
 	return d.h.PublishRecord(ctx, rec)
 }
 
-func (d *daemon) execResolveRecords(ctx context.Context, aidStr string, recType uint8) ([]map[string]any, error) {
+func (d *Daemon) execResolveRecords(ctx context.Context, aidStr string, recType uint8) ([]map[string]any, error) {
 	aid, err := a2al.ParseAddress(aidStr)
 	if err != nil {
 		return nil, errBadAID
@@ -589,25 +572,25 @@ func (d *daemon) execResolveRecords(ctx context.Context, aidStr string, recType 
 
 var (
 	errBadDelegationHex      = errors.New("bad delegation_proof_hex")
-	errDelegationParse     = errors.New("delegation parse")
-	errBadOpKeyHex         = errors.New("bad operational_private_key_hex")
-	errDelegationVerify    = errors.New("delegation verify")
-	errAID                 = errors.New("aid")
-	errNodeAsAgent         = errors.New("cannot register node identity as agent")
-	errServiceTCPRequired  = errors.New("service_tcp required")
+	errDelegationParse       = errors.New("delegation parse")
+	errBadOpKeyHex           = errors.New("bad operational_private_key_hex")
+	errDelegationVerify      = errors.New("delegation verify")
+	errAID                   = errors.New("aid")
+	errNodeAsAgent           = errors.New("cannot register node identity as agent")
+	errServiceTCPRequired    = errors.New("service_tcp required")
 	errServiceTCPUnreachable = errors.New("service_tcp unreachable")
-	errPersist             = errors.New("persist failed")
-	errBadAID              = errors.New("bad aid")
-	errNotFound            = errors.New("not found")
-	errPublish             = errors.New("publish failed")
-	errDeleteNode          = errors.New("cannot delete node identity")
-	errResolve             = errors.New("resolve failed")
-	errListen              = errors.New("listen failed")
-	errConnectQUIC         = errors.New("quic connect failed")
-	errOpKeyMismatch       = errors.New("operational key mismatch")
-	errTopicsRequired      = errors.New("topics required")
-	errBadRecType          = errors.New("rec_type must be sovereign custom 0x02-0x0f")
-	errTTLRequired         = errors.New("ttl required")
-	errBadPayloadB64       = errors.New("invalid payload_base64")
-	errNoDelegation        = errors.New("delegation required")
+	errPersist               = errors.New("persist failed")
+	errBadAID                = errors.New("bad aid")
+	errNotFound              = errors.New("not found")
+	errPublish               = errors.New("publish failed")
+	errDeleteNode            = errors.New("cannot delete node identity")
+	errResolve               = errors.New("resolve failed")
+	errListen                = errors.New("listen failed")
+	errConnectQUIC           = errors.New("quic connect failed")
+	errOpKeyMismatch         = errors.New("operational key mismatch")
+	errTopicsRequired        = errors.New("topics required")
+	errBadRecType            = errors.New("rec_type must be sovereign custom 0x02-0x0f")
+	errTTLRequired           = errors.New("ttl required")
+	errBadPayloadB64         = errors.New("invalid payload_base64")
+	errNoDelegation          = errors.New("delegation required")
 )

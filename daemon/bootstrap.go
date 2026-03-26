@@ -1,7 +1,7 @@
 // Copyright 2026 The A2AL Authors. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-package main
+package daemon
 
 import (
 	"context"
@@ -10,9 +10,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/a2al/a2al/cmd/a2ald/internal/peerscache"
 	"github.com/a2al/a2al/config"
 	"github.com/a2al/a2al/host"
+	"github.com/a2al/a2al/internal/peerscache"
 	"log/slog"
 )
 
@@ -42,26 +42,6 @@ func runBootstrapChain(ctx context.Context, h *host.Host, cfg *config.Config, da
 		if len(addrs) > 0 && tryBootstrap(ctx, h, addrs, log, "dns_txt") {
 			return
 		}
-	}
-}
-
-func savePeersCache(path string, h *host.Host, log *slog.Logger) {
-	addrs := h.Node().BootstrapCandidateAddrs(64)
-	strs := make([]string, 0, len(addrs))
-	seen := make(map[string]struct{})
-	for _, a := range addrs {
-		s := addrToHostPort(a)
-		if s == "" {
-			continue
-		}
-		if _, ok := seen[s]; ok {
-			continue
-		}
-		seen[s] = struct{}{}
-		strs = append(strs, s)
-	}
-	if err := peerscache.Save(path, strs); err != nil {
-		log.Warn("peers.cache save", "err", err)
 	}
 }
 
@@ -108,9 +88,6 @@ func tryBootstrap(ctx context.Context, h *host.Host, addrs []net.Addr, log *slog
 	defer ocancel()
 	h.ObserveFromPeers(obctx, addrs)
 
-	// Auto-lower the natsense consensus threshold when the network is small
-	// (fewer peers than the default minimum of 3). This ensures that two-node
-	// deployments can still determine their external address via observed_addr.
 	peers := len(h.Node().BootstrapCandidateAddrs(10))
 	minAgree := h.Sense().MinAgreeing()
 	if peers > 0 && peers < minAgree {

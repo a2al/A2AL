@@ -1,7 +1,7 @@
 // Copyright 2026 The A2AL Authors. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-package main
+package daemon
 
 import (
 	"bytes"
@@ -13,14 +13,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/a2al/a2al/cmd/a2ald/internal/nodeks"
-	"github.com/a2al/a2al/cmd/a2ald/internal/registry"
 	"github.com/a2al/a2al/config"
 	"github.com/a2al/a2al/host"
+	"github.com/a2al/a2al/internal/nodeks"
+	"github.com/a2al/a2al/internal/registry"
 	"log/slog"
 )
 
-func newTestDaemon(t *testing.T) *daemon {
+func newTestDaemon(t *testing.T) *Daemon {
 	t.Helper()
 	dir := t.TempDir()
 	ks, err := nodeks.LoadOrGenerate(filepath.Join(dir, "node.key"))
@@ -44,7 +44,7 @@ func newTestDaemon(t *testing.T) *daemon {
 		t.Fatal(err)
 	}
 	cfg := config.Default()
-	return &daemon{
+	return &Daemon{
 		dataDir:  dir,
 		cfgPath:  filepath.Join(dir, "config.toml"),
 		cfg:      &cfg,
