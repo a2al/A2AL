@@ -78,7 +78,7 @@ jobs:
         run: |
           go install tool
           gomobile init
-          gomobile bind -target=android -o a2al.aar github.com/a2al/a2al/mobile
+          gomobile bind -target=android -androidapi 21 -o a2al.aar github.com/a2al/a2al/mobile
       - uses: actions/upload-artifact@v4
         with:
           name: a2al-android-aar
