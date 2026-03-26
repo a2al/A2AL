@@ -47,48 +47,6 @@ jobs:
           path: a2ald-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
           retention-days: 7
 
-      - name: build demo1-node
-        run: |
-          cd examples/demo1-node
-          go build -o demo1-node-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }} .
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: "0"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: demo1-node-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: examples/demo1-node/demo1-node-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
-          retention-days: 7
-
-      - name: build demo2-chat
-        run: |
-          cd examples/demo2-chat
-          go build -o demo2-chat-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }} .
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: "0"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: demo2-chat-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: examples/demo2-chat/demo2-chat-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
-          retention-days: 7
-
-      - name: build demo3-chat
-        run: |
-          cd examples/demo3-chat
-          go build -o demo3-chat-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }} .
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: "0"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: demo3-chat-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: examples/demo3-chat/demo3-chat-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
-          retention-days: 7
-
       - name: build demo4-marketplace
         run: |
           cd examples/demo4-marketplace
