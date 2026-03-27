@@ -110,6 +110,10 @@ A2AL is under active development. Core discovery and encrypted connection layers
 
 See [`doc/API.md`](doc/API.md) for the current library API.
 
+## Disclaimer
+
+A2AL is a networking protocol project. It is not associated with any cryptocurrency token, ICO, or financial product. Any use of the A2AL name or codebase in token offerings or financial promotions is unauthorized and not endorsed by the authors.
+
 ## Contributing
 
 Contributions are welcome. Before your pull request can be merged, you must sign the [Contributor License Agreement](CLA.md). A bot will prompt you automatically when you open a PR.

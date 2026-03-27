@@ -46,14 +46,16 @@ type delegationSignFields struct {
 }
 
 // DelegationProof is the full CBOR object including signature (key 7).
+// Ethereum (and other blockchain) proofs omit MasterPub (key 1) and set Message (key 8).
 type DelegationProof struct {
-	MasterPub []byte `cbor:"1,keyasint"`
+	MasterPub []byte `cbor:"1,keyasint,omitempty"`
 	OpPub     []byte `cbor:"2,keyasint"`
 	AgentAddr []byte `cbor:"3,keyasint"`
 	IssuedAt  uint64 `cbor:"4,keyasint"`
 	ExpiresAt uint64 `cbor:"5,keyasint"`
 	Scope     uint8  `cbor:"6,keyasint"`
 	Signature []byte `cbor:"7,keyasint"`
+	Message   string `cbor:"8,keyasint,omitempty"`
 }
 
 // SignDelegation builds a proof: master authorizes op key for AID and scope.
@@ -109,20 +111,51 @@ func ParseDelegationProof(b []byte) (DelegationProof, error) {
 	if err := cbor.Unmarshal(b, &p); err != nil {
 		return DelegationProof{}, err
 	}
-	if len(p.MasterPub) != ed25519.PublicKeySize || len(p.OpPub) != ed25519.PublicKeySize {
-		return DelegationProof{}, ErrInvalidDelegation
-	}
 	if len(p.AgentAddr) != len(a2al.Address{}) {
 		return DelegationProof{}, ErrInvalidDelegation
 	}
-	if len(p.Signature) != ed25519.SignatureSize {
+	if len(p.OpPub) != ed25519.PublicKeySize {
 		return DelegationProof{}, ErrInvalidDelegation
+	}
+	v := p.AgentAddr[0]
+	switch v {
+	case a2al.VersionEd25519:
+		if len(p.MasterPub) != ed25519.PublicKeySize || len(p.Signature) != ed25519.SignatureSize {
+			return DelegationProof{}, ErrInvalidDelegation
+		}
+		if p.Message != "" {
+			return DelegationProof{}, ErrInvalidDelegation
+		}
+	case a2al.VersionEthereum:
+		if len(p.MasterPub) != 0 {
+			return DelegationProof{}, ErrInvalidDelegation
+		}
+		if len(p.Signature) != 65 || p.Message == "" {
+			return DelegationProof{}, ErrInvalidDelegation
+		}
+	default:
+		return DelegationProof{}, fmt.Errorf("%w: unsupported agent address version 0x%02x", ErrInvalidDelegation, v)
 	}
 	return p, nil
 }
 
-// VerifyDelegation checks the master signature, AID binding, expiry, and that opPub matches opPriv if provided.
+// VerifyDelegation checks the proof (Ed25519 master or Ethereum EIP-191) and optional op key binding.
 func VerifyDelegation(p DelegationProof, nowUnix uint64, opPriv ed25519.PrivateKey) error {
+	if len(p.AgentAddr) != len(a2al.Address{}) {
+		return ErrInvalidDelegation
+	}
+	switch p.AgentAddr[0] {
+	case a2al.VersionEthereum:
+		return verifyEthereumDelegation(p, nowUnix, opPriv)
+	default:
+		return verifyEd25519Delegation(p, nowUnix, opPriv)
+	}
+}
+
+func verifyEd25519Delegation(p DelegationProof, nowUnix uint64, opPriv ed25519.PrivateKey) error {
+	if p.AgentAddr[0] != a2al.VersionEd25519 {
+		return ErrInvalidDelegation
+	}
 	fields := delegationSignFields{
 		MasterPub: p.MasterPub,
 		OpPub:     p.OpPub,

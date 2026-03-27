@@ -1,4 +1,4 @@
-﻿// Copyright 2026 The A2AL Authors. All rights reserved.
+// Copyright 2026 The A2AL Authors. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
 package a2al
@@ -68,7 +68,7 @@ func TestAddressString_roundTrip(t *testing.T) {
 	addr[0] = VersionEd25519
 	copy(addr[1:], bytes.Repeat([]byte{0xcd}, 20))
 	s := addr.String()
-	if len(s) != addressHexLen {
+	if len(s) != nativeHexLen {
 		t.Fatalf("len %d", len(s))
 	}
 	back, err := ParseAddress(s)
@@ -107,6 +107,23 @@ func TestParseAddress_badChecksum(t *testing.T) {
 	_, err := ParseAddress(string(bad))
 	if err == nil {
 		t.Fatal("expected error for bad checksum")
+	}
+}
+
+func TestParseAddress_ethereum_roundTrip(t *testing.T) {
+	// Known test vector: all-zero address (valid checksum is lowercase only)
+	var addr Address
+	addr[0] = VersionEthereum
+	s := addr.String()
+	if s[:2] != "0x" || len(s) != 42 {
+		t.Fatalf("ethereum string: %q", s)
+	}
+	back, err := ParseAddress(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if back != addr {
+		t.Fatalf("got %v want %v", back, addr)
 	}
 }
 

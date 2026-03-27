@@ -39,6 +39,22 @@ func buildMCPServer(d *Daemon) *mcp.Server {
 		Description: "List registered agents.",
 	}, d.mcpAgentsList)
 	mcp.AddTool(s, &mcp.Tool{
+		Name:        "a2al_agents_generate_ethereum",
+		Description: "Generate Ethereum AID (0x…), secp256k1 owner key, Ed25519 op key, and EIP-191 delegation proof; keys are not stored by the daemon.",
+	}, d.mcpAgentsGenerateEthereum)
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "a2al_ethereum_delegation_message",
+		Description: "Build UTF-8 text for wallet personal_sign. Use operational_public_key_hex OR operational_private_key_seed_hex (exactly one), agent 0x address, issued_at, expires_at.",
+	}, d.mcpEthereumDelegationMessage)
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "a2al_ethereum_register",
+		Description: "Register after EIP-191 signature: eth_signature_hex, agent, timestamps, service_tcp, operational_private_key_hex OR operational_private_key_seed_hex.",
+	}, d.mcpEthereumRegister)
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "a2al_ethereum_proof",
+		Description: "Create DelegationProof CBOR using ethereum_private_key_hex (automation only). Optional op keys; if omitted a new Ed25519 op key is generated and returned.",
+	}, d.mcpEthereumProof)
+	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_agent_register",
 		Description: "Register an agent with delegation proof and reachable service_tcp.",
 	}, d.mcpAgentRegister)
@@ -97,6 +113,81 @@ func buildMCPServer(d *Daemon) *mcp.Server {
 func (d *Daemon) mcpIdentityGenerate(ctx context.Context, _ *mcp.ServerSession, _ *mcp.CallToolParamsFor[struct{}]) (*mcp.CallToolResultFor[map[string]any], error) {
 	_ = ctx
 	out, err := d.execIdentityGenerate()
+	if err != nil {
+		return nil, err
+	}
+	m, err := structToMap(out)
+	if err != nil {
+		return nil, err
+	}
+	return &mcp.CallToolResultFor[map[string]any]{StructuredContent: m}, nil
+}
+
+type mcpEthDelMsgArgs struct {
+	OperationalPublicKeyHex      string `json:"operational_public_key_hex,omitempty"`
+	OperationalPrivateKeySeedHex string `json:"operational_private_key_seed_hex,omitempty"`
+	Agent                        string `json:"agent"`
+	IssuedAt                     uint64 `json:"issued_at"`
+	ExpiresAt                    uint64 `json:"expires_at"`
+	Scope                        uint8  `json:"scope,omitempty"`
+}
+
+func (d *Daemon) mcpEthereumDelegationMessage(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[mcpEthDelMsgArgs]) (*mcp.CallToolResultFor[map[string]any], error) {
+	_ = ctx
+	msg, err := d.execEthereumDelegationMessage(params.Arguments.OperationalPublicKeyHex, params.Arguments.OperationalPrivateKeySeedHex, params.Arguments.Agent, params.Arguments.IssuedAt, params.Arguments.ExpiresAt, params.Arguments.Scope)
+	if err != nil {
+		return nil, err
+	}
+	return &mcp.CallToolResultFor[map[string]any]{StructuredContent: map[string]any{"message": msg}}, nil
+}
+
+type mcpEthRegisterArgs struct {
+	Agent                        string `json:"agent"`
+	IssuedAt                     uint64 `json:"issued_at"`
+	ExpiresAt                    uint64 `json:"expires_at"`
+	Scope                        uint8  `json:"scope,omitempty"`
+	EthSignatureHex              string `json:"eth_signature_hex"`
+	ServiceTCP                   string `json:"service_tcp"`
+	OperationalPrivateKeyHex     string `json:"operational_private_key_hex,omitempty"`
+	OperationalPrivateKeySeedHex string `json:"operational_private_key_seed_hex,omitempty"`
+}
+
+func (d *Daemon) mcpEthereumRegister(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[mcpEthRegisterArgs]) (*mcp.CallToolResultFor[map[string]any], error) {
+	_ = ctx
+	a := params.Arguments
+	aid, err := d.execEthereumRegister(a.Agent, a.IssuedAt, a.ExpiresAt, a.Scope, a.EthSignatureHex, a.ServiceTCP, a.OperationalPrivateKeyHex, a.OperationalPrivateKeySeedHex)
+	if err != nil {
+		return nil, err
+	}
+	return &mcp.CallToolResultFor[map[string]any]{StructuredContent: map[string]any{"aid": aid.String(), "status": "registered"}}, nil
+}
+
+type mcpEthProofArgs struct {
+	EthereumPrivateKeyHex        string `json:"ethereum_private_key_hex"`
+	IssuedAt                     uint64 `json:"issued_at"`
+	ExpiresAt                    uint64 `json:"expires_at"`
+	Scope                        uint8  `json:"scope,omitempty"`
+	OperationalPrivateKeyHex     string `json:"operational_private_key_hex,omitempty"`
+	OperationalPrivateKeySeedHex string `json:"operational_private_key_seed_hex,omitempty"`
+}
+
+func (d *Daemon) mcpEthereumProof(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[mcpEthProofArgs]) (*mcp.CallToolResultFor[map[string]any], error) {
+	_ = ctx
+	a := params.Arguments
+	out, err := d.execEthereumProofFromKey(a.EthereumPrivateKeyHex, a.IssuedAt, a.ExpiresAt, a.Scope, a.OperationalPrivateKeyHex, a.OperationalPrivateKeySeedHex)
+	if err != nil {
+		return nil, err
+	}
+	m, err := structToMap(out)
+	if err != nil {
+		return nil, err
+	}
+	return &mcp.CallToolResultFor[map[string]any]{StructuredContent: m}, nil
+}
+
+func (d *Daemon) mcpAgentsGenerateEthereum(ctx context.Context, _ *mcp.ServerSession, _ *mcp.CallToolParamsFor[struct{}]) (*mcp.CallToolResultFor[map[string]any], error) {
+	_ = ctx
+	out, err := d.execEthereumIdentityGenerate()
 	if err != nil {
 		return nil, err
 	}

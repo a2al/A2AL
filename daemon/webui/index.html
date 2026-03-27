@@ -245,6 +245,7 @@ tr:hover td { background: #fafafa; }
         <div style="display:grid;gap:.5rem">
           <button class="btn btn-primary w-full" id="genBtn">⚡ Generate new identity</button>
           <button class="btn btn-secondary w-full" id="manualBtn">Enter existing credentials</button>
+          <button class="btn btn-secondary w-full" id="ethWalletBtn">Ethereum (MetaMask)</button>
         </div>
       </div>
 
@@ -282,6 +283,47 @@ tr:hover td { background: #fafafa; }
           <span class="f-hint">TCP address the daemon forwards inbound connections to. Must be reachable locally.</span>
         </div>
 
+      </div>
+
+      <!-- Ethereum + MetaMask -->
+      <div id="regStepEth" class="hidden f-grid" style="gap:.75rem">
+        <div class="warn-box">
+          <strong>Local daemon only</strong>
+          <span>Operational key seed is sent to this daemon to build the delegation text. Use only on trusted localhost. Your Ethereum key never leaves MetaMask.</span>
+        </div>
+        <div class="f-group">
+          <label class="f-label" for="ethAgent">Ethereum address (AID)</label>
+          <input id="ethAgent" class="w-full mono" placeholder="0x…" autocomplete="off">
+        </div>
+        <div class="f-grid f-grid-2">
+          <div class="f-group">
+            <label class="f-label" for="ethIssuedAt">issued_at (unix)</label>
+            <input id="ethIssuedAt" type="text" class="w-full mono" style="font-size:.78rem">
+          </div>
+          <div class="f-group">
+            <label class="f-label" for="ethExpiresAt">expires_at (0 = none)</label>
+            <input id="ethExpiresAt" type="text" class="w-full mono" value="0" style="font-size:.78rem">
+          </div>
+        </div>
+        <div class="f-group">
+          <label class="f-label" for="ethSvcTCP">Service TCP <span style="color:var(--error)">*</span></label>
+          <input id="ethSvcTCP" class="w-full" placeholder="127.0.0.1:9000">
+        </div>
+        <div class="f-group">
+          <button class="btn btn-secondary btn-sm" type="button" id="ethGenSeed">1 · Generate Ed25519 seed (browser)</button>
+          <span id="ethSeedOk" class="f-hint hidden">Seed ready (32 bytes).</span>
+        </div>
+        <div class="f-group">
+          <button class="btn btn-secondary btn-sm" type="button" id="ethFetchMsg" disabled>2 · Get delegation message</button>
+        </div>
+        <div class="f-group">
+          <label class="f-label">Message to sign</label>
+          <textarea id="ethMsg" class="w-full mono" readonly rows="6" style="font-size:.72rem;resize:vertical"></textarea>
+        </div>
+        <div class="f-group">
+          <button class="btn btn-secondary btn-sm" type="button" id="ethSignMM" disabled>3 · Sign with MetaMask</button>
+          <span id="ethSigOk" class="f-hint hidden">Signature captured.</span>
+        </div>
       </div>
 
     </div>
@@ -569,12 +611,34 @@ async function doDelete(aid, btn) {
 }
 
 // ─── Register modal ───────────────────────────────────────────────────────────
+var regMode = 'ed25519';
+var ethOpSeedHex = '';
+var ethDelMessage = '';
+var ethSigHex = '';
+var ethIssuedUsed = 0;
+var ethExpiresUsed = 0;
+var ethScopeUsed = 1;
+
 function openRegModal() {
-  ['regStep2','masterWarn','regSubmit'].forEach(id => document.getElementById(id).classList.add('hidden'));
+  regMode = 'ed25519';
+  ethOpSeedHex = '';
+  ethDelMessage = '';
+  ethSigHex = '';
+  ['regStep2','masterWarn','regSubmit','regStepEth'].forEach(id => document.getElementById(id).classList.add('hidden'));
   document.getElementById('regStep1').classList.remove('hidden');
   ['regOpKey','regDelProof','regSvcTCP'].forEach(id => { document.getElementById(id).value = ''; });
   document.getElementById('masterDisp').value = '';
   document.getElementById('aidPreview').textContent = '';
+  document.getElementById('ethAgent').value = '';
+  document.getElementById('ethSvcTCP').value = '';
+  document.getElementById('ethMsg').value = '';
+  document.getElementById('ethIssuedAt').value = String(Math.floor(Date.now() / 1000));
+  document.getElementById('ethExpiresAt').value = '0';
+  document.getElementById('ethSeedOk').classList.add('hidden');
+  document.getElementById('ethSigOk').classList.add('hidden');
+  document.getElementById('ethFetchMsg').disabled = true;
+  document.getElementById('ethSignMM').disabled = true;
+  document.getElementById('regSubmit').textContent = 'Register';
   document.getElementById('regModal').classList.remove('hidden');
 }
 function closeRegModal() { document.getElementById('regModal').classList.add('hidden'); }
@@ -597,8 +661,11 @@ document.getElementById('genBtn').onclick = async function () {
     document.getElementById('masterDisp').value = ident.master_private_key_hex;
     document.getElementById('masterWarn').classList.remove('hidden');
     document.getElementById('regStep1').classList.add('hidden');
+    document.getElementById('regStepEth').classList.add('hidden');
     document.getElementById('regStep2').classList.remove('hidden');
     document.getElementById('regSubmit').classList.remove('hidden');
+    document.getElementById('regSubmit').textContent = 'Register';
+    regMode = 'ed25519';
     toast('Identity generated — save master key now!', 'warn', 6000);
   } catch (e) {
     toast('Generate failed: ' + e.message, 'err');
@@ -609,9 +676,89 @@ document.getElementById('genBtn').onclick = async function () {
 
 document.getElementById('manualBtn').onclick = function () {
   document.getElementById('regStep1').classList.add('hidden');
+  document.getElementById('regStepEth').classList.add('hidden');
   document.getElementById('masterWarn').classList.add('hidden');
   document.getElementById('regStep2').classList.remove('hidden');
   document.getElementById('regSubmit').classList.remove('hidden');
+  document.getElementById('regSubmit').textContent = 'Register';
+  regMode = 'ed25519';
+};
+
+document.getElementById('ethWalletBtn').onclick = function () {
+  regMode = 'ethereum';
+  document.getElementById('regStep1').classList.add('hidden');
+  document.getElementById('regStep2').classList.add('hidden');
+  document.getElementById('masterWarn').classList.add('hidden');
+  document.getElementById('regStepEth').classList.remove('hidden');
+  document.getElementById('regSubmit').classList.remove('hidden');
+  document.getElementById('regSubmit').textContent = '4 · Register agent';
+};
+
+document.getElementById('ethGenSeed').onclick = function () {
+  const a = new Uint8Array(32);
+  crypto.getRandomValues(a);
+  ethOpSeedHex = Array.from(a, function (b) { return ('0' + b.toString(16)).slice(-2); }).join('');
+  document.getElementById('ethSeedOk').classList.remove('hidden');
+  document.getElementById('ethFetchMsg').disabled = false;
+  toast('Operational seed generated in browser', 'ok');
+};
+
+document.getElementById('ethFetchMsg').onclick = async function () {
+  const btn = this;
+  const agent = document.getElementById('ethAgent').value.trim();
+  const issued = parseInt(document.getElementById('ethIssuedAt').value, 10);
+  const exp = parseInt(document.getElementById('ethExpiresAt').value, 10) || 0;
+  if (!agent || !ethOpSeedHex) { toast('Agent and seed required.', 'err'); return; }
+  if (!/^0x[0-9a-fA-F]{40}$/.test(agent)) { toast('Invalid 0x address.', 'err'); return; }
+  setLoading(btn, true);
+  try {
+    const r = await api('/agents/ethereum/delegation-message', {
+      method: 'POST',
+      body: JSON.stringify({
+        operational_private_key_seed_hex: ethOpSeedHex,
+        agent: agent,
+        issued_at: issued,
+        expires_at: exp,
+        scope: 1
+      })
+    });
+    ethDelMessage = r.message;
+    document.getElementById('ethMsg').value = ethDelMessage;
+    ethIssuedUsed = issued;
+    ethExpiresUsed = exp;
+    ethScopeUsed = 1;
+    document.getElementById('ethSignMM').disabled = false;
+    toast('Delegation message ready — sign with MetaMask.', 'ok', 4000);
+  } catch (e) {
+    toast('Delegation message failed: ' + e.message, 'err');
+  } finally {
+    setLoading(btn, false);
+  }
+};
+
+document.getElementById('ethSignMM').onclick = async function () {
+  const btn = this;
+  const eth = window.ethereum;
+  if (!eth) { toast('MetaMask not found (window.ethereum).', 'err'); return; }
+  if (!ethDelMessage) { toast('Fetch delegation message first.', 'err'); return; }
+  const want = document.getElementById('ethAgent').value.trim().toLowerCase();
+  setLoading(btn, true);
+  try {
+    const accs = await eth.request({ method: 'eth_requestAccounts' });
+    const ac = (accs[0] || '').toLowerCase();
+    if (ac !== want) {
+      toast('Active MetaMask account must match Ethereum AID.', 'err');
+      return;
+    }
+    const sig = await eth.request({ method: 'personal_sign', params: [ethDelMessage, accs[0]] });
+    ethSigHex = String(sig).startsWith('0x') ? String(sig).slice(2) : String(sig);
+    document.getElementById('ethSigOk').classList.remove('hidden');
+    toast('Signed.', 'ok');
+  } catch (e) {
+    toast('MetaMask sign failed: ' + (e && e.message ? e.message : e), 'err');
+  } finally {
+    setLoading(btn, false);
+  }
 };
 
 document.getElementById('copyMasterBtn').onclick = () =>
@@ -619,6 +766,42 @@ document.getElementById('copyMasterBtn').onclick = () =>
 
 document.getElementById('regSubmit').onclick = async function () {
   const btn = this;
+  if (regMode === 'ethereum') {
+    const svcTCP = document.getElementById('ethSvcTCP').value.trim();
+    const agent = document.getElementById('ethAgent').value.trim();
+    if (!ethOpSeedHex || !ethDelMessage || !ethSigHex || !svcTCP || !agent) {
+      toast('Complete steps 1–3 and set service TCP.', 'err');
+      return;
+    }
+    setLoading(btn, true);
+    try {
+      const r = await api('/agents/ethereum/register', {
+        method: 'POST',
+        body: JSON.stringify({
+          agent: agent,
+          issued_at: ethIssuedUsed,
+          expires_at: ethExpiresUsed,
+          scope: ethScopeUsed,
+          eth_signature_hex: ethSigHex,
+          service_tcp: svcTCP,
+          operational_private_key_seed_hex: ethOpSeedHex
+        })
+      });
+      toast('Agent registered: ' + r.aid, 'ok', 4000);
+      closeRegModal();
+      refreshAgents();
+      try {
+        const p = await api('/agents/' + encodeURIComponent(r.aid) + '/publish', { method: 'POST', body: '{}' });
+        toast('Endpoint published to DHT (seq ' + p.seq + ').', 'ok');
+        refreshAgents();
+      } catch (_) {}
+    } catch (e) {
+      toast('Register failed: ' + e.message, 'err', 5000);
+    } finally {
+      setLoading(btn, false);
+    }
+    return;
+  }
   const opKey   = document.getElementById('regOpKey').value.trim();
   const delProof= document.getElementById('regDelProof').value.trim();
   const svcTCP  = document.getElementById('regSvcTCP').value.trim();

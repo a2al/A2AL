@@ -9,6 +9,7 @@ tool (
 
 require (
 	github.com/coder/websocket v1.8.12
+	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.0
 	github.com/fxamacker/cbor/v2 v2.7.0
 	github.com/huin/goupnp v1.3.0
 	github.com/modelcontextprotocol/go-sdk v0.2.0
