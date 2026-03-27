@@ -32,6 +32,9 @@ type Config struct {
 	// signature/expiry verification passes (Phase 4: includes DHT key).
 	// If nil, no authority check is performed (useful in tests).
 	RecordAuth RecordAuthFunc
+	// MaxStoreKeys limits the number of distinct DHT keys in the local store.
+	// 0 uses DefaultMaxTotalKeys. Configurable per-node soft limit.
+	MaxStoreKeys int
 }
 
 // Node is a single DHT participant (routing + local store + wire handler).
@@ -89,7 +92,7 @@ func NewNode(cfg Config) (*Node, error) {
 		ks:     cfg.Keystore,
 		addr:   addr,
 		nid:    nid,
-		store:  NewStore(cfg.RecordAuth),
+		store:  NewStore(cfg.RecordAuth, cfg.MaxStoreKeys),
 		ctx:    ctx,
 		cancel: cancel,
 		wait:           make(map[string]*waitEntry),
@@ -97,17 +100,7 @@ func NewNode(cfg Config) (*Node, error) {
 		onObservedAddr: cfg.OnObservedAddr,
 		auth:           cfg.RecordAuth,
 	}
-	n.table = routing.NewTable(nid, func(ni protocol.NodeInfo) bool {
-		pctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-		var peerID a2al.NodeID
-		copy(peerID[:], ni.NodeID)
-		a, ok := n.lookupPeer(peerID)
-		if !ok {
-			return false
-		}
-		return n.Ping(pctx, a) == nil
-	})
+	n.table = routing.NewTable(nid, nil)
 	return n, nil
 }
 
@@ -197,9 +190,45 @@ func (n *Node) remember(from net.Addr, dec *protocol.DecodedMessage) {
 }
 
 func (n *Node) tabAdd(ni protocol.NodeInfo) {
+	var nid a2al.NodeID
+	if len(ni.NodeID) != len(nid) {
+		return
+	}
+	copy(nid[:], ni.NodeID)
+
 	n.tabMu.Lock()
-	defer n.tabMu.Unlock()
-	n.table.Add(ni)
+	if n.table.Contains(nid) {
+		n.table.Add(ni)
+		n.tabMu.Unlock()
+		return
+	}
+	if n.table.PeerBucketLen(nid) < routing.K {
+		n.table.Add(ni)
+		n.tabMu.Unlock()
+		return
+	}
+	oldest, ok := n.table.OldestInBucket(nid)
+	n.tabMu.Unlock()
+	if !ok {
+		return
+	}
+	var oldID a2al.NodeID
+	copy(oldID[:], oldest.NodeID)
+	pctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	addr, found := n.lookupPeer(oldID)
+	if found && n.Ping(pctx, addr) == nil {
+		return
+	}
+	n.tabMu.Lock()
+	n.table.Remove(oldID)
+	// Add may return false if a concurrent tabAdd already refilled this bucket
+	// between the lock release above and re-acquisition here (TOCTOU: both
+	// goroutines raced on the same oldest entry, one already evicted it and
+	// filled the slot). Dropping ni is correct per Kademlia "prefer known nodes"
+	// semantics; the node will be re-discovered via future lookups.
+	_ = n.table.Add(ni)
+	n.tabMu.Unlock()
 }
 
 func (n *Node) tabNearest(target a2al.NodeID, k int) []protocol.NodeInfo {

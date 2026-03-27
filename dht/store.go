@@ -19,6 +19,8 @@ const (
 	maxTopicPerKey      = 100
 	maxMailboxPerKey    = 50
 	maxMailboxPerPubkey = 4
+
+	DefaultMaxTotalKeys = 100_000
 )
 
 // RecordAuthFunc decides whether a record may be stored at the given DHT key
@@ -30,14 +32,25 @@ var ErrStaleRecord = errors.New("dht: stale record")
 
 // Store is an in-memory record map keyed by DHT NodeID (Phase 4 multi-category).
 type Store struct {
-	mu   sync.Mutex
-	m    map[string][]protocol.SignedRecord
-	auth RecordAuthFunc // nil → no authority check
+	mu          sync.Mutex
+	m           map[string][]protocol.SignedRecord
+	lastAccess  map[string]int64 // key → unix timestamp of last Put or Get
+	auth        RecordAuthFunc   // nil → no authority check
+	maxKeys     int
 }
 
 // NewStore creates an empty Store. auth is optional (see Config.RecordAuth).
-func NewStore(auth RecordAuthFunc) *Store {
-	return &Store{m: make(map[string][]protocol.SignedRecord), auth: auth}
+// maxKeys limits distinct key count; 0 uses DefaultMaxTotalKeys.
+func NewStore(auth RecordAuthFunc, maxKeys int) *Store {
+	if maxKeys <= 0 {
+		maxKeys = DefaultMaxTotalKeys
+	}
+	return &Store{
+		m:          make(map[string][]protocol.SignedRecord),
+		lastAccess: make(map[string]int64),
+		auth:       auth,
+		maxKeys:    maxKeys,
+	}
 }
 
 func recordKeyForSigned(rec protocol.SignedRecord) a2al.NodeID {
@@ -82,7 +95,12 @@ func (s *Store) Put(key a2al.NodeID, rec protocol.SignedRecord, now time.Time) e
 	if err != nil {
 		return err
 	}
+	_, isExisting := s.m[k]
 	s.m[k] = newList
+	s.lastAccess[k] = now.Unix()
+	if !isExisting {
+		s.evictLRUKeysLocked()
+	}
 	return nil
 }
 
@@ -292,11 +310,36 @@ func oldestByTimestampIndex(rs []protocol.SignedRecord) int {
 	return best
 }
 
+// evictLRUKeysLocked removes the least-recently-used key until len(m) <= maxKeys.
+// TODO: O(n) linear scan per eviction. Acceptable at maxKeys=100k, but consider
+// switching to a min-heap or doubly-linked LRU list if maxKeys grows significantly.
+func (s *Store) evictLRUKeysLocked() {
+	for len(s.m) > s.maxKeys {
+		var oldestKey string
+		var oldestTS int64 = 1<<63 - 1
+		for k, ts := range s.lastAccess {
+			if ts < oldestTS {
+				oldestTS = ts
+				oldestKey = k
+			}
+		}
+		if oldestKey == "" {
+			break
+		}
+		delete(s.m, oldestKey)
+		delete(s.lastAccess, oldestKey)
+	}
+}
+
 // GetAll returns verified non-expired records at key, optionally filtered by RecType (0 = all).
 func (s *Store) GetAll(key a2al.NodeID, recType uint8, now time.Time) []protocol.SignedRecord {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	list := s.filterExpiredLocked(s.m[nodeIDKey(key)], now)
+	k := nodeIDKey(key)
+	if _, ok := s.m[k]; ok {
+		s.lastAccess[k] = now.Unix()
+	}
+	list := s.filterExpiredLocked(s.m[k], now)
 	var out []protocol.SignedRecord
 	for _, r := range list {
 		if err := protocol.VerifySignedRecord(r, now); err != nil {
@@ -314,7 +357,11 @@ func (s *Store) GetAll(key a2al.NodeID, recType uint8, now time.Time) []protocol
 func (s *Store) Get(key a2al.NodeID, now time.Time) *protocol.SignedRecord {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	list := s.filterExpiredLocked(s.m[nodeIDKey(key)], now)
+	k := nodeIDKey(key)
+	if _, ok := s.m[k]; ok {
+		s.lastAccess[k] = now.Unix()
+	}
+	list := s.filterExpiredLocked(s.m[k], now)
 	var best *protocol.SignedRecord
 	for i := range list {
 		r := list[i]

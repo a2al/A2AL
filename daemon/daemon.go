@@ -58,7 +58,7 @@ type Daemon struct {
 	// mailboxSeen prevents duplicate delivery of mailbox messages within a
 	// daemon session (DHT records persist until TTL expiry).
 	mailboxSeenMu sync.Mutex
-	mailboxSeen   map[string]map[string]struct{} // aidStr → set of msgKey
+	mailboxSeen   map[string]map[string]time.Time // aidStr → msgKey → first-seen time
 }
 
 // APIAddr returns the REST API / Web UI listen address from the loaded config.
@@ -70,7 +70,7 @@ func New(cfg Config) (*Daemon, error) {
 	if cfg.DataDir == "" {
 		return nil, errors.New("daemon: DataDir is required")
 	}
-	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
+	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
 		return nil, err
 	}
 

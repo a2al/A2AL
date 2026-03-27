@@ -24,7 +24,7 @@ type Store struct {
 // LoadOrGenerate reads hex-encoded 64-byte Ed25519 private key from path, or creates one.
 func LoadOrGenerate(keyPath string) (*Store, error) {
 	dir := filepath.Dir(keyPath)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
 	b, err := os.ReadFile(keyPath)
@@ -100,7 +100,10 @@ func (s *Store) PublicKey(addr a2al.Address) ([]byte, error) {
 	if addr != s.addr {
 		return nil, errors.New("nodeks: wrong address")
 	}
-	return s.priv.Public().(ed25519.PublicKey), nil
+	pub := s.priv.Public().(ed25519.PublicKey)
+	out := make([]byte, len(pub))
+	copy(out, pub)
+	return out, nil
 }
 
 // List implements crypto.KeyStore.
@@ -113,5 +116,7 @@ func (s *Store) Ed25519PrivateKey(addr a2al.Address) (ed25519.PrivateKey, error)
 	if addr != s.addr {
 		return nil, errors.New("nodeks: wrong address")
 	}
-	return s.priv, nil
+	out := make(ed25519.PrivateKey, len(s.priv))
+	copy(out, s.priv)
+	return out, nil
 }
