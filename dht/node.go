@@ -222,12 +222,7 @@ func (n *Node) tabAdd(ni protocol.NodeInfo) {
 	}
 	n.tabMu.Lock()
 	n.table.Remove(oldID)
-	// Add may return false if a concurrent tabAdd already refilled this bucket
-	// between the lock release above and re-acquisition here (TOCTOU: both
-	// goroutines raced on the same oldest entry, one already evicted it and
-	// filled the slot). Dropping ni is correct per Kademlia "prefer known nodes"
-	// semantics; the node will be re-discovered via future lookups.
-	_ = n.table.Add(ni)
+	n.table.Add(ni)
 	n.tabMu.Unlock()
 }
 

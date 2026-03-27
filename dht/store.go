@@ -310,9 +310,6 @@ func oldestByTimestampIndex(rs []protocol.SignedRecord) int {
 	return best
 }
 
-// evictLRUKeysLocked removes the least-recently-used key until len(m) <= maxKeys.
-// TODO: O(n) linear scan per eviction. Acceptable at maxKeys=100k, but consider
-// switching to a min-heap or doubly-linked LRU list if maxKeys grows significantly.
 func (s *Store) evictLRUKeysLocked() {
 	for len(s.m) > s.maxKeys {
 		var oldestKey string
