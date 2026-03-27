@@ -1,0 +1,63 @@
+version: 2
+
+snapshot:
+  version_template: '0~{{ .ShortCommit }}'
+
+builds:
+  - id: a2ald
+    main: ./cmd/a2ald
+    binary: a2ald
+    goos: [linux, darwin, windows]
+    goarch: [amd64]
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+
+archives:
+  - id: a2ald
+    ids: [a2ald]
+    name_template: "a2ald_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+
+nfpms:
+  - id: a2ald-pkg
+    package_name: a2ald
+    ids: [a2ald]
+    vendor: A2AL Authors
+    homepage: https://github.com/a2al/a2al
+    maintainer: A2AL Authors <noreply@github.com>
+    description: A2AL daemon — decentralized agent networking
+    license: Apache-2.0
+
+    formats: [deb, rpm]
+    bindir: /opt/a2al/bin
+
+    contents:
+      - src: deploy/linux/a2ald.service
+        dst: /etc/systemd/system/a2ald.service
+        file_info:
+          mode: 0644
+
+    scripts:
+      postinstall: deploy/linux/postinst
+      postremove: deploy/linux/postrm
+
+    file_name_template: "a2ald_{{ .Version }}_{{ .Arch }}"
+
+    overrides:
+      rpm:
+        file_name_template: "a2ald-{{ .Version }}-1.{{ .Arch }}"
+        dependencies:
+          - systemd
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - Merge pull request

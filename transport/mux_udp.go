@@ -4,6 +4,8 @@
 package transport
 
 import (
+	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"sync"
@@ -39,6 +41,14 @@ type UDPMux struct {
 	qMu      sync.Mutex
 	qReadDL  time.Time
 	qWriteDL time.Time
+
+	// UDP echo probe state (magic 0x00 0xEC).
+	// Daemon echoes each probe packet verbatim and reports aggregate stats every 10 s.
+	echoMu       sync.Mutex
+	echoWinStart time.Time
+	echoAddr     net.Addr
+	echoCount    int
+	echoBuckets  [4]int // ≤200 B, ≤500 B, ≤900 B, >900 B
 }
 
 type pkt struct {
@@ -75,6 +85,14 @@ func (m *UDPMux) readLoop() {
 			return
 		}
 		if n == 0 {
+			continue
+		}
+		// UDP echo probe: magic 0x00 0xEC — echo verbatim + accumulate stats.
+		// First byte 0x00 is outside both the QUIC range (0x40 bit set) and the
+		// CBOR map range (0xa0-0xbf), so there is no collision with real traffic.
+		if n >= 2 && buf[0] == 0x00 && buf[1] == 0xEC {
+			m.conn.WriteTo(buf[:n], addr)
+			m.recordEcho(addr, n)
 			continue
 		}
 		data := make([]byte, n)
@@ -226,4 +244,47 @@ func (c *muxQUICConn) SetWriteDeadline(t time.Time) error {
 	c.m.qWriteDL = t
 	c.m.qMu.Unlock()
 	return nil
+}
+
+// recordEcho accumulates per-window counters and, once 10 s have elapsed,
+// logs a summary at DEBUG and sends the same text back to the probe sender.
+// The stats packet uses magic 0x00 0xED so the sender can distinguish it from
+// regular echo replies.
+func (m *UDPMux) recordEcho(from net.Addr, size int) {
+	m.echoMu.Lock()
+	defer m.echoMu.Unlock()
+
+	now := time.Now()
+	m.echoAddr = from
+	m.echoCount++
+	switch {
+	case size <= 200:
+		m.echoBuckets[0]++
+	case size <= 500:
+		m.echoBuckets[1]++
+	case size <= 900:
+		m.echoBuckets[2]++
+	default:
+		m.echoBuckets[3]++
+	}
+
+	if m.echoWinStart.IsZero() {
+		m.echoWinStart = now
+		return
+	}
+	elapsed := now.Sub(m.echoWinStart)
+	if elapsed < 10*time.Second {
+		return
+	}
+
+	b, n := m.echoBuckets, m.echoCount
+	msg := fmt.Sprintf("recv=%d <=200:%d <=500:%d <=900:%d >900:%d window=%.0fs",
+		n, b[0], b[1], b[2], b[3], elapsed.Seconds())
+	slog.Default().Debug("udp echo", "from", from,
+		"recv", n, "<=200", b[0], "<=500", b[1], "<=900", b[2], ">900", b[3])
+	m.conn.WriteTo(append([]byte{0x00, 0xED}, []byte(msg)...), from)
+
+	m.echoWinStart = now
+	m.echoCount = 0
+	m.echoBuckets = [4]int{}
 }

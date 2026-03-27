@@ -1,10 +1,12 @@
-name: go
+name: build
 
 on:
   push:
-    branches: [main, master]
-  pull_request:
-    branches: [main, master]
+    tags:
+      - 'build-*'
+
+permissions:
+  contents: read
 
 jobs:
   test:
@@ -18,87 +20,42 @@ jobs:
         env:
           CGO_ENABLED: "0"
 
-  build:
+  packages:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { goos: linux,   goarch: amd64, ext: ""     }
-          - { goos: linux,   goarch: arm64, ext: ""     }
-          - { goos: darwin,  goarch: amd64, ext: ""     }
-          - { goos: darwin,  goarch: arm64, ext: ""     }
-          - { goos: windows, goarch: amd64, ext: ".exe" }
+    needs: test
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - uses: actions/setup-go@v5
         with:
           go-version: "1.24"
 
-      - name: build a2ald
-        run: go build -o a2ald-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }} ./cmd/a2ald
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          args: release --snapshot --clean -f .goreleaser.quick.yaml
         env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: "0"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - uses: actions/upload-artifact@v4
         with:
-          name: a2ald-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: a2ald-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
+          name: linux-amd64
+          path: |
+            dist/*linux_amd64*
+            dist/*.deb
+            dist/*.rpm
           retention-days: 7
 
-      - name: build demo4-marketplace
-        run: |
-          cd examples/demo4-marketplace
-          go build -o demo4-marketplace-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }} .
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: "0"
       - uses: actions/upload-artifact@v4
         with:
-          name: demo4-marketplace-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: examples/demo4-marketplace/demo4-marketplace-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
+          name: darwin-amd64
+          path: dist/*darwin_amd64*
           retention-days: 7
 
-  gomobile-android:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.24"
-      - uses: nttld/setup-ndk@v1
-        id: setup-ndk
-        with:
-          ndk-version: r25c
-      - name: gomobile bind (android)
-        env:
-          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
-        run: |
-          go install tool
-          gomobile init
-          gomobile bind -target=android -androidapi 21 -ldflags="-checklinkname=0" -o a2al.aar github.com/a2al/a2al/mobile
       - uses: actions/upload-artifact@v4
         with:
-          name: a2al-android-aar
-          path: a2al.aar
-          retention-days: 7
-
-  gomobile-ios:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.24"
-      - name: gomobile bind (ios)
-        run: |
-          go install tool
-          gomobile init
-          gomobile bind -target=ios -o A2AL.xcframework github.com/a2al/a2al/mobile
-      - uses: actions/upload-artifact@v4
-        with:
-          name: a2al-ios-xcframework
-          path: A2AL.xcframework
+          name: windows-amd64
+          path: dist/*windows_amd64*
           retention-days: 7

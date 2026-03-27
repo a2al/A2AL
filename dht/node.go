@@ -7,6 +7,7 @@ import (
 	"context"
 	crand "crypto/rand"
 	"errors"
+	"log/slog"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -35,6 +36,9 @@ type Config struct {
 	// MaxStoreKeys limits the number of distinct DHT keys in the local store.
 	// 0 uses DefaultMaxTotalKeys. Configurable per-node soft limit.
 	MaxStoreKeys int
+	// Logger is used for DHT-level diagnostics (send failures, RPC retries).
+	// If nil, slog.Default() is used.
+	Logger *slog.Logger
 }
 
 // Node is a single DHT participant (routing + local store + wire handler).
@@ -47,6 +51,7 @@ type Node struct {
 	store  *Store
 	ctx    context.Context
 	cancel context.CancelFunc
+	log    *slog.Logger
 
 	pendMu sync.Mutex
 	wait   map[string]*waitEntry
@@ -62,9 +67,14 @@ type Node struct {
 	onObservedAddr func(reporter a2al.NodeID, wire []byte)
 	auth           RecordAuthFunc // nil → no check
 
+	selfExtMu sync.RWMutex
+	selfExtIP net.IP // our own public IP (set by host after STUN/HTTP probe)
+
 	statsRx  atomic.Uint64
 	statsTx  atomic.Uint64
 	statsRPC atomic.Uint64 // outbound request/response pairs (sendAndWait success)
+
+	decodeErrNext atomic.Int64 // unix-nano: next time a decode-error WARN may fire
 }
 
 type waitEntry struct {
@@ -86,6 +96,10 @@ func NewNode(cfg Config) (*Node, error) {
 	}
 	addr := addrs[0]
 	nid := a2al.NodeIDFromAddress(addr)
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	n := &Node{
 		tr:     cfg.Transport,
@@ -95,6 +109,7 @@ func NewNode(cfg Config) (*Node, error) {
 		store:  NewStore(cfg.RecordAuth, cfg.MaxStoreKeys),
 		ctx:    ctx,
 		cancel: cancel,
+		log:            logger,
 		wait:           make(map[string]*waitEntry),
 		peers:          make(map[string]net.Addr),
 		onObservedAddr: cfg.OnObservedAddr,
@@ -121,6 +136,11 @@ func (n *Node) recvLoop() {
 		}
 		dec, err := protocol.VerifyAndDecode(data)
 		if err != nil {
+			now := time.Now().UnixNano()
+			if n.decodeErrNext.Load() <= now {
+				n.decodeErrNext.Store(now + int64(30*time.Second))
+				n.log.Warn("dht decode failed", "from", from, "err", err)
+			}
 			continue
 		}
 		n.statsRx.Add(1)
@@ -222,12 +242,7 @@ func (n *Node) tabAdd(ni protocol.NodeInfo) {
 	}
 	n.tabMu.Lock()
 	n.table.Remove(oldID)
-	// Add may return false if a concurrent tabAdd already refilled this bucket
-	// between the lock release above and re-acquisition here (TOCTOU: both
-	// goroutines raced on the same oldest entry, one already evicted it and
-	// filled the slot). Dropping ni is correct per Kademlia "prefer known nodes"
-	// semantics; the node will be re-discovered via future lookups.
-	_ = n.table.Add(ni)
+	n.table.Add(ni)
 	n.tabMu.Unlock()
 }
 
@@ -259,6 +274,40 @@ func (n *Node) BindPeerAddr(id a2al.NodeID, addr net.Addr) {
 	n.peers[nodeIDKey(id)] = addr
 }
 
+// SetSelfExtIP records our own public IP (from STUN/HTTP probe). Used to detect
+// NAT hairpin peers: nodes behind the same NAT share the same public IP and
+// typically cannot reach each other via that IP (router hairpinning not supported).
+func (n *Node) SetSelfExtIP(ip net.IP) {
+	n.selfExtMu.Lock()
+	n.selfExtIP = ip
+	n.selfExtMu.Unlock()
+}
+
+// isHairpinAddr returns true when addr shares our public IP but is not our own
+// port — a strong signal that sending to it requires NAT hairpinning.
+func (n *Node) isHairpinAddr(addr net.Addr) bool {
+	udp, ok := addr.(*net.UDPAddr)
+	if !ok {
+		return false
+	}
+	n.selfExtMu.RLock()
+	ext := n.selfExtIP
+	n.selfExtMu.RUnlock()
+	if ext == nil {
+		return false
+	}
+	if !ext.Equal(udp.IP) {
+		return false
+	}
+	// Same IP but different port → another node behind the same NAT.
+	// Same IP + same port → our own reflected address, not a peer.
+	self := n.tr.LocalAddr()
+	if selfUDP, ok := self.(*net.UDPAddr); ok && selfUDP.Port == udp.Port {
+		return false
+	}
+	return true
+}
+
 func (n *Node) reply(from net.Addr, req *protocol.DecodedMessage, msgType uint8, body any) {
 	hdr := protocol.Header{
 		Version: protocol.ProtocolVersion,
@@ -267,9 +316,12 @@ func (n *Node) reply(from net.Addr, req *protocol.DecodedMessage, msgType uint8,
 	}
 	raw, err := protocol.MarshalSignedMessageKeyStore(hdr, body, n.ks, n.addr)
 	if err != nil {
+		n.log.Warn("dht reply marshal failed", "msg_type", msgType, "to", from, "err", err)
 		return
 	}
-	if err := n.tr.Send(from, raw); err == nil {
+	if err := n.tr.Send(from, raw); err != nil {
+		n.log.Warn("dht reply send failed", "msg_type", msgType, "to", from, "size", len(raw), "err", err)
+	} else {
 		n.statsTx.Add(1)
 	}
 }
@@ -284,6 +336,7 @@ func (n *Node) onPing(from net.Addr, dec *protocol.DecodedMessage) {
 }
 
 func (n *Node) onFindNode(from net.Addr, dec *protocol.DecodedMessage) {
+	n.log.Debug("dht recv find_node", "from", from)
 	n.remember(from, dec)
 	target := dec.Body.(*protocol.BodyFindNode).Target
 	var tid a2al.NodeID
@@ -292,10 +345,18 @@ func (n *Node) onFindNode(from net.Addr, dec *protocol.DecodedMessage) {
 		Nodes:        n.tabNearest(tid, routing.K),
 		ObservedAddr: ObservedAddr(from),
 	}
+	for len(resp.Nodes) > 1 {
+		sz, err := protocol.FindNodeResponseWireSize(resp)
+		if err != nil || sz <= maxResponsePayload {
+			break
+		}
+		resp.Nodes = resp.Nodes[:len(resp.Nodes)-1]
+	}
 	n.reply(from, dec, protocol.MsgFindNodeResp, resp)
 }
 
 func (n *Node) onFindValue(from net.Addr, dec *protocol.DecodedMessage) {
+	n.log.Debug("dht recv find_value", "from", from)
 	n.remember(from, dec)
 	body := dec.Body.(*protocol.BodyFindValue)
 	var tid a2al.NodeID
@@ -308,22 +369,26 @@ func (n *Node) onFindValue(from net.Addr, dec *protocol.DecodedMessage) {
 		ObservedAddr: ObservedAddr(from),
 		Records:      records,
 	}
-	if best != nil {
+	// Only include the legacy Record field when it matches the requested type,
+	// to avoid wasting packet space with unrelated record types (e.g. endpoint
+	// records cluttering a mailbox query).
+	if best != nil && (body.RecType == 0 || best.RecType == body.RecType) {
 		r := *best
 		resp.Record = &r
 	}
-	const maxPayload = 1100
 	for {
 		sz, err := protocol.FindValueResponseWireSize(resp)
-		if err != nil || sz <= maxPayload {
+		if err != nil || sz <= maxResponsePayload {
 			break
 		}
 		if len(resp.Nodes) > 1 {
 			resp.Nodes = resp.Nodes[:len(resp.Nodes)-1]
 			continue
 		}
+		// Drop the oldest record (index 0) to preserve newer records for the
+		// requester. GetAll returns records in insertion order (oldest first).
 		if len(resp.Records) > 1 {
-			resp.Records = resp.Records[:len(resp.Records)-1]
+			resp.Records = resp.Records[1:]
 			continue
 		}
 		break
@@ -343,35 +408,66 @@ func (n *Node) onStore(from net.Addr, dec *protocol.DecodedMessage) {
 	n.reply(from, dec, protocol.MsgStoreResp, &protocol.BodyStoreResp{Stored: ok})
 }
 
+// rpcAttemptTimeout is the per-attempt deadline for a single UDP RPC round-trip.
+// rpcMaxAttempts is the number of retries on timeout (total = attempts × timeout = 15 s).
+const (
+	rpcAttemptTimeout = 5 * time.Second
+	rpcMaxAttempts    = 3
+)
+
+// maxResponsePayload is the maximum CBOR body size for response messages sent via reply().
+// wireOuter overhead: Header≈30 B + SenderPubkey(32+2)=34 B + Signature(64+2)=66 B +
+// bstr frame(3) + map/key framing(5) ≈ 138 B total.
+// 1200 (MaxPacketSize) - 138 (overhead) - 12 (safety margin) = 1050.
+const maxResponsePayload = 1050
+
 func (n *Node) sendAndWait(ctx context.Context, to net.Addr, hdr protocol.Header, body any, expect uint8) (*protocol.DecodedMessage, error) {
-	if len(hdr.TxID) != 20 {
+	for attempt := 0; attempt < rpcMaxAttempts; attempt++ {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		// Fresh TxID per attempt to avoid stale-response cross-matching.
 		hdr.TxID = make([]byte, 20)
 		if _, err := crand.Read(hdr.TxID); err != nil {
 			return nil, err
 		}
+		ch := n.registerWait(hdr.TxID, expect)
+		raw, err := protocol.MarshalSignedMessageKeyStore(hdr, body, n.ks, n.addr)
+		if err != nil {
+			n.unregisterWait(hdr.TxID)
+			return nil, err
+		}
+		if err := n.tr.Send(to, raw); err != nil {
+			n.unregisterWait(hdr.TxID)
+			return nil, err
+		}
+		n.statsTx.Add(1)
+
+		aCtx, aCancel := context.WithTimeout(ctx, rpcAttemptTimeout)
+		select {
+		case dec := <-ch:
+			aCancel()
+			n.statsRPC.Add(1)
+			return dec, nil
+		case <-aCtx.Done():
+			n.unregisterWait(hdr.TxID)
+			aCancel()
+			if n.ctx.Err() != nil {
+				return nil, n.ctx.Err()
+			}
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			n.log.Debug("dht rpc timeout, retrying", "to", to, "msg_type", hdr.MsgType, "attempt", attempt+1)
+			// per-attempt timeout; retry
+		case <-n.ctx.Done():
+			n.unregisterWait(hdr.TxID)
+			aCancel()
+			return nil, n.ctx.Err()
+		}
 	}
-	ch := n.registerWait(hdr.TxID, expect)
-	raw, err := protocol.MarshalSignedMessageKeyStore(hdr, body, n.ks, n.addr)
-	if err != nil {
-		n.unregisterWait(hdr.TxID)
-		return nil, err
-	}
-	if err := n.tr.Send(to, raw); err != nil {
-		n.unregisterWait(hdr.TxID)
-		return nil, err
-	}
-	n.statsTx.Add(1)
-	select {
-	case dec := <-ch:
-		n.statsRPC.Add(1)
-		return dec, nil
-	case <-ctx.Done():
-		n.unregisterWait(hdr.TxID)
-		return nil, ctx.Err()
-	case <-n.ctx.Done():
-		n.unregisterWait(hdr.TxID)
-		return nil, n.ctx.Err()
-	}
+	n.log.Warn("dht rpc failed after retries", "to", to, "msg_type", hdr.MsgType, "attempts", rpcMaxAttempts)
+	return nil, context.DeadlineExceeded
 }
 
 func (n *Node) notifyObserved(reporter a2al.NodeID, wire []byte) {

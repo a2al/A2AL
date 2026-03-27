@@ -71,6 +71,18 @@ func buildMCPServer(d *Daemon) *mcp.Server {
 		Description: "Publish endpoint record for an agent to the DHT.",
 	}, d.mcpAgentPublish)
 	mcp.AddTool(s, &mcp.Tool{
+		Name:        "a2al_agent_heartbeat",
+		Description: "Record agent liveness for auto-republish (within TTL); use when service is not on local service_tcp.",
+	}, d.mcpAgentHeartbeat)
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "a2al_agent_delete",
+		Description: "Unregister agent: remove from registry, stop auto-republish, delete operational key.",
+	}, d.mcpAgentDelete)
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "a2al_status",
+		Description: "Return node auto-publish status: auto_publish flag, node_aid, node_seq, last and next publish timestamps.",
+	}, d.mcpStatus)
+	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_agent_publish_record",
 		Description: "Publish sovereign custom DHT record RecType 0x02-0x0f.",
 	}, d.mcpAgentPublishRecord)
@@ -95,16 +107,16 @@ func buildMCPServer(d *Daemon) *mcp.Server {
 		Description: "Poll and decrypt mailbox for a registered agent.",
 	}, d.mcpMailboxPoll)
 	mcp.AddTool(s, &mcp.Tool{
-		Name:        "a2al_topic_register",
-		Description: "Register DHT topic discovery entries for an agent.",
+		Name:        "a2al_service_register",
+		Description: "Register DHT service discovery entries for an agent.",
 	}, d.mcpTopicRegister)
 	mcp.AddTool(s, &mcp.Tool{
-		Name:        "a2al_topic_unregister",
-		Description: "Remove a topic from agent renewal list; DHT TTL expires naturally.",
+		Name:        "a2al_service_unregister",
+		Description: "Remove a service from agent renewal list; DHT TTL expires naturally.",
 	}, d.mcpTopicUnregister)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_discover",
-		Description: "Search agents by topic(s) on the DHT.",
+		Description: "Search agents by service(s) on the DHT.",
 	}, d.mcpDiscover)
 
 	return s
@@ -267,6 +279,14 @@ func (d *Daemon) mcpAgentPublish(ctx context.Context, _ *mcp.ServerSession, para
 	return &mcp.CallToolResultFor[map[string]any]{StructuredContent: map[string]any{"ok": true, "seq": seq}}, nil
 }
 
+func (d *Daemon) mcpAgentHeartbeat(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[mcpAIDArgs]) (*mcp.CallToolResultFor[map[string]any], error) {
+	_ = ctx
+	if err := d.execAgentHeartbeat(params.Arguments.AID); err != nil {
+		return nil, err
+	}
+	return &mcp.CallToolResultFor[map[string]any]{StructuredContent: map[string]any{"ok": true}}, nil
+}
+
 type mcpPublishRecordArgs struct {
 	AID           string `json:"aid"`
 	RecType       uint8  `json:"rec_type"`
@@ -361,8 +381,8 @@ func (d *Daemon) mcpMailboxPoll(ctx context.Context, _ *mcp.ServerSession, param
 }
 
 type mcpTopicRegisterArgs struct {
-	AID       string         `json:"aid"`
-	Topics    []string       `json:"topics"`
+	AID      string         `json:"aid"`
+	Services []string       `json:"services"`
 	Name      string         `json:"name"`
 	Protocols []string       `json:"protocols"`
 	Tags      []string       `json:"tags"`
@@ -376,7 +396,7 @@ func (d *Daemon) mcpTopicRegister(ctx context.Context, _ *mcp.ServerSession, par
 	defer cancel()
 	a := params.Arguments
 	if err := d.execTopicRegister(tctx, a.AID, topicRegisterReq{
-		Topics: a.Topics, Name: a.Name, Protocols: a.Protocols,
+		Services: a.Services, Name: a.Name, Protocols: a.Protocols,
 		Tags: a.Tags, Brief: a.Brief, Meta: a.Meta, TTL: a.TTL,
 	}); err != nil {
 		return nil, err
@@ -385,16 +405,16 @@ func (d *Daemon) mcpTopicRegister(ctx context.Context, _ *mcp.ServerSession, par
 }
 
 type mcpTopicUnregisterArgs struct {
-	AID   string `json:"aid"`
-	Topic string `json:"topic"`
+	AID     string `json:"aid"`
+	Service string `json:"service"`
 }
 
 func (d *Daemon) mcpTopicUnregister(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[mcpTopicUnregisterArgs]) (*mcp.CallToolResultFor[map[string]any], error) {
 	_ = ctx
-	if params.Arguments.Topic == "" {
-		return nil, errors.New("topic required")
+	if params.Arguments.Service == "" {
+		return nil, errors.New("service required")
 	}
-	if err := d.execTopicUnregister(params.Arguments.AID, params.Arguments.Topic); err != nil {
+	if err := d.execTopicUnregister(params.Arguments.AID, params.Arguments.Service); err != nil {
 		return nil, err
 	}
 	return &mcp.CallToolResultFor[map[string]any]{StructuredContent: map[string]any{"ok": true}}, nil
@@ -408,6 +428,19 @@ func (d *Daemon) mcpDiscover(ctx context.Context, _ *mcp.ServerSession, params *
 		return nil, err
 	}
 	return &mcp.CallToolResultFor[map[string]any]{StructuredContent: map[string]any{"entries": entries}}, nil
+}
+
+func (d *Daemon) mcpAgentDelete(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[mcpAIDArgs]) (*mcp.CallToolResultFor[map[string]any], error) {
+	_ = ctx
+	if err := d.execAgentDelete(params.Arguments.AID); err != nil {
+		return nil, err
+	}
+	return &mcp.CallToolResultFor[map[string]any]{StructuredContent: map[string]any{"ok": true}}, nil
+}
+
+func (d *Daemon) mcpStatus(ctx context.Context, _ *mcp.ServerSession, _ *mcp.CallToolParamsFor[struct{}]) (*mcp.CallToolResultFor[map[string]any], error) {
+	_ = ctx
+	return &mcp.CallToolResultFor[map[string]any]{StructuredContent: d.execStatus()}, nil
 }
 
 func structToMap(v any) (map[string]any, error) {

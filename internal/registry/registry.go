@@ -14,6 +14,18 @@ import (
 	"github.com/a2al/a2al"
 )
 
+// ServiceRecord persists a published service (full payload) for auto-renewal.
+// JSON key is "services" to align with user-facing terminology.
+type ServiceRecord struct {
+	Topic     string         `json:"topic"`
+	Name      string         `json:"name,omitempty"`
+	Protocols []string       `json:"protocols,omitempty"`
+	Tags      []string       `json:"tags,omitempty"`
+	Brief     string         `json:"brief,omitempty"`
+	Meta      map[string]any `json:"meta,omitempty"`
+	TTL       uint32         `json:"ttl,omitempty"`
+}
+
 // Entry is one registered application agent (not the node identity).
 type Entry struct {
 	AID            a2al.Address
@@ -21,17 +33,19 @@ type Entry struct {
 	OpPriv         ed25519.PrivateKey
 	DelegationCBOR []byte
 	Seq            uint64
-	// Topics lists DHT topic strings this agent has registered (for renewal / unregister; spec §5.8).
-	Topics []string
+	// Services lists published service payloads for auto-renewal (user-facing name for DHT topics).
+	Services []ServiceRecord
 }
 
 type diskAgent struct {
-	AID                string   `json:"aid"`
-	ServiceTCP         string   `json:"service_tcp"`
-	OpPrivateKeyHex    string   `json:"op_private_key_hex"`
-	DelegationProofHex string   `json:"delegation_proof_hex"`
-	Seq                uint64   `json:"seq"`
-	Topics             []string `json:"topics,omitempty"`
+	AID                string          `json:"aid"`
+	ServiceTCP         string          `json:"service_tcp"`
+	OpPrivateKeyHex    string          `json:"op_private_key_hex"`
+	DelegationProofHex string          `json:"delegation_proof_hex"`
+	Seq                uint64          `json:"seq"`
+	Services           []ServiceRecord `json:"services,omitempty"`
+	// Topics is a legacy field (pre-v1.1); loaded for migration, never written.
+	Topics []string `json:"topics,omitempty"`
 }
 
 type diskFile struct {
@@ -80,13 +94,20 @@ func Load(path string) (*Registry, error) {
 		if err != nil {
 			continue
 		}
+		svcs := append([]ServiceRecord(nil), da.Services...)
+		// Migrate legacy topics list (name-only) to ServiceRecord if services absent.
+		if len(svcs) == 0 {
+			for _, t := range da.Topics {
+				svcs = append(svcs, ServiceRecord{Topic: t})
+			}
+		}
 		r.byAID[aid] = &Entry{
 			AID:            aid,
 			ServiceTCP:     da.ServiceTCP,
 			OpPriv:         ed25519.PrivateKey(opRaw),
 			DelegationCBOR: proof,
 			Seq:            da.Seq,
-			Topics:         append([]string(nil), da.Topics...),
+			Services:       svcs,
 		}
 	}
 	return r, nil
@@ -143,7 +164,7 @@ func (r *Registry) Save() error {
 			OpPrivateKeyHex:    hex.EncodeToString(e.OpPriv),
 			DelegationProofHex: hex.EncodeToString(e.DelegationCBOR),
 			Seq:                e.Seq,
-			Topics:             append([]string(nil), e.Topics...),
+			Services:           append([]ServiceRecord(nil), e.Services...),
 		})
 	}
 	b, err := json.MarshalIndent(df, "", "  ")

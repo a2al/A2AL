@@ -16,22 +16,26 @@ import (
 
 // Config is the a2ald configuration (spec Phase 3).
 type Config struct {
-	ListenAddr       string   `toml:"listen_addr"`
-	QUICListenAddr   string   `toml:"quic_listen_addr"`
-	Bootstrap        []string `toml:"bootstrap"`
-	DisableUPnP      bool     `toml:"disable_upnp"`
-	FallbackHost     string   `toml:"fallback_host"`
-	MinObservedPeers int      `toml:"min_observed_peers"`
-	APIAddr          string   `toml:"api_addr"`
-	APIToken         string   `toml:"api_token"`
-	KeyDir           string   `toml:"key_dir"`
-	LogFormat        string   `toml:"log_format"`
-	LogLevel         string   `toml:"log_level"`
+	ListenAddr       string   `toml:"listen_addr" json:"listen_addr"`
+	QUICListenAddr   string   `toml:"quic_listen_addr" json:"quic_listen_addr"`
+	Bootstrap        []string `toml:"bootstrap" json:"bootstrap"`
+	DisableUPnP      bool     `toml:"disable_upnp" json:"disable_upnp"`
+	FallbackHost     string   `toml:"fallback_host" json:"fallback_host"`
+	MinObservedPeers int      `toml:"min_observed_peers" json:"min_observed_peers"`
+	APIAddr          string   `toml:"api_addr" json:"api_addr"`
+	APIToken         string   `toml:"api_token" json:"api_token"`
+	KeyDir           string   `toml:"key_dir" json:"key_dir"`
+	LogFormat        string   `toml:"log_format" json:"log_format"`
+	LogLevel         string   `toml:"log_level" json:"log_level"`
 
-	ICESignalURL    string   `toml:"ice_signal_url"`
-	ICESTUNURLs     []string `toml:"ice_stun_urls"`
-	ICETURNURLs     []string `toml:"ice_turn_urls"`
-	ICEPublishTurns []string `toml:"ice_publish_turns"`
+	ICESignalURL    string   `toml:"ice_signal_url" json:"ice_signal_url"`
+	ICESTUNURLs     []string `toml:"ice_stun_urls" json:"ice_stun_urls"`
+	ICETURNURLs     []string `toml:"ice_turn_urls" json:"ice_turn_urls"`
+	ICEPublishTurns []string `toml:"ice_publish_turns" json:"ice_publish_turns"`
+	// AutoPublish controls whether the daemon publishes the node identity to the DHT
+	// on startup and on a schedule (default true). When false, the node stays off the DHT
+	// as a discoverable endpoint while still participating in routing.
+	AutoPublish bool `toml:"auto_publish" json:"auto_publish"`
 }
 
 // Default returns a copy with zero values filled to spec defaults.
@@ -48,6 +52,7 @@ func Default() Config {
 		KeyDir:           "",
 		LogFormat:        "text",
 		LogLevel:         "info",
+		AutoPublish:      true,
 	}
 }
 
@@ -140,6 +145,14 @@ func ApplyEnv(c *Config) {
 	}
 	if v := os.Getenv("A2AL_ICE_SIGNAL_URL"); v != "" {
 		c.ICESignalURL = v
+	}
+	if v := os.Getenv("A2AL_AUTO_PUBLISH"); v != "" {
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "0", "false", "no", "off":
+			c.AutoPublish = false
+		case "1", "true", "yes", "on":
+			c.AutoPublish = true
+		}
 	}
 }
 

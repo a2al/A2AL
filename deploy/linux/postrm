@@ -1,0 +1,8 @@
+#!/bin/bash
+set -e
+
+systemctl disable --now a2ald 2>/dev/null || true
+systemctl daemon-reload
+
+# Data and keys in /opt/a2al/data/ are intentionally preserved.
+# To fully remove: sudo rm -rf /opt/a2al/data && sudo userdel a2al

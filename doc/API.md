@@ -135,13 +135,13 @@ Use when you implement your own stack but need Kademlia-style RPCs and storage.
 | `SignedRecord` | On-wire CBOR container; optional `Delegation` bytes (field 9) for operational-key publishes. |
 | `EndpointPayload` | `Endpoints []string` (use `quic://host:port`), `NatType uint8` |
 | `EndpointRecord` | Decoded view after verify (`Address`, `Endpoints`, `NatType`, `Seq`, `Timestamp`, `TTL`) |
-| `SignEndpointRecord(priv, addr, payload, seq, timestamp, ttl)` | Build `SignedRecord` when the signing key is the AID’s master key |
+| `SignEndpointRecord(priv, addr, payload, seq, timestamp, ttl)` | Build `SignedRecord` when the signing key is the AID's master key |
 | `SignEndpointRecordDelegated(opPriv, delegationCBOR, addr, payload, seq, timestamp, ttl)` | Build `SignedRecord` when an operational key publishes for a master-derived `addr` |
 | `ParseEndpointRecord(sr)` | Verify and decode to `EndpointRecord` |
 | `VerifySignedRecord(sr, now)` | Cryptographic integrity + expiry + payload shape; does **not** enforce pubkey↔address authority (use `RecordAuth` at store/query) |
 | NAT constants | `NATUnknown`, `NATFullCone`, `NATRestricted`, `NATPortRestricted`, `NATSymmetric` |
 
-`timestamp` + `TTL` must cover “now” or verification/storage fails.
+`timestamp` + `TTL` must cover "now" or verification/storage fails.
 
 ### Mailbox (Phase 4)
 
@@ -170,22 +170,28 @@ Binds to `config.Config.APIAddr` (default `127.0.0.1:2121`). If `api_token` is s
 |--------|------|------|
 | `GET` | `/` | Embedded Web UI (HTML). |
 | `GET` | `/health` | `{"status":"ok"}`. |
+| `GET` | `/status` | Node status: `auto_publish`, `node_aid`, `node_seq`, `last_publish`, `next_publish`. |
 | `GET` | `/config` | Current config (`api_token` redacted as `***`). |
 | `PATCH` | `/config` | Partial update; response includes `restart_required` field names. |
 | `GET` | `/config/schema` | JSON Schema for config keys (UI / tooling). |
-| `POST` | `/identity/generate` | Generate master + operational keys and delegation proof; daemon does not retain the master key. |
-| `POST` | `/agents` | Register delegated agent (`operational_private_key_hex`, `delegation_proof_hex`, `service_tcp`). |
-| `GET` | `/agents` | List registered agents. |
-| `GET` | `/agents/{aid}` | Agent status (reachability, publish info). |
-| `PATCH` | `/agents/{aid}` | Update `service_tcp` (requires operational key). |
+| `POST` | `/identity/generate` | Generate Ed25519 master + operational keys and delegation proof; daemon does not retain the master key. |
+| `POST` | `/identity/generate-ethereum` | Generate Ethereum AID, secp256k1 owner key, Ed25519 op key, and EIP-191 delegation proof; keys are not stored. |
+| `POST` | `/ethereum/delegation-message` | Build EIP-191 `personal_sign` text from `agent`, `issued_at`, `expires_at`, and one of `operational_public_key_hex` / `operational_private_key_seed_hex`. |
+| `POST` | `/ethereum/register` | Register Ethereum-keyed agent after wallet `personal_sign`: `agent`, timestamps, `eth_signature_hex`, optional `service_tcp`, op key. |
+| `POST` | `/ethereum/proof` | Autonomous Ethereum delegation: `ethereum_private_key_hex` signs; op keys generated if omitted. |
+| `POST` | `/agents` | Register delegated agent (`operational_private_key_hex`, `delegation_proof_hex`, `service_tcp` optional). |
+| `GET` | `/agents` | List registered agents with status (`service_tcp_ok`, `heartbeat_seconds_ago`, `last_publish`). |
+| `GET` | `/agents/{aid}` | Single agent status (reachability, publish info). |
+| `PATCH` | `/agents/{aid}` | Update `service_tcp` (requires operational key); triggers implicit heartbeat. |
+| `DELETE` | `/agents/{aid}` | Unregister agent. |
 | `POST` | `/agents/{aid}/publish` | Publish/refresh DHT endpoint record. |
+| `POST` | `/agents/{aid}/heartbeat` | Explicit agent liveness signal for auto-republish. |
 | `POST` | `/agents/{aid}/records` | Sovereign custom record (RecType `0x02`–`0x0f`): `rec_type`, `payload_base64`, `ttl`; signed with operational key + delegation. |
 | `POST` | `/agents/{aid}/mailbox/send` | Encrypted mailbox: JSON `recipient`, `msg_type`, `body_base64` → `{"ok":true}`. |
 | `POST` | `/agents/{aid}/mailbox/poll` | Returns `{"messages":[{"sender","msg_type","body_base64"},...]}`. |
-| `POST` | `/agents/{aid}/topics` | Register topic(s): `topics`, `name`, `protocols`, `tags`, `brief`, optional `meta`, `ttl`. |
-| `DELETE` | `/agents/{aid}/topics/{topic...}` | Drop topic from daemon renewal list (send `Content-Type: application/json`, body `{}`); DHT entry expires by TTL. |
-| `POST` | `/discover` | `{"topics":["..."],"filter":{"protocols":[],"tags":[]}}` → `{"entries":[...]}`. |
-| `DELETE` | `/agents/{aid}` | Unregister agent. |
+| `POST` | `/agents/{aid}/services` | Register service(s): `services`, `name`, `protocols`, `tags`, `brief`, optional `meta` (incl. `url` for self-hosted agents), `ttl`. |
+| `DELETE` | `/agents/{aid}/services/{service...}` | Drop service from daemon renewal list (body `{}`); DHT entry expires by TTL. |
+| `POST` | `/discover` | `{"services":["..."],"filter":{"protocols":[],"tags":[]}}` → `{"entries":[{"service","aid","name",...},...]}`. |
 | `GET` | `/resolve/{aid}/records?type={rec_type}` | List verified `SignedRecord`s for remote AID; omit `type` or `type=0` for all RecTypes. Response `records[]` with `payload_base64`, `pubkey_base64`, `signature_base64`, etc. |
 | `POST` | `/resolve/{aid}` | Resolve remote AID to endpoint record JSON. |
 | `POST` | `/connect/{aid}` | Outbound tunnel: returns `{"tunnel":"127.0.0.1:<port>"}`; optional JSON `{"local_aid":"..."}` if multiple local agents. |
@@ -197,7 +203,7 @@ Binds to `config.Config.APIAddr` (default `127.0.0.1:2121`). If `api_token` is s
 - **Streamable HTTP**: mounted at `/mcp/` on the API server.  
 - **Stdio**: run `a2ald -mcp-stdio` (no HTTP API in that mode).
 
-Example tool names: `a2al_identity_generate`, `a2al_agents_list`, `a2al_agent_register`, `a2al_agent_get`, `a2al_agent_patch`, `a2al_agent_publish`, `a2al_agent_publish_record`, `a2al_resolve_records`, `a2al_resolve`, `a2al_connect`, `a2al_mailbox_send`, `a2al_mailbox_poll`, `a2al_topic_register`, `a2al_topic_unregister`, `a2al_discover`.
+All tools: `a2al_identity_generate`, `a2al_agents_generate_ethereum`, `a2al_ethereum_delegation_message`, `a2al_ethereum_register`, `a2al_ethereum_proof`, `a2al_agents_list`, `a2al_agent_register`, `a2al_agent_get`, `a2al_agent_patch`, `a2al_agent_publish`, `a2al_agent_heartbeat`, `a2al_agent_delete`, `a2al_agent_publish_record`, `a2al_status`, `a2al_resolve_records`, `a2al_resolve`, `a2al_connect`, `a2al_mailbox_send`, `a2al_mailbox_poll`, `a2al_service_register`, `a2al_service_unregister`, `a2al_discover`.
 
 ---
 

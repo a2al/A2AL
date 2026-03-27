@@ -19,6 +19,11 @@ import (
 const (
 	DefaultAlpha   = 3
 	DefaultStagger = 5 * time.Millisecond
+
+	// queryPeerTimeout is the per-peer deadline inside iterative queries.
+	// Shorter than sendAndWait's full 3×5 s = 15 s to avoid slow peers blocking
+	// entire query batches; allows one attempt with margin.
+	queryPeerTimeout = 6 * time.Second
 )
 
 // Query runs iterative FIND_NODE / FIND_VALUE (spec Step 8).
@@ -140,7 +145,12 @@ func (q *Query) FindNode(ctx context.Context, target a2al.NodeID) ([]protocol.No
 				queried[key] = struct{}{}
 				continue
 			}
-			if _, ok := q.n.lookupPeer(peerID); !ok {
+			addr, ok := q.n.lookupPeer(peerID)
+			if !ok {
+				continue
+			}
+			if q.n.isHairpinAddr(addr) {
+				queried[key] = struct{}{} // treat as done, won't respond
 				continue
 			}
 			batch = append(batch, ni)
@@ -176,7 +186,9 @@ func (q *Query) FindNode(ctx context.Context, target a2al.NodeID) ([]protocol.No
 						return
 					}
 				}
-				nodes, err := q.n.FindNode(ctx, addr, target)
+				peerCtx, peerCancel := context.WithTimeout(ctx, queryPeerTimeout)
+				defer peerCancel()
+				nodes, err := q.n.FindNode(peerCtx, addr, target)
 				if err != nil {
 					ch <- res{}
 					return
@@ -315,7 +327,12 @@ func (q *Query) FindRecords(ctx context.Context, target a2al.NodeID, recType uin
 				queried[key] = struct{}{}
 				continue
 			}
-			if _, ok := q.n.lookupPeer(peerID); !ok {
+			addr, ok := q.n.lookupPeer(peerID)
+			if !ok {
+				continue
+			}
+			if q.n.isHairpinAddr(addr) {
+				queried[key] = struct{}{}
 				continue
 			}
 			batch = append(batch, ni)
@@ -351,7 +368,9 @@ func (q *Query) FindRecords(ctx context.Context, target a2al.NodeID, recType uin
 						return
 					}
 				}
-				recs, nodes, err := q.n.FindValueWithNodes(ctx, addr, target, recType)
+				peerCtx, peerCancel := context.WithTimeout(ctx, queryPeerTimeout)
+				defer peerCancel()
+				recs, nodes, err := q.n.FindValueWithNodes(peerCtx, addr, target, recType)
 				if err != nil {
 					ch <- fvRes{}
 					return
@@ -374,6 +393,9 @@ func (q *Query) FindRecords(ctx context.Context, target a2al.NodeID, recType uin
 				}
 				candidates[k] = cloneNI(x)
 				q.n.absorbNodeInfo(x)
+			}
+			if len(batchMerged) > 0 {
+				break // fast path: got records, don't block on slow peers
 			}
 		}
 		if len(batchMerged) > 0 {
@@ -439,7 +461,12 @@ func (q *Query) AggregateRecords(ctx context.Context, target a2al.NodeID, recTyp
 				queried[key] = struct{}{}
 				continue
 			}
-			if _, ok := q.n.lookupPeer(peerID); !ok {
+			addr, ok := q.n.lookupPeer(peerID)
+			if !ok {
+				continue
+			}
+			if q.n.isHairpinAddr(addr) {
+				queried[key] = struct{}{}
 				continue
 			}
 			batch = append(batch, ni)
@@ -475,7 +502,9 @@ func (q *Query) AggregateRecords(ctx context.Context, target a2al.NodeID, recTyp
 						return
 					}
 				}
-				recs, nodes, err := q.n.FindValueWithNodes(ctx, addr, target, recType)
+				peerCtx, peerCancel := context.WithTimeout(ctx, queryPeerTimeout)
+				defer peerCancel()
+				recs, nodes, err := q.n.FindValueWithNodes(peerCtx, addr, target, recType)
 				if err != nil {
 					ch <- fvRes{}
 					return
@@ -487,19 +516,39 @@ func (q *Query) AggregateRecords(ctx context.Context, target a2al.NodeID, recTyp
 			wg.Wait()
 			close(ch)
 		}()
-		for r := range ch {
-			now := time.Now()
-			mergeAggregate(merged, filterRecordsAuth(q.n, target, r.recs, now))
-			for _, x := range r.nodes {
-				k := infoKey(x)
-				if k == "" {
-					continue
+		batchTimer := time.NewTimer(queryPeerTimeout + 500*time.Millisecond)
+		received := 0
+	batchLoop:
+		for received < len(batch) {
+			select {
+			case r, ok := <-ch:
+				if !ok {
+					break batchLoop
 				}
-				candidates[k] = cloneNI(x)
-				q.n.absorbNodeInfo(x)
+				now := time.Now()
+				mergeAggregate(merged, filterRecordsAuth(q.n, target, r.recs, now))
+				for _, x := range r.nodes {
+					k := infoKey(x)
+					if k == "" {
+						continue
+					}
+					candidates[k] = cloneNI(x)
+					q.n.absorbNodeInfo(x)
+				}
+				received++
+			case <-batchTimer.C:
+				break batchLoop
+			case <-ctx.Done():
+				batchTimer.Stop()
+				if len(merged) == 0 {
+					return nil, ctx.Err()
+				}
+				goto aggregateDone
 			}
 		}
+		batchTimer.Stop()
 	}
+aggregateDone:
 	if len(merged) == 0 {
 		return nil, ErrNoMatchingRecords
 	}

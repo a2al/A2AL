@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -59,6 +60,17 @@ type Daemon struct {
 	// daemon session (DHT records persist until TTL expiry).
 	mailboxSeenMu sync.Mutex
 	mailboxSeen   map[string]map[string]time.Time // aidStr → msgKey → first-seen time
+
+	nodePublishMu  sync.Mutex
+	nodePublishSeq uint64 // last successfully published DHT seq for node identity
+
+	publishMetaMu    sync.Mutex
+	nodeLastPublish  time.Time
+	lastEndpointsFP  string // for detecting IP / endpoint list changes
+	agentLastPublish map[a2al.Address]time.Time
+
+	heartbeatMu sync.Mutex
+	heartbeatAt map[a2al.Address]time.Time
 }
 
 // APIAddr returns the REST API / Web UI listen address from the loaded config.
@@ -95,7 +107,23 @@ func New(cfg Config) (*Daemon, error) {
 
 	log := cfg.Log
 	if log == nil {
-		log = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+		level := slog.LevelInfo
+		switch strings.ToLower(strings.TrimSpace(nodeCfg.LogLevel)) {
+		case "debug":
+			level = slog.LevelDebug
+		case "warn", "warning":
+			level = slog.LevelWarn
+		case "error":
+			level = slog.LevelError
+		}
+		opts := &slog.HandlerOptions{Level: level}
+		var h slog.Handler
+		if strings.ToLower(strings.TrimSpace(nodeCfg.LogFormat)) == "json" {
+			h = slog.NewJSONHandler(os.Stdout, opts)
+		} else {
+			h = slog.NewTextHandler(os.Stdout, opts)
+		}
+		log = slog.New(h)
 	}
 
 	keyPath := filepath.Join(nodeCfg.KeyDirOrDefault(cfg.DataDir), "node.key")
@@ -120,19 +148,23 @@ func New(cfg Config) (*Daemon, error) {
 		ICESTUNURLs:      nodeCfg.ICESTUNURLs,
 		ICETURNURLs:      nodeCfg.ICETURNURLs,
 		ICEPublishTurns:  nodeCfg.ICEPublishTurns,
+		Logger:           log,
 	})
 	if err != nil {
 		return nil, err
 	}
 
 	return &Daemon{
-		dataDir:  cfg.DataDir,
-		cfgPath:  cfgPath,
-		cfg:      &nodeCfg,
-		log:      log,
-		h:        h,
-		reg:      reg,
-		nodeAddr: ks.Address(),
+		dataDir:          cfg.DataDir,
+		cfgPath:          cfgPath,
+		cfg:              &nodeCfg,
+		log:              log,
+		h:                h,
+		reg:              reg,
+		nodeAddr:         ks.Address(),
+		agentLastPublish: make(map[a2al.Address]time.Time),
+		heartbeatAt:      make(map[a2al.Address]time.Time),
+		mailboxSeen:      make(map[string]map[string]time.Time),
 	}, nil
 }
 
@@ -142,7 +174,6 @@ func (d *Daemon) Run(ctx context.Context, mcpStdio bool) error {
 	defer func() {
 		savePeersCache(filepath.Join(d.dataDir, "peers.cache"), d.h, d.log)
 		_ = d.h.Close()
-		_ = config.Save(d.cfgPath, *d.cfg)
 	}()
 
 	runBootstrapChain(ctx, d.h, d.cfg, d.dataDir, d.log)
@@ -152,6 +183,11 @@ func (d *Daemon) Run(ctx context.Context, mcpStdio bool) error {
 			d.log.Warn("re-register agent", "aid", e.AID.String(), "err", err)
 		}
 	}
+
+	d.initialAutoPublish(ctx)
+	loopCtx, loopCancel := context.WithCancel(ctx)
+	defer loopCancel()
+	go d.autoPublishMainLoop(loopCtx)
 
 	gwCtx, gwCancel := context.WithCancel(ctx)
 	defer gwCancel()

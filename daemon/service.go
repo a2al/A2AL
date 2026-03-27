@@ -57,11 +57,11 @@ func (d *Daemon) execIdentityGenerate() (identityGenResp, error) {
 }
 
 type ethereumGenResp struct {
-	EthereumPrivateKeyHex     string `json:"ethereum_private_key_hex"`
-	OperationalPrivateKeyHex  string `json:"operational_private_key_hex"`
-	DelegationProofHex        string `json:"delegation_proof_hex"`
-	AID                       string `json:"aid"`
-	Warning                   string `json:"warning"`
+	EthereumPrivateKeyHex    string `json:"ethereum_private_key_hex"`
+	OperationalPrivateKeyHex string `json:"operational_private_key_hex"`
+	DelegationProofHex       string `json:"delegation_proof_hex"`
+	AID                      string `json:"aid"`
+	Warning                  string `json:"warning"`
 }
 
 func (d *Daemon) execEthereumIdentityGenerate() (ethereumGenResp, error) {
@@ -90,11 +90,10 @@ func (d *Daemon) persistDelegatedAgent(aid a2al.Address, opPriv ed25519.PrivateK
 	if aid == d.nodeAddr {
 		return errNodeAsAgent
 	}
-	if serviceTCP == "" {
-		return errServiceTCPRequired
-	}
-	if !probeTCP(serviceTCP, 2*time.Second) {
-		return errServiceTCPUnreachable
+	// service_tcp is optional: agents with their own public URL don't need daemon gateway forwarding.
+	// Warn when set but unreachable; do not block registration.
+	if serviceTCP != "" && !probeTCP(serviceTCP, 2*time.Second) {
+		d.log.Warn("service_tcp unreachable at registration time; daemon gateway forwarding will not work until it becomes reachable", "aid", aid.String(), "service_tcp", serviceTCP)
 	}
 	if err := d.h.RegisterDelegatedAgent(aid, opPriv, proofRaw); err != nil {
 		return err
@@ -104,7 +103,7 @@ func (d *Daemon) persistDelegatedAgent(aid a2al.Address, opPriv ed25519.PrivateK
 		ServiceTCP:     serviceTCP,
 		OpPriv:         opPriv,
 		DelegationCBOR: proofRaw,
-		Seq:            1,
+		Seq:            0, // first DHT publish uses seq 1 via POST /publish or auto-republish
 	}
 	if err := d.reg.Put(ent); err != nil {
 		d.h.UnregisterAgent(aid)
@@ -320,13 +319,50 @@ func (d *Daemon) execAgentsList() []map[string]any {
 	d.regMu.RLock()
 	list := d.reg.List()
 	d.regMu.RUnlock()
+
+	// Snapshot shared maps under their respective locks to avoid holding both
+	// locks simultaneously (deadlock prevention).
+	d.heartbeatMu.Lock()
+	hbSnap := make(map[a2al.Address]time.Time, len(d.heartbeatAt))
+	for k, v := range d.heartbeatAt {
+		hbSnap[k] = v
+	}
+	d.heartbeatMu.Unlock()
+
+	d.publishMetaMu.Lock()
+	pubSnap := make(map[a2al.Address]time.Time, len(d.agentLastPublish))
+	for k, v := range d.agentLastPublish {
+		pubSnap[k] = v
+	}
+	d.publishMetaMu.Unlock()
+
 	out := make([]map[string]any, 0, len(list))
 	for _, e := range list {
-		out = append(out, map[string]any{
-			"aid":         e.AID.String(),
-			"service_tcp": e.ServiceTCP,
-			"seq":         e.Seq,
-		})
+		var tcpOK any // nil = not configured; bool = probe result
+		if e.ServiceTCP != "" {
+			tcpOK = probeTCP(e.ServiceTCP, 2*time.Second)
+		}
+		m := map[string]any{
+			"aid":              e.AID.String(),
+			"service_tcp":      e.ServiceTCP,
+			"seq":              e.Seq,
+			"service_tcp_ok":   tcpOK,
+			"published_to_dht": e.Seq > 0,
+			"services":         e.Services,
+		}
+		if hbT, ok := hbSnap[e.AID]; ok {
+			m["heartbeat_seconds_ago"] = time.Since(hbT).Seconds()
+		} else {
+			m["heartbeat_seconds_ago"] = nil
+		}
+		if lastPub := pubSnap[e.AID]; !lastPub.IsZero() {
+			m["last_publish_at"] = lastPub.UTC().Format(time.RFC3339)
+			m["next_republish_estimate"] = lastPub.Add(republishPeriod).UTC().Format(time.RFC3339)
+		} else {
+			m["last_publish_at"] = nil
+			m["next_republish_estimate"] = nil
+		}
+		out = append(out, m)
 	}
 	return out
 }
@@ -342,17 +378,40 @@ func (d *Daemon) execAgentGet(ctx context.Context, aidStr string) (map[string]an
 	if e == nil {
 		return nil, errNotFound
 	}
+	var tcpOK any // nil = not configured; bool = probe result
+	if e.ServiceTCP != "" {
+		tcpOK = probeTCP(e.ServiceTCP, 2*time.Second)
+	}
 	out := map[string]any{
 		"aid":                  e.AID.String(),
 		"service_tcp":          e.ServiceTCP,
 		"seq":                  e.Seq,
-		"service_tcp_ok":       probeTCP(e.ServiceTCP, 2*time.Second),
+		"service_tcp_ok":       tcpOK,
 		"published_to_dht":     e.Seq > 0,
+		"services":             e.Services,
 		"published_endpoints":  nil,
 		"published_nat_type":   nil,
 		"published_record_seq": nil,
 	}
-	if e.Seq > 1 {
+	d.heartbeatMu.Lock()
+	hbT, hbOK := d.heartbeatAt[e.AID]
+	d.heartbeatMu.Unlock()
+	if hbOK {
+		out["heartbeat_seconds_ago"] = time.Since(hbT).Seconds()
+	} else {
+		out["heartbeat_seconds_ago"] = nil
+	}
+	d.publishMetaMu.Lock()
+	lastPub := d.agentLastPublish[e.AID]
+	d.publishMetaMu.Unlock()
+	if !lastPub.IsZero() {
+		out["last_publish_at"] = lastPub.UTC().Format(time.RFC3339)
+		out["next_republish_estimate"] = lastPub.Add(republishPeriod).UTC().Format(time.RFC3339)
+	} else {
+		out["last_publish_at"] = nil
+		out["next_republish_estimate"] = nil
+	}
+	if e.Seq > 0 {
 		rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		er, err := d.h.Resolve(rctx, aid)
 		cancel()
@@ -376,14 +435,33 @@ func (d *Daemon) execAgentPublish(ctx context.Context, aidStr string) (uint64, e
 	if e == nil {
 		return 0, errNotFound
 	}
-	if !probeTCP(e.ServiceTCP, 2*time.Second) {
-		return 0, errServiceTCPUnreachable
+	// Warn when service_tcp is set but unreachable; still allow publish for agents with their own public URL.
+	if e.ServiceTCP != "" && !probeTCP(e.ServiceTCP, 2*time.Second) {
+		d.log.Warn("service_tcp unreachable at publish time; daemon gateway forwarding will not work", "aid", aid.String(), "service_tcp", e.ServiceTCP)
 	}
 	nextSeq := e.Seq + 1
 	if err := d.h.PublishEndpointForAgent(ctx, aid, nextSeq, 3600); err != nil {
+		// Stale record: DHT peers hold a higher seq (e.g. agent was deleted and
+		// re-imported, resetting local seq to 0). Resolve the current network seq
+		// and retry once at networkSeq+1 — symmetric to recoverSeqFromNetwork for
+		// the node AID.
+		if errors.Is(err, dht.ErrStaleRecord) {
+			if er, rerr := d.h.Resolve(ctx, aid); rerr == nil && er.Seq >= nextSeq {
+				d.log.Info("agent seq recovery: network ahead, retrying",
+					"aid", aid.String(), "network_seq", er.Seq, "local_seq", e.Seq)
+				nextSeq = er.Seq + 1
+				if err2 := d.h.PublishEndpointForAgent(ctx, aid, nextSeq, 3600); err2 != nil {
+					d.log.Warn("publish endpoint (retry)", "aid", aid.String(), "err", err2)
+					return 0, errPublish
+				}
+				// Retry succeeded — fall through to persist the updated seq.
+				goto persist
+			}
+		}
 		d.log.Warn("publish endpoint", "aid", aid.String(), "err", err)
 		return 0, errPublish
 	}
+persist:
 	d.regMu.Lock()
 	defer d.regMu.Unlock()
 	e = d.reg.Get(aid)
@@ -394,7 +472,77 @@ func (d *Daemon) execAgentPublish(ctx context.Context, aidStr string) (uint64, e
 	if err := d.reg.Put(e); err != nil {
 		return 0, errPersist
 	}
+	d.recordAgentPublishTime(aid)
 	return nextSeq, nil
+}
+
+// touchHeartbeat records agent liveness for auto-republish (middleware + explicit heartbeat).
+// If the agent's last publish is stale or unknown (e.g. after daemon restart), an immediate
+// background republish is triggered so services recover without waiting for the 30-min tick.
+func (d *Daemon) touchHeartbeat(aid a2al.Address) {
+	d.heartbeatMu.Lock()
+	if d.heartbeatAt == nil {
+		d.heartbeatAt = make(map[a2al.Address]time.Time)
+	}
+	d.heartbeatAt[aid] = time.Now()
+	d.heartbeatMu.Unlock()
+
+	d.publishMetaMu.Lock()
+	lastPub := d.agentLastPublish[aid]
+	d.publishMetaMu.Unlock()
+
+	if time.Since(lastPub) > republishPeriod && d.reg != nil {
+		d.regMu.RLock()
+		e := d.reg.Get(aid)
+		d.regMu.RUnlock()
+		if e != nil {
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+				defer cancel()
+				d.tryRepublishAgent(ctx, e)
+			}()
+		}
+	}
+}
+
+func (d *Daemon) execAgentHeartbeat(aidStr string) error {
+	aid, err := a2al.ParseAddress(aidStr)
+	if err != nil {
+		return errBadAID
+	}
+	d.regMu.RLock()
+	e := d.reg.Get(aid)
+	d.regMu.RUnlock()
+	if e == nil {
+		return errNotFound
+	}
+	d.touchHeartbeat(aid)
+	return nil
+}
+
+func (d *Daemon) execStatus() map[string]any {
+	d.nodePublishMu.Lock()
+	nseq := d.nodePublishSeq
+	d.nodePublishMu.Unlock()
+	d.publishMetaMu.Lock()
+	nlp := d.nodeLastPublish
+	d.publishMetaMu.Unlock()
+	out := map[string]any{
+		"node_aid":             d.nodeAddr.String(),
+		"auto_publish":         d.cfg.AutoPublish,
+		"node_seq":             nseq,
+		"node_published":       nseq > 0,
+		"republish_interval_s": int(republishPeriod.Seconds()),
+		"endpoint_ttl_s":       int(endpointRecordTTL),
+	}
+	if !nlp.IsZero() {
+		out["node_last_publish_at"] = nlp.UTC().Format(time.RFC3339)
+		out["node_next_republish_estimate"] = nlp.Add(republishPeriod).UTC().Format(time.RFC3339)
+	} else {
+		out["node_last_publish_at"] = nil
+		out["node_next_republish_estimate"] = nil
+	}
+	return out
 }
 
 func (d *Daemon) execAgentDelete(aidStr string) error {
@@ -411,6 +559,12 @@ func (d *Daemon) execAgentDelete(aidStr string) error {
 	if err := d.reg.Delete(aid); err != nil {
 		return errPersist
 	}
+	d.heartbeatMu.Lock()
+	delete(d.heartbeatAt, aid)
+	d.heartbeatMu.Unlock()
+	d.publishMetaMu.Lock()
+	delete(d.agentLastPublish, aid)
+	d.publishMetaMu.Unlock()
 	return nil
 }
 
@@ -418,9 +572,6 @@ func (d *Daemon) execAgentPatch(aidStr string, req patchAgentReq) error {
 	aid, err := a2al.ParseAddress(aidStr)
 	if err != nil {
 		return errBadAID
-	}
-	if req.ServiceTCP == "" {
-		return errServiceTCPRequired
 	}
 	opPrivBytes, err := hex.DecodeString(req.OperationalPrivateKeyHex)
 	if err != nil || len(opPrivBytes) != ed25519.PrivateKeySize {
@@ -436,8 +587,9 @@ func (d *Daemon) execAgentPatch(aidStr string, req patchAgentReq) error {
 	if subtle.ConstantTimeCompare(e.OpPriv, opPriv) != 1 {
 		return errOpKeyMismatch
 	}
-	if !probeTCP(req.ServiceTCP, 2*time.Second) {
-		return errServiceTCPUnreachable
+	// service_tcp is optional; warn when set but unreachable, do not block.
+	if req.ServiceTCP != "" && !probeTCP(req.ServiceTCP, 2*time.Second) {
+		d.log.Warn("service_tcp unreachable", "aid", aid.String(), "service_tcp", req.ServiceTCP)
 	}
 	e.ServiceTCP = req.ServiceTCP
 	return d.reg.Put(e)
@@ -577,7 +729,7 @@ func mailboxMsgKey(m protocol.MailboxMessage) string {
 }
 
 type topicRegisterReq struct {
-	Topics    []string       `json:"topics"`
+	Services  []string       `json:"services"`
 	Name      string         `json:"name"`
 	Protocols []string       `json:"protocols"`
 	Tags      []string       `json:"tags"`
@@ -587,7 +739,7 @@ type topicRegisterReq struct {
 }
 
 type discoverReq struct {
-	Topics []string                 `json:"topics"`
+	Services []string                 `json:"services"`
 	Filter *protocol.DiscoverFilter `json:"filter,omitempty"`
 }
 
@@ -598,7 +750,7 @@ func topicEntryToMap(e protocol.TopicEntry) map[string]any {
 		"timestamp": e.Timestamp,
 		"ttl":       e.TTL,
 		"version":   e.Version,
-		"topic":     e.Topic,
+		"service":   e.Topic,
 		"name":      e.Name,
 		"protocols": e.Protocols,
 		"tags":      e.Tags,
@@ -612,14 +764,8 @@ func (d *Daemon) execTopicRegister(ctx context.Context, aidStr string, req topic
 	if err != nil {
 		return errBadAID
 	}
-	if len(req.Topics) == 0 {
-		return errTopicsRequired
-	}
-	d.regMu.RLock()
-	e := d.reg.Get(aid)
-	d.regMu.RUnlock()
-	if e == nil {
-		return errNotFound
+	if len(req.Services) == 0 {
+		return errServicesRequired
 	}
 	base := protocol.TopicPayload{
 		Name:      req.Name,
@@ -628,7 +774,16 @@ func (d *Daemon) execTopicRegister(ctx context.Context, aidStr string, req topic
 		Brief:     req.Brief,
 		Meta:      req.Meta,
 	}
-	if err := d.h.RegisterTopicsForAgent(ctx, aid, req.Topics, base, req.TTL); err != nil {
+	if aid == d.nodeAddr {
+		return d.h.RegisterTopicsForAgent(ctx, aid, req.Services, base, req.TTL)
+	}
+	d.regMu.RLock()
+	e := d.reg.Get(aid)
+	d.regMu.RUnlock()
+	if e == nil {
+		return errNotFound
+	}
+	if err := d.h.RegisterTopicsForAgent(ctx, aid, req.Services, base, req.TTL); err != nil {
 		return err
 	}
 	d.regMu.Lock()
@@ -637,19 +792,34 @@ func (d *Daemon) execTopicRegister(ctx context.Context, aidStr string, req topic
 	if e == nil {
 		return errNotFound
 	}
-	seen := make(map[string]struct{}, len(e.Topics)+len(req.Topics))
-	for _, t := range e.Topics {
-		seen[t] = struct{}{}
+	// Build a map of existing services keyed by topic name for upsert.
+	byTopic := make(map[string]registry.ServiceRecord, len(e.Services)+len(req.Services))
+	for _, s := range e.Services {
+		byTopic[s.Topic] = s
 	}
-	for _, t := range req.Topics {
-		seen[t] = struct{}{}
+	ttl := req.TTL
+	if ttl == 0 {
+		ttl = 3600
 	}
-	next := make([]string, 0, len(seen))
-	for t := range seen {
-		next = append(next, t)
+	for _, t := range req.Services {
+		byTopic[t] = registry.ServiceRecord{
+			Topic:     t,
+			Name:      req.Name,
+			Protocols: req.Protocols,
+			Tags:      req.Tags,
+			Brief:     req.Brief,
+			Meta:      req.Meta,
+			TTL:       ttl,
+		}
 	}
-	slices.Sort(next)
-	e.Topics = next
+	next := make([]registry.ServiceRecord, 0, len(byTopic))
+	for _, s := range byTopic {
+		next = append(next, s)
+	}
+	slices.SortFunc(next, func(a, b registry.ServiceRecord) int {
+		return strings.Compare(a.Topic, b.Topic)
+	})
+	e.Services = next
 	return d.reg.Put(e)
 }
 
@@ -658,32 +828,36 @@ func (d *Daemon) execTopicUnregister(aidStr, topic string) error {
 	if err != nil {
 		return errBadAID
 	}
+	if aid == d.nodeAddr {
+		// Node topics are not tracked in agents.json; DHT TTL handles expiry.
+		return nil
+	}
 	d.regMu.Lock()
 	defer d.regMu.Unlock()
 	e := d.reg.Get(aid)
 	if e == nil {
 		return errNotFound
 	}
-	out := make([]string, 0, len(e.Topics))
-	for _, t := range e.Topics {
-		if t != topic {
-			out = append(out, t)
+	out := make([]registry.ServiceRecord, 0, len(e.Services))
+	for _, s := range e.Services {
+		if s.Topic != topic {
+			out = append(out, s)
 		}
 	}
-	e.Topics = out
+	e.Services = out
 	return d.reg.Put(e)
 }
 
 func (d *Daemon) execDiscover(ctx context.Context, req discoverReq) ([]map[string]any, error) {
-	if len(req.Topics) == 0 {
-		return nil, errTopicsRequired
+	if len(req.Services) == 0 {
+		return nil, errServicesRequired
 	}
 	var entries []protocol.TopicEntry
 	var err error
-	if len(req.Topics) == 1 {
-		entries, err = d.h.SearchTopic(ctx, req.Topics[0])
+	if len(req.Services) == 1 {
+		entries, err = d.h.SearchTopic(ctx, req.Services[0])
 	} else {
-		entries, err = d.h.SearchTopics(ctx, req.Topics)
+		entries, err = d.h.SearchTopics(ctx, req.Services)
 	}
 	if err != nil {
 		return nil, err
@@ -805,10 +979,8 @@ var (
 	errBadOpKeyHex           = errors.New("bad operational_private_key_hex")
 	errDelegationVerify      = errors.New("delegation verify")
 	errAID                   = errors.New("aid")
-	errNodeAsAgent           = errors.New("cannot register node identity as agent")
-	errServiceTCPRequired    = errors.New("service_tcp required")
-	errServiceTCPUnreachable = errors.New("service_tcp unreachable")
-	errPersist               = errors.New("persist failed")
+	errNodeAsAgent = errors.New("cannot register node identity as agent")
+	errPersist     = errors.New("persist failed")
 	errBadAID                = errors.New("bad aid")
 	errNotFound              = errors.New("not found")
 	errPublish               = errors.New("publish failed")
@@ -817,7 +989,7 @@ var (
 	errListen                = errors.New("listen failed")
 	errConnectQUIC           = errors.New("quic connect failed")
 	errOpKeyMismatch         = errors.New("operational key mismatch")
-	errTopicsRequired        = errors.New("topics required")
+	errServicesRequired      = errors.New("services required")
 	errBadRecType            = errors.New("rec_type must be sovereign custom 0x02-0x0f")
 	errTTLRequired           = errors.New("ttl required")
 	errBadPayloadB64         = errors.New("invalid payload_base64")

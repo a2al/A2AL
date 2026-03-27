@@ -1,4 +1,5 @@
 doc-local/
+daemon/webui/node_modules/
 *.exe
 *.exe~
 identity-*.json

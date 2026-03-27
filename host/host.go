@@ -20,6 +20,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"strconv"
@@ -78,6 +79,9 @@ type Config struct {
 	ICETURNURLs []string
 	// ICEPublishTurns lists credential-free turn: hints stored in EndpointPayload.Turns.
 	ICEPublishTurns []string
+	// Logger is forwarded to the DHT node for diagnostic logging (reply failures, RPC retries).
+	// If nil, slog.Default() is used.
+	Logger *slog.Logger
 }
 
 // agentRouteMagic is the 4-byte prefix of the agent-route control stream.
@@ -104,6 +108,7 @@ type agentEntry struct {
 // Host is the Phase 2a runtime.
 type Host struct {
 	cfg     Config
+	log     *slog.Logger
 	addr    a2al.Address // default (first) agent address
 	priv    ed25519.PrivateKey
 	mux     *transport.UDPMux
@@ -172,6 +177,7 @@ func New(cfg Config) (*Host, error) {
 			sense.Record(reporter, wire)
 		},
 		RecordAuth: recordAuthPolicy,
+		Logger:     cfg.Logger,
 	}
 
 	var node *dht.Node
@@ -222,8 +228,13 @@ func New(cfg Config) (*Host, error) {
 		return nil, err
 	}
 
+	hlog := cfg.Logger
+	if hlog == nil {
+		hlog = slog.Default()
+	}
 	h := &Host{
 		cfg:    cfg,
+		log:    hlog,
 		addr:   myAddr,
 		priv:   priv,
 		mux:    mux,
@@ -345,12 +356,27 @@ func (h *Host) ObserveFromPeers(ctx context.Context, seeds []net.Addr) {
 // BuildEndpointPayload builds ordered, deduplicated quic:// candidates (Phase 2b).
 // UPnP discovery and external IP probing (STUN + HTTP) run concurrently.
 func (h *Host) BuildEndpointPayload(ctx context.Context) (protocol.EndpointPayload, error) {
+	t0 := time.Now()
 	upCh := make(chan string, 1)
 	extCh := make(chan string, 1)
 	go func() { upCh <- h.ensureUPnP(ctx) }()
 	go func() { extCh <- h.ensureExternalIP(ctx) }()
 	up := <-upCh
 	ext := <-extCh
+	if elapsed := time.Since(t0).Truncate(time.Millisecond); elapsed > 0 {
+		h.log.Debug("endpoint probe done", "elapsed", elapsed, "ext_ip", ext, "upnp", up)
+	}
+
+	// Keep the DHT node informed of our public IP so it can detect NAT hairpin peers.
+	if ext != "" {
+		ipStr := ext
+		if host, _, err := net.SplitHostPort(ext); err == nil {
+			ipStr = host
+		}
+		if ip := net.ParseIP(ipStr); ip != nil {
+			h.node.SetSelfExtIP(ip)
+		}
+	}
 
 	eps, err := h.orderedQUICEndpointStrings(ext, up)
 	if err != nil {

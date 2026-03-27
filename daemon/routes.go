@@ -21,8 +21,8 @@ import (
 
 func (d *Daemon) routes() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /{$}", d.handleWebUIRoot)
 	mux.HandleFunc("GET /health", d.handleHealth)
+	mux.HandleFunc("GET /status", d.handleStatus)
 	mux.HandleFunc("GET /config", d.handleGetConfig)
 	mux.HandleFunc("PATCH /config", d.handlePatchConfig)
 	mux.HandleFunc("GET /config/schema", d.handleConfigSchema)
@@ -34,21 +34,64 @@ func (d *Daemon) routes() http.Handler {
 	mux.HandleFunc("POST /agents/ethereum/proof", d.handleEthProof)
 	mux.HandleFunc("GET /agents", d.handleAgentsList)
 	mux.HandleFunc("GET /agents/{aid}", d.handleAgentsGet)
-	mux.HandleFunc("PATCH /agents/{aid}", d.handleAgentsPatch)
-	mux.HandleFunc("POST /agents/{aid}/publish", d.handleAgentsPublish)
-	mux.HandleFunc("POST /agents/{aid}/records", d.handleAgentsRecordsPost)
-	mux.HandleFunc("POST /agents/{aid}/mailbox/send", d.handleAgentsMailboxSend)
-	mux.HandleFunc("POST /agents/{aid}/mailbox/poll", d.handleAgentsMailboxPoll)
-	mux.HandleFunc("POST /agents/{aid}/topics", d.handleAgentsTopicsPost)
-	mux.HandleFunc("DELETE /agents/{aid}/topics/{topic...}", d.handleAgentsTopicsDelete)
+	mux.HandleFunc("PATCH /agents/{aid}", d.withAgentMiddleware(d.handleAgentsPatch))
+	mux.HandleFunc("POST /agents/{aid}/heartbeat", d.withAgentMiddleware(d.handleAgentHeartbeat))
+	mux.HandleFunc("POST /agents/{aid}/publish", d.withAgentMiddleware(d.handleAgentsPublish))
+	mux.HandleFunc("POST /agents/{aid}/records", d.withAgentMiddleware(d.handleAgentsRecordsPost))
+	mux.HandleFunc("POST /agents/{aid}/mailbox/send", d.withAgentMiddleware(d.handleAgentsMailboxSend))
+	mux.HandleFunc("POST /agents/{aid}/mailbox/poll", d.withAgentMiddleware(d.handleAgentsMailboxPoll))
+	mux.HandleFunc("POST /agents/{aid}/services", d.withAgentMiddleware(d.handleAgentsTopicsPost))
+	mux.HandleFunc("DELETE /agents/{aid}/services/{service...}", d.withAgentMiddleware(d.handleAgentsTopicsDelete))
 	mux.HandleFunc("POST /discover", d.handleDiscover)
-	mux.HandleFunc("DELETE /agents/{aid}", d.handleAgentsDelete)
+	mux.HandleFunc("DELETE /agents/{aid}", d.withAgentMiddleware(d.handleAgentsDelete))
 	mux.HandleFunc("GET /resolve/{aid}/records", d.handleResolveRecords)
 	mux.HandleFunc("POST /resolve/{aid}", d.handleResolve)
 	mux.HandleFunc("POST /connect/{aid}", d.handleConnect)
 	mux.Handle("/debug/", d.h.DebugHTTPHandler())
 	mux.Handle("/mcp/", d.mcpHTTPHandler())
+	registerWebUIRoutes(mux)
 	return d.withMiddleware(mux)
+}
+
+// withAgentMiddleware wraps agent-specific handlers with:
+//  1. (Future) per-agent token verification via X-Agent-Token header.
+//     When the registry entry carries a token (not yet issued), it will be
+//     validated here with constant-time compare before proceeding.
+//  2. Implicit heartbeat: any non-GET call that reaches a registered agent
+//     is treated as a liveness signal, eliminating the need for explicit
+//     heartbeat calls in agents that already use other API endpoints.
+//
+// The hook point for per-agent auth is intentionally isolated here so that
+// future implementations only need to fill in step 1 without touching
+// individual handler functions.
+func (d *Daemon) withAgentMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		aid, err := a2al.ParseAddress(r.PathValue("aid"))
+		if err != nil {
+			// Let the underlying handler produce the proper error.
+			next(w, r)
+			return
+		}
+
+		// --- Future per-agent token verification slot ---
+		// When per-agent tokens are introduced, uncomment and implement:
+		//
+		//   agentToken := r.Header.Get("X-Agent-Token")
+		//   d.regMu.RLock()
+		//   e := d.reg.Get(aid)
+		//   d.regMu.RUnlock()
+		//   if e != nil && e.Token != "" {
+		//       if subtle.ConstantTimeCompare([]byte(agentToken), []byte(e.Token)) != 1 {
+		//           http.Error(w, `{"error":"agent unauthorized"}`, http.StatusUnauthorized)
+		//           return
+		//       }
+		//   }
+		// ------------------------------------------------
+
+		d.touchHeartbeat(aid)
+
+		next(w, r)
+	}
 }
 
 func (d *Daemon) withMiddleware(next http.Handler) http.Handler {
@@ -95,6 +138,25 @@ func (d *Daemon) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, map[string]string{"status": "ok"})
 }
 
+func (d *Daemon) handleStatus(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, d.execStatus())
+}
+
+func (d *Daemon) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
+	if err := d.execAgentHeartbeat(r.PathValue("aid")); err != nil {
+		switch {
+		case errors.Is(err, errBadAID):
+			http.Error(w, `{"error":"bad aid"}`, http.StatusBadRequest)
+		case errors.Is(err, errNotFound):
+			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+		default:
+			http.Error(w, `{"error":"heartbeat failed"}`, http.StatusInternalServerError)
+		}
+		return
+	}
+	writeJSON(w, map[string]string{"status": "ok"})
+}
+
 func (d *Daemon) handleGetConfig(w http.ResponseWriter, _ *http.Request) {
 	c := *d.cfg
 	if c.APIToken != "" {
@@ -115,6 +177,7 @@ type patchConfigReq struct {
 	KeyDir           *string   `json:"key_dir,omitempty"`
 	LogFormat        *string   `json:"log_format,omitempty"`
 	LogLevel         *string   `json:"log_level,omitempty"`
+	AutoPublish      *bool     `json:"auto_publish,omitempty"`
 }
 
 func (d *Daemon) handlePatchConfig(w http.ResponseWriter, r *http.Request) {
@@ -124,6 +187,7 @@ func (d *Daemon) handlePatchConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cfg := *d.cfg
+	prevAutoPublish := cfg.AutoPublish
 	restart := []string{}
 	if req.ListenAddr != nil {
 		cfg.ListenAddr = *req.ListenAddr
@@ -166,6 +230,9 @@ func (d *Daemon) handlePatchConfig(w http.ResponseWriter, r *http.Request) {
 	if req.LogLevel != nil {
 		cfg.LogLevel = *req.LogLevel
 	}
+	if req.AutoPublish != nil {
+		cfg.AutoPublish = *req.AutoPublish
+	}
 	if err := cfg.Validate(); err != nil {
 		http.Error(w, `{"error":"invalid config"}`, http.StatusBadRequest)
 		return
@@ -175,6 +242,9 @@ func (d *Daemon) handlePatchConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	*d.cfg = cfg
+	if req.AutoPublish != nil && *req.AutoPublish && !prevAutoPublish {
+		d.publishNodeNowAsync()
+	}
 	writeJSON(w, map[string]any{"ok": true, "restart_required": restart})
 }
 
@@ -192,7 +262,8 @@ func (d *Daemon) handleConfigSchema(w http.ResponseWriter, _ *http.Request) {
     "api_token": {"type": "string"},
     "key_dir": {"type": "string"},
     "log_format": {"type": "string", "enum": ["text","json"]},
-    "log_level": {"type": "string"}
+    "log_level": {"type": "string"},
+    "auto_publish": {"type": "boolean", "description": "Publish node AID to DHT on a schedule (default true)"}
   }
 }`
 	w.Header().Set("Content-Type", "application/json")
@@ -316,10 +387,6 @@ func (d *Daemon) handleEthRegister(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error":"signature verify failed"}`, http.StatusBadRequest)
 		case errors.Is(err, errDelegationVerify):
 			http.Error(w, `{"error":"delegation verify"}`, http.StatusBadRequest)
-		case errors.Is(err, errServiceTCPRequired):
-			http.Error(w, `{"error":"service_tcp required"}`, http.StatusBadRequest)
-		case errors.Is(err, errServiceTCPUnreachable):
-			http.Error(w, `{"error":"service_tcp unreachable"}`, http.StatusBadRequest)
 		case errors.Is(err, errNodeAsAgent):
 			http.Error(w, `{"error":"cannot register node identity as agent"}`, http.StatusBadRequest)
 		case errors.Is(err, errPersist):
@@ -403,10 +470,6 @@ func (d *Daemon) handleAgentsPost(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error":"aid"}`, http.StatusBadRequest)
 		case errors.Is(err, errNodeAsAgent):
 			http.Error(w, `{"error":"cannot register node identity as agent"}`, http.StatusBadRequest)
-		case errors.Is(err, errServiceTCPRequired):
-			http.Error(w, `{"error":"service_tcp required"}`, http.StatusBadRequest)
-		case errors.Is(err, errServiceTCPUnreachable):
-			http.Error(w, `{"error":"service_tcp unreachable"}`, http.StatusBadRequest)
 		case errors.Is(err, errPersist):
 			http.Error(w, `{"error":"persist"}`, http.StatusInternalServerError)
 		default:
@@ -448,14 +511,10 @@ func (d *Daemon) handleAgentsPatch(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error":"bad aid"}`, http.StatusBadRequest)
 		case errors.Is(err, errNotFound):
 			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
-		case errors.Is(err, errServiceTCPRequired):
-			http.Error(w, `{"error":"service_tcp required"}`, http.StatusBadRequest)
 		case errors.Is(err, errBadOpKeyHex):
 			http.Error(w, `{"error":"bad operational_private_key_hex"}`, http.StatusBadRequest)
 		case errors.Is(err, errOpKeyMismatch):
 			http.Error(w, `{"error":"operational key mismatch"}`, http.StatusForbidden)
-		case errors.Is(err, errServiceTCPUnreachable):
-			http.Error(w, `{"error":"service_tcp unreachable"}`, http.StatusBadRequest)
 		case errors.Is(err, errPersist):
 			http.Error(w, `{"error":"persist"}`, http.StatusInternalServerError)
 		default:
@@ -476,8 +535,6 @@ func (d *Daemon) handleAgentsPublish(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error":"bad aid"}`, http.StatusBadRequest)
 		case errors.Is(err, errNotFound):
 			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
-		case errors.Is(err, errServiceTCPUnreachable):
-			http.Error(w, `{"error":"service_tcp unreachable"}`, http.StatusBadRequest)
 		default:
 			http.Error(w, `{"error":"publish failed"}`, http.StatusInternalServerError)
 		}
@@ -607,12 +664,12 @@ func (d *Daemon) handleAgentsTopicsPost(w http.ResponseWriter, r *http.Request) 
 		switch {
 		case errors.Is(err, errBadAID):
 			http.Error(w, `{"error":"bad aid"}`, http.StatusBadRequest)
-		case errors.Is(err, errTopicsRequired):
-			http.Error(w, `{"error":"topics required"}`, http.StatusBadRequest)
+		case errors.Is(err, errServicesRequired):
+			http.Error(w, `{"error":"services required"}`, http.StatusBadRequest)
 		case errors.Is(err, errNotFound):
 			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
 		default:
-			http.Error(w, `{"error":"topic register failed"}`, http.StatusBadGateway)
+			http.Error(w, `{"error":"service register failed"}`, http.StatusBadGateway)
 		}
 		return
 	}
@@ -620,9 +677,9 @@ func (d *Daemon) handleAgentsTopicsPost(w http.ResponseWriter, r *http.Request) 
 }
 
 func (d *Daemon) handleAgentsTopicsDelete(w http.ResponseWriter, r *http.Request) {
-	topic := r.PathValue("topic")
+	topic := r.PathValue("service")
 	if topic == "" {
-		http.Error(w, `{"error":"topic required"}`, http.StatusBadRequest)
+		http.Error(w, `{"error":"service required"}`, http.StatusBadRequest)
 		return
 	}
 	if err := d.execTopicUnregister(r.PathValue("aid"), topic); err != nil {
@@ -649,8 +706,8 @@ func (d *Daemon) handleDiscover(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	entries, err := d.execDiscover(ctx, req)
 	if err != nil {
-		if errors.Is(err, errTopicsRequired) {
-			http.Error(w, `{"error":"topics required"}`, http.StatusBadRequest)
+		if errors.Is(err, errServicesRequired) {
+			http.Error(w, `{"error":"services required"}`, http.StatusBadRequest)
 			return
 		}
 		http.Error(w, `{"error":"discover failed"}`, http.StatusBadGateway)
@@ -693,23 +750,12 @@ type connectReq struct {
 	LocalAID string `json:"local_aid,omitempty"`
 }
 
-var errNoLocalAgent = errors.New("no registered agents")
-var errAmbiguousLocal = errors.New("local_aid required when multiple agents")
-
 func (d *Daemon) pickLocalAgent(body connectReq) (a2al.Address, error) {
 	if body.LocalAID != "" {
 		return a2al.ParseAddress(body.LocalAID)
 	}
-	d.regMu.RLock()
-	list := d.reg.List()
-	d.regMu.RUnlock()
-	if len(list) == 1 {
-		return list[0].AID, nil
-	}
-	if len(list) == 0 {
-		return a2al.Address{}, errNoLocalAgent
-	}
-	return a2al.Address{}, errAmbiguousLocal
+	// Outbound QUIC uses the host default identity (node); see CLI spec §1.4.
+	return d.nodeAddr, nil
 }
 
 func (d *Daemon) handleConnect(w http.ResponseWriter, r *http.Request) {
@@ -722,8 +768,6 @@ func (d *Daemon) handleConnect(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case errors.Is(err, errBadAID):
 			http.Error(w, `{"error":"bad aid"}`, http.StatusBadRequest)
-		case errors.Is(err, errNoLocalAgent), errors.Is(err, errAmbiguousLocal):
-			writeJSONStatus(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		case errors.Is(err, errResolve):
 			http.Error(w, `{"error":"resolve failed"}`, http.StatusNotFound)
 		case errors.Is(err, errListen):
@@ -737,4 +781,3 @@ func (d *Daemon) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, map[string]string{"tunnel": tun})
 }
-
