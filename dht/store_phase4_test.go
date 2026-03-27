@@ -24,7 +24,7 @@ func TestStore_Put_topic_same_pubkey_replaces(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s := NewStore(nil)
+	s := NewStore(nil, 0)
 	r1, err := protocol.SignRecord(priv, addr, protocol.RecTypeTopic, payload, 1, uint64(now.Unix()), 60)
 	if err != nil {
 		t.Fatal(err)
@@ -56,7 +56,7 @@ func TestStore_Put_sovereign_wrong_key_rejected(t *testing.T) {
 	}
 	var wrong a2al.NodeID
 	wrong[0] = 0xff
-	s := NewStore(nil)
+	s := NewStore(nil, 0)
 	if err := s.Put(wrong, r, now); err == nil {
 		t.Fatal("expected error")
 	}
