@@ -15,6 +15,7 @@ import (
 
 	"filippo.io/edwards25519"
 	"github.com/a2al/a2al"
+	acrypto "github.com/a2al/a2al/crypto"
 	"golang.org/x/crypto/hkdf"
 )
 
@@ -28,8 +29,7 @@ func ed25519PublicToX25519(pub ed25519.PublicKey) ([]byte, error) {
 
 func ed25519PrivateToX25519(priv ed25519.PrivateKey) (*ecdh.PrivateKey, error) {
 	h := sha512.Sum512(priv.Seed())
-	// RFC 8032 §5.1.5: clamp the scalar before use as an X25519 private key.
-	// Clear the three lowest bits (cofactor), clear bit 255, set bit 254.
+	defer acrypto.Wipe(h[:])
 	h[0] &= 248
 	h[31] &= 127
 	h[31] |= 64
@@ -67,10 +67,12 @@ func mailboxEncryptAEAD(recipientPub ed25519.PublicKey, senderAddr, recipientAdd
 	if err != nil {
 		return nil, nil, nil, err
 	}
+	defer acrypto.Wipe(shared)
 	key, err := deriveMailboxKey(shared, senderAddr[:], recipientAddr[:])
 	if err != nil {
 		return nil, nil, nil, err
 	}
+	defer acrypto.Wipe(key)
 	nonce = make([]byte, 12)
 	if _, err = rand.Read(nonce); err != nil {
 		return nil, nil, nil, err
@@ -102,10 +104,12 @@ func mailboxDecryptAEAD(recipientPriv ed25519.PrivateKey, recipientAddr a2al.Add
 	if err != nil {
 		return nil, err
 	}
+	defer acrypto.Wipe(shared)
 	key, err := deriveMailboxKey(shared, senderAddr, recipientAddr[:])
 	if err != nil {
 		return nil, err
 	}
+	defer acrypto.Wipe(key)
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, err

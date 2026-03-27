@@ -163,7 +163,7 @@ func (e *EncryptedKeyStore) List() ([]a2al.Address, error) {
 	return []a2al.Address{a}, nil
 }
 
-// Ed25519PrivateKey returns the decrypted identity for QUIC/TLS (Phase 2). Requires Load or Generate first.
+// Ed25519PrivateKey returns a copy of the decrypted identity for QUIC/TLS (Phase 2). Requires Load or Generate first.
 func (e *EncryptedKeyStore) Ed25519PrivateKey(address a2al.Address) (ed25519.PrivateKey, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -177,7 +177,9 @@ func (e *EncryptedKeyStore) Ed25519PrivateKey(address a2al.Address) (ed25519.Pri
 	if want != address {
 		return nil, errors.New("a2al/crypto: address does not match loaded key")
 	}
-	return e.priv, nil
+	out := make(ed25519.PrivateKey, len(e.priv))
+	copy(out, e.priv)
+	return out, nil
 }
 
 func encryptIdentity(pass, seed []byte) ([]byte, error) {
@@ -189,6 +191,7 @@ func encryptIdentity(pass, seed []byte) ([]byte, error) {
 		return nil, err
 	}
 	key := argon2.IDKey(pass, salt, argonTime, argonMemoryKiB, argonThreads, deriveKeyLen)
+	defer Wipe(key)
 	aead, err := chacha20poly1305.NewX(key)
 	if err != nil {
 		return nil, err
@@ -218,6 +221,7 @@ func decryptIdentity(pass, blob []byte) (ed25519.PrivateKey, error) {
 	nonce := blob[len(encryptedBlobMagic)+saltSize : len(encryptedBlobMagic)+saltSize+xchachaNonceSize]
 	ct := blob[len(encryptedBlobMagic)+saltSize+xchachaNonceSize:]
 	key := argon2.IDKey(pass, salt, argonTime, argonMemoryKiB, argonThreads, deriveKeyLen)
+	defer Wipe(key)
 	aead, err := chacha20poly1305.NewX(key)
 	if err != nil {
 		return nil, err
@@ -226,6 +230,7 @@ func decryptIdentity(pass, blob []byte) (ed25519.PrivateKey, error) {
 	if err != nil {
 		return nil, ErrWrongPassphrase
 	}
+	defer Wipe(seed)
 	if len(seed) != ed25519SeedSize {
 		return nil, ErrWrongPassphrase
 	}
