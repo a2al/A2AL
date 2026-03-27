@@ -10,9 +10,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/a2al/a2al"
 	"github.com/a2al/a2al/config"
 	"github.com/a2al/a2al/host"
 	"github.com/a2al/a2al/internal/nodeks"
@@ -45,13 +47,16 @@ func newTestDaemon(t *testing.T) *Daemon {
 	}
 	cfg := config.Default()
 	return &Daemon{
-		dataDir:  dir,
-		cfgPath:  filepath.Join(dir, "config.toml"),
-		cfg:      &cfg,
-		log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
-		h:        h,
-		reg:      reg,
-		nodeAddr: ks.Address(),
+		dataDir:          dir,
+		cfgPath:          filepath.Join(dir, "config.toml"),
+		cfg:              &cfg,
+		log:              slog.New(slog.NewTextHandler(io.Discard, nil)),
+		h:                h,
+		reg:              reg,
+		nodeAddr:         ks.Address(),
+		agentLastPublish: make(map[a2al.Address]time.Time),
+		heartbeatAt:      make(map[a2al.Address]time.Time),
+		mailboxSeen:      make(map[string]map[string]time.Time),
 	}
 }
 
@@ -220,5 +225,82 @@ func TestAPI_resolveRecords_empty(t *testing.T) {
 	}
 	if out.Records == nil {
 		t.Fatal("want non-nil records slice")
+	}
+}
+
+func TestAPI_register_emptyServiceTCP(t *testing.T) {
+	d := newTestDaemon(t)
+	srv := httptest.NewServer(d.routes())
+	defer srv.Close()
+	client := &http.Client{Timeout: 30 * time.Second}
+
+	genReq, _ := http.NewRequest(http.MethodPost, srv.URL+"/identity/generate", nil)
+	genReq.Header.Set("Content-Type", "application/json")
+	genResp, err := client.Do(genReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer genResp.Body.Close()
+	if genResp.StatusCode != http.StatusOK {
+		t.Fatalf("generate: %d", genResp.StatusCode)
+	}
+	var gen identityGenResp
+	if err := json.NewDecoder(genResp.Body).Decode(&gen); err != nil {
+		t.Fatal(err)
+	}
+
+	regBody := map[string]string{
+		"operational_private_key_hex": gen.OperationalPrivateKeyHex,
+		"delegation_proof_hex":        gen.DelegationProofHex,
+		"service_tcp":                 "",
+	}
+	b, _ := json.Marshal(regBody)
+	regReq, _ := http.NewRequest(http.MethodPost, srv.URL+"/agents", bytes.NewReader(b))
+	regReq.Header.Set("Content-Type", "application/json")
+	regResp, err := client.Do(regReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer regResp.Body.Close()
+	if regResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(regResp.Body)
+		t.Fatalf("register: %d %s", regResp.StatusCode, body)
+	}
+
+	listResp, err := client.Get(srv.URL + "/agents")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listResp.Body.Close()
+	var list struct {
+		Agents []map[string]any `json:"agents"`
+	}
+	if err := json.NewDecoder(listResp.Body).Decode(&list); err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Agents) != 1 {
+		t.Fatalf("agents len %d", len(list.Agents))
+	}
+	ag := list.Agents[0]
+	if ag["service_tcp"] != "" {
+		t.Fatalf("service_tcp %#v", ag["service_tcp"])
+	}
+	if _, ok := ag["service_tcp_ok"]; ok && ag["service_tcp_ok"] != nil {
+		t.Fatalf("service_tcp_ok should be null when unset, got %#v", ag["service_tcp_ok"])
+	}
+}
+
+func TestAPI_touchHeartbeat_nilMapSafe(t *testing.T) {
+	d := &Daemon{}
+	aid, err := a2al.ParseAddress(strings.ToLower("A0" + strings.Repeat("ef", 20)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.touchHeartbeat(aid)
+	if d.heartbeatAt == nil {
+		t.Fatal("heartbeatAt should be allocated")
+	}
+	if _, ok := d.heartbeatAt[aid]; !ok {
+		t.Fatal("missing entry")
 	}
 }
