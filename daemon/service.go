@@ -13,6 +13,7 @@ import (
 	"net"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/a2al/a2al"
@@ -21,6 +22,7 @@ import (
 	"github.com/a2al/a2al/identity"
 	"github.com/a2al/a2al/internal/registry"
 	"github.com/a2al/a2al/protocol"
+	"github.com/decred/dcrd/dcrec/secp256k1/v4"
 )
 
 func (d *Daemon) execIdentityGenerate() (identityGenResp, error) {
@@ -54,10 +56,240 @@ func (d *Daemon) execIdentityGenerate() (identityGenResp, error) {
 	}, nil
 }
 
+type ethereumGenResp struct {
+	EthereumPrivateKeyHex     string `json:"ethereum_private_key_hex"`
+	OperationalPrivateKeyHex  string `json:"operational_private_key_hex"`
+	DelegationProofHex        string `json:"delegation_proof_hex"`
+	AID                       string `json:"aid"`
+	Warning                   string `json:"warning"`
+}
+
+func (d *Daemon) execEthereumIdentityGenerate() (ethereumGenResp, error) {
+	ethPriv, opPriv, proof, err := identity.GenerateEthereumIdentity()
+	if err != nil {
+		return ethereumGenResp{}, err
+	}
+	raw, err := identity.EncodeDelegationProof(proof)
+	if err != nil {
+		return ethereumGenResp{}, err
+	}
+	aid, err := proof.AgentAID()
+	if err != nil {
+		return ethereumGenResp{}, err
+	}
+	return ethereumGenResp{
+		EthereumPrivateKeyHex:    hex.EncodeToString(ethPriv.Serialize()),
+		OperationalPrivateKeyHex: hex.EncodeToString(opPriv),
+		DelegationProofHex:       hex.EncodeToString(raw),
+		AID:                      aid.String(),
+		Warning:                  "Persist ethereum_private_key_hex like a wallet seed; the daemon does not retain it. Loss = loss of AID ownership.",
+	}, nil
+}
+
+func (d *Daemon) persistDelegatedAgent(aid a2al.Address, opPriv ed25519.PrivateKey, proofRaw []byte, serviceTCP string) error {
+	if aid == d.nodeAddr {
+		return errNodeAsAgent
+	}
+	if serviceTCP == "" {
+		return errServiceTCPRequired
+	}
+	if !probeTCP(serviceTCP, 2*time.Second) {
+		return errServiceTCPUnreachable
+	}
+	if err := d.h.RegisterDelegatedAgent(aid, opPriv, proofRaw); err != nil {
+		return err
+	}
+	ent := &registry.Entry{
+		AID:            aid,
+		ServiceTCP:     serviceTCP,
+		OpPriv:         opPriv,
+		DelegationCBOR: proofRaw,
+		Seq:            1,
+	}
+	if err := d.reg.Put(ent); err != nil {
+		d.h.UnregisterAgent(aid)
+		return errPersist
+	}
+	return nil
+}
+
+func decodeFlexibleHex(s string) ([]byte, error) {
+	s = strings.TrimSpace(s)
+	s = strings.TrimPrefix(s, "0x")
+	s = strings.TrimPrefix(s, "0X")
+	return hex.DecodeString(s)
+}
+
+func operationalPrivateFromHexOrSeed(privHex, seedHex string) (ed25519.PrivateKey, error) {
+	switch {
+	case privHex != "" && seedHex != "":
+		return nil, errEthOpKeyAmbiguous
+	case privHex != "":
+		raw, err := decodeFlexibleHex(privHex)
+		if err != nil || len(raw) != ed25519.PrivateKeySize {
+			return nil, errBadOpKeyHex
+		}
+		return ed25519.PrivateKey(raw), nil
+	case seedHex != "":
+		raw, err := decodeFlexibleHex(seedHex)
+		if err != nil || len(raw) != ed25519.SeedSize {
+			return nil, errBadOpSeedHex
+		}
+		return ed25519.NewKeyFromSeed(raw), nil
+	default:
+		return nil, errEthOpKeyMissing
+	}
+}
+
+// execEthereumDelegationMessage builds the canonical UTF-8 string to pass to wallet personal_sign.
+func (d *Daemon) execEthereumDelegationMessage(opPubHex, opSeedHex, agentStr string, issuedAt, expiresAt uint64, scope uint8) (string, error) {
+	_ = d
+	if scope == 0 {
+		scope = identity.ScopeNetworkOps
+	}
+	var opPub ed25519.PublicKey
+	switch {
+	case opPubHex != "" && opSeedHex != "":
+		return "", errEthOpKeyAmbiguous
+	case opSeedHex != "":
+		seed, err := decodeFlexibleHex(opSeedHex)
+		if err != nil || len(seed) != ed25519.SeedSize {
+			return "", errBadOpSeedHex
+		}
+		opPriv := ed25519.NewKeyFromSeed(seed)
+		opPub = opPriv.Public().(ed25519.PublicKey)
+	case opPubHex != "":
+		opRaw, err := decodeFlexibleHex(opPubHex)
+		if err != nil || len(opRaw) != ed25519.PublicKeySize {
+			return "", errBadOpPubHex
+		}
+		opPub = ed25519.PublicKey(opRaw)
+	default:
+		return "", errEthPubOrSeedRequired
+	}
+	aid, err := a2al.ParseAddress(strings.TrimSpace(agentStr))
+	if err != nil || aid[0] != a2al.VersionEthereum {
+		return "", errEthBadAgent
+	}
+	return identity.BuildEthereumDelegationMessage(opPub, aid, issuedAt, expiresAt, scope), nil
+}
+
+// execEthereumRegister verifies EIP-191 signature over the canonical message and registers the agent.
+func (d *Daemon) execEthereumRegister(agentStr string, issuedAt, expiresAt uint64, scope uint8, ethSigHex, serviceTCP, opPrivHex, opSeedHex string) (a2al.Address, error) {
+	if scope == 0 {
+		scope = identity.ScopeNetworkOps
+	}
+	opPriv, err := operationalPrivateFromHexOrSeed(opPrivHex, opSeedHex)
+	if err != nil {
+		return a2al.Address{}, err
+	}
+	opPub := opPriv.Public().(ed25519.PublicKey)
+	aid, err := a2al.ParseAddress(strings.TrimSpace(agentStr))
+	if err != nil || aid[0] != a2al.VersionEthereum {
+		return a2al.Address{}, errEthBadAgent
+	}
+	canonical := identity.BuildEthereumDelegationMessage(opPub, aid, issuedAt, expiresAt, scope)
+	sig, err := decodeFlexibleHex(ethSigHex)
+	if err != nil || len(sig) != 65 {
+		return a2al.Address{}, errEthBadSignature
+	}
+	var addr20 [20]byte
+	copy(addr20[:], aid[1:])
+	if err := crypto.VerifyEIP191Signature(addr20, canonical, sig); err != nil {
+		return a2al.Address{}, errEthSigVerify
+	}
+	proof, err := identity.ImportBlockchainDelegation(sig, canonical, opPub, aid, issuedAt, expiresAt, scope)
+	if err != nil {
+		return a2al.Address{}, errEthProofBuild
+	}
+	now := uint64(time.Now().Unix())
+	if err := identity.VerifyDelegation(proof, now, opPriv); err != nil {
+		return a2al.Address{}, errDelegationVerify
+	}
+	proofRaw, err := identity.EncodeDelegationProof(proof)
+	if err != nil {
+		return a2al.Address{}, errDelegationParse
+	}
+
+	d.regMu.Lock()
+	defer d.regMu.Unlock()
+	if err := d.persistDelegatedAgent(aid, opPriv, proofRaw, serviceTCP); err != nil {
+		return a2al.Address{}, err
+	}
+	return aid, nil
+}
+
+type ethereumProofResp struct {
+	AID                      string `json:"aid"`
+	DelegationProofHex       string `json:"delegation_proof_hex"`
+	OperationalPrivateKeyHex string `json:"operational_private_key_hex,omitempty"`
+	Warning                  string `json:"warning,omitempty"`
+}
+
+// execEthereumProofFromKey signs delegation with a local secp256k1 key (automation / AI on trusted paths only).
+func (d *Daemon) execEthereumProofFromKey(ethPrivHex string, issuedAt, expiresAt uint64, scope uint8, opPrivHex, opSeedHex string) (ethereumProofResp, error) {
+	_ = d
+	if scope == 0 {
+		scope = identity.ScopeNetworkOps
+	}
+	ethRaw, err := decodeFlexibleHex(ethPrivHex)
+	if err != nil || len(ethRaw) != 32 {
+		return ethereumProofResp{}, errEthBadPrivHex
+	}
+	ethPriv := secp256k1.PrivKeyFromBytes(ethRaw)
+
+	var opPriv ed25519.PrivateKey
+	var generatedOp bool
+	if opPrivHex != "" || opSeedHex != "" {
+		opPriv, err = operationalPrivateFromHexOrSeed(opPrivHex, opSeedHex)
+		if err != nil {
+			return ethereumProofResp{}, err
+		}
+	} else {
+		_, opPriv, err = ed25519.GenerateKey(nil)
+		if err != nil {
+			return ethereumProofResp{}, err
+		}
+		generatedOp = true
+	}
+	opPub := opPriv.Public().(ed25519.PublicKey)
+
+	var aid a2al.Address
+	aid[0] = a2al.VersionEthereum
+	addr20, err := crypto.EthPubKeyToAddress20(ethPriv.PubKey())
+	if err != nil {
+		return ethereumProofResp{}, err
+	}
+	copy(aid[1:], addr20[:])
+
+	issued := issuedAt
+	if issued == 0 {
+		issued = uint64(time.Now().Unix())
+	}
+
+	proof, err := identity.SignEthDelegation(ethPriv, opPub, aid, issued, expiresAt, scope)
+	if err != nil {
+		return ethereumProofResp{}, err
+	}
+	raw, err := identity.EncodeDelegationProof(proof)
+	if err != nil {
+		return ethereumProofResp{}, err
+	}
+	out := ethereumProofResp{
+		AID:                aid.String(),
+		DelegationProofHex: hex.EncodeToString(raw),
+	}
+	if generatedOp {
+		out.OperationalPrivateKeyHex = hex.EncodeToString(opPriv)
+		out.Warning = "New operational key generated; store operational_private_key_hex before registering."
+	}
+	return out, nil
+}
+
 func (d *Daemon) execAgentRegister(req registerAgentReq) (a2al.Address, error) {
 	d.regMu.Lock()
 	defer d.regMu.Unlock()
-	proofRaw, err := hex.DecodeString(req.DelegationProofHex)
+	proofRaw, err := decodeFlexibleHex(req.DelegationProofHex)
 	if err != nil {
 		return a2al.Address{}, errBadDelegationHex
 	}
@@ -65,7 +297,7 @@ func (d *Daemon) execAgentRegister(req registerAgentReq) (a2al.Address, error) {
 	if err != nil {
 		return a2al.Address{}, errDelegationParse
 	}
-	opPrivBytes, err := hex.DecodeString(req.OperationalPrivateKeyHex)
+	opPrivBytes, err := decodeFlexibleHex(req.OperationalPrivateKeyHex)
 	if err != nil || len(opPrivBytes) != ed25519.PrivateKeySize {
 		return a2al.Address{}, errBadOpKeyHex
 	}
@@ -78,28 +310,8 @@ func (d *Daemon) execAgentRegister(req registerAgentReq) (a2al.Address, error) {
 	if err != nil {
 		return a2al.Address{}, errAID
 	}
-	if aid == d.nodeAddr {
-		return a2al.Address{}, errNodeAsAgent
-	}
-	if req.ServiceTCP == "" {
-		return a2al.Address{}, errServiceTCPRequired
-	}
-	if !probeTCP(req.ServiceTCP, 2*time.Second) {
-		return a2al.Address{}, errServiceTCPUnreachable
-	}
-	if err := d.h.RegisterDelegatedAgent(aid, opPriv, proofRaw); err != nil {
+	if err := d.persistDelegatedAgent(aid, opPriv, proofRaw, req.ServiceTCP); err != nil {
 		return a2al.Address{}, err
-	}
-	ent := &registry.Entry{
-		AID:            aid,
-		ServiceTCP:     req.ServiceTCP,
-		OpPriv:         opPriv,
-		DelegationCBOR: proofRaw,
-		Seq:            1,
-	}
-	if err := d.reg.Put(ent); err != nil {
-		d.h.UnregisterAgent(aid)
-		return a2al.Address{}, errPersist
 	}
 	return aid, nil
 }
@@ -571,6 +783,16 @@ func (d *Daemon) execResolveRecords(ctx context.Context, aidStr string, recType 
 }
 
 var (
+	errBadOpPubHex           = errors.New("bad operational_public_key_hex")
+	errEthPubOrSeedRequired  = errors.New("operational_public_key_hex or operational_private_key_seed_hex required")
+	errBadOpSeedHex          = errors.New("bad operational_private_key_seed_hex")
+	errEthOpKeyMissing       = errors.New("operational_private_key_hex or operational_private_key_seed_hex required")
+	errEthOpKeyAmbiguous     = errors.New("provide only one of operational_private_key_hex or operational_private_key_seed_hex")
+	errEthBadAgent           = errors.New("bad ethereum agent address")
+	errEthBadSignature       = errors.New("bad eth_signature_hex (want 65 bytes)")
+	errEthSigVerify          = errors.New("ethereum signature verification failed")
+	errEthBadPrivHex         = errors.New("bad ethereum_private_key_hex")
+	errEthProofBuild         = errors.New("ethereum proof build failed")
 	errBadDelegationHex      = errors.New("bad delegation_proof_hex")
 	errDelegationParse       = errors.New("delegation parse")
 	errBadOpKeyHex           = errors.New("bad operational_private_key_hex")

@@ -27,6 +27,10 @@ func (d *Daemon) routes() http.Handler {
 	mux.HandleFunc("GET /config/schema", d.handleConfigSchema)
 	mux.HandleFunc("POST /identity/generate", d.handleIdentityGenerate)
 	mux.HandleFunc("POST /agents", d.handleAgentsPost)
+	mux.HandleFunc("POST /agents/generate", d.handleAgentsGenerate)
+	mux.HandleFunc("POST /agents/ethereum/delegation-message", d.handleEthDelegationMessage)
+	mux.HandleFunc("POST /agents/ethereum/register", d.handleEthRegister)
+	mux.HandleFunc("POST /agents/ethereum/proof", d.handleEthProof)
 	mux.HandleFunc("GET /agents", d.handleAgentsList)
 	mux.HandleFunc("GET /agents/{aid}", d.handleAgentsGet)
 	mux.HandleFunc("PATCH /agents/{aid}", d.handleAgentsPatch)
@@ -237,6 +241,140 @@ func probeTCP(addr string, d time.Duration) bool {
 	}
 	_ = c.Close()
 	return true
+}
+
+type agentsGenerateReq struct {
+	Chain string `json:"chain,omitempty"`
+}
+
+type ethDelegationMessageReq struct {
+	OperationalPublicKeyHex      string `json:"operational_public_key_hex,omitempty"`
+	OperationalPrivateKeySeedHex string `json:"operational_private_key_seed_hex,omitempty"`
+	Agent                        string `json:"agent"`
+	IssuedAt                     uint64 `json:"issued_at"`
+	ExpiresAt                    uint64 `json:"expires_at"`
+	Scope                        uint8  `json:"scope,omitempty"`
+}
+
+func (d *Daemon) handleEthDelegationMessage(w http.ResponseWriter, r *http.Request) {
+	var req ethDelegationMessageReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return
+	}
+	msg, err := d.execEthereumDelegationMessage(req.OperationalPublicKeyHex, req.OperationalPrivateKeySeedHex, req.Agent, req.IssuedAt, req.ExpiresAt, req.Scope)
+	if err != nil {
+		switch {
+		case errors.Is(err, errBadOpPubHex), errors.Is(err, errBadOpSeedHex):
+			http.Error(w, `{"error":"bad operational key material"}`, http.StatusBadRequest)
+		case errors.Is(err, errEthPubOrSeedRequired), errors.Is(err, errEthOpKeyAmbiguous):
+			http.Error(w, `{"error":"provide exactly one of operational_public_key_hex or operational_private_key_seed_hex"}`, http.StatusBadRequest)
+		case errors.Is(err, errEthBadAgent):
+			http.Error(w, `{"error":"bad agent"}`, http.StatusBadRequest)
+		default:
+			http.Error(w, `{"error":"delegation message"}`, http.StatusBadRequest)
+		}
+		return
+	}
+	writeJSON(w, map[string]string{"message": msg})
+}
+
+type ethRegisterAPIReq struct {
+	Agent                        string `json:"agent"`
+	IssuedAt                     uint64 `json:"issued_at"`
+	ExpiresAt                    uint64 `json:"expires_at"`
+	Scope                        uint8  `json:"scope,omitempty"`
+	EthSignatureHex              string `json:"eth_signature_hex"`
+	ServiceTCP                   string `json:"service_tcp"`
+	OperationalPrivateKeyHex     string `json:"operational_private_key_hex,omitempty"`
+	OperationalPrivateKeySeedHex string `json:"operational_private_key_seed_hex,omitempty"`
+}
+
+func (d *Daemon) handleEthRegister(w http.ResponseWriter, r *http.Request) {
+	var req ethRegisterAPIReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return
+	}
+	aid, err := d.execEthereumRegister(req.Agent, req.IssuedAt, req.ExpiresAt, req.Scope, req.EthSignatureHex, req.ServiceTCP, req.OperationalPrivateKeyHex, req.OperationalPrivateKeySeedHex)
+	if err != nil {
+		switch {
+		case errors.Is(err, errEthOpKeyMissing), errors.Is(err, errEthOpKeyAmbiguous):
+			http.Error(w, `{"error":"operational key"}`, http.StatusBadRequest)
+		case errors.Is(err, errBadOpKeyHex), errors.Is(err, errBadOpSeedHex):
+			http.Error(w, `{"error":"bad operational key"}`, http.StatusBadRequest)
+		case errors.Is(err, errEthBadAgent):
+			http.Error(w, `{"error":"bad agent"}`, http.StatusBadRequest)
+		case errors.Is(err, errEthBadSignature):
+			http.Error(w, `{"error":"bad eth_signature_hex"}`, http.StatusBadRequest)
+		case errors.Is(err, errEthSigVerify):
+			http.Error(w, `{"error":"signature verify failed"}`, http.StatusBadRequest)
+		case errors.Is(err, errDelegationVerify):
+			http.Error(w, `{"error":"delegation verify"}`, http.StatusBadRequest)
+		case errors.Is(err, errServiceTCPRequired):
+			http.Error(w, `{"error":"service_tcp required"}`, http.StatusBadRequest)
+		case errors.Is(err, errServiceTCPUnreachable):
+			http.Error(w, `{"error":"service_tcp unreachable"}`, http.StatusBadRequest)
+		case errors.Is(err, errNodeAsAgent):
+			http.Error(w, `{"error":"cannot register node identity as agent"}`, http.StatusBadRequest)
+		case errors.Is(err, errPersist):
+			http.Error(w, `{"error":"persist"}`, http.StatusInternalServerError)
+		default:
+			writeJSONStatus(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		}
+		return
+	}
+	writeJSON(w, map[string]string{"aid": aid.String(), "status": "registered"})
+}
+
+type ethProofAPIReq struct {
+	EthereumPrivateKeyHex        string `json:"ethereum_private_key_hex"`
+	IssuedAt                     uint64 `json:"issued_at"`
+	ExpiresAt                    uint64 `json:"expires_at"`
+	Scope                        uint8  `json:"scope,omitempty"`
+	OperationalPrivateKeyHex     string `json:"operational_private_key_hex,omitempty"`
+	OperationalPrivateKeySeedHex string `json:"operational_private_key_seed_hex,omitempty"`
+}
+
+func (d *Daemon) handleEthProof(w http.ResponseWriter, r *http.Request) {
+	var req ethProofAPIReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return
+	}
+	out, err := d.execEthereumProofFromKey(req.EthereumPrivateKeyHex, req.IssuedAt, req.ExpiresAt, req.Scope, req.OperationalPrivateKeyHex, req.OperationalPrivateKeySeedHex)
+	if err != nil {
+		switch {
+		case errors.Is(err, errEthBadPrivHex):
+			http.Error(w, `{"error":"bad ethereum_private_key_hex"}`, http.StatusBadRequest)
+		case errors.Is(err, errEthOpKeyAmbiguous):
+			http.Error(w, `{"error":"operational key"}`, http.StatusBadRequest)
+		case errors.Is(err, errBadOpKeyHex), errors.Is(err, errBadOpSeedHex):
+			http.Error(w, `{"error":"bad operational key"}`, http.StatusBadRequest)
+		default:
+			http.Error(w, `{"error":"proof failed"}`, http.StatusBadRequest)
+		}
+		return
+	}
+	writeJSON(w, out)
+}
+
+func (d *Daemon) handleAgentsGenerate(w http.ResponseWriter, r *http.Request) {
+	var req agentsGenerateReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return
+	}
+	if req.Chain != "" && req.Chain != "ethereum" {
+		http.Error(w, `{"error":"unsupported chain"}`, http.StatusBadRequest)
+		return
+	}
+	out, err := d.execEthereumIdentityGenerate()
+	if err != nil {
+		http.Error(w, `{"error":"generate failed"}`, http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, out)
 }
 
 func (d *Daemon) handleAgentsPost(w http.ResponseWriter, r *http.Request) {
