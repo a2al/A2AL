@@ -8,12 +8,21 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/a2al/a2al/host"
 	"github.com/quic-go/quic-go"
 )
 
+const (
+	maxGatewayConns    = 1024
+	maxStreamsPerConn   = 100
+	tcpBridgeDeadline  = 30 * time.Second
+)
+
 func (d *Daemon) gatewayAcceptLoop(ctx context.Context) {
+	var active atomic.Int64
 	for {
 		ac, err := d.h.Accept(ctx)
 		if err != nil {
@@ -23,7 +32,16 @@ func (d *Daemon) gatewayAcceptLoop(ctx context.Context) {
 			d.log.Debug("accept", "err", err)
 			continue
 		}
-		go d.serveGatewayConn(ctx, ac)
+		if active.Load() >= maxGatewayConns {
+			d.log.Warn("gateway: max connections reached", "limit", maxGatewayConns)
+			_ = ac.CloseWithError(1, "too many connections")
+			continue
+		}
+		active.Add(1)
+		go func() {
+			defer active.Add(-1)
+			d.serveGatewayConn(ctx, ac)
+		}()
 	}
 }
 
@@ -37,17 +55,26 @@ func (d *Daemon) serveGatewayConn(ctx context.Context, ac *host.AgentConn) {
 		return
 	}
 	defer ac.CloseWithError(0, "gateway closed")
+	var streamCount atomic.Int64
 	for {
 		str, err := ac.AcceptStream(ctx)
 		if err != nil {
 			return
 		}
-		go d.bridgeInboundStream(ac, str, reg.ServiceTCP)
+		if streamCount.Load() >= maxStreamsPerConn {
+			_ = str.Close()
+			continue
+		}
+		streamCount.Add(1)
+		go func() {
+			defer streamCount.Add(-1)
+			d.bridgeInboundStream(ac, str, reg.ServiceTCP)
+		}()
 	}
 }
 
 func (d *Daemon) bridgeInboundStream(ac *host.AgentConn, str quic.Stream, serviceTCP string) {
-	tcp, err := net.Dial("tcp", serviceTCP)
+	tcp, err := net.DialTimeout("tcp", serviceTCP, 5*time.Second)
 	if err != nil {
 		d.log.Warn("gateway: tcp dial", "target", serviceTCP, "err", err)
 		_ = str.Close()
@@ -64,6 +91,10 @@ func (d *Daemon) bridgeInboundStream(ac *host.AgentConn, str quic.Stream, servic
 }
 
 func bridgeTCPQUICStream(str quic.Stream, tcp net.Conn) {
+	if tc, ok := tcp.(*net.TCPConn); ok {
+		_ = tc.SetKeepAlive(true)
+		_ = tc.SetKeepAlivePeriod(tcpBridgeDeadline)
+	}
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {

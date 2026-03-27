@@ -41,8 +41,10 @@ import (
 
 func defaultQUICConfig() *quic.Config {
 	return &quic.Config{
-		HandshakeIdleTimeout: 30 * time.Second,
-		MaxIdleTimeout:       90 * time.Second,
+		HandshakeIdleTimeout:    10 * time.Second,
+		MaxIdleTimeout:          90 * time.Second,
+		MaxIncomingStreams:       100,
+		MaxIncomingUniStreams:    10,
 	}
 }
 
