@@ -379,6 +379,10 @@ func nodeInfoCheck(n NodeInfo) error {
 }
 
 func signedRecordCheck(r SignedRecord) error {
+	// SignedRecord.Pubkey and Signature are always the Ed25519 operational key's material,
+	// regardless of whether the record's Address belongs to an Ed25519, Ethereum, or other
+	// blockchain identity. Delegation proof (field 9) carries the chain-specific signature;
+	// this check must stay Ed25519-sized.
 	if len(r.Address) != len(a2al.Address{}) || len(r.Pubkey) != ed25519.PublicKeySize || len(r.Signature) != ed25519.SignatureSize {
 		return ErrInvalidMessage
 	}
