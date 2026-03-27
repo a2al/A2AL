@@ -541,12 +541,19 @@ func (d *Daemon) execMailboxPoll(ctx context.Context, aidStr string) ([]map[stri
 
 	d.mailboxSeenMu.Lock()
 	if d.mailboxSeen == nil {
-		d.mailboxSeen = make(map[string]map[string]struct{})
+		d.mailboxSeen = make(map[string]map[string]time.Time)
 	}
 	seen := d.mailboxSeen[aidStr]
 	if seen == nil {
-		seen = make(map[string]struct{})
+		seen = make(map[string]time.Time)
 		d.mailboxSeen[aidStr] = seen
+	}
+	now := time.Now()
+	const mailboxSeenTTL = 2 * time.Hour
+	for k, t := range seen {
+		if now.Sub(t) > mailboxSeenTTL {
+			delete(seen, k)
+		}
 	}
 	out := make([]map[string]any, 0, len(msgs))
 	for _, m := range msgs {
@@ -554,7 +561,7 @@ func (d *Daemon) execMailboxPoll(ctx context.Context, aidStr string) ([]map[stri
 		if _, already := seen[key]; already {
 			continue
 		}
-		seen[key] = struct{}{}
+		seen[key] = now
 		out = append(out, map[string]any{
 			"sender":      m.Sender.String(),
 			"msg_type":    m.MsgType,
