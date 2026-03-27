@@ -112,7 +112,7 @@ See [`doc/API.md`](doc/API.md) for the current library API.
 
 ## Disclaimer
 
-A2AL is a networking protocol library. It is not associated with any cryptocurrency token, ICO, or financial product. Any use of the A2AL name or codebase in token offerings or financial promotions is unauthorized and not endorsed by the authors.
+A2AL is a networking protocol project. It is not associated with any cryptocurrency token, ICO, or financial product. Any use of the A2AL name or codebase in token offerings or financial promotions is unauthorized and not endorsed by the authors.
 
 ## Contributing
 
