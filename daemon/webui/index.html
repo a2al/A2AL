@@ -142,6 +142,13 @@ tr:hover td { background: #fafafa; }
 .text-sm { font-size: .8rem; }
 .empty { padding: 2.5rem 1rem; text-align: center; color: var(--muted); font-size: .83rem; }
 .empty .ico { font-size: 1.5rem; margin-bottom: .4rem; }
+/* Network visibility card */
+.info-box { background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 6px; padding: .6rem .875rem; font-size: .8rem; color: #1e3a8a; display: flex; gap: .75rem; align-items: flex-start; margin-bottom: .75rem; line-height: 1.45; }
+.info-box code { background: #dbeafe; border-radius: 3px; padding: .05rem .3rem; font-family: ui-monospace,monospace; font-size: .78rem; }
+.pub-rows { display: grid; gap: .5rem; }
+.pub-row { display: flex; align-items: center; gap: .75rem; min-height: 1.75rem; }
+.pub-lbl { color: var(--muted); width: 5rem; flex-shrink: 0; font-size: .79rem; font-weight: 500; }
+
 /* Config read-only table */
 .cfg-table { width: 100%; border-collapse: collapse; font-size: .83rem; }
 .cfg-table tr:not(:last-child) td { border-bottom: 1px solid #f3f4f6; }
@@ -169,6 +176,11 @@ tr:hover td { background: #fafafa; }
 </header>
 
 <div class="main">
+
+  <div class="card hidden" id="publishGuideCard">
+    <div class="card-header"><h2>Network visibility</h2></div>
+    <div class="card-body" id="publishGuideBody"><span class="muted text-sm">Loading…</span></div>
+  </div>
 
   <!-- Agents ------------------------------------------------------------------>
   <div class="card">
@@ -278,9 +290,9 @@ tr:hover td { background: #fafafa; }
         </div>
 
         <div class="f-group">
-          <label class="f-label" for="regSvcTCP">Service TCP <span style="color:var(--error)">*</span></label>
+          <label class="f-label" for="regSvcTCP">Service TCP <span class="muted" style="font-weight:400">(optional)</span></label>
           <input id="regSvcTCP" class="w-full" placeholder="127.0.0.1:9000">
-          <span class="f-hint">TCP address the daemon forwards inbound connections to. Must be reachable locally.</span>
+          <span class="f-hint">Local address the daemon forwards inbound QUIC connections to. Leave blank if the agent has its own public URL (register a topic with <code>meta.url</code> instead).</span>
         </div>
 
       </div>
@@ -306,7 +318,7 @@ tr:hover td { background: #fafafa; }
           </div>
         </div>
         <div class="f-group">
-          <label class="f-label" for="ethSvcTCP">Service TCP <span style="color:var(--error)">*</span></label>
+          <label class="f-label" for="ethSvcTCP">Service TCP <span class="muted" style="font-weight:400">(optional)</span></label>
           <input id="ethSvcTCP" class="w-full" placeholder="127.0.0.1:9000">
         </div>
         <div class="f-group">
@@ -484,6 +496,11 @@ async function refreshStatus() {
   }
 }
 
+function fmtShortIso(iso) {
+  if (!iso) return '—';
+  try { return new Date(iso).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }); } catch (_) { return iso; }
+}
+
 // ─── Agents table ─────────────────────────────────────────────────────────────
 async function refreshAgents() {
   const wrap = document.getElementById('agentsWrap');
@@ -493,20 +510,16 @@ async function refreshAgents() {
       wrap.innerHTML = '<div class="empty"><div class="ico">📭</div><p>No agents registered.</p><p class="mt-xs" style="font-size:.77rem">Click <strong>Register Agent</strong> to get started.</p></div>';
       return;
     }
-    const details = await Promise.all(
-      agents.map(a => api('/agents/' + encodeURIComponent(a.aid)).catch(() => null))
-    );
 
     const div = document.createElement('div');
     div.className = 't-wrap';
     const tbl = document.createElement('table');
     tbl.innerHTML = `<thead><tr>
-      <th>AID</th><th>Service TCP</th><th>TCP</th><th>DHT</th><th>Seq</th><th></th>
+      <th>AID</th><th>Service TCP</th><th>TCP</th><th>DHT</th><th>HB</th><th>Last pub</th><th>Next renew</th><th>Seq</th><th></th>
     </tr></thead>`;
     const tbody = document.createElement('tbody');
 
-    agents.forEach((ag, i) => {
-      const d = details[i];
+    agents.forEach((ag) => {
       const tr = document.createElement('tr');
 
       // AID
@@ -522,32 +535,50 @@ async function refreshAgents() {
 
       // Service TCP
       const td1 = document.createElement('td');
-      td1.innerHTML = '<span class="mono">' + esc(ag.service_tcp) + '</span>';
+      td1.innerHTML = ag.service_tcp
+        ? '<span class="mono">' + esc(ag.service_tcp) + '</span>'
+        : '<span class="muted text-sm">—</span>';
       tr.appendChild(td1);
 
-      // TCP reachable
+      // TCP reachable (null = not configured, true/false = probe result)
       const td2 = document.createElement('td');
-      if (d !== null) {
-        const b = document.createElement('span');
-        b.className = 'badge ' + (d.service_tcp_ok ? 'b-green' : 'b-red');
-        b.textContent = d.service_tcp_ok ? '✓ OK' : '✗ Down';
-        td2.appendChild(b);
+      if (ag.service_tcp_ok === null || ag.service_tcp_ok === undefined) {
+        td2.innerHTML = '<span class="muted text-sm">—</span>';
       } else {
-        td2.innerHTML = '<span class="badge b-gray">—</span>';
+        const bTcp = document.createElement('span');
+        bTcp.className = 'badge ' + (ag.service_tcp_ok ? 'b-green' : 'b-yellow');
+        bTcp.textContent = ag.service_tcp_ok ? '✓ OK' : '✗ Down';
+        td2.appendChild(bTcp);
       }
       tr.appendChild(td2);
 
       // Published
       const td3 = document.createElement('td');
-      if (d !== null) {
-        const b = document.createElement('span');
-        b.className = 'badge ' + (d.published_to_dht ? 'b-blue' : 'b-gray');
-        b.textContent = d.published_to_dht ? '✓ Published' : 'Unpublished';
-        td3.appendChild(b);
-      } else {
-        td3.innerHTML = '<span class="badge b-gray">—</span>';
-      }
+      const bPub = document.createElement('span');
+      bPub.className = 'badge ' + (ag.published_to_dht ? 'b-blue' : 'b-gray');
+      bPub.textContent = ag.published_to_dht ? '✓ Published' : 'Unpublished';
+      td3.appendChild(bPub);
       tr.appendChild(td3);
+
+      // Heartbeat age
+      const tdHb = document.createElement('td');
+      tdHb.className = 'muted text-sm';
+      if (ag.heartbeat_seconds_ago != null && typeof ag.heartbeat_seconds_ago === 'number') {
+        tdHb.textContent = Math.round(ag.heartbeat_seconds_ago) + 's ago';
+      } else {
+        tdHb.textContent = '—';
+      }
+      tr.appendChild(tdHb);
+
+      const tdLp = document.createElement('td');
+      tdLp.className = 'muted text-sm';
+      tdLp.textContent = fmtShortIso(ag.last_publish_at);
+      tr.appendChild(tdLp);
+
+      const tdNx = document.createElement('td');
+      tdNx.className = 'muted text-sm';
+      tdNx.textContent = fmtShortIso(ag.next_republish_estimate);
+      tr.appendChild(tdNx);
 
       // Seq
       const td4 = document.createElement('td');
@@ -580,6 +611,107 @@ async function refreshAgents() {
     wrap.appendChild(div);
   } catch (e) {
     wrap.innerHTML = '<div class="empty"><div class="ico">⚠</div><p>' + esc(e.message) + '</p></div>';
+  }
+}
+
+async function refreshPublishBanner() {
+  const card = document.getElementById('publishGuideCard');
+  const body = document.getElementById('publishGuideBody');
+  try {
+    const st = await api('/status');
+    card.classList.remove('hidden');
+    const on = !!st.auto_publish;
+    body.innerHTML = '';
+
+    // Dismissible info hint
+    if (!localStorage.getItem('a2al_publish_hint_dismissed')) {
+      const hint = document.createElement('div');
+      hint.className = 'info-box';
+      const txt = document.createElement('span');
+      txt.style.flex = '1';
+      const repMin = st.republish_interval_s ? Math.round(st.republish_interval_s / 60) : 30;
+      txt.innerHTML = '<strong>Node</strong> auto-publish registers this machine on the DHT (default: on). ' +
+        '<strong>Agents</strong> auto-renew every ~' + repMin + ' min when <code>service_tcp</code> is reachable or any agent API call is made.';
+      const dis = document.createElement('button');
+      dis.className = 'btn btn-ghost btn-sm';
+      dis.textContent = 'Dismiss';
+      dis.style.flexShrink = '0';
+      dis.onclick = () => { localStorage.setItem('a2al_publish_hint_dismissed', '1'); hint.remove(); };
+      hint.appendChild(txt);
+      hint.appendChild(dis);
+      body.appendChild(hint);
+    }
+
+    const rows = document.createElement('div');
+    rows.className = 'pub-rows';
+
+    function pubRow(labelText, content) {
+      const row = document.createElement('div');
+      row.className = 'pub-row';
+      const lbl = document.createElement('span');
+      lbl.className = 'pub-lbl';
+      lbl.textContent = labelText;
+      row.appendChild(lbl);
+      if (typeof content === 'string') {
+        const s = document.createElement('span');
+        s.className = 'text-sm';
+        s.textContent = content;
+        row.appendChild(s);
+      } else {
+        row.appendChild(content);
+      }
+      return row;
+    }
+
+    // Status row: badge + toggle button
+    const statusWrap = document.createElement('div');
+    statusWrap.className = 'flex gap-s';
+    const badge = document.createElement('span');
+    badge.className = 'badge ' + (on ? 'b-green' : 'b-yellow');
+    badge.textContent = on ? 'ON' : 'Off — stealth';
+    statusWrap.appendChild(badge);
+    const toggleBtn = document.createElement('button');
+    toggleBtn.className = 'btn btn-secondary btn-sm';
+    toggleBtn.textContent = on ? 'Disable' : 'Enable';
+    toggleBtn.onclick = async function () {
+      try {
+        await api('/config', { method: 'PATCH', body: JSON.stringify({ auto_publish: !on }) });
+        toast(on ? 'Node auto-publish disabled.' : 'Node auto-publish enabled.', 'ok');
+        await Promise.all([refreshPublishBanner(), loadConfig()]);
+      } catch (e) { toast(e.message, 'err'); }
+    };
+    statusWrap.appendChild(toggleBtn);
+    rows.appendChild(pubRow('Status', statusWrap));
+
+    // Node AID row with copy button
+    const aidWrap = document.createElement('div');
+    aidWrap.className = 'aid-wrap';
+    const aidSpan = document.createElement('span');
+    aidSpan.className = 'aid-text';
+    aidSpan.textContent = st.node_aid || '—';
+    aidSpan.title = st.node_aid || '';
+    aidWrap.appendChild(aidSpan);
+    if (st.node_aid) aidWrap.appendChild(mkCopyBtn(st.node_aid));
+    rows.appendChild(pubRow('Node AID', aidWrap));
+
+    // Publish info rows
+    if (st.node_published) {
+      rows.appendChild(pubRow('DHT seq', String(st.node_seq)));
+      if (st.node_last_publish_at)
+        rows.appendChild(pubRow('Last pub', fmtShortIso(st.node_last_publish_at)));
+      if (st.node_next_republish_estimate)
+        rows.appendChild(pubRow('Next ~', fmtShortIso(st.node_next_republish_estimate)));
+    } else if (on) {
+      const warn = document.createElement('span');
+      warn.className = 'text-sm';
+      warn.style.color = 'var(--warn)';
+      warn.textContent = 'Not yet published — check bootstrap / logs.';
+      rows.appendChild(pubRow('DHT', warn));
+    }
+
+    body.appendChild(rows);
+  } catch (e) {
+    card.classList.add('hidden');
   }
 }
 
@@ -769,8 +901,8 @@ document.getElementById('regSubmit').onclick = async function () {
   if (regMode === 'ethereum') {
     const svcTCP = document.getElementById('ethSvcTCP').value.trim();
     const agent = document.getElementById('ethAgent').value.trim();
-    if (!ethOpSeedHex || !ethDelMessage || !ethSigHex || !svcTCP || !agent) {
-      toast('Complete steps 1–3 and set service TCP.', 'err');
+    if (!ethOpSeedHex || !ethDelMessage || !ethSigHex || !agent) {
+      toast('Complete steps 1–3.', 'err');
       return;
     }
     setLoading(btn, true);
@@ -805,7 +937,7 @@ document.getElementById('regSubmit').onclick = async function () {
   const opKey   = document.getElementById('regOpKey').value.trim();
   const delProof= document.getElementById('regDelProof').value.trim();
   const svcTCP  = document.getElementById('regSvcTCP').value.trim();
-  if (!opKey || !delProof || !svcTCP) { toast('All fields are required.', 'err'); return; }
+  if (!opKey || !delProof) { toast('Operational key and delegation proof are required.', 'err'); return; }
   setLoading(btn, true);
   try {
     const r = await api('/agents', {
@@ -924,6 +1056,7 @@ const CFG_DEFAULTS = {
   disable_upnp: false, fallback_host: '', min_observed_peers: 3,
   api_addr: '127.0.0.1:2121', api_token: '', key_dir: '',
   log_format: 'text', log_level: 'info',
+  auto_publish: true,
 };
 // Human-readable note when a field is empty/zero (its semantic meaning)
 const CFG_EMPTY_NOTES = {
@@ -1180,7 +1313,7 @@ document.getElementById('saveTok').onclick = () => {
 
 // ─── Boot ─────────────────────────────────────────────────────────────────────
 async function refreshAll() {
-  await Promise.allSettled([refreshStatus(), refreshAgents()]);
+  await Promise.allSettled([refreshStatus(), refreshAgents(), refreshPublishBanner()]);
 }
 
 document.getElementById('refreshBtn').onclick = refreshAll;
