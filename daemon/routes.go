@@ -5,6 +5,7 @@ package daemon
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -51,9 +52,13 @@ func (d *Daemon) routes() http.Handler {
 }
 
 func (d *Daemon) withMiddleware(next http.Handler) http.Handler {
+	const maxRequestBody = 1 << 20 // 1 MiB
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
 		if d.cfg.APIToken != "" {
-			if r.Header.Get("Authorization") != "Bearer "+d.cfg.APIToken {
+			got := r.Header.Get("Authorization")
+			want := "Bearer " + d.cfg.APIToken
+			if subtle.ConstantTimeCompare([]byte(got), []byte(want)) != 1 {
 				http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 				return
 			}
