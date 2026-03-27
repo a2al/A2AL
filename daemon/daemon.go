@@ -59,6 +59,17 @@ type Daemon struct {
 	// daemon session (DHT records persist until TTL expiry).
 	mailboxSeenMu sync.Mutex
 	mailboxSeen   map[string]map[string]time.Time // aidStr → msgKey → first-seen time
+
+	nodePublishMu  sync.Mutex
+	nodePublishSeq uint64 // last successfully published DHT seq for node identity
+
+	publishMetaMu    sync.Mutex
+	nodeLastPublish  time.Time
+	lastEndpointsFP  string // for detecting IP / endpoint list changes
+	agentLastPublish map[a2al.Address]time.Time
+
+	heartbeatMu sync.Mutex
+	heartbeatAt map[a2al.Address]time.Time
 }
 
 // APIAddr returns the REST API / Web UI listen address from the loaded config.
@@ -126,13 +137,16 @@ func New(cfg Config) (*Daemon, error) {
 	}
 
 	return &Daemon{
-		dataDir:  cfg.DataDir,
-		cfgPath:  cfgPath,
-		cfg:      &nodeCfg,
-		log:      log,
-		h:        h,
-		reg:      reg,
-		nodeAddr: ks.Address(),
+		dataDir:          cfg.DataDir,
+		cfgPath:          cfgPath,
+		cfg:              &nodeCfg,
+		log:              log,
+		h:                h,
+		reg:              reg,
+		nodeAddr:         ks.Address(),
+		agentLastPublish: make(map[a2al.Address]time.Time),
+		heartbeatAt:      make(map[a2al.Address]time.Time),
+		mailboxSeen:      make(map[string]map[string]time.Time),
 	}, nil
 }
 
@@ -152,6 +166,11 @@ func (d *Daemon) Run(ctx context.Context, mcpStdio bool) error {
 			d.log.Warn("re-register agent", "aid", e.AID.String(), "err", err)
 		}
 	}
+
+	d.initialAutoPublish(ctx)
+	loopCtx, loopCancel := context.WithCancel(ctx)
+	defer loopCancel()
+	go d.autoPublishMainLoop(loopCtx)
 
 	gwCtx, gwCancel := context.WithCancel(ctx)
 	defer gwCancel()
