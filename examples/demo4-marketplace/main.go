@@ -5,7 +5,7 @@
 //
 // 场景：Alice 是翻译服务提供方，Bob 是使用方。
 //
-//   - Alice 上线后发布 topic "ai/translate" 并持续 poll 收件箱，自动回复翻译请求。
+//   - Alice 上线后发布 topic "lang.translate" 并持续 poll 收件箱，自动回复翻译请求。
 //   - Bob 通过 topic discover 找到 Alice，通过 DHT mailbox 发送翻译请求，等待并显示结果。
 //
 // 二者都只和本机 a2ald 通信，P2P 通信由两个 daemon 完成。
@@ -239,16 +239,16 @@ func runAlice(c *client, idPath string) {
 	}
 
 	// Register topic.
-	fmt.Print(`  注册 topic "ai/translate"...`)
+	fmt.Print(`  注册 topic "lang.translate"...`)
 	topicReq := map[string]any{
-		"topics":    []string{"ai/translate"},
+		"services":  []string{"lang.translate"},
 		"name":      "Alice Translate",
 		"protocols": []string{"mcp"},
 		"tags":      []string{"en", "zh"},
 		"brief":     "English ↔ Chinese translation service",
 		"ttl":       3600,
 	}
-	if err := c.do("POST", "/agents/"+id.AID+"/topics", topicReq, nil); err != nil {
+	if err := c.do("POST", "/agents/"+id.AID+"/services", topicReq, nil); err != nil {
 		fatal("注册 topic: %v", err)
 	}
 	fmt.Println(" OK")
@@ -333,9 +333,9 @@ func runBob(c *client, idPath string) {
 	}
 
 	// Discover translator via topic.
-	fmt.Print(`  discover "ai/translate" (tag=zh)`)
+	fmt.Print(`  discover "lang.translate" (tag=zh)`)
 	discoverReq := map[string]any{
-		"topics": []string{"ai/translate"},
+		"services": []string{"lang.translate"},
 		"filter": map[string]any{"tags": []string{"zh"}},
 	}
 	var discoverResp struct {
@@ -364,7 +364,7 @@ func runBob(c *client, idPath string) {
 	fmt.Println()
 
 	if aliceAID == "" {
-		fatal("未找到翻译服务（topic: ai/translate, tag: zh）。\n请确认 Alice 已上线，且 DHT 已同步（通常需等待数秒）。")
+		fatal("未找到翻译服务（topic: lang.translate, tag: zh）。\n请确认 Alice 已上线，且 DHT 已同步（通常需等待数秒）。")
 	}
 
 	fmt.Printf("\n  找到 %d 个翻译服务:\n", len(discoverResp.Entries))

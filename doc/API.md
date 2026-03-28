@@ -189,9 +189,9 @@ Binds to `config.Config.APIAddr` (default `127.0.0.1:2121`). If `api_token` is s
 | `POST` | `/agents/{aid}/records` | Sovereign custom record (RecType `0x02`–`0x0f`): `rec_type`, `payload_base64`, `ttl`; signed with operational key + delegation. |
 | `POST` | `/agents/{aid}/mailbox/send` | Encrypted mailbox: JSON `recipient`, `msg_type`, `body_base64` → `{"ok":true}`. |
 | `POST` | `/agents/{aid}/mailbox/poll` | Returns `{"messages":[{"sender","msg_type","body_base64"},...]}`. |
-| `POST` | `/agents/{aid}/topics` | Register topic(s): `topics`, `name`, `protocols`, `tags`, `brief`, optional `meta` (incl. `url` for self-hosted agents), `ttl`. |
-| `DELETE` | `/agents/{aid}/topics/{topic...}` | Drop topic from daemon renewal list (body `{}`); DHT entry expires by TTL. |
-| `POST` | `/discover` | `{"topics":["..."],"filter":{"protocols":[],"tags":[]}}` → `{"entries":[...]}`. |
+| `POST` | `/agents/{aid}/services` | Register service(s): `services`, `name`, `protocols`, `tags`, `brief`, optional `meta` (incl. `url` for self-hosted agents), `ttl`. |
+| `DELETE` | `/agents/{aid}/services/{service...}` | Drop service from daemon renewal list (body `{}`); DHT entry expires by TTL. |
+| `POST` | `/discover` | `{"services":["..."],"filter":{"protocols":[],"tags":[]}}` → `{"entries":[{"service","aid","name",...},...]}`. |
 | `GET` | `/resolve/{aid}/records?type={rec_type}` | List verified `SignedRecord`s for remote AID; omit `type` or `type=0` for all RecTypes. Response `records[]` with `payload_base64`, `pubkey_base64`, `signature_base64`, etc. |
 | `POST` | `/resolve/{aid}` | Resolve remote AID to endpoint record JSON. |
 | `POST` | `/connect/{aid}` | Outbound tunnel: returns `{"tunnel":"127.0.0.1:<port>"}`; optional JSON `{"local_aid":"..."}` if multiple local agents. |
@@ -203,7 +203,7 @@ Binds to `config.Config.APIAddr` (default `127.0.0.1:2121`). If `api_token` is s
 - **Streamable HTTP**: mounted at `/mcp/` on the API server.  
 - **Stdio**: run `a2ald -mcp-stdio` (no HTTP API in that mode).
 
-All tools: `a2al_identity_generate`, `a2al_agents_generate_ethereum`, `a2al_ethereum_delegation_message`, `a2al_ethereum_register`, `a2al_ethereum_proof`, `a2al_agents_list`, `a2al_agent_register`, `a2al_agent_get`, `a2al_agent_patch`, `a2al_agent_publish`, `a2al_agent_heartbeat`, `a2al_agent_delete`, `a2al_agent_publish_record`, `a2al_status`, `a2al_resolve_records`, `a2al_resolve`, `a2al_connect`, `a2al_mailbox_send`, `a2al_mailbox_poll`, `a2al_topic_register`, `a2al_topic_unregister`, `a2al_discover`.
+All tools: `a2al_identity_generate`, `a2al_agents_generate_ethereum`, `a2al_ethereum_delegation_message`, `a2al_ethereum_register`, `a2al_ethereum_proof`, `a2al_agents_list`, `a2al_agent_register`, `a2al_agent_get`, `a2al_agent_patch`, `a2al_agent_publish`, `a2al_agent_heartbeat`, `a2al_agent_delete`, `a2al_agent_publish_record`, `a2al_status`, `a2al_resolve_records`, `a2al_resolve`, `a2al_connect`, `a2al_mailbox_send`, `a2al_mailbox_poll`, `a2al_service_register`, `a2al_service_unregister`, `a2al_discover`.
 
 ---
 
