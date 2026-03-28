@@ -1,5 +1,8 @@
 version: 2
 
+snapshot:
+  version_template: '{{ .Tag | replace "/" "-" }}-SNAPSHOT-{{ .ShortCommit }}'
+
 builds:
   - id: a2ald
     main: ./cmd/a2ald
@@ -16,7 +19,7 @@ builds:
 
 archives:
   - id: a2ald
-    builds: [a2ald]
+    ids: [a2ald]
     name_template: "a2ald_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
     format_overrides:
       - goos: windows
@@ -25,7 +28,7 @@ archives:
 nfpms:
   - id: a2ald-pkg
     package_name: a2ald
-    builds: [a2ald]
+    ids: [a2ald]
     vendor: A2AL Authors
     homepage: https://github.com/a2al/a2al
     maintainer: A2AL Authors <noreply@github.com>
