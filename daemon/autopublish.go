@@ -230,6 +230,12 @@ func (d *Daemon) initialAutoPublish(ctx context.Context) {
 			d.log.Warn("initial node publish", "err", err)
 		}
 		cancel()
+
+		// Recover from lost persistence: resolve own record from the DHT.
+		// If the network already has a higher seq (e.g. from a previous run
+		// whose state file was lost), republish at networkSeq+1 immediately so
+		// our record is accepted without waiting for the old TTL to expire.
+		go d.recoverSeqFromNetwork(ctx)
 	} else {
 		// Still capture fingerprint so endpoint-change detection works after user enables auto_publish.
 		pctx, cancel := context.WithTimeout(ctx, 45*time.Second)
@@ -240,6 +246,42 @@ func (d *Daemon) initialAutoPublish(ctx context.Context) {
 			d.lastEndpointsFP = endpointPayloadFingerprint(ep)
 			d.publishMetaMu.Unlock()
 		}
+	}
+}
+
+// recoverSeqFromNetwork resolves the node's own AID from the DHT and, if the
+// network holds a higher seq than our current local value (e.g. after losing
+// the persistence file), immediately republishes at networkSeq+1 so the record
+// is accepted by all peers without waiting for TTL expiry.
+func (d *Daemon) recoverSeqFromNetwork(ctx context.Context) {
+	rctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+
+	er, err := d.h.Resolve(rctx, d.nodeAddr)
+	if err != nil {
+		// DHT lookup failed (e.g. no peers yet); nothing to recover.
+		return
+	}
+
+	d.nodePublishMu.Lock()
+	local := d.nodePublishSeq
+	d.nodePublishMu.Unlock()
+
+	if er.Seq <= local {
+		// Network seq is not ahead; our initial publish already succeeded.
+		return
+	}
+
+	// Network has a higher seq: update local state and republish.
+	d.log.Info("seq recovery: network ahead, republishing", "network_seq", er.Seq, "local_seq", local)
+	d.nodePublishMu.Lock()
+	d.nodePublishSeq = er.Seq
+	d.nodePublishMu.Unlock()
+
+	pubCtx, pubCancel := context.WithTimeout(ctx, 90*time.Second)
+	defer pubCancel()
+	if err := d.publishNodeOnce(pubCtx); err != nil {
+		d.log.Warn("seq recovery republish", "err", err)
 	}
 }
 
