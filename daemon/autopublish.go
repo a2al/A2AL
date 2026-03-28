@@ -6,6 +6,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/a2al/a2al"
+	"github.com/a2al/a2al/dht"
 	"github.com/a2al/a2al/internal/registry"
 	"github.com/a2al/a2al/protocol"
 )
@@ -83,8 +85,14 @@ func (d *Daemon) agentAliveForRepublish(e *registry.Entry) bool {
 	d.heartbeatMu.Lock()
 	t, hbOK := d.heartbeatAt[e.AID]
 	d.heartbeatMu.Unlock()
-	if hbOK && time.Since(t) < heartbeatTTL {
-		return true
+	if hbOK {
+		if t.IsZero() {
+			// Zero sentinel: forcibly marked inactive (e.g. stale record detected).
+			return false
+		}
+		if time.Since(t) < heartbeatTTL {
+			return true
+		}
 	}
 	// No service_tcp means the agent manages its own public reachability (e.g. public URL).
 	// In that case heartbeat is the only liveness signal — TCP probe is not applicable.
@@ -176,7 +184,20 @@ func (d *Daemon) tryRepublishAgent(ctx context.Context, e *registry.Entry) {
 	}
 	nextSeq := e.Seq + 1
 	if err := d.h.PublishEndpointForAgent(ctx, e.AID, nextSeq, endpointRecordTTL); err != nil {
-		d.log.Debug("agent auto-republish", "aid", e.AID.String(), "err", err)
+		if errors.Is(err, dht.ErrStaleRecord) {
+			// Network has a higher seq: another node has taken over publishing for this agent.
+			// Set zero sentinel to suppress both heartbeat and TCP-probe paths until the
+			// agent re-contacts this node (touchHeartbeat will restore a real timestamp).
+			d.heartbeatMu.Lock()
+			if d.heartbeatAt == nil {
+				d.heartbeatAt = make(map[a2al.Address]time.Time)
+			}
+			d.heartbeatAt[e.AID] = time.Time{}
+			d.heartbeatMu.Unlock()
+			d.log.Info("agent auto-republish stopped: stale record, agent may have migrated", "aid", e.AID.String())
+		} else {
+			d.log.Debug("agent auto-republish", "aid", e.AID.String(), "err", err)
+		}
 		return
 	}
 
@@ -263,6 +284,28 @@ func (d *Daemon) initialAutoPublish(ctx context.Context) {
 		// whose state file was lost), republish at networkSeq+1 immediately so
 		// our record is accepted without waiting for the old TTL to expire.
 		go d.recoverSeqFromNetwork(ctx)
+
+		// Republish agent services ~60 s after startup so gateway agents
+		// (service_tcp reachable) recover without waiting for the first
+		// periodic tick (30 min). Self-service agents still require a fresh
+		// heartbeat before republish — no change in that behaviour.
+		go func() {
+			t := time.NewTimer(60 * time.Second)
+			defer t.Stop()
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+			}
+			rctx, cancel := context.WithTimeout(ctx, 120*time.Second)
+			defer cancel()
+			d.regMu.RLock()
+			agents := d.reg.List()
+			d.regMu.RUnlock()
+			for _, e := range agents {
+				d.tryRepublishAgent(rctx, e)
+			}
+		}()
 	} else {
 		// Still capture fingerprint so endpoint-change detection works after user enables auto_publish.
 		pctx, cancel := context.WithTimeout(ctx, 45*time.Second)
