@@ -1,0 +1,84 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - run: go test -vet=off -count=1 ./...
+        env:
+          CGO_ENABLED: "0"
+
+  release:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  gomobile-android:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r25c
+      - name: gomobile bind (android)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          go install tool
+          gomobile init
+          gomobile bind -target=android -androidapi 21 -ldflags="-checklinkname=0" -o a2al.aar github.com/a2al/a2al/mobile
+      - uses: actions/upload-artifact@v4
+        with:
+          name: a2al-android-aar
+          path: a2al.aar
+          retention-days: 7
+
+  gomobile-ios:
+    runs-on: macos-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - name: gomobile bind (ios)
+        run: |
+          go install tool
+          gomobile init
+          gomobile bind -target=ios -o A2AL.xcframework github.com/a2al/a2al/mobile
+      - uses: actions/upload-artifact@v4
+        with:
+          name: a2al-ios-xcframework
+          path: A2AL.xcframework
+          retention-days: 7

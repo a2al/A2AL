@@ -1,0 +1,22 @@
+[Unit]
+Description=A2AL Daemon
+Documentation=https://github.com/a2al/a2al
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=a2al
+Group=a2al
+ExecStart=/opt/a2al/bin/a2ald -data-dir /opt/a2al/data
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/a2al/data
+
+[Install]
+WantedBy=multi-user.target
