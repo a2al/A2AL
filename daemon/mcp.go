@@ -75,6 +75,14 @@ func buildMCPServer(d *Daemon) *mcp.Server {
 		Description: "Record agent liveness for auto-republish (within TTL); use when service is not on local service_tcp.",
 	}, d.mcpAgentHeartbeat)
 	mcp.AddTool(s, &mcp.Tool{
+		Name:        "a2al_agent_delete",
+		Description: "Unregister agent: remove from registry, stop auto-republish, delete operational key.",
+	}, d.mcpAgentDelete)
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "a2al_status",
+		Description: "Return node auto-publish status: auto_publish flag, node_aid, node_seq, last and next publish timestamps.",
+	}, d.mcpStatus)
+	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_agent_publish_record",
 		Description: "Publish sovereign custom DHT record RecType 0x02-0x0f.",
 	}, d.mcpAgentPublishRecord)
@@ -420,6 +428,19 @@ func (d *Daemon) mcpDiscover(ctx context.Context, _ *mcp.ServerSession, params *
 		return nil, err
 	}
 	return &mcp.CallToolResultFor[map[string]any]{StructuredContent: map[string]any{"entries": entries}}, nil
+}
+
+func (d *Daemon) mcpAgentDelete(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[mcpAIDArgs]) (*mcp.CallToolResultFor[map[string]any], error) {
+	_ = ctx
+	if err := d.execAgentDelete(params.Arguments.AID); err != nil {
+		return nil, err
+	}
+	return &mcp.CallToolResultFor[map[string]any]{StructuredContent: map[string]any{"ok": true}}, nil
+}
+
+func (d *Daemon) mcpStatus(ctx context.Context, _ *mcp.ServerSession, _ *mcp.CallToolParamsFor[struct{}]) (*mcp.CallToolResultFor[map[string]any], error) {
+	_ = ctx
+	return &mcp.CallToolResultFor[map[string]any]{StructuredContent: d.execStatus()}, nil
 }
 
 func structToMap(v any) (map[string]any, error) {
