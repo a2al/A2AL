@@ -441,9 +441,27 @@ func (d *Daemon) execAgentPublish(ctx context.Context, aidStr string) (uint64, e
 	}
 	nextSeq := e.Seq + 1
 	if err := d.h.PublishEndpointForAgent(ctx, aid, nextSeq, 3600); err != nil {
+		// Stale record: DHT peers hold a higher seq (e.g. agent was deleted and
+		// re-imported, resetting local seq to 0). Resolve the current network seq
+		// and retry once at networkSeq+1 — symmetric to recoverSeqFromNetwork for
+		// the node AID.
+		if errors.Is(err, dht.ErrStaleRecord) {
+			if er, rerr := d.h.Resolve(ctx, aid); rerr == nil && er.Seq >= nextSeq {
+				d.log.Info("agent seq recovery: network ahead, retrying",
+					"aid", aid.String(), "network_seq", er.Seq, "local_seq", e.Seq)
+				nextSeq = er.Seq + 1
+				if err2 := d.h.PublishEndpointForAgent(ctx, aid, nextSeq, 3600); err2 != nil {
+					d.log.Warn("publish endpoint (retry)", "aid", aid.String(), "err", err2)
+					return 0, errPublish
+				}
+				// Retry succeeded — fall through to persist the updated seq.
+				goto persist
+			}
+		}
 		d.log.Warn("publish endpoint", "aid", aid.String(), "err", err)
 		return 0, errPublish
 	}
+persist:
 	d.regMu.Lock()
 	defer d.regMu.Unlock()
 	e = d.reg.Get(aid)
@@ -459,6 +477,8 @@ func (d *Daemon) execAgentPublish(ctx context.Context, aidStr string) (uint64, e
 }
 
 // touchHeartbeat records agent liveness for auto-republish (middleware + explicit heartbeat).
+// If the agent's last publish is stale or unknown (e.g. after daemon restart), an immediate
+// background republish is triggered so services recover without waiting for the 30-min tick.
 func (d *Daemon) touchHeartbeat(aid a2al.Address) {
 	d.heartbeatMu.Lock()
 	if d.heartbeatAt == nil {
@@ -466,6 +486,23 @@ func (d *Daemon) touchHeartbeat(aid a2al.Address) {
 	}
 	d.heartbeatAt[aid] = time.Now()
 	d.heartbeatMu.Unlock()
+
+	d.publishMetaMu.Lock()
+	lastPub := d.agentLastPublish[aid]
+	d.publishMetaMu.Unlock()
+
+	if time.Since(lastPub) > republishPeriod {
+		d.regMu.RLock()
+		e := d.reg.Get(aid)
+		d.regMu.RUnlock()
+		if e != nil {
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+				defer cancel()
+				d.tryRepublishAgent(ctx, e)
+			}()
+		}
+	}
 }
 
 func (d *Daemon) execAgentHeartbeat(aidStr string) error {
