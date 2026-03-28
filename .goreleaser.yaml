@@ -1,7 +1,7 @@
 version: 2
 
 snapshot:
-  version_template: '{{ .ShortCommit }}'
+  version_template: '0~{{ .ShortCommit }}'
 
 builds:
   - id: a2ald
