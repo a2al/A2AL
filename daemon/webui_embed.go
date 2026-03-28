@@ -4,14 +4,34 @@
 package daemon
 
 import (
-	_ "embed"
+	"embed"
+	"io/fs"
 	"net/http"
 )
 
-//go:embed webui/index.html
-var webuiIndex []byte
+//go:embed all:webui/dist
+var webuiDist embed.FS
 
-func (d *Daemon) handleWebUIRoot(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = w.Write(webuiIndex)
+func registerWebUIRoutes(mux *http.ServeMux) {
+	distFS, err := fs.Sub(webuiDist, "webui/dist")
+	if err != nil {
+		panic("webui/dist: " + err.Error())
+	}
+	assetsFS, err := fs.Sub(distFS, "assets")
+	if err != nil {
+		panic("webui/dist/assets: " + err.Error())
+	}
+	mux.Handle(
+		"GET /assets/",
+		http.StripPrefix("/assets/", http.FileServer(http.FS(assetsFS))),
+	)
+	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
+		b, err := fs.ReadFile(distFS, "index.html")
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write(b)
+	})
 }

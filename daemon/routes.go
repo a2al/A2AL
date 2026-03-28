@@ -21,7 +21,6 @@ import (
 
 func (d *Daemon) routes() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /{$}", d.handleWebUIRoot)
 	mux.HandleFunc("GET /health", d.handleHealth)
 	mux.HandleFunc("GET /status", d.handleStatus)
 	mux.HandleFunc("GET /config", d.handleGetConfig)
@@ -50,6 +49,7 @@ func (d *Daemon) routes() http.Handler {
 	mux.HandleFunc("POST /connect/{aid}", d.handleConnect)
 	mux.Handle("/debug/", d.h.DebugHTTPHandler())
 	mux.Handle("/mcp/", d.mcpHTTPHandler())
+	registerWebUIRoutes(mux)
 	return d.withMiddleware(mux)
 }
 
