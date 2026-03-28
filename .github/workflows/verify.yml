@@ -3,7 +3,7 @@ name: verify
 on:
   push:
     tags:
-      - 'verify/*'
+      - 'verify-*'
 
 permissions:
   contents: read

@@ -1,8 +1,5 @@
 version: 2
 
-snapshot:
-  version_template: '{{ .Tag | replace "/" "-" }}-SNAPSHOT-{{ .ShortCommit }}'
-
 builds:
   - id: a2ald
     main: ./cmd/a2ald
