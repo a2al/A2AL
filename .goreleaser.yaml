@@ -1,5 +1,8 @@
 version: 2
 
+snapshot:
+  version_template: '{{ .ShortCommit }}'
+
 builds:
   - id: a2ald
     main: ./cmd/a2ald

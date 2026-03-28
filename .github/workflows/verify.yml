@@ -41,12 +41,38 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: packages-all-platforms
+          name: linux-amd64
           path: |
-            dist/*.tar.gz
-            dist/*.zip
-            dist/*.deb
-            dist/*.rpm
+            dist/*linux_amd64*
+            dist/*_amd64.deb
+            dist/*amd64.rpm
+          retention-days: 7
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-arm64
+          path: |
+            dist/*linux_arm64*
+            dist/*_arm64.deb
+            dist/*arm64.rpm
+          retention-days: 7
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: darwin-amd64
+          path: dist/*darwin_amd64*
+          retention-days: 7
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: darwin-arm64
+          path: dist/*darwin_arm64*
+          retention-days: 7
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-amd64
+          path: dist/*windows_amd64*
           retention-days: 7
 
   gomobile-android:
