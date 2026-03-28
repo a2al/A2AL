@@ -348,6 +348,7 @@ func (d *Daemon) execAgentsList() []map[string]any {
 			"seq":              e.Seq,
 			"service_tcp_ok":   tcpOK,
 			"published_to_dht": e.Seq > 0,
+			"services":         e.Services,
 		}
 		if hbT, ok := hbSnap[e.AID]; ok {
 			m["heartbeat_seconds_ago"] = time.Since(hbT).Seconds()
@@ -387,6 +388,7 @@ func (d *Daemon) execAgentGet(ctx context.Context, aidStr string) (map[string]an
 		"seq":                  e.Seq,
 		"service_tcp_ok":       tcpOK,
 		"published_to_dht":     e.Seq > 0,
+		"services":             e.Services,
 		"published_endpoints":  nil,
 		"published_nat_type":   nil,
 		"published_record_seq": nil,
@@ -690,7 +692,7 @@ func mailboxMsgKey(m protocol.MailboxMessage) string {
 }
 
 type topicRegisterReq struct {
-	Topics    []string       `json:"topics"`
+	Services  []string       `json:"services"`
 	Name      string         `json:"name"`
 	Protocols []string       `json:"protocols"`
 	Tags      []string       `json:"tags"`
@@ -700,7 +702,7 @@ type topicRegisterReq struct {
 }
 
 type discoverReq struct {
-	Topics []string                 `json:"topics"`
+	Services []string                 `json:"services"`
 	Filter *protocol.DiscoverFilter `json:"filter,omitempty"`
 }
 
@@ -711,7 +713,7 @@ func topicEntryToMap(e protocol.TopicEntry) map[string]any {
 		"timestamp": e.Timestamp,
 		"ttl":       e.TTL,
 		"version":   e.Version,
-		"topic":     e.Topic,
+		"service":   e.Topic,
 		"name":      e.Name,
 		"protocols": e.Protocols,
 		"tags":      e.Tags,
@@ -725,14 +727,8 @@ func (d *Daemon) execTopicRegister(ctx context.Context, aidStr string, req topic
 	if err != nil {
 		return errBadAID
 	}
-	if len(req.Topics) == 0 {
-		return errTopicsRequired
-	}
-	d.regMu.RLock()
-	e := d.reg.Get(aid)
-	d.regMu.RUnlock()
-	if e == nil {
-		return errNotFound
+	if len(req.Services) == 0 {
+		return errServicesRequired
 	}
 	base := protocol.TopicPayload{
 		Name:      req.Name,
@@ -741,7 +737,16 @@ func (d *Daemon) execTopicRegister(ctx context.Context, aidStr string, req topic
 		Brief:     req.Brief,
 		Meta:      req.Meta,
 	}
-	if err := d.h.RegisterTopicsForAgent(ctx, aid, req.Topics, base, req.TTL); err != nil {
+	if aid == d.nodeAddr {
+		return d.h.RegisterTopicsForAgent(ctx, aid, req.Services, base, req.TTL)
+	}
+	d.regMu.RLock()
+	e := d.reg.Get(aid)
+	d.regMu.RUnlock()
+	if e == nil {
+		return errNotFound
+	}
+	if err := d.h.RegisterTopicsForAgent(ctx, aid, req.Services, base, req.TTL); err != nil {
 		return err
 	}
 	d.regMu.Lock()
@@ -750,19 +755,34 @@ func (d *Daemon) execTopicRegister(ctx context.Context, aidStr string, req topic
 	if e == nil {
 		return errNotFound
 	}
-	seen := make(map[string]struct{}, len(e.Topics)+len(req.Topics))
-	for _, t := range e.Topics {
-		seen[t] = struct{}{}
+	// Build a map of existing services keyed by topic name for upsert.
+	byTopic := make(map[string]registry.ServiceRecord, len(e.Services)+len(req.Services))
+	for _, s := range e.Services {
+		byTopic[s.Topic] = s
 	}
-	for _, t := range req.Topics {
-		seen[t] = struct{}{}
+	ttl := req.TTL
+	if ttl == 0 {
+		ttl = 3600
 	}
-	next := make([]string, 0, len(seen))
-	for t := range seen {
-		next = append(next, t)
+	for _, t := range req.Services {
+		byTopic[t] = registry.ServiceRecord{
+			Topic:     t,
+			Name:      req.Name,
+			Protocols: req.Protocols,
+			Tags:      req.Tags,
+			Brief:     req.Brief,
+			Meta:      req.Meta,
+			TTL:       ttl,
+		}
 	}
-	slices.Sort(next)
-	e.Topics = next
+	next := make([]registry.ServiceRecord, 0, len(byTopic))
+	for _, s := range byTopic {
+		next = append(next, s)
+	}
+	slices.SortFunc(next, func(a, b registry.ServiceRecord) int {
+		return strings.Compare(a.Topic, b.Topic)
+	})
+	e.Services = next
 	return d.reg.Put(e)
 }
 
@@ -771,32 +791,36 @@ func (d *Daemon) execTopicUnregister(aidStr, topic string) error {
 	if err != nil {
 		return errBadAID
 	}
+	if aid == d.nodeAddr {
+		// Node topics are not tracked in agents.json; DHT TTL handles expiry.
+		return nil
+	}
 	d.regMu.Lock()
 	defer d.regMu.Unlock()
 	e := d.reg.Get(aid)
 	if e == nil {
 		return errNotFound
 	}
-	out := make([]string, 0, len(e.Topics))
-	for _, t := range e.Topics {
-		if t != topic {
-			out = append(out, t)
+	out := make([]registry.ServiceRecord, 0, len(e.Services))
+	for _, s := range e.Services {
+		if s.Topic != topic {
+			out = append(out, s)
 		}
 	}
-	e.Topics = out
+	e.Services = out
 	return d.reg.Put(e)
 }
 
 func (d *Daemon) execDiscover(ctx context.Context, req discoverReq) ([]map[string]any, error) {
-	if len(req.Topics) == 0 {
-		return nil, errTopicsRequired
+	if len(req.Services) == 0 {
+		return nil, errServicesRequired
 	}
 	var entries []protocol.TopicEntry
 	var err error
-	if len(req.Topics) == 1 {
-		entries, err = d.h.SearchTopic(ctx, req.Topics[0])
+	if len(req.Services) == 1 {
+		entries, err = d.h.SearchTopic(ctx, req.Services[0])
 	} else {
-		entries, err = d.h.SearchTopics(ctx, req.Topics)
+		entries, err = d.h.SearchTopics(ctx, req.Services)
 	}
 	if err != nil {
 		return nil, err
@@ -928,7 +952,7 @@ var (
 	errListen                = errors.New("listen failed")
 	errConnectQUIC           = errors.New("quic connect failed")
 	errOpKeyMismatch         = errors.New("operational key mismatch")
-	errTopicsRequired        = errors.New("topics required")
+	errServicesRequired      = errors.New("services required")
 	errBadRecType            = errors.New("rec_type must be sovereign custom 0x02-0x0f")
 	errTTLRequired           = errors.New("ttl required")
 	errBadPayloadB64         = errors.New("invalid payload_base64")

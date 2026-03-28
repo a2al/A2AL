@@ -41,8 +41,8 @@ func (d *Daemon) routes() http.Handler {
 	mux.HandleFunc("POST /agents/{aid}/records", d.withAgentMiddleware(d.handleAgentsRecordsPost))
 	mux.HandleFunc("POST /agents/{aid}/mailbox/send", d.withAgentMiddleware(d.handleAgentsMailboxSend))
 	mux.HandleFunc("POST /agents/{aid}/mailbox/poll", d.withAgentMiddleware(d.handleAgentsMailboxPoll))
-	mux.HandleFunc("POST /agents/{aid}/topics", d.withAgentMiddleware(d.handleAgentsTopicsPost))
-	mux.HandleFunc("DELETE /agents/{aid}/topics/{topic...}", d.withAgentMiddleware(d.handleAgentsTopicsDelete))
+	mux.HandleFunc("POST /agents/{aid}/services", d.withAgentMiddleware(d.handleAgentsTopicsPost))
+	mux.HandleFunc("DELETE /agents/{aid}/services/{service...}", d.withAgentMiddleware(d.handleAgentsTopicsDelete))
 	mux.HandleFunc("POST /discover", d.handleDiscover)
 	mux.HandleFunc("DELETE /agents/{aid}", d.withAgentMiddleware(d.handleAgentsDelete))
 	mux.HandleFunc("GET /resolve/{aid}/records", d.handleResolveRecords)
@@ -664,12 +664,12 @@ func (d *Daemon) handleAgentsTopicsPost(w http.ResponseWriter, r *http.Request) 
 		switch {
 		case errors.Is(err, errBadAID):
 			http.Error(w, `{"error":"bad aid"}`, http.StatusBadRequest)
-		case errors.Is(err, errTopicsRequired):
-			http.Error(w, `{"error":"topics required"}`, http.StatusBadRequest)
+		case errors.Is(err, errServicesRequired):
+			http.Error(w, `{"error":"services required"}`, http.StatusBadRequest)
 		case errors.Is(err, errNotFound):
 			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
 		default:
-			http.Error(w, `{"error":"topic register failed"}`, http.StatusBadGateway)
+			http.Error(w, `{"error":"service register failed"}`, http.StatusBadGateway)
 		}
 		return
 	}
@@ -677,9 +677,9 @@ func (d *Daemon) handleAgentsTopicsPost(w http.ResponseWriter, r *http.Request) 
 }
 
 func (d *Daemon) handleAgentsTopicsDelete(w http.ResponseWriter, r *http.Request) {
-	topic := r.PathValue("topic")
+	topic := r.PathValue("service")
 	if topic == "" {
-		http.Error(w, `{"error":"topic required"}`, http.StatusBadRequest)
+		http.Error(w, `{"error":"service required"}`, http.StatusBadRequest)
 		return
 	}
 	if err := d.execTopicUnregister(r.PathValue("aid"), topic); err != nil {
@@ -706,8 +706,8 @@ func (d *Daemon) handleDiscover(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	entries, err := d.execDiscover(ctx, req)
 	if err != nil {
-		if errors.Is(err, errTopicsRequired) {
-			http.Error(w, `{"error":"topics required"}`, http.StatusBadRequest)
+		if errors.Is(err, errServicesRequired) {
+			http.Error(w, `{"error":"services required"}`, http.StatusBadRequest)
 			return
 		}
 		http.Error(w, `{"error":"discover failed"}`, http.StatusBadGateway)
@@ -750,23 +750,12 @@ type connectReq struct {
 	LocalAID string `json:"local_aid,omitempty"`
 }
 
-var errNoLocalAgent = errors.New("no registered agents")
-var errAmbiguousLocal = errors.New("local_aid required when multiple agents")
-
 func (d *Daemon) pickLocalAgent(body connectReq) (a2al.Address, error) {
 	if body.LocalAID != "" {
 		return a2al.ParseAddress(body.LocalAID)
 	}
-	d.regMu.RLock()
-	list := d.reg.List()
-	d.regMu.RUnlock()
-	if len(list) == 1 {
-		return list[0].AID, nil
-	}
-	if len(list) == 0 {
-		return a2al.Address{}, errNoLocalAgent
-	}
-	return a2al.Address{}, errAmbiguousLocal
+	// Outbound QUIC uses the host default identity (node); see CLI spec §1.4.
+	return d.nodeAddr, nil
 }
 
 func (d *Daemon) handleConnect(w http.ResponseWriter, r *http.Request) {
@@ -779,8 +768,6 @@ func (d *Daemon) handleConnect(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case errors.Is(err, errBadAID):
 			http.Error(w, `{"error":"bad aid"}`, http.StatusBadRequest)
-		case errors.Is(err, errNoLocalAgent), errors.Is(err, errAmbiguousLocal):
-			writeJSONStatus(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		case errors.Is(err, errResolve):
 			http.Error(w, `{"error":"resolve failed"}`, http.StatusNotFound)
 		case errors.Is(err, errListen):

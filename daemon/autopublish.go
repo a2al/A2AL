@@ -193,6 +193,33 @@ func (d *Daemon) tryRepublishAgent(ctx context.Context, e *registry.Entry) {
 	}
 	d.recordAgentPublishTime(e.AID)
 	d.log.Debug("agent endpoint republished", "aid", e.AID.String(), "seq", nextSeq)
+
+	// Also re-publish all registered services (topic records) for this agent.
+	d.republishAgentServices(ctx, e2)
+}
+
+func (d *Daemon) republishAgentServices(ctx context.Context, e *registry.Entry) {
+	if len(e.Services) == 0 {
+		return
+	}
+	for _, svc := range e.Services {
+		ttl := svc.TTL
+		if ttl == 0 {
+			ttl = 3600
+		}
+		base := protocol.TopicPayload{
+			Name:      svc.Name,
+			Protocols: svc.Protocols,
+			Tags:      svc.Tags,
+			Brief:     svc.Brief,
+			Meta:      svc.Meta,
+		}
+		if err := d.h.RegisterTopicsForAgent(ctx, e.AID, []string{svc.Topic}, base, ttl); err != nil {
+			d.log.Debug("agent service republish", "aid", e.AID.String(), "topic", svc.Topic, "err", err)
+		} else {
+			d.log.Debug("agent service republished", "aid", e.AID.String(), "topic", svc.Topic)
+		}
+	}
 }
 
 func (d *Daemon) runPeriodicRepublish(ctx context.Context) {
