@@ -491,7 +491,7 @@ func (d *Daemon) touchHeartbeat(aid a2al.Address) {
 	lastPub := d.agentLastPublish[aid]
 	d.publishMetaMu.Unlock()
 
-	if time.Since(lastPub) > republishPeriod {
+	if time.Since(lastPub) > republishPeriod && d.reg != nil {
 		d.regMu.RLock()
 		e := d.reg.Get(aid)
 		d.regMu.RUnlock()
