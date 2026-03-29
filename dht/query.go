@@ -19,6 +19,11 @@ import (
 const (
 	DefaultAlpha   = 3
 	DefaultStagger = 5 * time.Millisecond
+
+	// queryPeerTimeout is the per-peer deadline inside iterative queries.
+	// Shorter than sendAndWait's full 3×5 s = 15 s to avoid slow peers blocking
+	// entire query batches; allows one attempt with margin.
+	queryPeerTimeout = 6 * time.Second
 )
 
 // Query runs iterative FIND_NODE / FIND_VALUE (spec Step 8).
@@ -181,7 +186,9 @@ func (q *Query) FindNode(ctx context.Context, target a2al.NodeID) ([]protocol.No
 						return
 					}
 				}
-				nodes, err := q.n.FindNode(ctx, addr, target)
+				peerCtx, peerCancel := context.WithTimeout(ctx, queryPeerTimeout)
+				defer peerCancel()
+				nodes, err := q.n.FindNode(peerCtx, addr, target)
 				if err != nil {
 					ch <- res{}
 					return
@@ -361,7 +368,9 @@ func (q *Query) FindRecords(ctx context.Context, target a2al.NodeID, recType uin
 						return
 					}
 				}
-				recs, nodes, err := q.n.FindValueWithNodes(ctx, addr, target, recType)
+				peerCtx, peerCancel := context.WithTimeout(ctx, queryPeerTimeout)
+				defer peerCancel()
+				recs, nodes, err := q.n.FindValueWithNodes(peerCtx, addr, target, recType)
 				if err != nil {
 					ch <- fvRes{}
 					return
@@ -490,7 +499,9 @@ func (q *Query) AggregateRecords(ctx context.Context, target a2al.NodeID, recTyp
 						return
 					}
 				}
-				recs, nodes, err := q.n.FindValueWithNodes(ctx, addr, target, recType)
+				peerCtx, peerCancel := context.WithTimeout(ctx, queryPeerTimeout)
+				defer peerCancel()
+				recs, nodes, err := q.n.FindValueWithNodes(peerCtx, addr, target, recType)
 				if err != nil {
 					ch <- fvRes{}
 					return
