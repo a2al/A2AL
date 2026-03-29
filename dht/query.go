@@ -140,7 +140,12 @@ func (q *Query) FindNode(ctx context.Context, target a2al.NodeID) ([]protocol.No
 				queried[key] = struct{}{}
 				continue
 			}
-			if _, ok := q.n.lookupPeer(peerID); !ok {
+			addr, ok := q.n.lookupPeer(peerID)
+			if !ok {
+				continue
+			}
+			if q.n.isHairpinAddr(addr) {
+				queried[key] = struct{}{} // treat as done, won't respond
 				continue
 			}
 			batch = append(batch, ni)
@@ -315,7 +320,12 @@ func (q *Query) FindRecords(ctx context.Context, target a2al.NodeID, recType uin
 				queried[key] = struct{}{}
 				continue
 			}
-			if _, ok := q.n.lookupPeer(peerID); !ok {
+			addr, ok := q.n.lookupPeer(peerID)
+			if !ok {
+				continue
+			}
+			if q.n.isHairpinAddr(addr) {
+				queried[key] = struct{}{}
 				continue
 			}
 			batch = append(batch, ni)
@@ -439,7 +449,12 @@ func (q *Query) AggregateRecords(ctx context.Context, target a2al.NodeID, recTyp
 				queried[key] = struct{}{}
 				continue
 			}
-			if _, ok := q.n.lookupPeer(peerID); !ok {
+			addr, ok := q.n.lookupPeer(peerID)
+			if !ok {
+				continue
+			}
+			if q.n.isHairpinAddr(addr) {
+				queried[key] = struct{}{}
 				continue
 			}
 			batch = append(batch, ni)
