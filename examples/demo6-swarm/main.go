@@ -3,9 +3,9 @@
 
 // demo6-swarm: 多 Agent 协作出海决策 Swarm。
 //
-// 场景：企业想将产品打入海外市场。Planner 通过 A2AL 网络动态发现四个垂直领域
-// 专家 Agent（合规 / 物流 / 关税 / 本地化），并行建立 QUIC 隧道并发咨询，
-// 汇总为出海方案。专家随时可下线，Planner 按实际在线情况处理。
+// 场景：企业想将产品打入海外市场。Planner 搜索 Tangled 网络，动态发现已注册的
+// 各领域 Agent，组建 Swarm，并行建立 QUIC 隧道咨询，汇总为出海方案。
+// Agent 随时可下线，Planner 按实际发现情况动态处理，无需预先知道有多少个 Agent。
 //
 // 【单机运行（4 个终端）】
 //
@@ -20,8 +20,12 @@
 //	Terminal 3 — Worker（等 Terminal 1 启动后运行）:
 //	  go run . --role worker
 //
-//	Terminal 4 — Planner（等 Worker 打印「就绪」后运行）:
+//	Terminal 4 — Planner（等 Worker 打印「已上线」后运行）:
 //	  go run . --role planner --api 127.0.0.1:2122
+//
+// 【Web UI 验证】在 Discover 标签页分别搜索以下服务名可看到对应 Agent：
+//
+//	reason.evaluate  /  data.search  /  reason.analyze  /  reason.recommend
 //
 // 【参数】
 //
@@ -182,18 +186,19 @@ func (l *aidListener) Accept() (net.Conn, error) {
 // ─── Expert definitions ───────────────────────────────────────────────────────
 
 type expert struct {
-	topic string
-	name  string
-	brief string
-	// consult returns a one-line Chinese summary given product and market.
+	topic   string
+	name    string
+	brief   string
+	tags    []string
 	consult func(product, market string) string
 }
 
 var experts = []expert{
 	{
-		topic: "domain.compliance",
-		name:  "合规认证顾问",
-		brief: "产品准入、认证标准、法规要求",
+		topic: "reason.evaluate",
+		name:  "国际合规认证 Agent",
+		brief: "产品准入合规评估，含认证标准与法规审查",
+		tags:  []string{"compliance", "certification", "regulation"},
 		consult: func(product, market string) string {
 			if strings.Contains(market, "欧") {
 				return "需 CE/RED/WEEE 认证，GDPR 隐私合规，认证周期约 6-8 周"
@@ -205,9 +210,10 @@ var experts = []expert{
 		},
 	},
 	{
-		topic: "domain.logistics",
-		name:  "供应链与货运专家",
-		brief: "运输方案、仓储、末端配送",
+		topic: "data.search",
+		name:  "供应链物流 Agent",
+		brief: "跨境物流方案查询，含运输路线、仓储与末端配送",
+		tags:  []string{"logistics", "shipping", "supply-chain"},
 		consult: func(product, market string) string {
 			if strings.Contains(market, "欧") {
 				return "深圳→鹿特丹海运约 22 天，推荐 DHL 末端配送，鹿特丹仓储 €0.8/件/月"
@@ -219,9 +225,10 @@ var experts = []expert{
 		},
 	},
 	{
-		topic: "domain.customs",
-		name:  "关税与贸易报关专家",
-		brief: "HS 编码、税率、清关文件",
+		topic: "reason.analyze",
+		name:  "关税贸易 Agent",
+		brief: "HS 编码与关税税率分析，含清关文件建议",
+		tags:  []string{"customs", "tariff", "trade"},
 		consult: func(product, market string) string {
 			if strings.Contains(market, "欧") {
 				return "HS 8517.62，欧盟关税 0%，荷兰 VAT 21%，需 EUR.1 产地证+CE 证书"
@@ -233,9 +240,10 @@ var experts = []expert{
 		},
 	},
 	{
-		topic: "domain.localize",
-		name:  "本地化与市场适配顾问",
-		brief: "定价策略、竞品分析、文化适配",
+		topic: "reason.recommend",
+		name:  "本地化市场 Agent",
+		brief: "目标市场定价策略与本地化适配建议",
+		tags:  []string{"localization", "market-fit", "pricing"},
 		consult: func(product, market string) string {
 			if strings.Contains(market, "欧") {
 				return "主要竞品 Amazfit €129/Garmin €199，建议定价 €119，DE/FR/ES 语言包已覆盖"
@@ -258,47 +266,53 @@ func shortAID(aid string) string {
 // ─── Worker ──────────────────────────────────────────────────────────────────
 
 func runWorker(c *client, apiPort string) {
-	fmt.Println("\n=== 出海专家团 — Worker ===")
-	fmt.Println()
+	fmt.Println("\n=== Agent 注册上线 ===")
 
 	type agentInfo struct {
-		exp  expert
-		id   *savedIdentity
-		addr string
+		id *savedIdentity
 	}
 	agents := make([]agentInfo, len(experts))
 
 	for i, exp := range experts {
-		idPath := fmt.Sprintf("identity-worker-%s-%s.json", exp.topic[len("domain."):], apiPort)
+		expCopy := exp
+		shortTopic := exp.topic
+		idPath := fmt.Sprintf("identity-worker-%d-%s.json", i+1, apiPort)
 
+		fmt.Printf("\n[%d/%d] %s\n", i+1, len(experts), exp.name)
+
+		fmt.Print("  生成身份...")
 		id, err := loadOrCreateIdentity(idPath, c)
 		if err != nil {
-			fatal("身份初始化 [%s]: %v", exp.topic, err)
+			fatal("身份初始化 [%s]: %v", exp.name, err)
 		}
+		fmt.Printf(" AID: %s\n", shortAID(id.AID))
 
 		ln, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
-			fatal("启动 HTTP 服务 [%s]: %v", exp.topic, err)
+			fatal("启动 HTTP 服务 [%s]: %v", exp.name, err)
 		}
 		svcAddr := fmt.Sprintf("127.0.0.1:%d", ln.Addr().(*net.TCPAddr).Port)
 
+		fmt.Print("  注册 agent...")
 		if err := setupAgent(c, id, svcAddr); err != nil {
-			fatal("注册 agent [%s]: %v", exp.topic, err)
+			fatal("注册 [%s]: %v", exp.name, err)
 		}
+		fmt.Println(" OK")
 
+		fmt.Printf("  注册服务 %s...", shortTopic)
 		topicReq := map[string]any{
 			"services":  []string{exp.topic},
 			"name":      exp.name,
 			"protocols": []string{"http"},
+			"tags":      exp.tags,
 			"brief":     exp.brief,
 			"ttl":       3600,
 		}
 		if err := c.do("POST", "/agents/"+id.AID+"/services", topicReq, nil); err != nil {
-			fatal("注册服务 [%s]: %v", exp.topic, err)
+			fatal("注册服务 [%s]: %v", exp.name, err)
 		}
+		fmt.Println(" OK")
 
-		// Start HTTP server for this expert.
-		expCopy := exp
 		mux := http.NewServeMux()
 		mux.HandleFunc("/consult", func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodPost {
@@ -315,8 +329,8 @@ func runWorker(c *client, apiPort string) {
 			}
 			callerAID, _ := r.Context().Value(remoteAIDKey{}).(string)
 			result := expCopy.consult(req.Product, req.Market)
-			fmt.Printf("  [%s] 收到来自 %s 的咨询 → %s\n",
-				expCopy.name, shortAID(callerAID), req.Product+" / "+req.Market)
+			fmt.Printf("\n  [%s] 收到来自 %s 的咨询\n  → %s\n",
+				expCopy.name, shortAID(callerAID), result)
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]string{"result": result})
 		})
@@ -337,13 +351,14 @@ func runWorker(c *client, apiPort string) {
 			}
 		}()
 
-		agents[i] = agentInfo{exp: exp, id: id, addr: svcAddr}
-		fmt.Printf("  ✓ %-16s  AID: %s\n", "["+exp.name+"]", shortAID(id.AID))
+		fmt.Printf("  ✓ 已上线\n")
+		agents[i] = agentInfo{id: id}
 	}
 
 	fmt.Printf(`
-4 位专家已就绪，等待 Planner 调用（Ctrl-C 退出）...
-可在 Web UI 的 Discover 标签页搜索 "domain." 查看所有专家。
+Agent 已上线，等待调用（Ctrl-C 退出）
+可在 Web UI 的 Discover 标签页搜索以下服务名查看各 Agent:
+  reason.evaluate  /  data.search  /  reason.analyze  /  reason.recommend
 
 `)
 
@@ -390,8 +405,8 @@ func runPlanner(c *client, apiPort string) {
 	market := "欧盟"
 	fmt.Printf("  任务: %s → %s 市场\n\n", product, market)
 
-	// Discover all domain.* experts in parallel.
-	fmt.Println("  搜索专家网络...")
+	// Discover agents in parallel; print each as it's found.
+	fmt.Println("  搜索 Tangled 网络...")
 	type discovery struct {
 		topic string
 		aid   string
@@ -407,9 +422,6 @@ func runPlanner(c *client, apiPort string) {
 					Name string `json:"name"`
 				} `json:"entries"`
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			_ = ctx
 			for attempt := 0; attempt < 10; attempt++ {
 				if attempt > 0 {
 					time.Sleep(2 * time.Second)
@@ -429,18 +441,19 @@ func runPlanner(c *client, apiPort string) {
 	for range experts {
 		d := <-discoveryCh
 		if d.aid != "" {
-			fmt.Printf("    ✓ %-22s  %s  %s\n", d.topic, shortAID(d.aid), d.name)
+			fmt.Printf("  发现: %-28s  %s  (%s)\n", d.name, shortAID(d.aid), d.topic)
 			discovered = append(discovered, d)
 		} else {
-			fmt.Printf("    ✗ %-22s  未找到，跳过\n", d.topic)
+			fmt.Printf("  未找到: %-26s  跳过\n", d.topic)
 		}
 	}
 
 	if len(discovered) == 0 {
-		fatal("未找到任何专家。\n请先启动 Worker 并等待其打印「就绪」后再运行 Planner。")
+		fatal("未在网络中找到任何可用 Agent。\n请先启动 Worker 并等待其打印「已上线」后再运行 Planner。")
 	}
 
-	fmt.Printf("\n  建立 %d 条 QUIC 隧道，并行咨询...\n\n", len(discovered))
+	fmt.Printf("\n  建立 Agent Swarm（%d 个 Agent）\n", len(discovered))
+	fmt.Println("  开始并行处理...\n")
 
 	// Connect + query all discovered experts in parallel.
 	results := make(chan expertResult, len(discovered))
@@ -490,11 +503,10 @@ func runPlanner(c *client, apiPort string) {
 	// Collect results and print as they arrive.
 	collected := make(map[string]expertResult)
 	for r := range results {
-		shortTopic := r.topic[len("domain."):]
 		if r.err != nil {
-			fmt.Printf("  [%-10s] ✗  %v\n", shortTopic, r.err)
+			fmt.Printf("  [%-18s] ✗  %v\n", r.name, r.err)
 		} else {
-			fmt.Printf("  [%-10s] ✓  %s\n", shortTopic, r.result)
+			fmt.Printf("  [%-18s] ✓  %s\n", r.name, r.result)
 		}
 		collected[r.topic] = r
 	}
@@ -507,10 +519,10 @@ func runPlanner(c *client, apiPort string) {
 `, product, market)
 
 	labels := []struct{ topic, label string }{
-		{"domain.compliance", "合规"},
-		{"domain.logistics", "物流"},
-		{"domain.customs", "关税"},
-		{"domain.localize", "本地化"},
+		{"reason.evaluate", "合规"},
+		{"data.search", "物流"},
+		{"reason.analyze", "关税"},
+		{"reason.recommend", "本地化"},
 	}
 	for _, l := range labels {
 		if r, ok := collected[l.topic]; ok && r.err == nil {
