@@ -10,16 +10,23 @@
 //   demo4 — DHT Mailbox 异步通信（信件往来）
 //   demo5 — QUIC 隧道 + HTTP 同步调用（直接打电话）
 //
-// 【单机运行（3 个终端）】
+// 【单机运行（4 个终端）】
 //
-//	Terminal 1 — daemon:
-//	  a2ald --data-dir ./tmp/node --fallback-host 127.0.0.1
+// connect API 需要两个独立的 daemon 节点（QUIC 直连是跨节点操作）。
 //
-//	Terminal 2 — Seller（先启动，等打印"已上线"后再启动 Buyer）:
+//	Terminal 1 — Seller daemon:
+//	  a2ald --data-dir ./tmp/seller --fallback-host 127.0.0.1
+//
+//	Terminal 2 — Buyer daemon（bootstrap 指向 Seller daemon）:
+//	  a2ald --data-dir ./tmp/buyer --listen 127.0.0.1:4122 \
+//	        --api-addr 127.0.0.1:2122 --fallback-host 127.0.0.1 \
+//	        --bootstrap 127.0.0.1:4121
+//
+//	Terminal 3 — Seller（等 Terminal 1 启动后运行）:
 //	  go run . --role seller
 //
-//	Terminal 3 — Buyer:
-//	  go run . --role buyer
+//	Terminal 4 — Buyer（等 Seller 打印「已上线」后运行）:
+//	  go run . --role buyer --api 127.0.0.1:2122
 //
 // 【双机运行】
 //
