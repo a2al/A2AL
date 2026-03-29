@@ -46,6 +46,8 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -176,6 +178,38 @@ func setupAgent(c *client, id *savedIdentity, serviceTCP string) error {
 	return nil
 }
 
+// ─── Gateway AID header ──────────────────────────────────────────────────────
+//
+// a2ald gateway prepends a 21-byte binary Remote AID to every inbound TCP
+// connection before bridging the QUIC stream. A plain http.Serve would try to
+// parse these bytes as an HTTP request and fail. aidListener reads the header
+// in Accept() and exposes the AID via ConnContext so HTTP handlers can retrieve
+// it from the request context.
+
+type remoteAIDKey struct{}
+
+type aidConn struct {
+	net.Conn
+	remoteAID string
+}
+
+type aidListener struct{ net.Listener }
+
+func (l *aidListener) Accept() (net.Conn, error) {
+	for {
+		conn, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		var hdr [21]byte
+		if _, err := io.ReadFull(conn, hdr[:]); err != nil {
+			conn.Close()
+			continue
+		}
+		return &aidConn{Conn: conn, remoteAID: hex.EncodeToString(hdr[:])}, nil
+	}
+}
+
 // ─── Seller ──────────────────────────────────────────────────────────────────
 
 // answers maps questions to canned answers for demo purposes.
@@ -202,7 +236,6 @@ func startSellerHTTP() (net.Listener, string) {
 		}
 		var req struct {
 			Question string `json:"question"`
-			BuyerAID string `json:"buyer_aid"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "bad request", http.StatusBadRequest)
@@ -213,8 +246,11 @@ func startSellerHTTP() (net.Listener, string) {
 		if !ok {
 			answer = fmt.Sprintf("(未收录问题，原样返回) %s", req.Question)
 		}
-		callerLabel := shortAID(req.BuyerAID)
-		if req.BuyerAID == "" {
+		// Remote AID is injected by aidListener via ConnContext — cryptographically
+		// verified by the daemon's mutual-TLS QUIC handshake.
+		callerAID, _ := r.Context().Value(remoteAIDKey{}).(string)
+		callerLabel := shortAID(callerAID)
+		if callerAID == "" {
 			callerLabel = "(未知)"
 		}
 		fmt.Printf("\n[Seller] 收到来自 %s 的请求\n", callerLabel)
@@ -225,8 +261,17 @@ func startSellerHTTP() (net.Listener, string) {
 		json.NewEncoder(w).Encode(map[string]string{"answer": answer})
 	})
 
+	srv := &http.Server{
+		Handler: mux,
+		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
+			if ac, ok := c.(*aidConn); ok {
+				return context.WithValue(ctx, remoteAIDKey{}, ac.remoteAID)
+			}
+			return ctx
+		},
+	}
 	go func() {
-		if err := http.Serve(ln, mux); err != nil && !strings.Contains(err.Error(), "use of closed") {
+		if err := srv.Serve(&aidListener{ln}); err != nil && !strings.Contains(err.Error(), "use of closed") {
 			fmt.Fprintf(os.Stderr, "[Seller] HTTP 服务错误: %v\n", err)
 		}
 	}()
@@ -368,8 +413,7 @@ func runBuyer(c *client, idPath string) {
 		fmt.Printf("  问: %q\n", q)
 
 		body, _ := json.Marshal(map[string]string{
-			"question":  q,
-			"buyer_aid": id.AID,
+			"question": q,
 		})
 		resp, err := httpClient.Post(tunnelBase+"/ask", "application/json", bytes.NewReader(body))
 		if err != nil {

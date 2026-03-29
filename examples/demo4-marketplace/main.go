@@ -422,7 +422,7 @@ func runBob(c *client, idPath string) {
 				body, _ := base64.StdEncoding.DecodeString(msg.BodyBase64)
 				fmt.Printf("\n\n[Bob] 收到翻译结果: %q\n", string(body))
 				fmt.Println("\n✓ Phase 4 功能验证完成！")
-				fmt.Println("  验证链路：身份 → Tangled 端点发布 → Topic注册 → Discover → Sovereign记录 → 邮箱加密通信")
+				fmt.Println("  验证链路：身份 → Tangled 端点发布 → Topic注册 → Discover → Sovereign记录 → 加密通信")
 				return
 			}
 		}
