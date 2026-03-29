@@ -137,6 +137,10 @@ func (n *Node) PublishEndpointRecord(ctx context.Context, rec protocol.SignedRec
 			n.log.Debug("publish StoreAt skip: no addr", "peer", id)
 			continue
 		}
+		if n.isHairpinAddr(addr) {
+			n.log.Debug("publish StoreAt skip: NAT hairpin", "peer", addr)
+			continue
+		}
 		wg.Add(1)
 		go func(addr net.Addr) {
 			defer wg.Done()
@@ -187,6 +191,10 @@ func (n *Node) publishKeyedRecord(ctx context.Context, storeKey a2al.NodeID, rec
 		}
 		addr, ok := n.lookupPeer(id)
 		if !ok {
+			continue
+		}
+		if n.isHairpinAddr(addr) {
+			n.log.Debug("publish keyed StoreAt skip: NAT hairpin", "peer", addr)
 			continue
 		}
 		wg.Add(1)

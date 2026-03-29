@@ -67,6 +67,9 @@ type Node struct {
 	onObservedAddr func(reporter a2al.NodeID, wire []byte)
 	auth           RecordAuthFunc // nil → no check
 
+	selfExtMu sync.RWMutex
+	selfExtIP net.IP // our own public IP (set by host after STUN/HTTP probe)
+
 	statsRx  atomic.Uint64
 	statsTx  atomic.Uint64
 	statsRPC atomic.Uint64 // outbound request/response pairs (sendAndWait success)
@@ -262,6 +265,40 @@ func (n *Node) BindPeerAddr(id a2al.NodeID, addr net.Addr) {
 	n.peerMu.Lock()
 	defer n.peerMu.Unlock()
 	n.peers[nodeIDKey(id)] = addr
+}
+
+// SetSelfExtIP records our own public IP (from STUN/HTTP probe). Used to detect
+// NAT hairpin peers: nodes behind the same NAT share the same public IP and
+// typically cannot reach each other via that IP (router hairpinning not supported).
+func (n *Node) SetSelfExtIP(ip net.IP) {
+	n.selfExtMu.Lock()
+	n.selfExtIP = ip
+	n.selfExtMu.Unlock()
+}
+
+// isHairpinAddr returns true when addr shares our public IP but is not our own
+// port — a strong signal that sending to it requires NAT hairpinning.
+func (n *Node) isHairpinAddr(addr net.Addr) bool {
+	udp, ok := addr.(*net.UDPAddr)
+	if !ok {
+		return false
+	}
+	n.selfExtMu.RLock()
+	ext := n.selfExtIP
+	n.selfExtMu.RUnlock()
+	if ext == nil {
+		return false
+	}
+	if !ext.Equal(udp.IP) {
+		return false
+	}
+	// Same IP but different port → another node behind the same NAT.
+	// Same IP + same port → our own reflected address, not a peer.
+	self := n.tr.LocalAddr()
+	if selfUDP, ok := self.(*net.UDPAddr); ok && selfUDP.Port == udp.Port {
+		return false
+	}
+	return true
 }
 
 func (n *Node) reply(from net.Addr, req *protocol.DecodedMessage, msgType uint8, body any) {

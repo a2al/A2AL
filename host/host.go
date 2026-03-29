@@ -365,6 +365,17 @@ func (h *Host) BuildEndpointPayload(ctx context.Context) (protocol.EndpointPaylo
 	ext := <-extCh
 	h.log.Debug("endpoint probe done", "elapsed", time.Since(t0).Truncate(time.Millisecond), "ext_ip", ext, "upnp", up)
 
+	// Keep the DHT node informed of our public IP so it can detect NAT hairpin peers.
+	if ext != "" {
+		ipStr := ext
+		if host, _, err := net.SplitHostPort(ext); err == nil {
+			ipStr = host
+		}
+		if ip := net.ParseIP(ipStr); ip != nil {
+			h.node.SetSelfExtIP(ip)
+		}
+	}
+
 	eps, err := h.orderedQUICEndpointStrings(ext, up)
 	if err != nil {
 		return protocol.EndpointPayload{}, err
