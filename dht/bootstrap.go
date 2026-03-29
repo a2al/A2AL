@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/a2al/a2al"
@@ -20,16 +21,34 @@ func (n *Node) BootstrapAddrs(ctx context.Context, addrs []net.Addr) error {
 		return errors.New("dht: nil node")
 	}
 	n.Start()
-	contacted := 0
-	for _, addr := range addrs {
-		pi, err := n.PingIdentity(ctx, addr)
-		if err != nil {
-			n.log.Debug("bootstrap ping failed", "addr", addr, "err", err)
-			continue
-		}
-		n.log.Debug("bootstrap ping ok", "addr", addr, "peer", pi.NodeID)
-		contacted++
+
+	type pingResult struct {
+		addr net.Addr
+		ok   bool
 	}
+	ch := make(chan pingResult, len(addrs))
+	for _, a := range addrs {
+		a := a
+		go func() {
+			pctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			defer cancel()
+			pi, err := n.PingIdentity(pctx, a)
+			if err != nil {
+				n.log.Debug("bootstrap ping failed", "addr", a, "err", err)
+				ch <- pingResult{addr: a}
+				return
+			}
+			n.log.Debug("bootstrap ping ok", "addr", a, "peer", pi.NodeID)
+			ch <- pingResult{addr: a, ok: true}
+		}()
+	}
+	contacted := 0
+	for range addrs {
+		if (<-ch).ok {
+			contacted++
+		}
+	}
+
 	if contacted == 0 && len(addrs) > 0 {
 		return errors.New("dht: all bootstrap seeds unreachable")
 	}
@@ -104,8 +123,12 @@ func (n *Node) PublishEndpointRecord(ctx context.Context, rec protocol.SignedRec
 	if len(nearest) < limit {
 		limit = len(nearest)
 	}
-	var lastErr error
-	stored := 0
+	var (
+		mu      sync.Mutex
+		stored  int
+		lastErr error
+		wg      sync.WaitGroup
+	)
 	for i := 0; i < limit; i++ {
 		var id a2al.NodeID
 		copy(id[:], nearest[i].NodeID)
@@ -114,15 +137,27 @@ func (n *Node) PublishEndpointRecord(ctx context.Context, rec protocol.SignedRec
 			n.log.Debug("publish StoreAt skip: no addr", "peer", id)
 			continue
 		}
-		if _, err := n.StoreAt(ctx, addr, a2al.NodeID{}, rec); err != nil {
-			n.log.Debug("publish StoreAt failed", "peer", addr, "err", err)
-			lastErr = err
-		} else {
-			stored++
-			n.log.Debug("publish StoreAt ok", "peer", addr)
-		}
+		wg.Add(1)
+		go func(addr net.Addr) {
+			defer wg.Done()
+			if _, err := n.StoreAt(ctx, addr, a2al.NodeID{}, rec); err != nil {
+				n.log.Debug("publish StoreAt failed", "peer", addr, "err", err)
+				mu.Lock()
+				lastErr = err
+				mu.Unlock()
+			} else {
+				n.log.Debug("publish StoreAt ok", "peer", addr)
+				mu.Lock()
+				stored++
+				mu.Unlock()
+			}
+		}(addr)
 	}
+	wg.Wait()
 	n.log.Debug("publish done", "stored", stored, "attempted", limit)
+	if stored > 0 {
+		return nil
+	}
 	return lastErr
 }
 
@@ -138,7 +173,12 @@ func (n *Node) publishKeyedRecord(ctx context.Context, storeKey a2al.NodeID, rec
 		return err
 	}
 	peers := n.tabNearest(storeKey, routing.K)
-	var lastErr error
+	var (
+		mu      sync.Mutex
+		stored  int
+		lastErr error
+		wg      sync.WaitGroup
+	)
 	for i := 0; i < len(peers); i++ {
 		var id a2al.NodeID
 		copy(id[:], peers[i].NodeID)
@@ -149,9 +189,23 @@ func (n *Node) publishKeyedRecord(ctx context.Context, storeKey a2al.NodeID, rec
 		if !ok {
 			continue
 		}
-		if _, err := n.StoreAt(ctx, addr, storeKey, rec); err != nil {
-			lastErr = err
-		}
+		wg.Add(1)
+		go func(addr net.Addr) {
+			defer wg.Done()
+			if _, err := n.StoreAt(ctx, addr, storeKey, rec); err != nil {
+				mu.Lock()
+				lastErr = err
+				mu.Unlock()
+			} else {
+				mu.Lock()
+				stored++
+				mu.Unlock()
+			}
+		}(addr)
+	}
+	wg.Wait()
+	if stored > 0 {
+		return nil
 	}
 	return lastErr
 }
