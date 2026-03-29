@@ -369,7 +369,10 @@ func (n *Node) onFindValue(from net.Addr, dec *protocol.DecodedMessage) {
 		ObservedAddr: ObservedAddr(from),
 		Records:      records,
 	}
-	if best != nil {
+	// Only include the legacy Record field when it matches the requested type,
+	// to avoid wasting packet space with unrelated record types (e.g. endpoint
+	// records cluttering a mailbox query).
+	if best != nil && (body.RecType == 0 || best.RecType == body.RecType) {
 		r := *best
 		resp.Record = &r
 	}
@@ -382,8 +385,10 @@ func (n *Node) onFindValue(from net.Addr, dec *protocol.DecodedMessage) {
 			resp.Nodes = resp.Nodes[:len(resp.Nodes)-1]
 			continue
 		}
+		// Drop the oldest record (index 0) to preserve newer records for the
+		// requester. GetAll returns records in insertion order (oldest first).
 		if len(resp.Records) > 1 {
-			resp.Records = resp.Records[:len(resp.Records)-1]
+			resp.Records = resp.Records[1:]
 			continue
 		}
 		break
