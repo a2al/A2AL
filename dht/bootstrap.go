@@ -22,19 +22,25 @@ func (n *Node) BootstrapAddrs(ctx context.Context, addrs []net.Addr) error {
 	n.Start()
 	contacted := 0
 	for _, addr := range addrs {
-		if _, err := n.PingIdentity(ctx, addr); err == nil {
-			contacted++
+		pi, err := n.PingIdentity(ctx, addr)
+		if err != nil {
+			n.log.Debug("bootstrap ping failed", "addr", addr, "err", err)
+			continue
 		}
+		n.log.Debug("bootstrap ping ok", "addr", addr, "peer", pi.NodeID)
+		contacted++
 	}
 	if contacted == 0 && len(addrs) > 0 {
 		return errors.New("dht: all bootstrap seeds unreachable")
 	}
 	if contacted > 0 {
 		q := NewQuery(n)
-		// FIND_NODE(self) widens the routing table; non-fatal on failure so
-		// that a single lost packet does not prevent bootstrap from succeeding
-		// when PingIdentity already confirmed at least one reachable seed.
-		_, _ = q.FindNode(ctx, n.nid)
+		peers, err := q.FindNode(ctx, n.nid)
+		if err != nil {
+			n.log.Debug("bootstrap FindNode(self) failed", "err", err)
+		} else {
+			n.log.Debug("bootstrap FindNode(self) done", "peers_found", len(peers))
+		}
 	}
 	return nil
 }
@@ -83,29 +89,40 @@ func (n *Node) PublishEndpointRecord(ctx context.Context, rec protocol.SignedRec
 	copy(pubAddr[:], rec.Address)
 	key := a2al.NodeIDFromAddress(pubAddr)
 	q := NewQuery(n)
-	if _, err := q.FindNode(ctx, key); err != nil {
+	peers, err := q.FindNode(ctx, key)
+	if err != nil {
+		n.log.Debug("publish FindNode failed", "err", err)
 		return err
 	}
-	peers := n.tabNearest(key, routing.K)
-	if len(peers) == 0 {
-		return nil // local-only publish; no peers yet
+	n.log.Debug("publish FindNode done", "peers_found", len(peers))
+	nearest := n.tabNearest(key, routing.K)
+	if len(nearest) == 0 {
+		n.log.Debug("publish: no peers, local-only")
+		return nil
 	}
 	limit := 3
-	if len(peers) < limit {
-		limit = len(peers)
+	if len(nearest) < limit {
+		limit = len(nearest)
 	}
 	var lastErr error
+	stored := 0
 	for i := 0; i < limit; i++ {
 		var id a2al.NodeID
-		copy(id[:], peers[i].NodeID)
+		copy(id[:], nearest[i].NodeID)
 		addr, ok := n.lookupPeer(id)
 		if !ok {
+			n.log.Debug("publish StoreAt skip: no addr", "peer", id)
 			continue
 		}
 		if _, err := n.StoreAt(ctx, addr, a2al.NodeID{}, rec); err != nil {
+			n.log.Debug("publish StoreAt failed", "peer", addr, "err", err)
 			lastErr = err
+		} else {
+			stored++
+			n.log.Debug("publish StoreAt ok", "peer", addr)
 		}
 	}
+	n.log.Debug("publish done", "stored", stored, "attempted", limit)
 	return lastErr
 }
 

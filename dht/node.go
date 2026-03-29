@@ -407,13 +407,14 @@ func (n *Node) sendAndWait(ctx context.Context, to net.Addr, hdr protocol.Header
 				return nil, ctx.Err()
 			}
 			n.log.Debug("dht rpc timeout, retrying", "to", to, "msg_type", hdr.MsgType, "attempt", attempt+1)
-			// Per-attempt timeout; retry.
+			// per-attempt timeout; retry
 		case <-n.ctx.Done():
 			n.unregisterWait(hdr.TxID)
 			aCancel()
 			return nil, n.ctx.Err()
 		}
 	}
+	n.log.Warn("dht rpc failed after retries", "to", to, "msg_type", hdr.MsgType, "attempts", rpcMaxAttempts)
 	return nil, context.DeadlineExceeded
 }
 

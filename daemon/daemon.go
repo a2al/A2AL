@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -106,7 +107,23 @@ func New(cfg Config) (*Daemon, error) {
 
 	log := cfg.Log
 	if log == nil {
-		log = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+		level := slog.LevelInfo
+		switch strings.ToLower(strings.TrimSpace(nodeCfg.LogLevel)) {
+		case "debug":
+			level = slog.LevelDebug
+		case "warn", "warning":
+			level = slog.LevelWarn
+		case "error":
+			level = slog.LevelError
+		}
+		opts := &slog.HandlerOptions{Level: level}
+		var h slog.Handler
+		if strings.ToLower(strings.TrimSpace(nodeCfg.LogFormat)) == "json" {
+			h = slog.NewJSONHandler(os.Stdout, opts)
+		} else {
+			h = slog.NewTextHandler(os.Stdout, opts)
+		}
+		log = slog.New(h)
 	}
 
 	keyPath := filepath.Join(nodeCfg.KeyDirOrDefault(cfg.DataDir), "node.key")

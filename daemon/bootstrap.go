@@ -81,7 +81,7 @@ func tryBootstrap(ctx context.Context, h *host.Host, addrs []net.Addr, log *slog
 	bctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	if err := h.Node().BootstrapAddrs(bctx, addrs); err != nil {
-		log.Debug("bootstrap failed", "source", src, "err", err)
+		log.Warn("bootstrap failed", "source", src, "err", err)
 		return false
 	}
 	obctx, ocancel := context.WithTimeout(ctx, 10*time.Second)

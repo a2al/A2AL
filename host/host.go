@@ -108,6 +108,7 @@ type agentEntry struct {
 // Host is the Phase 2a runtime.
 type Host struct {
 	cfg     Config
+	log     *slog.Logger
 	addr    a2al.Address // default (first) agent address
 	priv    ed25519.PrivateKey
 	mux     *transport.UDPMux
@@ -227,8 +228,13 @@ func New(cfg Config) (*Host, error) {
 		return nil, err
 	}
 
+	hlog := cfg.Logger
+	if hlog == nil {
+		hlog = slog.Default()
+	}
 	h := &Host{
 		cfg:    cfg,
+		log:    hlog,
 		addr:   myAddr,
 		priv:   priv,
 		mux:    mux,
@@ -350,12 +356,14 @@ func (h *Host) ObserveFromPeers(ctx context.Context, seeds []net.Addr) {
 // BuildEndpointPayload builds ordered, deduplicated quic:// candidates (Phase 2b).
 // UPnP discovery and external IP probing (STUN + HTTP) run concurrently.
 func (h *Host) BuildEndpointPayload(ctx context.Context) (protocol.EndpointPayload, error) {
+	t0 := time.Now()
 	upCh := make(chan string, 1)
 	extCh := make(chan string, 1)
 	go func() { upCh <- h.ensureUPnP(ctx) }()
 	go func() { extCh <- h.ensureExternalIP(ctx) }()
 	up := <-upCh
 	ext := <-extCh
+	h.log.Debug("endpoint probe done", "elapsed", time.Since(t0).Truncate(time.Millisecond), "ext_ip", ext, "upnp", up)
 
 	eps, err := h.orderedQUICEndpointStrings(ext, up)
 	if err != nil {
