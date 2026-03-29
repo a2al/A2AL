@@ -6,7 +6,7 @@
 // 场景：Alice 是翻译服务提供方，Bob 是使用方。
 //
 //   - Alice 上线后发布 topic "lang.translate" 并持续 poll 收件箱，自动回复翻译请求。
-//   - Bob 通过 topic discover 找到 Alice，通过 Tangled 网络邮箱发送翻译请求，等待并显示结果。
+//   - Bob 通过 topic discover 找到 Alice，通过 DHT mailbox 发送翻译请求，等待并显示结果。
 //
 // 二者都只和本机 a2ald 通信，P2P 通信由两个 daemon 完成。
 //

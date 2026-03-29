@@ -21,7 +21,7 @@
 //
 // Debug HTTP (浏览器):
 //   http://127.0.0.1:2634/debug/host     ← Phase 2 状态
-//   http://127.0.0.1:2634/debug/identity  ← Tangled 网络身份
+//   http://127.0.0.1:2634/debug/identity  ← DHT 身份
 //   http://127.0.0.1:2634/debug/routing   ← 路由表
 //   http://127.0.0.1:2634/debug/store     ← 端点记录存储
 //   http://127.0.0.1:2634/debug/stats     ← 收发统计
@@ -45,9 +45,9 @@ import (
 )
 
 func main() {
-	listen := flag.String("listen", ":4121", "DHT UDP listen address")
-	quicListen := flag.String("quic", "", "QUIC UDP listen (empty = share DHT port)")
-	bootstrapAddr := flag.String("bootstrap", "", "seed DHT UDP address")
+	listen := flag.String("listen", ":4121", "Tangled Network UDP listen address")
+	quicListen := flag.String("quic", "", "QUIC UDP listen (empty = share Tangled port)")
+	bootstrapAddr := flag.String("bootstrap", "", "seed Tangled Network UDP address")
 	debugAddr := flag.String("debug", "", "debug HTTP address")
 	extIP := flag.String("ip", "", "advertise host (fallback)")
 	minObs := flag.Int("min-observed", 1, "nat-sense threshold")
