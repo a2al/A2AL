@@ -61,7 +61,7 @@ export default {
   'service.action.unpublish': '下架',
   'service.action.edit': '编辑',
 
-  'service.unpublish.notice': 'DHT 记录将在约 1 小时内自然失效。',
+  'service.unpublish.notice': 'Tangled 网络上的条目将在约 1 小时内自然失效。',
 
   'service.modal.title': '发布服务',
   'service.modal.import.label': '从 Agent Card 导入（推荐）',
@@ -144,8 +144,8 @@ export default {
   'node.token.placeholder': '（未设置 — 本地默认无需鉴权）',
   'node.token.save': '保存到本次会话',
   'node.debug.title': '高级',
-  'node.debug.routing': 'DHT 路由表',
-  'node.debug.store': 'DHT 存储',
+  'node.debug.routing': 'Tangled 路由（JSON）',
+  'node.debug.store': 'Tangled 存储（JSON）',
   'node.debug.connections': '连接详情',
 
   'common.copy': '复制',

@@ -60,7 +60,7 @@ func buildMCPServer(d *Daemon) *mcp.Server {
 	}, d.mcpAgentRegister)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_agent_get",
-		Description: "Get agent status: service_tcp, seq, reachability, published DHT fields.",
+		Description: "Get agent status: service_tcp, seq, reachability, published Tangled Network fields.",
 	}, d.mcpAgentGet)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_agent_patch",
@@ -84,7 +84,7 @@ func buildMCPServer(d *Daemon) *mcp.Server {
 	}, d.mcpStatus)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_agent_publish_record",
-		Description: "Publish sovereign custom DHT record RecType 0x02-0x0f.",
+		Description: "Publish sovereign custom signed record (RecType 0x02-0x0f) to the Tangled Network.",
 	}, d.mcpAgentPublishRecord)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_resolve_records",
@@ -100,7 +100,7 @@ func buildMCPServer(d *Daemon) *mcp.Server {
 	}, d.mcpConnect)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_mailbox_send",
-		Description: "Send encrypted DHT mailbox message.",
+		Description: "Send encrypted mailbox message on the Tangled Network.",
 	}, d.mcpMailboxSend)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_mailbox_poll",
@@ -108,15 +108,15 @@ func buildMCPServer(d *Daemon) *mcp.Server {
 	}, d.mcpMailboxPoll)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_service_register",
-		Description: "Register DHT service discovery entries for an agent.",
+		Description: "Register service discovery entries for an agent on the Tangled Network.",
 	}, d.mcpTopicRegister)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_service_unregister",
-		Description: "Remove a service from agent renewal list; DHT TTL expires naturally.",
+		Description: "Remove a service from agent renewal list; Tangled Network entry TTL expires naturally.",
 	}, d.mcpTopicUnregister)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_discover",
-		Description: "Search agents by service(s) on the DHT.",
+		Description: "Search agents by service(s) on the Tangled Network.",
 	}, d.mcpDiscover)
 
 	return s

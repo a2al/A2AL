@@ -80,7 +80,7 @@ async function refreshHeader() {
       meta.appendChild(d);
     };
     add(t('node.aid'), shortAid(host.address));
-    add('DHT', host.dht_addr || '—');
+    add('Tangled', host.dht_addr || '—');
     add('QUIC', host.quic_addr || '—');
     add(t('node.peers'), String(stats.total_peers ?? 0));
   } catch (e) {

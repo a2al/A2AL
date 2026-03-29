@@ -4,13 +4,13 @@
 // demo3-chat: 通过 a2ald REST API 实现的聊天程序。
 //
 // 与 demo2-chat 的区别：本程序完全不依赖 a2al Go 库，只使用标准库。
-// 网络传输、DHT、QUIC、NAT 穿透全部由 a2ald 处理；
+// 网络传输、Tangled 网络、QUIC、NAT 穿透全部由 a2ald 处理；
 // 本程序通过 REST API 控制 a2ald，通过 TCP 收发消息。
 //
 // 使用前提：先在另一个终端启动 a2ald。
 //
 // 【Bootstrap 节点】
-// a2ald 需要至少一个已知节点来加入 DHT 网络。有三种方式：
+// a2ald 需要至少一个已知节点来加入 Tangled 网络。有三种方式：
 //  1. 默认：自动解析公共种子节点
 //  2. 显式指定：--bootstrap 127.0.0.1:4121（可多个，逗号分隔）
 //  3. 配置文件：在 config.toml 中设置 bootstrap 列表

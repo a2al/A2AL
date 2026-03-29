@@ -20,7 +20,7 @@ import (
 func main() {
 	dataDir := flag.String("data-dir", "", "data directory (default: UserConfigDir/a2al)")
 	cfgPath := flag.String("config", "", "path to config.toml (default: <data-dir>/config.toml)")
-	listen := flag.String("listen", "", "override DHT listen address")
+	listen := flag.String("listen", "", "override Tangled Network (UDP) listen address")
 	apiAddr := flag.String("api-addr", "", "override REST API listen address")
 	fallbackHost := flag.String("fallback-host", "", "advertised host when no public IP is detected")
 	bootstrapFlag := flag.String("bootstrap", "", "comma-separated bootstrap peers (appended to config)")

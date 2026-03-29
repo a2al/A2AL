@@ -21,7 +21,7 @@
 //
 // Debug HTTP (浏览器):
 //   http://127.0.0.1:2634/debug/host     ← Phase 2 状态
-//   http://127.0.0.1:2634/debug/identity  ← DHT 身份
+//   http://127.0.0.1:2634/debug/identity  ← Tangled 网络身份
 //   http://127.0.0.1:2634/debug/routing   ← 路由表
 //   http://127.0.0.1:2634/debug/store     ← 端点记录存储
 //   http://127.0.0.1:2634/debug/stats     ← 收发统计
@@ -121,7 +121,7 @@ func main() {
 	fmt.Println()
 	fmt.Println("═══════════════════════════════════════════")
 	fmt.Println("  My AID:    ", ks.addr.String())
-	fmt.Println("  DHT UDP:   ", h.DHTLocalAddr())
+	fmt.Println("  Tangled UDP:", h.DHTLocalAddr())
 	fmt.Println("  QUIC UDP:  ", h.QUICLocalAddr())
 	fmt.Printf("  NAT type:   %s\n", natStr)
 	if oh, op, ok := h.Sense().TrustedUDP(); ok {
