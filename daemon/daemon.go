@@ -131,6 +131,7 @@ func New(cfg Config) (*Daemon, error) {
 		ICESTUNURLs:      nodeCfg.ICESTUNURLs,
 		ICETURNURLs:      nodeCfg.ICETURNURLs,
 		ICEPublishTurns:  nodeCfg.ICEPublishTurns,
+		Logger:           log,
 	})
 	if err != nil {
 		return nil, err

@@ -7,6 +7,7 @@ import (
 	"context"
 	crand "crypto/rand"
 	"errors"
+	"log/slog"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -35,6 +36,9 @@ type Config struct {
 	// MaxStoreKeys limits the number of distinct DHT keys in the local store.
 	// 0 uses DefaultMaxTotalKeys. Configurable per-node soft limit.
 	MaxStoreKeys int
+	// Logger is used for DHT-level diagnostics (send failures, RPC retries).
+	// If nil, slog.Default() is used.
+	Logger *slog.Logger
 }
 
 // Node is a single DHT participant (routing + local store + wire handler).
@@ -47,6 +51,7 @@ type Node struct {
 	store  *Store
 	ctx    context.Context
 	cancel context.CancelFunc
+	log    *slog.Logger
 
 	pendMu sync.Mutex
 	wait   map[string]*waitEntry
@@ -86,6 +91,10 @@ func NewNode(cfg Config) (*Node, error) {
 	}
 	addr := addrs[0]
 	nid := a2al.NodeIDFromAddress(addr)
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	n := &Node{
 		tr:     cfg.Transport,
@@ -95,6 +104,7 @@ func NewNode(cfg Config) (*Node, error) {
 		store:  NewStore(cfg.RecordAuth, cfg.MaxStoreKeys),
 		ctx:    ctx,
 		cancel: cancel,
+		log:            logger,
 		wait:           make(map[string]*waitEntry),
 		peers:          make(map[string]net.Addr),
 		onObservedAddr: cfg.OnObservedAddr,
@@ -264,7 +274,9 @@ func (n *Node) reply(from net.Addr, req *protocol.DecodedMessage, msgType uint8,
 	if err != nil {
 		return
 	}
-	if err := n.tr.Send(from, raw); err == nil {
+	if err := n.tr.Send(from, raw); err != nil {
+		n.log.Warn("dht reply send failed", "msg_type", msgType, "to", from, "size", len(raw), "err", err)
+	} else {
 		n.statsTx.Add(1)
 	}
 }
@@ -287,10 +299,9 @@ func (n *Node) onFindNode(from net.Addr, dec *protocol.DecodedMessage) {
 		Nodes:        n.tabNearest(tid, routing.K),
 		ObservedAddr: ObservedAddr(from),
 	}
-	const maxPayload = 1100
 	for len(resp.Nodes) > 1 {
 		sz, err := protocol.FindNodeResponseWireSize(resp)
-		if err != nil || sz <= maxPayload {
+		if err != nil || sz <= maxResponsePayload {
 			break
 		}
 		resp.Nodes = resp.Nodes[:len(resp.Nodes)-1]
@@ -315,10 +326,9 @@ func (n *Node) onFindValue(from net.Addr, dec *protocol.DecodedMessage) {
 		r := *best
 		resp.Record = &r
 	}
-	const maxPayload = 1100
 	for {
 		sz, err := protocol.FindValueResponseWireSize(resp)
-		if err != nil || sz <= maxPayload {
+		if err != nil || sz <= maxResponsePayload {
 			break
 		}
 		if len(resp.Nodes) > 1 {
@@ -352,6 +362,12 @@ const (
 	rpcAttemptTimeout = 5 * time.Second
 	rpcMaxAttempts    = 3
 )
+
+// maxResponsePayload is the maximum CBOR body size for response messages sent via reply().
+// wireOuter overhead: Header≈30 B + SenderPubkey(32+2)=34 B + Signature(64+2)=66 B +
+// bstr frame(3) + map/key framing(5) ≈ 138 B total.
+// 1200 (MaxPacketSize) - 138 (overhead) - 12 (safety margin) = 1050.
+const maxResponsePayload = 1050
 
 func (n *Node) sendAndWait(ctx context.Context, to net.Addr, hdr protocol.Header, body any, expect uint8) (*protocol.DecodedMessage, error) {
 	for attempt := 0; attempt < rpcMaxAttempts; attempt++ {
@@ -390,6 +406,7 @@ func (n *Node) sendAndWait(ctx context.Context, to net.Addr, hdr protocol.Header
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
+			n.log.Debug("dht rpc timeout, retrying", "to", to, "msg_type", hdr.MsgType, "attempt", attempt+1)
 			// Per-attempt timeout; retry.
 		case <-n.ctx.Done():
 			n.unregisterWait(hdr.TxID)

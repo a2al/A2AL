@@ -20,6 +20,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"strconv"
@@ -78,6 +79,9 @@ type Config struct {
 	ICETURNURLs []string
 	// ICEPublishTurns lists credential-free turn: hints stored in EndpointPayload.Turns.
 	ICEPublishTurns []string
+	// Logger is forwarded to the DHT node for diagnostic logging (reply failures, RPC retries).
+	// If nil, slog.Default() is used.
+	Logger *slog.Logger
 }
 
 // agentRouteMagic is the 4-byte prefix of the agent-route control stream.
@@ -172,6 +176,7 @@ func New(cfg Config) (*Host, error) {
 			sense.Record(reporter, wire)
 		},
 		RecordAuth: recordAuthPolicy,
+		Logger:     cfg.Logger,
 	}
 
 	var node *dht.Node
