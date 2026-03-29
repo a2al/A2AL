@@ -565,6 +565,7 @@ func (h *Host) dialAndAgentRoute(ctx context.Context, localPriv ed25519.PrivateK
 	if err != nil {
 		return nil, err
 	}
+	h.log.Debug("quic dial", "src", h.quicTr.Conn.LocalAddr(), "dst", udpAddr, "remote_aid", expectRemote)
 	conn, err := h.quicTr.Dial(ctx, udpAddr, cliTLS, defaultQUICConfig())
 	if err != nil {
 		return nil, err
