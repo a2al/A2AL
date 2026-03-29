@@ -31,9 +31,10 @@ func (n *Node) BootstrapAddrs(ctx context.Context, addrs []net.Addr) error {
 	}
 	if contacted > 0 {
 		q := NewQuery(n)
-		if _, err := q.FindNode(ctx, n.nid); err != nil {
-			return err
-		}
+		// FIND_NODE(self) widens the routing table; non-fatal on failure so
+		// that a single lost packet does not prevent bootstrap from succeeding
+		// when PingIdentity already confirmed at least one reachable seed.
+		_, _ = q.FindNode(ctx, n.nid)
 	}
 	return nil
 }

@@ -389,6 +389,21 @@ func signedRecordCheck(r SignedRecord) error {
 	return nil
 }
 
+// FindNodeResponseWireSize returns the canonical CBOR size of a FIND_NODE_RESP body (UDP trim, spec §3.7).
+func FindNodeResponseWireSize(resp *BodyFindNodeResp) (int, error) {
+	if resp == nil {
+		return 0, ErrInvalidMessage
+	}
+	if err := bodyWireCheck(MsgFindNodeResp, resp); err != nil {
+		return 0, err
+	}
+	b, err := canonical.Marshal(resp)
+	if err != nil {
+		return 0, err
+	}
+	return len(b), nil
+}
+
 // FindValueResponseWireSize returns the canonical CBOR size of a FIND_VALUE_RESP body (UDP trim, spec §3.7).
 func FindValueResponseWireSize(resp *BodyFindValueResp) (int, error) {
 	if resp == nil {

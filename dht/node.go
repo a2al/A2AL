@@ -287,6 +287,14 @@ func (n *Node) onFindNode(from net.Addr, dec *protocol.DecodedMessage) {
 		Nodes:        n.tabNearest(tid, routing.K),
 		ObservedAddr: ObservedAddr(from),
 	}
+	const maxPayload = 1100
+	for len(resp.Nodes) > 1 {
+		sz, err := protocol.FindNodeResponseWireSize(resp)
+		if err != nil || sz <= maxPayload {
+			break
+		}
+		resp.Nodes = resp.Nodes[:len(resp.Nodes)-1]
+	}
 	n.reply(from, dec, protocol.MsgFindNodeResp, resp)
 }
 
@@ -338,35 +346,58 @@ func (n *Node) onStore(from net.Addr, dec *protocol.DecodedMessage) {
 	n.reply(from, dec, protocol.MsgStoreResp, &protocol.BodyStoreResp{Stored: ok})
 }
 
+// rpcAttemptTimeout is the per-attempt deadline for a single UDP RPC round-trip.
+// rpcMaxAttempts is the number of retries on timeout (total = attempts × timeout = 15 s).
+const (
+	rpcAttemptTimeout = 5 * time.Second
+	rpcMaxAttempts    = 3
+)
+
 func (n *Node) sendAndWait(ctx context.Context, to net.Addr, hdr protocol.Header, body any, expect uint8) (*protocol.DecodedMessage, error) {
-	if len(hdr.TxID) != 20 {
+	for attempt := 0; attempt < rpcMaxAttempts; attempt++ {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		// Fresh TxID per attempt to avoid stale-response cross-matching.
 		hdr.TxID = make([]byte, 20)
 		if _, err := crand.Read(hdr.TxID); err != nil {
 			return nil, err
 		}
+		ch := n.registerWait(hdr.TxID, expect)
+		raw, err := protocol.MarshalSignedMessageKeyStore(hdr, body, n.ks, n.addr)
+		if err != nil {
+			n.unregisterWait(hdr.TxID)
+			return nil, err
+		}
+		if err := n.tr.Send(to, raw); err != nil {
+			n.unregisterWait(hdr.TxID)
+			return nil, err
+		}
+		n.statsTx.Add(1)
+
+		aCtx, aCancel := context.WithTimeout(ctx, rpcAttemptTimeout)
+		select {
+		case dec := <-ch:
+			aCancel()
+			n.statsRPC.Add(1)
+			return dec, nil
+		case <-aCtx.Done():
+			n.unregisterWait(hdr.TxID)
+			aCancel()
+			if n.ctx.Err() != nil {
+				return nil, n.ctx.Err()
+			}
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			// Per-attempt timeout; retry.
+		case <-n.ctx.Done():
+			n.unregisterWait(hdr.TxID)
+			aCancel()
+			return nil, n.ctx.Err()
+		}
 	}
-	ch := n.registerWait(hdr.TxID, expect)
-	raw, err := protocol.MarshalSignedMessageKeyStore(hdr, body, n.ks, n.addr)
-	if err != nil {
-		n.unregisterWait(hdr.TxID)
-		return nil, err
-	}
-	if err := n.tr.Send(to, raw); err != nil {
-		n.unregisterWait(hdr.TxID)
-		return nil, err
-	}
-	n.statsTx.Add(1)
-	select {
-	case dec := <-ch:
-		n.statsRPC.Add(1)
-		return dec, nil
-	case <-ctx.Done():
-		n.unregisterWait(hdr.TxID)
-		return nil, ctx.Err()
-	case <-n.ctx.Done():
-		n.unregisterWait(hdr.TxID)
-		return nil, n.ctx.Err()
-	}
+	return nil, context.DeadlineExceeded
 }
 
 func (n *Node) notifyObserved(reporter a2al.NodeID, wire []byte) {

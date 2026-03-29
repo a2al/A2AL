@@ -324,6 +324,13 @@ func (d *Daemon) initialAutoPublish(ctx context.Context) {
 // the persistence file), immediately republishes at networkSeq+1 so the record
 // is accepted by all peers without waiting for TTL expiry.
 func (d *Daemon) recoverSeqFromNetwork(ctx context.Context) {
+	// FindRecords checks the local store before querying the network, so without
+	// real DHT peers the resolved record is our own just-written local entry —
+	// not a true "network" value. Bail out early to avoid a spurious republish.
+	if len(d.h.Node().BootstrapCandidateAddrs(1)) == 0 {
+		return
+	}
+
 	rctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 
