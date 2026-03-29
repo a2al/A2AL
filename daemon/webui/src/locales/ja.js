@@ -62,7 +62,7 @@ export default {
   'service.action.unpublish': '公開停止',
   'service.action.edit': '編集',
 
-  'service.unpublish.notice': 'DHTレコードは約1時間以内に自然に期限切れになります。',
+  'service.unpublish.notice': 'Tangled ネットワーク上のエントリは約1時間以内に自然に期限切れになります。',
 
   'service.modal.title': 'サービスを公開',
   'service.modal.import.label': 'Agent Cardからインポート（推奨）',
@@ -135,7 +135,7 @@ export default {
   'node.nat.port_restricted': 'Port Restricted',
   'node.nat.symmetric': 'Symmetric',
   'node.nat.unknown': '不明',
-  'node.dht': 'DHT',
+  'node.dht': 'Tangled',
   'node.quic': 'QUIC',
   'node.config.restart_needed': '再起動が必要',
   'node.config.restart_tooltip': 'この変更を有効にするには再起動が必要です',
@@ -145,8 +145,8 @@ export default {
   'node.token.placeholder': '（未設定 — ローカルはデフォルトで認証不要）',
   'node.token.save': 'セッションに保存',
   'node.debug.title': '高度な設定',
-  'node.debug.routing': 'DHTルーティング',
-  'node.debug.store': 'DHTストア',
+  'node.debug.routing': 'Tangled ルーティング（JSON）',
+  'node.debug.store': 'Tangled ストア（JSON）',
   'node.debug.connections': '接続詳細',
 
   'common.copy': 'コピー',

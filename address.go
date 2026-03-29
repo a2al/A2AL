@@ -1,5 +1,5 @@
 // Copyright 2026 The A2AL Authors. All rights reserved.
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MPL-2.0
 
 package a2al
 
@@ -71,7 +71,7 @@ type AddressCodec interface {
 // chainCodecs: ordered list of chain-specific codecs. First CanParse match wins.
 var chainCodecs = []AddressCodec{
 	ethereumCodec{},
-	// bitcoinCodec{},  // future: Paralism / Bitcoin
+	paralismCodec{},
 }
 
 // codecByVersion maps version byte → chain codec (excludes native).

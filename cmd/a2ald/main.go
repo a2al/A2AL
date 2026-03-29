@@ -1,5 +1,5 @@
 // Copyright 2026 The A2AL Authors. All rights reserved.
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MPL-2.0
 
 // a2ald is the A2AL daemon: DHT/QUIC host, REST API, Web UI, TCP gateway, MCP.
 package main
@@ -20,7 +20,7 @@ import (
 func main() {
 	dataDir := flag.String("data-dir", "", "data directory (default: UserConfigDir/a2al)")
 	cfgPath := flag.String("config", "", "path to config.toml (default: <data-dir>/config.toml)")
-	listen := flag.String("listen", "", "override DHT listen address")
+	listen := flag.String("listen", "", "override Tangled Network (UDP) listen address")
 	apiAddr := flag.String("api-addr", "", "override REST API listen address")
 	fallbackHost := flag.String("fallback-host", "", "advertised host when no public IP is detected")
 	bootstrapFlag := flag.String("bootstrap", "", "comma-separated bootstrap peers (appended to config)")

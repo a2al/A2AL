@@ -1,5 +1,5 @@
 // Copyright 2026 The A2AL Authors. All rights reserved.
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MPL-2.0
 
 package a2al
 
@@ -9,6 +9,9 @@ import (
 	"encoding/hex"
 	"strings"
 	"testing"
+
+	"github.com/btcsuite/btcd/btcutil/base58"
+	"github.com/btcsuite/btcd/btcutil/bech32"
 )
 
 func TestNodeIDFromAddress_deterministic(t *testing.T) {
@@ -107,6 +110,59 @@ func TestParseAddress_badChecksum(t *testing.T) {
 	_, err := ParseAddress(string(bad))
 	if err == nil {
 		t.Fatal("expected error for bad checksum")
+	}
+}
+
+func TestParseAddress_paralism_p2pkh_base58(t *testing.T) {
+	var h [20]byte
+	copy(h[:], bytes.Repeat([]byte{0x01}, 20))
+	addrStr := base58.CheckEncode(h[:], paralismP2PKHVersionByte)
+	addr, err := ParseAddress(addrStr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if addr[0] != VersionParalism {
+		t.Fatalf("want VersionParalism, got 0x%02x", addr[0])
+	}
+	var got [20]byte
+	copy(got[:], addr[1:])
+	if got != h {
+		t.Fatalf("hash mismatch: got %x want %x", got, h)
+	}
+	// Format produces bech32 (bc1q...) as preferred output.
+	if !strings.HasPrefix(addr.String(), "bc1") {
+		t.Fatalf("format: %s", addr.String())
+	}
+}
+
+func TestParseAddress_paralism_bech32_bc_pr_sameAID(t *testing.T) {
+	var h [20]byte
+	copy(h[:], bytes.Repeat([]byte{0x42}, 20))
+	witness := append([]byte{0x00}, h[:]...)
+	sbc, err := bech32.EncodeFromBase256("bc", witness)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spr, err := bech32.EncodeFromBase256("pr", witness)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addrBC, err := ParseAddress(sbc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if addrBC[0] != VersionParalism {
+		t.Fatal(addrBC[0])
+	}
+	addrPR, err := ParseAddress(spr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if addrBC != addrPR {
+		t.Fatalf("bc vs pr: %x vs %x", addrBC[:], addrPR[:])
+	}
+	if !strings.HasPrefix(addrBC.String(), "bc1") {
+		t.Fatalf("format: %s", addrBC.String())
 	}
 }
 

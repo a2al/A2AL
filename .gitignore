@@ -3,3 +3,4 @@ daemon/webui/node_modules/
 *.exe
 *.exe~
 identity-*.json
+tools-local/

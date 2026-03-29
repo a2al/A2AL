@@ -62,7 +62,7 @@ export default {
   'service.action.unpublish': 'Unpublish',
   'service.action.edit': 'Edit',
 
-  'service.unpublish.notice': 'The DHT record will expire naturally within ~1 hour.',
+  'service.unpublish.notice': 'The entry on the Tangled Network will expire naturally within ~1 hour.',
 
   'service.modal.title': 'Publish Service',
   'service.modal.import.label': 'Import from Agent Card (recommended)',
@@ -135,7 +135,7 @@ export default {
   'node.nat.port_restricted': 'Port Restricted',
   'node.nat.symmetric': 'Symmetric',
   'node.nat.unknown': 'Unknown',
-  'node.dht': 'DHT',
+  'node.dht': 'Tangled',
   'node.quic': 'QUIC',
   'node.config.restart_needed': 'restart needed',
   'node.config.restart_tooltip': 'Restart required for this change to take effect',
@@ -145,8 +145,8 @@ export default {
   'node.token.placeholder': '(none — localhost is open by default)',
   'node.token.save': 'Save to session',
   'node.debug.title': 'Advanced',
-  'node.debug.routing': 'DHT Routing',
-  'node.debug.store': 'DHT Store',
+  'node.debug.routing': 'Tangled routing (JSON)',
+  'node.debug.store': 'Tangled store (JSON)',
   'node.debug.connections': 'Connections',
 
   'common.copy': 'Copy',

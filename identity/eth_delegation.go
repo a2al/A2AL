@@ -1,5 +1,5 @@
 // Copyright 2026 The A2AL Authors. All rights reserved.
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MPL-2.0
 
 package identity
 
@@ -31,8 +31,8 @@ func BuildEthereumDelegationMessage(opPub ed25519.PublicKey, aid a2al.Address, i
 	return b.String()
 }
 
-// EthDelegationMessageFields are the structured lines from BuildEthereumDelegationMessage.
-type EthDelegationMessageFields struct {
+// DelegationMessageFields are the structured key:value fields shared by all chain delegation messages.
+type DelegationMessageFields struct {
 	OpKeyHex string
 	Agent    string
 	Scope    uint8
@@ -40,9 +40,9 @@ type EthDelegationMessageFields struct {
 	Expires  uint64
 }
 
-// ParseEthereumDelegationMessageFields parses key:value lines from a delegation message body.
-func ParseEthereumDelegationMessageFields(msg string) (EthDelegationMessageFields, error) {
-	var f EthDelegationMessageFields
+// ParseDelegationMessageFields parses key:value lines from a delegation message body.
+func ParseDelegationMessageFields(msg string) (DelegationMessageFields, error) {
+	var f DelegationMessageFields
 	var seenOp, seenAgent, seenScope, seenIssued, seenExp bool
 	for _, line := range strings.Split(msg, "\n") {
 		line = strings.TrimSpace(line)
@@ -108,7 +108,7 @@ func verifyEthereumDelegation(p DelegationProof, nowUnix uint64, opPriv ed25519.
 	if err := crypto.VerifyEIP191Signature(addr20, p.Message, p.Signature); err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidDelegation, err)
 	}
-	mf, err := ParseEthereumDelegationMessageFields(p.Message)
+	mf, err := ParseDelegationMessageFields(p.Message)
 	if err != nil {
 		return fmt.Errorf("%w: message parse: %v", ErrInvalidDelegation, err)
 	}

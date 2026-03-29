@@ -27,7 +27,7 @@ const CFG_DEFAULTS = {
 };
 
 const CFG_EMPTY_NOTES = {
-  quic_listen_addr: 'shared with DHT port',
+  quic_listen_addr: 'shared with Tangled port',
   fallback_host: 'disabled',
   key_dir: '<data-dir>/keys/',
   api_token: 'no authentication',

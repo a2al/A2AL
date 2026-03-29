@@ -1,5 +1,5 @@
 // Copyright 2026 The A2AL Authors. All rights reserved.
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MPL-2.0
 
 package daemon
 
@@ -32,91 +32,91 @@ func buildMCPServer(d *Daemon) *mcp.Server {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_identity_generate",
-		Description: "Generate master + operational Ed25519 keys and delegation proof.",
+		Description: "Create a new permanent cryptographic identity (AID) for an agent. Returns the AID address, keys, and delegation proof. Run once per agent; the master key is shown once and must be saved by the user — the daemon does not retain it.",
 	}, d.mcpIdentityGenerate)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_agents_list",
-		Description: "List registered agents.",
+		Description: "List all agent identities currently registered with the daemon.",
 	}, d.mcpAgentsList)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_agents_generate_ethereum",
-		Description: "Generate Ethereum AID (0x…), secp256k1 owner key, Ed25519 op key, and EIP-191 delegation proof; keys are not stored by the daemon.",
+		Description: "Create a new agent identity linked to an Ethereum wallet address (0x…). Use when the user wants their crypto wallet to serve as their agent's identity. Keys are not stored by the daemon.",
 	}, d.mcpAgentsGenerateEthereum)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_ethereum_delegation_message",
-		Description: "Build UTF-8 text for wallet personal_sign. Use operational_public_key_hex OR operational_private_key_seed_hex (exactly one), agent 0x address, issued_at, expires_at.",
+		Description: "Build the message text that the user must sign with their Ethereum wallet (personal_sign) to authorize an operational key. Provide the agent 0x address, operational key, and validity timestamps.",
 	}, d.mcpEthereumDelegationMessage)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_ethereum_register",
-		Description: "Register after EIP-191 signature: eth_signature_hex, agent, timestamps, service_tcp, operational_private_key_hex OR operational_private_key_seed_hex.",
+		Description: "Complete Ethereum agent registration after the user has signed the delegation message with their wallet. Provide the signature, agent address, timestamps, service address, and operational key.",
 	}, d.mcpEthereumRegister)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_ethereum_proof",
-		Description: "Create DelegationProof CBOR using ethereum_private_key_hex (automation only). Optional op keys; if omitted a new Ed25519 op key is generated and returned.",
+		Description: "Create an Ethereum delegation proof from a raw private key (automation / scripting only — do not use when a human is signing). If no operational key is provided, a new one is generated and returned.",
 	}, d.mcpEthereumProof)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_agent_register",
-		Description: "Register an agent with delegation proof and reachable service_tcp.",
+		Description: "Register a generated agent identity with the daemon so it can publish to and connect via the Tangled Network. Requires the keys returned by identity_generate.",
 	}, d.mcpAgentRegister)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_agent_get",
-		Description: "Get agent status: service_tcp, seq, reachability, published DHT fields.",
+		Description: "Check a local agent's current status: service address, whether it is reachable on the network, and when it was last published.",
 	}, d.mcpAgentGet)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_agent_patch",
-		Description: "Update service_tcp for a registered agent; requires operational_private_key_hex.",
+		Description: "Update the service address for a registered agent (e.g. after the local HTTP server moves to a different port).",
 	}, d.mcpAgentPatch)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_agent_publish",
-		Description: "Publish endpoint record for an agent to the DHT.",
+		Description: "Announce an agent's current network address to the Tangled Network so other agents can discover and connect to it. The daemon auto-publishes on a schedule; call this to force an immediate refresh.",
 	}, d.mcpAgentPublish)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_agent_heartbeat",
-		Description: "Record agent liveness for auto-republish (within TTL); use when service is not on local service_tcp.",
+		Description: "Keep a registered agent visible on the Tangled Network when it has no direct service address. Call periodically to prevent the agent from expiring off the network.",
 	}, d.mcpAgentHeartbeat)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_agent_delete",
-		Description: "Unregister agent: remove from registry, stop auto-republish, delete operational key.",
+		Description: "Permanently remove a local agent registration: stops auto-publish and deletes the operational key from the daemon.",
 	}, d.mcpAgentDelete)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_status",
-		Description: "Return node auto-publish status: auto_publish flag, node_aid, node_seq, last and next publish timestamps.",
+		Description: "Return the daemon's current status: this node's AID, whether auto-publish is enabled, and the last/next publish times.",
 	}, d.mcpStatus)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_agent_publish_record",
-		Description: "Publish sovereign custom DHT record RecType 0x02-0x0f.",
+		Description: "Publish a custom signed data record for an agent on the Tangled Network (advanced use). Useful for attaching structured metadata beyond standard endpoint and service records.",
 	}, d.mcpAgentPublishRecord)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_resolve_records",
-		Description: "List signed records for a remote AID (type 0 = all).",
+		Description: "Fetch all signed records published by a remote agent (endpoint record, service registrations, custom records). Use type=0 for all, or specify a record type.",
 	}, d.mcpResolveRecords)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_resolve",
-		Description: "Resolve an AID to its signed endpoint record.",
+		Description: "Look up a remote agent by its AID to get its current network endpoints and NAT type.",
 	}, d.mcpResolve)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_connect",
-		Description: "Open local TCP tunnel to remote agent via QUIC; optional local_aid.",
+		Description: "Establish a direct encrypted connection to a remote agent by AID. Returns a local TCP address (127.0.0.1:port) that proxies to the remote agent — use it like any local HTTP server.",
 	}, d.mcpConnect)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_mailbox_send",
-		Description: "Send encrypted DHT mailbox message.",
+		Description: "Send an encrypted message to any agent by AID, even if they are currently offline. The message is stored on the Tangled Network until the recipient retrieves it.",
 	}, d.mcpMailboxSend)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_mailbox_poll",
-		Description: "Poll and decrypt mailbox for a registered agent.",
+		Description: "Check for and decrypt any incoming messages for a local registered agent.",
 	}, d.mcpMailboxPoll)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_service_register",
-		Description: "Register DHT service discovery entries for an agent.",
+		Description: "Publish capability tags for an agent so other agents can find it by searching for services. Use dot-namespaced labels like 'ai.assistant', 'lang.translate', or 'code.review'.",
 	}, d.mcpTopicRegister)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_service_unregister",
-		Description: "Remove a service from agent renewal list; DHT TTL expires naturally.",
+		Description: "Remove a capability tag from an agent. The tag disappears from the Tangled Network after its TTL expires (up to 1 hour).",
 	}, d.mcpTopicUnregister)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_discover",
-		Description: "Search agents by service(s) on the DHT.",
+		Description: "Search the Tangled Network for agents offering specific capabilities. Returns matching agents with their names, protocols, and AIDs. Optionally filter by protocol (e.g. 'mcp', 'a2a') or tags.",
 	}, d.mcpDiscover)
 
 	return s

@@ -1,5 +1,5 @@
 // Copyright 2026 The A2AL Authors. All rights reserved.
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MPL-2.0
 
 package crypto
 
@@ -12,11 +12,6 @@ import (
 	"github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa"
 	"golang.org/x/crypto/sha3"
 )
-
-// GenerateSecp256k1PrivateKey creates a random secp256k1 private key suitable for Ethereum addresses.
-func GenerateSecp256k1PrivateKey() (*secp256k1.PrivateKey, error) {
-	return secp256k1.GeneratePrivateKey()
-}
 
 // Keccak256 returns the Keccak-256 hash (Ethereum precompile, not SHA3-256).
 func Keccak256(b []byte) []byte {

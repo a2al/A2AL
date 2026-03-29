@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Python sidecar: spawn a2ald and call its REST API"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "Apache-2.0" }
+license = { text = "MPL-2.0" }
 authors = [{ name = "A2AL Authors" }]
 
 [project.urls]

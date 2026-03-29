@@ -1,5 +1,5 @@
 // Copyright 2026 The A2AL Authors. All rights reserved.
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MPL-2.0
 
 // demo2-chat: 双节点加密聊天，覆盖 Phase 2 核心能力（含 2b 多候选 + Happy Eyeballs）。
 //
@@ -45,9 +45,9 @@ import (
 )
 
 func main() {
-	listen := flag.String("listen", ":4121", "DHT UDP listen address")
-	quicListen := flag.String("quic", "", "QUIC UDP listen (empty = share DHT port)")
-	bootstrapAddr := flag.String("bootstrap", "", "seed DHT UDP address")
+	listen := flag.String("listen", ":4121", "Tangled Network UDP listen address")
+	quicListen := flag.String("quic", "", "QUIC UDP listen (empty = share Tangled port)")
+	bootstrapAddr := flag.String("bootstrap", "", "seed Tangled Network UDP address")
 	debugAddr := flag.String("debug", "", "debug HTTP address")
 	extIP := flag.String("ip", "", "advertise host (fallback)")
 	minObs := flag.Int("min-observed", 1, "nat-sense threshold")
@@ -121,7 +121,7 @@ func main() {
 	fmt.Println()
 	fmt.Println("═══════════════════════════════════════════")
 	fmt.Println("  My AID:    ", ks.addr.String())
-	fmt.Println("  DHT UDP:   ", h.DHTLocalAddr())
+	fmt.Println("  Tangled UDP:", h.DHTLocalAddr())
 	fmt.Println("  QUIC UDP:  ", h.QUICLocalAddr())
 	fmt.Printf("  NAT type:   %s\n", natStr)
 	if oh, op, ok := h.Sense().TrustedUDP(); ok {

@@ -1,5 +1,5 @@
 // Copyright 2026 The A2AL Authors. All rights reserved.
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MPL-2.0
 
 package daemon
 
@@ -83,6 +83,36 @@ func (d *Daemon) execEthereumIdentityGenerate() (ethereumGenResp, error) {
 		DelegationProofHex:       hex.EncodeToString(raw),
 		AID:                      aid.String(),
 		Warning:                  "Persist ethereum_private_key_hex like a wallet seed; the daemon does not retain it. Loss = loss of AID ownership.",
+	}, nil
+}
+
+type paralismGenResp struct {
+	ParalismPrivateKeyHex    string `json:"paralism_private_key_hex"`
+	OperationalPrivateKeyHex string `json:"operational_private_key_hex"`
+	DelegationProofHex       string `json:"delegation_proof_hex"`
+	AID                      string `json:"aid"`
+	Warning                  string `json:"warning"`
+}
+
+func (d *Daemon) execParalismIdentityGenerate() (paralismGenResp, error) {
+	btcPriv, opPriv, proof, err := identity.GenerateParalismIdentity()
+	if err != nil {
+		return paralismGenResp{}, err
+	}
+	raw, err := identity.EncodeDelegationProof(proof)
+	if err != nil {
+		return paralismGenResp{}, err
+	}
+	aid, err := proof.AgentAID()
+	if err != nil {
+		return paralismGenResp{}, err
+	}
+	return paralismGenResp{
+		ParalismPrivateKeyHex:    hex.EncodeToString(btcPriv.Serialize()),
+		OperationalPrivateKeyHex: hex.EncodeToString(opPriv),
+		DelegationProofHex:       hex.EncodeToString(raw),
+		AID:                      aid.String(),
+		Warning:                  "Persist paralism_private_key_hex like a wallet seed; the daemon does not retain it. Loss = loss of AID ownership.",
 	}, nil
 }
 
@@ -275,6 +305,73 @@ func (d *Daemon) execEthereumProofFromKey(ethPrivHex string, issuedAt, expiresAt
 		return ethereumProofResp{}, err
 	}
 	out := ethereumProofResp{
+		AID:                aid.String(),
+		DelegationProofHex: hex.EncodeToString(raw),
+	}
+	if generatedOp {
+		out.OperationalPrivateKeyHex = hex.EncodeToString(opPriv)
+		out.Warning = "New operational key generated; store operational_private_key_hex before registering."
+	}
+	return out, nil
+}
+
+type paralismProofResp struct {
+	AID                      string `json:"aid"`
+	DelegationProofHex       string `json:"delegation_proof_hex"`
+	OperationalPrivateKeyHex string `json:"operational_private_key_hex,omitempty"`
+	Warning                  string `json:"warning,omitempty"`
+}
+
+// execParalismProofFromKey signs delegation with a local secp256k1 key (automation / trusted paths).
+func (d *Daemon) execParalismProofFromKey(btcPrivHex string, issuedAt, expiresAt uint64, scope uint8, opPrivHex, opSeedHex string) (paralismProofResp, error) {
+	_ = d
+	if scope == 0 {
+		scope = identity.ScopeNetworkOps
+	}
+	btcRaw, err := decodeFlexibleHex(btcPrivHex)
+	if err != nil || len(btcRaw) != 32 {
+		return paralismProofResp{}, errParalismBadPrivHex
+	}
+	btcPriv := secp256k1.PrivKeyFromBytes(btcRaw)
+
+	var opPriv ed25519.PrivateKey
+	var generatedOp bool
+	if opPrivHex != "" || opSeedHex != "" {
+		opPriv, err = operationalPrivateFromHexOrSeed(opPrivHex, opSeedHex)
+		if err != nil {
+			return paralismProofResp{}, err
+		}
+	} else {
+		_, opPriv, err = ed25519.GenerateKey(nil)
+		if err != nil {
+			return paralismProofResp{}, err
+		}
+		generatedOp = true
+	}
+	opPub := opPriv.Public().(ed25519.PublicKey)
+
+	var aid a2al.Address
+	aid[0] = a2al.VersionParalism
+	addr20, err := crypto.Secp256k1PubKeyToHash160(btcPriv.PubKey(), true)
+	if err != nil {
+		return paralismProofResp{}, err
+	}
+	copy(aid[1:], addr20[:])
+
+	issued := issuedAt
+	if issued == 0 {
+		issued = uint64(time.Now().Unix())
+	}
+
+	proof, err := identity.SignParalismDelegation(btcPriv, opPub, aid, issued, expiresAt, scope)
+	if err != nil {
+		return paralismProofResp{}, err
+	}
+	raw, err := identity.EncodeDelegationProof(proof)
+	if err != nil {
+		return paralismProofResp{}, err
+	}
+	out := paralismProofResp{
 		AID:                aid.String(),
 		DelegationProofHex: hex.EncodeToString(raw),
 	}
@@ -974,6 +1071,7 @@ var (
 	errEthSigVerify          = errors.New("ethereum signature verification failed")
 	errEthBadPrivHex         = errors.New("bad ethereum_private_key_hex")
 	errEthProofBuild         = errors.New("ethereum proof build failed")
+	errParalismBadPrivHex    = errors.New("bad paralism_private_key_hex")
 	errBadDelegationHex      = errors.New("bad delegation_proof_hex")
 	errDelegationParse       = errors.New("delegation parse")
 	errBadOpKeyHex           = errors.New("bad operational_private_key_hex")

@@ -1,5 +1,5 @@
 // Copyright 2026 The A2AL Authors. All rights reserved.
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MPL-2.0
 
 package daemon
 
@@ -32,6 +32,7 @@ func (d *Daemon) routes() http.Handler {
 	mux.HandleFunc("POST /agents/ethereum/delegation-message", d.handleEthDelegationMessage)
 	mux.HandleFunc("POST /agents/ethereum/register", d.handleEthRegister)
 	mux.HandleFunc("POST /agents/ethereum/proof", d.handleEthProof)
+	mux.HandleFunc("POST /agents/paralism/proof", d.handleParalismProof)
 	mux.HandleFunc("GET /agents", d.handleAgentsList)
 	mux.HandleFunc("GET /agents/{aid}", d.handleAgentsGet)
 	mux.HandleFunc("PATCH /agents/{aid}", d.withAgentMiddleware(d.handleAgentsPatch))
@@ -431,22 +432,63 @@ func (d *Daemon) handleEthProof(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, out)
 }
 
+type paralismProofAPIReq struct {
+	ParalismPrivateKeyHex        string `json:"paralism_private_key_hex"`
+	IssuedAt                     uint64 `json:"issued_at"`
+	ExpiresAt                    uint64 `json:"expires_at"`
+	Scope                        uint8  `json:"scope,omitempty"`
+	OperationalPrivateKeyHex     string `json:"operational_private_key_hex,omitempty"`
+	OperationalPrivateKeySeedHex string `json:"operational_private_key_seed_hex,omitempty"`
+}
+
+func (d *Daemon) handleParalismProof(w http.ResponseWriter, r *http.Request) {
+	var req paralismProofAPIReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return
+	}
+	out, err := d.execParalismProofFromKey(req.ParalismPrivateKeyHex, req.IssuedAt, req.ExpiresAt, req.Scope, req.OperationalPrivateKeyHex, req.OperationalPrivateKeySeedHex)
+	if err != nil {
+		switch {
+		case errors.Is(err, errParalismBadPrivHex):
+			http.Error(w, `{"error":"bad paralism_private_key_hex"}`, http.StatusBadRequest)
+		case errors.Is(err, errEthOpKeyAmbiguous):
+			http.Error(w, `{"error":"operational key"}`, http.StatusBadRequest)
+		case errors.Is(err, errBadOpKeyHex), errors.Is(err, errBadOpSeedHex):
+			http.Error(w, `{"error":"bad operational key"}`, http.StatusBadRequest)
+		default:
+			http.Error(w, `{"error":"proof failed"}`, http.StatusBadRequest)
+		}
+		return
+	}
+	writeJSON(w, out)
+}
+
 func (d *Daemon) handleAgentsGenerate(w http.ResponseWriter, r *http.Request) {
 	var req agentsGenerateReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
 		return
 	}
-	if req.Chain != "" && req.Chain != "ethereum" {
+	switch req.Chain {
+	case "", "ethereum":
+		out, err := d.execEthereumIdentityGenerate()
+		if err != nil {
+			http.Error(w, `{"error":"generate failed"}`, http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, out)
+	case "paralism":
+		out, err := d.execParalismIdentityGenerate()
+		if err != nil {
+			http.Error(w, `{"error":"generate failed"}`, http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, out)
+	default:
 		http.Error(w, `{"error":"unsupported chain"}`, http.StatusBadRequest)
 		return
 	}
-	out, err := d.execEthereumIdentityGenerate()
-	if err != nil {
-		http.Error(w, `{"error":"generate failed"}`, http.StatusInternalServerError)
-		return
-	}
-	writeJSON(w, out)
 }
 
 func (d *Daemon) handleAgentsPost(w http.ResponseWriter, r *http.Request) {

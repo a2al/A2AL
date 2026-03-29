@@ -55,6 +55,21 @@ conn, err := agent.Connect(targetAID)
 
 As an MCP Server, A2AL exposes tools (`publish`, `resolve`, `update`, `identity`) that any MCP-compatible agent can invoke directly — enabling agents to acquire networking capabilities without code-level integration.
 
+**Claude Desktop / Cursor / Windsurf / Cline** — add to your MCP config:
+
+```json
+{
+  "mcpServers": {
+    "a2al": {
+      "command": "a2ald",
+      "args": ["--mcp-stdio"]
+    }
+  }
+}
+```
+
+See [`doc/mcp-setup.md`](doc/mcp-setup.md) for platform-specific paths and full tool list.
+
 ## Design Principles
 
 **Self-sovereign Identity** — Each agent's address is derived from its own key pair. No registration authority is involved. Identity is verifiable end-to-end: no agent can claim an AID it does not hold the private key for.
@@ -128,4 +143,4 @@ XG.Shi — This project is not affiliated with or endorsed by any employer or or
 
 Copyright (c) 2026 The A2AL Authors
 
-Licensed under the [Apache License, Version 2.0](LICENSE).
+Licensed under the [Mozilla Public License 2.0](LICENSE).

@@ -1,5 +1,5 @@
 // Copyright 2026 The A2AL Authors. All rights reserved.
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MPL-2.0
 
 package main
 
@@ -212,7 +212,7 @@ func registerEd25519(c *Client, g globalOpts, serviceTCP, saveMaster string, noP
 		fmt.Printf("Service TCP: %s\n", serviceTCP)
 	}
 	if !noPub {
-		fmt.Println("Publishing to DHT...  ✓")
+		fmt.Println("Publishing to Tangled Network...  ✓")
 	}
 	fmt.Println()
 	fmt.Println("⚠  Save your master key (displayed once, daemon does not retain it):")
@@ -564,7 +564,7 @@ func cmdUnpublish(c *Client, g globalOpts, args []string) {
 		return
 	}
 	if !g.Quiet {
-		fmt.Printf("Removed service %q for %s. DHT record will expire within 1 hour.\n", topic, shortAID(aid))
+		fmt.Printf("Removed service %q for %s. The entry on the Tangled Network will expire within 1 hour.\n", topic, shortAID(aid))
 	}
 }
 

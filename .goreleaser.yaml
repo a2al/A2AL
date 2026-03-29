@@ -17,10 +17,30 @@ builds:
     ldflags:
       - -s -w -X main.version={{.Version}}
 
+  - id: a2al
+    main: ./cmd/a2al
+    binary: a2al
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    ignore:
+      - goos: windows
+        goarch: arm64
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+
 archives:
   - id: a2ald
     ids: [a2ald]
     name_template: "a2ald_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+
+  - id: a2al
+    ids: [a2al]
+    name_template: "a2al_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
     format_overrides:
       - goos: windows
         formats: [zip]
@@ -33,7 +53,7 @@ nfpms:
     homepage: https://github.com/a2al/a2al
     maintainer: A2AL Authors <noreply@github.com>
     description: A2AL daemon — decentralized agent networking
-    license: Apache-2.0
+    license: MPL-2.0
 
     formats: [deb, rpm]
     bindir: /opt/a2al/bin

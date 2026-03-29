@@ -1,5 +1,5 @@
 // Copyright 2026 The A2AL Authors. All rights reserved.
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MPL-2.0
 
 // demo4-marketplace: Phase 4（Mailbox + Topic + Sovereign Record）功能验证 demo。
 //
@@ -191,7 +191,7 @@ func setupAgent(c *client, id *savedIdentity, serviceTCP string) error {
 		fmt.Println(" OK")
 	}
 
-	fmt.Print("  发布端点到 DHT...")
+	fmt.Print("  发布端点到 Tangled 网络...")
 	if err := c.do("POST", "/agents/"+id.AID+"/publish", struct{}{}, nil); err != nil {
 		return fmt.Errorf("publish endpoint: %w", err)
 	}
@@ -364,7 +364,7 @@ func runBob(c *client, idPath string) {
 	fmt.Println()
 
 	if aliceAID == "" {
-		fatal("未找到翻译服务（topic: lang.translate, tag: zh）。\n请确认 Alice 已上线，且 DHT 已同步（通常需等待数秒）。")
+		fatal("未找到翻译服务（topic: lang.translate, tag: zh）。\n请确认 Alice 已上线，且 Tangled 网络已同步（通常需等待数秒）。")
 	}
 
 	fmt.Printf("\n  找到 %d 个翻译服务:\n", len(discoverResp.Entries))
@@ -422,7 +422,7 @@ func runBob(c *client, idPath string) {
 				body, _ := base64.StdEncoding.DecodeString(msg.BodyBase64)
 				fmt.Printf("\n\n[Bob] 收到翻译结果: %q\n", string(body))
 				fmt.Println("\n✓ Phase 4 功能验证完成！")
-				fmt.Println("  验证链路：身份 → DHT端点发布 → Topic注册 → Discover → Sovereign记录 → Mailbox加密通信")
+				fmt.Println("  验证链路：身份 → Tangled 端点发布 → Topic注册 → Discover → Sovereign记录 → 加密通信")
 				return
 			}
 		}

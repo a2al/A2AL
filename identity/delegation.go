@@ -1,5 +1,5 @@
 // Copyright 2026 The A2AL Authors. All rights reserved.
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MPL-2.0
 
 // Package identity holds Phase 3 delegation proofs (master → operational key).
 package identity
@@ -133,6 +133,13 @@ func ParseDelegationProof(b []byte) (DelegationProof, error) {
 		if len(p.Signature) != 65 || p.Message == "" {
 			return DelegationProof{}, ErrInvalidDelegation
 		}
+	case a2al.VersionParalism:
+		if len(p.MasterPub) != 0 {
+			return DelegationProof{}, ErrInvalidDelegation
+		}
+		if len(p.Signature) != 65 || p.Message == "" {
+			return DelegationProof{}, ErrInvalidDelegation
+		}
 	default:
 		return DelegationProof{}, fmt.Errorf("%w: unsupported agent address version 0x%02x", ErrInvalidDelegation, v)
 	}
@@ -147,6 +154,8 @@ func VerifyDelegation(p DelegationProof, nowUnix uint64, opPriv ed25519.PrivateK
 	switch p.AgentAddr[0] {
 	case a2al.VersionEthereum:
 		return verifyEthereumDelegation(p, nowUnix, opPriv)
+	case a2al.VersionParalism:
+		return verifyParalismDelegation(p, nowUnix, opPriv)
 	default:
 		return verifyEd25519Delegation(p, nowUnix, opPriv)
 	}
