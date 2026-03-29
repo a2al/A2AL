@@ -174,7 +174,6 @@ func (d *Daemon) Run(ctx context.Context, mcpStdio bool) error {
 	defer func() {
 		savePeersCache(filepath.Join(d.dataDir, "peers.cache"), d.h, d.log)
 		_ = d.h.Close()
-		_ = config.Save(d.cfgPath, *d.cfg)
 	}()
 
 	runBootstrapChain(ctx, d.h, d.cfg, d.dataDir, d.log)
