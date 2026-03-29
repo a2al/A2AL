@@ -144,7 +144,9 @@ func (n *Node) PublishEndpointRecord(ctx context.Context, rec protocol.SignedRec
 		wg.Add(1)
 		go func(addr net.Addr) {
 			defer wg.Done()
-			if _, err := n.StoreAt(ctx, addr, a2al.NodeID{}, rec); err != nil {
+			peerCtx, peerCancel := context.WithTimeout(ctx, queryPeerTimeout)
+			defer peerCancel()
+			if _, err := n.StoreAt(peerCtx, addr, a2al.NodeID{}, rec); err != nil {
 				n.log.Debug("publish StoreAt failed", "peer", addr, "err", err)
 				mu.Lock()
 				lastErr = err
@@ -200,7 +202,9 @@ func (n *Node) publishKeyedRecord(ctx context.Context, storeKey a2al.NodeID, rec
 		wg.Add(1)
 		go func(addr net.Addr) {
 			defer wg.Done()
-			if _, err := n.StoreAt(ctx, addr, storeKey, rec); err != nil {
+			peerCtx, peerCancel := context.WithTimeout(ctx, queryPeerTimeout)
+			defer peerCancel()
+			if _, err := n.StoreAt(peerCtx, addr, storeKey, rec); err != nil {
 				mu.Lock()
 				lastErr = err
 				mu.Unlock()
