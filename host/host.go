@@ -363,7 +363,9 @@ func (h *Host) BuildEndpointPayload(ctx context.Context) (protocol.EndpointPaylo
 	go func() { extCh <- h.ensureExternalIP(ctx) }()
 	up := <-upCh
 	ext := <-extCh
-	h.log.Debug("endpoint probe done", "elapsed", time.Since(t0).Truncate(time.Millisecond), "ext_ip", ext, "upnp", up)
+	if elapsed := time.Since(t0).Truncate(time.Millisecond); elapsed > 0 {
+		h.log.Debug("endpoint probe done", "elapsed", elapsed, "ext_ip", ext, "upnp", up)
+	}
 
 	// Keep the DHT node informed of our public IP so it can detect NAT hairpin peers.
 	if ext != "" {

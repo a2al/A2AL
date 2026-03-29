@@ -73,6 +73,8 @@ type Node struct {
 	statsRx  atomic.Uint64
 	statsTx  atomic.Uint64
 	statsRPC atomic.Uint64 // outbound request/response pairs (sendAndWait success)
+
+	decodeErrNext atomic.Int64 // unix-nano: next time a decode-error WARN may fire
 }
 
 type waitEntry struct {
@@ -134,6 +136,11 @@ func (n *Node) recvLoop() {
 		}
 		dec, err := protocol.VerifyAndDecode(data)
 		if err != nil {
+			now := time.Now().UnixNano()
+			if n.decodeErrNext.Load() <= now {
+				n.decodeErrNext.Store(now + int64(30*time.Second))
+				n.log.Warn("dht decode failed", "from", from, "err", err)
+			}
 			continue
 		}
 		n.statsRx.Add(1)
@@ -309,6 +316,7 @@ func (n *Node) reply(from net.Addr, req *protocol.DecodedMessage, msgType uint8,
 	}
 	raw, err := protocol.MarshalSignedMessageKeyStore(hdr, body, n.ks, n.addr)
 	if err != nil {
+		n.log.Warn("dht reply marshal failed", "msg_type", msgType, "to", from, "err", err)
 		return
 	}
 	if err := n.tr.Send(from, raw); err != nil {
@@ -328,6 +336,7 @@ func (n *Node) onPing(from net.Addr, dec *protocol.DecodedMessage) {
 }
 
 func (n *Node) onFindNode(from net.Addr, dec *protocol.DecodedMessage) {
+	n.log.Debug("dht recv find_node", "from", from)
 	n.remember(from, dec)
 	target := dec.Body.(*protocol.BodyFindNode).Target
 	var tid a2al.NodeID
@@ -347,6 +356,7 @@ func (n *Node) onFindNode(from net.Addr, dec *protocol.DecodedMessage) {
 }
 
 func (n *Node) onFindValue(from net.Addr, dec *protocol.DecodedMessage) {
+	n.log.Debug("dht recv find_value", "from", from)
 	n.remember(from, dec)
 	body := dec.Body.(*protocol.BodyFindValue)
 	var tid a2al.NodeID
