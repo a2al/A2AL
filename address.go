@@ -71,7 +71,7 @@ type AddressCodec interface {
 // chainCodecs: ordered list of chain-specific codecs. First CanParse match wins.
 var chainCodecs = []AddressCodec{
 	ethereumCodec{},
-	// bitcoinCodec{},  // future: Paralism / Bitcoin
+	paralismCodec{},
 }
 
 // codecByVersion maps version byte → chain codec (excludes native).

@@ -13,11 +13,6 @@ import (
 	"golang.org/x/crypto/sha3"
 )
 
-// GenerateSecp256k1PrivateKey creates a random secp256k1 private key suitable for Ethereum addresses.
-func GenerateSecp256k1PrivateKey() (*secp256k1.PrivateKey, error) {
-	return secp256k1.GeneratePrivateKey()
-}
-
 // Keccak256 returns the Keccak-256 hash (Ethereum precompile, not SHA3-256).
 func Keccak256(b []byte) []byte {
 	h := sha3.NewLegacyKeccak256()
