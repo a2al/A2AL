@@ -1,5 +1,5 @@
 // Copyright 2026 The A2AL Authors. All rights reserved.
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MPL-2.0
 
 // demo5-marketplace: 通过 QUIC 隧道直连调用 HTTP 服务的端到端验证。
 //

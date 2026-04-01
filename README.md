@@ -128,4 +128,4 @@ XG.Shi — This project is not affiliated with or endorsed by any employer or or
 
 Copyright (c) 2026 The A2AL Authors
 
-Licensed under the [Apache License, Version 2.0](LICENSE).
+Licensed under the [Mozilla Public License 2.0](LICENSE).

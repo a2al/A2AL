@@ -33,7 +33,7 @@ nfpms:
     homepage: https://github.com/a2al/a2al
     maintainer: A2AL Authors <noreply@github.com>
     description: A2AL daemon — decentralized agent networking
-    license: Apache-2.0
+    license: MPL-2.0
 
     formats: [deb, rpm]
     bindir: /opt/a2al/bin

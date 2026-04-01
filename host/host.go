@@ -1,5 +1,5 @@
 // Copyright 2026 The A2AL Authors. All rights reserved.
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MPL-2.0
 
 // Package host is the Phase 2 SDK: DHT + QUIC, nat-sense, multi-candidate endpoints (2b),
 // optional UPnP, Happy Eyeballs dial, Publish/Resolve/Connect/Accept.

@@ -1,5 +1,5 @@
 // Copyright 2026 The A2AL Authors. All rights reserved.
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MPL-2.0
 
 // demo1-node: 单一 A2AL DHT 节点。
 //

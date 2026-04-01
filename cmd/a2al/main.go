@@ -1,5 +1,5 @@
 // Copyright 2026 The A2AL Authors. All rights reserved.
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MPL-2.0
 
 // a2al is the command-line client for the local a2ald daemon (REST API only).
 package main

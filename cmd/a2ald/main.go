@@ -1,5 +1,5 @@
 // Copyright 2026 The A2AL Authors. All rights reserved.
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MPL-2.0
 
 // a2ald is the A2AL daemon: DHT/QUIC host, REST API, Web UI, TCP gateway, MCP.
 package main

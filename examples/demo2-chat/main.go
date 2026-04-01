@@ -1,5 +1,5 @@
 // Copyright 2026 The A2AL Authors. All rights reserved.
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MPL-2.0
 
 // demo2-chat: 双节点加密聊天，覆盖 Phase 2 核心能力（含 2b 多候选 + Happy Eyeballs）。
 //

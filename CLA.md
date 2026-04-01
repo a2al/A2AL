@@ -1,5 +1,7 @@
 # Contributor License Agreement
 
+The open source license for this repository is **Mozilla Public License 2.0** — see [LICENSE](LICENSE). The terms below grant The A2AL Authors additional rights to your contributions.
+
 Thank you for your interest in contributing to A2AL (the "Project").
 
 By submitting a pull request or otherwise contributing code, documentation, or other materials to this repository, you agree to the following terms:

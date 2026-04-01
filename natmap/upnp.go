@@ -1,5 +1,5 @@
 // Copyright 2026 The A2AL Authors. All rights reserved.
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MPL-2.0
 
 // Package natmap provides optional NAT helpers (Phase 2b: UPnP IGD port mapping).
 // TURN and other relays are out of scope until Phase 3+.
