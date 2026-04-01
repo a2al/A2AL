@@ -88,7 +88,7 @@ Approved assignments are merged into this document and reflected in the codebase
 
 ## 7. Relationship to Chain Identity
 
-The version byte identifies a **cryptographic scheme**, not a blockchain. Two chains sharing the same key algorithm and derivation (e.g., Paralism and Cosmos SDK) produce identical A2AL addresses from the same public key. Chain-specific context (if needed by an application) is carried at the endpoint record or application layer, not in the address itself.
+The version byte identifies a **cryptographic scheme**, not a blockchain. Two chains sharing the same key algorithm and derivation (e.g., Paralism and Bitcoin SDK) produce identical A2AL addresses from the same public key. Chain-specific context (if needed by an application) is carried at the endpoint record or application layer, not in the address itself.
 
 ---
 

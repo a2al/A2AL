@@ -1,0 +1,28 @@
+{
+  "name": "a2ald",
+  "version": "0.0.0",
+  "description": "A2AL daemon — decentralized agent networking for AI agents",
+  "license": "MPL-2.0",
+  "homepage": "https://github.com/a2al/a2al",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/a2al/a2al.git",
+    "directory": "npm/a2ald"
+  },
+  "keywords": ["a2al", "agent", "mcp", "p2p", "decentralized", "ai"],
+  "bin": {
+    "a2ald": "bin/a2ald"
+  },
+  "main": "index.js",
+  "files": [
+    "bin",
+    "index.js"
+  ],
+  "optionalDependencies": {
+    "@a2al/a2ald-linux-x64":    "0.0.0",
+    "@a2al/a2ald-linux-arm64":  "0.0.0",
+    "@a2al/a2ald-darwin-x64":   "0.0.0",
+    "@a2al/a2ald-darwin-arm64": "0.0.0",
+    "@a2al/a2ald-win32-x64":    "0.0.0"
+  }
+}

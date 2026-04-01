@@ -96,6 +96,9 @@ func OpenMailboxRecord(recipientPriv ed25519.PrivateKey, recipientAddr a2al.Addr
 	if len(mp.SenderAddr) != len(recipientAddr) {
 		return empty, fmt.Errorf("%w: sender_addr length", ErrInvalidRecord)
 	}
+	if !bytes.Equal(mp.SenderAddr, sr.Address) {
+		return empty, fmt.Errorf("%w: sender_addr/record address mismatch", ErrInvalidRecord)
+	}
 	if len(mp.EphemeralPK) != 32 || len(mp.Nonce) != 12 {
 		return empty, fmt.Errorf("%w: mailbox field lengths", ErrInvalidRecord)
 	}

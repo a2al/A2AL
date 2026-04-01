@@ -1,0 +1,9 @@
+{
+  "name": "@a2al/a2ald-darwin-x64",
+  "version": "0.0.0",
+  "description": "A2AL daemon binary for darwin/x64",
+  "license": "MPL-2.0",
+  "os": ["darwin"],
+  "cpu": ["x64"],
+  "files": ["bin/a2ald"]
+}

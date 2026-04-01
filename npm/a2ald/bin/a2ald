@@ -1,0 +1,16 @@
+#!/usr/bin/env node
+"use strict";
+
+const { getBinaryPath } = require("..");
+const { spawnSync } = require("child_process");
+
+let bin;
+try {
+  bin = getBinaryPath();
+} catch (e) {
+  process.stderr.write(e.message + "\n");
+  process.exit(1);
+}
+
+const result = spawnSync(bin, process.argv.slice(2), { stdio: "inherit" });
+process.exit(result.status != null ? result.status : 1);
