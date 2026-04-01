@@ -745,17 +745,31 @@ func closeAfterError(mux *transport.UDPMux, node *dht.Node) {
 }
 
 // recordAuthPolicy is the DHT store authority policy for a2ald hosts.
-// Phase 4: sovereign records must use key == NodeID(sr.Address); Topic/Mailbox skip address binding.
+//
+// Sovereign records: DHT key must equal NodeID(sr.Address); signer must own or hold
+// a valid delegation for that address.
+// Topic records: signer must own or hold a valid delegation for sr.Address (the
+// registering agent's AID); DHT key binding is not checked (topic key is content-derived).
+// Mailbox records: no authority check — sender AID differs from the recipient key by design.
 func recordAuthPolicy(key a2al.NodeID, sr protocol.SignedRecord, now time.Time) error {
 	cat := protocol.RecordCategory(sr.RecType)
-	if cat == protocol.CategoryTopic || cat == protocol.CategoryMailbox {
+
+	// Mailbox: sender != recipient AID, skip authority check.
+	if cat == protocol.CategoryMailbox {
 		return nil
 	}
+
 	var recAddr a2al.Address
 	copy(recAddr[:], sr.Address)
-	if key != a2al.NodeIDFromAddress(recAddr) {
-		return errors.New("a2al/host: sovereign record DHT key mismatch")
+
+	// Sovereign-only: DHT key must equal NodeID(sr.Address).
+	if cat == protocol.CategorySovereign {
+		if key != a2al.NodeIDFromAddress(recAddr) {
+			return errors.New("a2al/host: sovereign record DHT key mismatch")
+		}
 	}
+
+	// Shared authority check (Sovereign + Topic): signing key must be authorized for sr.Address.
 	signerAddr, err := crypto.AddressFromPublicKey(sr.Pubkey)
 	if err != nil {
 		return err
