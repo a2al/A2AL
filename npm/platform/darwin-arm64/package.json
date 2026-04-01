@@ -1,0 +1,9 @@
+{
+  "name": "@a2al/a2ald-darwin-arm64",
+  "version": "0.0.0",
+  "description": "A2AL daemon binary for darwin/arm64 (Apple Silicon)",
+  "license": "MPL-2.0",
+  "os": ["darwin"],
+  "cpu": ["arm64"],
+  "files": ["bin/a2ald"]
+}

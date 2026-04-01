@@ -4,3 +4,7 @@ daemon/webui/node_modules/
 *.exe~
 identity-*.json
 tools-local/
+
+# npm platform package binaries (written by CI, not committed)
+npm/platform/*/bin/a2ald
+npm/platform/*/bin/a2ald.exe
