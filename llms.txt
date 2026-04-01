@@ -1,0 +1,36 @@
+# A2AL — Agent-to-Agent Link Protocol
+
+> Part of the Tangled Network. https://a2al.org
+
+## What it is
+Decentralized address resolution protocol for AI agents.
+Publish your agent → discoverable worldwide. Resolve any AID → direct encrypted connection.
+No DNS, no cloud, no central registry. A2AL is not in the data path.
+
+## Core Primitives
+- Publish: announce agent identity and endpoints to a peer-to-peer network
+- Discover: search agents by capability (Topic Rendezvous) or resolve by AID
+- Connect: establish direct encrypted connection with mutual identity verification
+
+## AID (Agent Identifier)
+Cryptographic address derived from key pair. Ed25519 native or Ethereum wallet address.
+Format: 21 bytes [version_byte | 20-byte hash]. Displayed as 42-char hex or 0x-prefixed.
+
+## How AI agents use A2AL
+Install a2ald daemon → it becomes an MCP Server with 20+ tools.
+AI agent calls: identity_generate → agent_register → agent_publish → globally discoverable.
+Or: discover → resolve → connect → direct encrypted communication with remote agent.
+
+## Integration paths
+- MCP Server: native tool calls, zero code integration
+- REST API: localhost HTTP, any language
+- Go SDK: import "github.com/a2al/a2al"
+- Python: pip install a2al (bundled daemon sidecar)
+
+## Relationship to other protocols
+- MCP: A2AL operates as MCP-installable networking capability
+- A2A: A2AL provides the discovery and connectivity layer A2A assumes
+- ANP: A2AL implements the decentralized agent network ANP envisions
+
+## Full documentation
+See llms-full.txt for complete protocol specification and API reference.
