@@ -750,14 +750,11 @@ func closeAfterError(mux *transport.UDPMux, node *dht.Node) {
 // a valid delegation for that address.
 // Topic records: signer must own or hold a valid delegation for sr.Address (the
 // registering agent's AID); DHT key binding is not checked (topic key is content-derived).
-// Mailbox records: no authority check — sender AID differs from the recipient key by design.
+// Mailbox records: DHT key is NodeID(recipient), which differs from sr.Address (sender AID),
+// so key binding is skipped — but the signer must still own or hold a valid delegation for
+// sr.Address (the sender AID). This prevents sender identity spoofing.
 func recordAuthPolicy(key a2al.NodeID, sr protocol.SignedRecord, now time.Time) error {
 	cat := protocol.RecordCategory(sr.RecType)
-
-	// Mailbox: sender != recipient AID, skip authority check.
-	if cat == protocol.CategoryMailbox {
-		return nil
-	}
 
 	var recAddr a2al.Address
 	copy(recAddr[:], sr.Address)
@@ -769,7 +766,7 @@ func recordAuthPolicy(key a2al.NodeID, sr protocol.SignedRecord, now time.Time) 
 		}
 	}
 
-	// Shared authority check (Sovereign + Topic): signing key must be authorized for sr.Address.
+	// Shared authority check (Sovereign + Topic + Mailbox): signing key must be authorized for sr.Address.
 	signerAddr, err := crypto.AddressFromPublicKey(sr.Pubkey)
 	if err != nil {
 		return err
