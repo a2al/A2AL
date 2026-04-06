@@ -83,7 +83,7 @@ jobs:
 
           mkdir -p npm/platform/win32-x64/bin
           curl -fsSL "${BASE}/a2al_${VERSION}_windows_amd64.zip" -o /tmp/win.zip
-          unzip -j /tmp/win.zip '*/a2ald.exe' -d npm/platform/win32-x64/bin/
+          unzip -j /tmp/win.zip 'a2ald.exe' -d npm/platform/win32-x64/bin/
 
       - name: Set versions
         run: |
@@ -171,7 +171,7 @@ jobs:
           # Windows
           rm -f src/a2al/bin/a2ald
           curl -fsSL "${BASE}/a2al_${VERSION}_windows_amd64.zip" -o /tmp/win.zip
-          unzip -j /tmp/win.zip '*/a2ald.exe' -d src/a2al/bin/
+          unzip -j /tmp/win.zip 'a2ald.exe' -d src/a2al/bin/
           python -m build --wheel --outdir dist/
           wheel tags --python-tag py3 --abi-tag none \
             --platform-tag win_amd64 --remove dist/a2al-*.whl
