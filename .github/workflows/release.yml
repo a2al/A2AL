@@ -59,7 +59,7 @@ jobs:
           unpack_tar() {
             local PLAT="$1" ASSET="$2"
             mkdir -p "npm/platform/${PLAT}/bin"
-            curl -fsSL "${BASE}/a2ald_${VERSION}_${ASSET}.tar.gz" \
+            curl -fsSL "${BASE}/a2al_${VERSION}_${ASSET}.tar.gz" \
               | tar xz -C "npm/platform/${PLAT}/bin/" a2ald
             chmod +x "npm/platform/${PLAT}/bin/a2ald"
           }
@@ -70,7 +70,7 @@ jobs:
           unpack_tar darwin-arm64 darwin_arm64
 
           mkdir -p npm/platform/win32-x64/bin
-          curl -fsSL "${BASE}/a2ald_${VERSION}_windows_amd64.zip" -o /tmp/win.zip
+          curl -fsSL "${BASE}/a2al_${VERSION}_windows_amd64.zip" -o /tmp/win.zip
           unzip -j /tmp/win.zip '*/a2ald.exe' -d npm/platform/win32-x64/bin/
 
       - name: Set versions
@@ -113,46 +113,63 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-  gomobile-android:
+  publish-pypi:
     runs-on: ubuntu-latest
-    needs: test
+    needs: release
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.24"
-      - uses: nttld/setup-ndk@v1
-        id: setup-ndk
-        with:
-          ndk-version: r25c
-      - name: gomobile bind (android)
-        env:
-          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
-        run: |
-          go install tool
-          gomobile init
-          gomobile bind -target=android -androidapi 21 -ldflags="-checklinkname=0" -o a2al.aar github.com/a2al/a2al/mobile
-      - uses: actions/upload-artifact@v4
-        with:
-          name: a2al-android-aar
-          path: a2al.aar
-          retention-days: 7
 
-  gomobile-ios:
-    runs-on: macos-latest
-    needs: test
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-python@v5
         with:
-          go-version: "1.24"
-      - name: gomobile bind (ios)
+          python-version: '3.12'
+
+      - name: Install build tools
+        run: pip install build wheel twine
+
+      - name: Build and publish platform wheels
         run: |
-          go install tool
-          gomobile init
-          gomobile bind -target=ios -o A2AL.xcframework github.com/a2al/a2al/mobile
-      - uses: actions/upload-artifact@v4
-        with:
-          name: a2al-ios-xcframework
-          path: A2AL.xcframework
-          retention-days: 7
+          VERSION="${GITHUB_REF_NAME#v}"
+          BASE="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}"
+
+          cd python
+          sed -i "s/^version = .*/version = \"${VERSION}\"/" pyproject.toml
+          mkdir -p src/a2al/bin
+
+          for ENTRY in \
+            "linux_amd64:manylinux2014_x86_64" \
+            "linux_arm64:manylinux2014_aarch64" \
+            "darwin_amd64:macosx_11_0_x86_64" \
+            "darwin_arm64:macosx_11_0_arm64"; do
+            ASSET="${ENTRY%%:*}"
+            PLAT="${ENTRY##*:}"
+
+            rm -f src/a2al/bin/a2ald
+            curl -fsSL "${BASE}/a2al_${VERSION}_${ASSET}.tar.gz" \
+              | tar xz -C src/a2al/bin/ a2ald
+            chmod +x src/a2al/bin/a2ald
+
+            python -m build --wheel --outdir dist/
+            wheel tags --python-tag py3 --abi-tag none \
+              --platform-tag "${PLAT}" --remove dist/a2al-*.whl
+            twine upload dist/a2al-*.whl
+            rm dist/a2al-*.whl
+          done
+
+          # Windows
+          rm -f src/a2al/bin/a2ald
+          curl -fsSL "${BASE}/a2al_${VERSION}_windows_amd64.zip" -o /tmp/win.zip
+          unzip -j /tmp/win.zip '*/a2ald.exe' -d src/a2al/bin/
+          python -m build --wheel --outdir dist/
+          wheel tags --python-tag py3 --abi-tag none \
+            --platform-tag win_amd64 --remove dist/a2al-*.whl
+          twine upload dist/a2al-*.whl
+          rm dist/a2al-*.whl
+
+          # Source distribution (no binary, fallback for unsupported platforms)
+          rm -f src/a2al/bin/a2ald src/a2al/bin/a2ald.exe
+          python -m build --sdist --outdir dist/
+          twine upload dist/a2al-*.tar.gz
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
+

@@ -31,28 +31,20 @@ builds:
       - -s -w -X main.version={{.Version}}
 
 archives:
-  - id: a2ald
-    ids: [a2ald]
-    name_template: "a2ald_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
-    format_overrides:
-      - goos: windows
-        formats: [zip]
-
-  - id: a2al
-    ids: [a2al]
+  - ids: [a2ald, a2al]
     name_template: "a2al_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
     format_overrides:
       - goos: windows
         formats: [zip]
 
 nfpms:
-  - id: a2ald-pkg
-    package_name: a2ald
-    ids: [a2ald]
+  - id: a2al-pkg
+    package_name: a2al
+    ids: [a2ald, a2al]
     vendor: A2AL Authors
-    homepage: https://github.com/a2al/a2al
+    homepage: https://a2al.org
     maintainer: A2AL Authors <noreply@github.com>
-    description: A2AL daemon — decentralized agent networking
+    description: A2AL — decentralized agent networking (daemon + CLI)
     license: MPL-2.0
 
     formats: [deb, rpm]
@@ -63,16 +55,22 @@ nfpms:
         dst: /etc/systemd/system/a2ald.service
         file_info:
           mode: 0644
+      - src: /opt/a2al/bin/a2ald
+        dst: /usr/local/bin/a2ald
+        type: symlink
+      - src: /opt/a2al/bin/a2al
+        dst: /usr/local/bin/a2al
+        type: symlink
 
     scripts:
       postinstall: deploy/linux/postinst
       postremove: deploy/linux/postrm
 
-    file_name_template: "a2ald_{{ .Version }}_{{ .Arch }}"
+    file_name_template: "a2al_{{ .Version }}_{{ .Arch }}"
 
     overrides:
       rpm:
-        file_name_template: "a2ald-{{ .Version }}-1.{{ .Arch }}"
+        file_name_template: "a2al-{{ .Version }}-1.{{ .Arch }}"
         dependencies:
           - systemd
 
