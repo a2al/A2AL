@@ -24,13 +24,13 @@ A2AL addresses the missing infrastructure layer: **agent-level addressing, disco
 
 **Publish** — An agent announces its identity and reachable endpoints to a global peer-to-peer network. Endpoint records update automatically as network conditions change.
 
-**Discover** — Resolve any agent by its AID, or search by capability (e.g. "translation agents supporting zh-en legal domain"). Discovery is fully decentralized — no registry to operate or depend on.
+**Discover** — Resolve any agent by its AID, or search by capability (e.g. "translation agents supporting zh-en legal domain"). Discovery is fully decentralized — no registry to operate or depend on. Offline agents can receive encrypted notes delivered through the network.
 
 **Connect** — Establish a direct, end-to-end encrypted connection with mutual identity verification. A2AL handles NAT traversal transparently, ensuring agents behind firewalls and home networks are as reachable as cloud-hosted services.
 
 ## Getting Started
 
-**For agent operators** — Install the A2AL daemon (`a2ald`) and open the web management interface. Configure your agent, and it becomes globally discoverable. No port forwarding, domain names, or cloud infrastructure required.
+**For agent operators** — Install `a2ald` and open `http://localhost:2121`. The web UI lets you manage identities, publish agents, and discover services — no port forwarding, domain names, or cloud infrastructure required.
 
 **For developers** — A2AL integrates into your existing stack:
 
@@ -40,6 +40,17 @@ A2AL addresses the missing infrastructure layer: **agent-level addressing, disco
 | **`a2ald` + REST API** | Any language | Local HTTP API for publish / discover / connect |
 | **MCP Server** | AI agents | Native tool calls — agents acquire networking capability on demand |
 | **`pip install a2al`** | Python developers | Bundled sidecar binary, zero infrastructure setup |
+
+### CLI
+
+```bash
+a2al status                  # node and agent status
+a2al register                # create and register a new agent
+a2al resolve <aid>           # look up an agent's endpoint
+a2al search <service>        # discover agents by capability
+a2al connect <aid>           # open a local TCP tunnel to a remote agent
+a2al note <aid> <message>    # send an encrypted note to an offline agent
+```
 
 ### SDK (Go)
 
@@ -96,32 +107,22 @@ A2AL is complementary to existing agent communication standards — it provides 
 
 ## Try the Demo
 
-**Discovery** (Demo 1 — AID address resolution):
-
-```bash
-cd examples/demo1-node
-
-go run . -listen :4121 -debug :2634                                    # node 1
-go run . -listen :4122 -bootstrap 127.0.0.1:4121 -debug :2635         # node 2
-go run . -listen :4123 -bootstrap 127.0.0.1:4121 -debug :2636         # node 3
-```
-
-Type any node's AID to resolve its endpoint. Inspect network state at `http://127.0.0.1:2634/debug/routing`.
-
-**Encrypted Chat** (publish → discover → connect → chat):
+**Encrypted Chat** — two terminals, no daemon required (Go required):
 
 ```bash
 cd examples/demo2-chat
 
-go run . -listen :4121 -quic :4122 -debug :2634                       # Alice
-go run . -listen :4123 -quic :4124 -bootstrap 127.0.0.1:4121 -debug :2635  # Bob
+go run . -listen :4121 -quic :4122 -debug :2634                            # Alice
+go run . -listen :4123 -quic :4124 -bootstrap 127.0.0.1:4121 -debug :2635 # Bob
 ```
 
-Bob enters Alice's AID → automatic resolution → encrypted connection → bidirectional messaging.
+Bob enters Alice's AID → automatic resolution → QUIC connection → bidirectional messaging. Inspect live state at `http://127.0.0.1:2634/debug/host`.
+
+For service discovery, marketplace, and multi-agent swarm scenarios using `a2ald`, see [`examples/`](examples/).
 
 ## Status
 
-A2AL is under active development. Core discovery and encrypted connection layers are functional. NAT traversal, the standalone daemon, MCP integration, and multi-language packages are in progress.
+A2AL is under active development. Core protocol capabilities are functional: decentralized AID resolution, NAT-transparent encrypted connections with mutual authentication, capability-based service discovery, delegated identity, and offline message delivery. Integration layers — daemon, Web UI, CLI, MCP server, REST API, and Go/Python/npm packages — are available.
 
 See [`doc/API.md`](doc/API.md) for the current library API.
 
