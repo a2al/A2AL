@@ -45,7 +45,7 @@ jobs:
           path: |
             dist/*linux_amd64*
             dist/*_amd64.deb
-            dist/*amd64.rpm
+            dist/*x86_64.rpm
           retention-days: 7
 
       - uses: actions/upload-artifact@v4
@@ -54,7 +54,7 @@ jobs:
           path: |
             dist/*linux_arm64*
             dist/*_arm64.deb
-            dist/*arm64.rpm
+            dist/*aarch64.rpm
           retention-days: 7
 
       - uses: actions/upload-artifact@v4

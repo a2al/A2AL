@@ -1,9 +1,24 @@
 # a2al (Python)
 
-Python sidecar: run a local `a2ald` child process and call its REST API.
+Python client for [a2al](https://github.com/a2al/a2al): spawns a local `a2ald` daemon and exposes a typed REST client for its API.
 
-- **Binary**: `a2ald` must be on `PATH`, or set the `A2ALD_PATH` environment variable to the executable’s absolute path.
-- **Distribution**: This package does not yet ship prebuilt `a2ald` binaries inside wheels. For local development, build with `go build -o a2ald ./cmd/a2ald` (use `a2ald.exe` on Windows) and ensure the binary is on `PATH`.
+## Installation
+
+```sh
+pip install a2al
+```
+
+Pre-built `a2ald` binaries are bundled inside platform wheels for:
+
+| Platform | Architecture |
+|----------|-------------|
+| Linux    | x86_64, arm64 |
+| macOS    | x86_64, arm64 |
+| Windows  | x86_64 |
+
+On unsupported platforms, install `a2ald` manually and ensure it is on `PATH`, or set `A2ALD_PATH` to the executable path.
+
+## Usage
 
 ```python
 from a2al import Daemon, Client
@@ -13,4 +28,14 @@ with Daemon() as d:
     print(c.health())
 ```
 
-Optional environment variable: `A2AL_API_TOKEN` — pass the same value as `api_token` in `config.toml` to `Client` when the daemon enforces bearer auth.
+## Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `A2ALD_PATH` | Override path to the `a2ald` executable |
+| `A2AL_API_TOKEN` | Bearer token when the daemon enforces auth |
+
+## Requirements
+
+- Python 3.10+
+- No third-party dependencies (standard library only)

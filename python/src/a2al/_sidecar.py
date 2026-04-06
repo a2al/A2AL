@@ -6,11 +6,21 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Any, Mapping, Optional
+
+
+def _find_exe() -> str:
+    exe = "a2ald.exe" if sys.platform == "win32" else "a2ald"
+    embedded = Path(__file__).parent / "bin" / exe
+    if embedded.is_file() and os.access(str(embedded), os.X_OK):
+        return str(embedded)
+    return exe
 
 
 def _free_port() -> int:
@@ -43,7 +53,7 @@ class Daemon:
         api_token: Optional[str] = None,
         extra_args: Optional[list[str]] = None,
     ) -> None:
-        self._exe = a2ald_exe or os.environ.get("A2ALD_PATH") or "a2ald"
+        self._exe = a2ald_exe or os.environ.get("A2ALD_PATH") or _find_exe()
         self._api_token = api_token if api_token is not None else os.environ.get("A2AL_API_TOKEN")
         self._extra = extra_args or []
         self._proc: Optional[subprocess.Popen[bytes]] = None

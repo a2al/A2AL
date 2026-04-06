@@ -8,3 +8,11 @@ tools-local/
 # npm platform package binaries (written by CI, not committed)
 npm/platform/*/bin/a2ald
 npm/platform/*/bin/a2ald.exe
+
+# python platform package binaries (written by CI, not committed)
+python/src/a2al/bin/a2ald
+python/src/a2al/bin/a2ald.exe
+
+# python build artifacts
+python/dist/
+python/src/a2al.egg-info/

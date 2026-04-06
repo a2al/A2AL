@@ -1,6 +1,6 @@
 [Unit]
 Description=A2AL Daemon
-Documentation=https://github.com/a2al/a2al
+Documentation=https://a2al.org
 After=network-online.target
 Wants=network-online.target
 
