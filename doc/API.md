@@ -29,6 +29,11 @@ A `Host` runs a DHT `Node`, optional UDP demux for DHT+QUIC on a single port, a 
 | `MinObservedPeers` | Minimum distinct peers that must report the same reflected address before `Sense` treats it as trusted (default 3 if ≤0). |
 | `FallbackHost` | Optional advertised host when bind address and reflection data are ambiguous (e.g. `0.0.0.0`). |
 | `DisableUPnP` | If true, skips IGD UDP port mapping for the QUIC listen port. |
+| `ICESignalURL` | WebSocket base URL published in endpoint records for ICE trickle signaling (optional). When set, `ConnectFromRecord` uses the ICE path as a fallback when direct QUIC fails. |
+| `ICESTUNURLs` | `stun:` URIs for ICE gathering. Empty means default public STUN when no TURN is configured. |
+| `ICETURNURLs` | `turn:` URIs (may include credentials) used locally for ICE relay. Not published to the DHT. |
+| `ICEPublishTurns` | Credential-free `turn:` hints stored in `EndpointPayload.Turns` for remote peers to use. |
+| `Logger` | `*slog.Logger` forwarded to the DHT node. If nil, `slog.Default()` is used. |
 
 The DHT node created by `Host` sets `dht.Config.RecordAuth` so stored records must be either self-signed for their address or carry a valid operational-key delegation (see `identity`).
 
@@ -48,13 +53,13 @@ The DHT node created by `Host` sets `dht.Config.RecordAuth` so stored records mu
 | `PublishEndpointForAgent(ctx, agentAddr, seq, ttl)` | Same as `PublishEndpoint` but for a **registered** delegated agent (operational key + delegation on the host). |
 | `Resolve(ctx, target Address)` | Iterative lookup; returns `*protocol.EndpointRecord`. |
 | `Connect(ctx, expectRemote Address, udpAddr)` | QUIC dial to one UDP address with mutual TLS + agent-route (see below). |
-| `ConnectFromRecord(ctx, expectRemote Address, er)` | Happy Eyeballs: staggered dials over every `quic://` / `udp://` in `er` (deduped); first success wins. |
+| `ConnectFromRecord(ctx, expectRemote Address, er)` | Happy Eyeballs: staggered dials over every `quic://` / `udp://` in `er` (deduped); if all fail and `er.Signal` is set, falls back to ICE trickle via WebSocket signaling. |
 | `ConnectFromRecordFor(ctx, localAgent, expectRemote Address, er)` | Same as `ConnectFromRecord` but dials using TLS credentials for `localAgent` (must be registered on this host). |
 | `Accept(ctx)` | Blocks for inbound QUIC; returns `*AgentConn` with `Local` / `Remote` addresses. |
 | `FirstQUICAddr(er)` | First `quic://` or legacy `udp://` entry as `*net.UDPAddr` (same order as `QUICDialTargets`). |
 | `QUICDialTargets(er)` | Ordered, deduplicated `[]*net.UDPAddr` from an `EndpointRecord`. |
 | `BuildEndpointPayload(ctx)` | Same candidate list as publish (includes UPnP attempt when enabled); does not sign or store. |
-| `SymmetricNATReachabilityHint()` | Non-empty user-facing note when inferred NAT is symmetric (reachability not guaranteed without relay; see **Not yet implemented**). |
+| `SymmetricNATReachabilityHint()` | Non-empty user-facing note when inferred NAT is symmetric (reachability not guaranteed without relay). |
 | `RegisterAgent(addr, priv)` | Add an extra agent identity on the same QUIC listener (self-signed TLS cert). |
 | `RegisterDelegatedAgent(addr, opPriv, delegationCBOR)` | Register an agent published under a master-derived AID using an operational key and CBOR `DelegationProof`. |
 | `UnregisterAgent(addr)` / `RegisteredAgents()` | Remove or list extra agents. |
@@ -133,8 +138,8 @@ Use when you implement your own stack but need Kademlia-style RPCs and storage.
 | Item | Role |
 |------|------|
 | `SignedRecord` | On-wire CBOR container; optional `Delegation` bytes (field 9) for operational-key publishes. |
-| `EndpointPayload` | `Endpoints []string` (use `quic://host:port`), `NatType uint8` |
-| `EndpointRecord` | Decoded view after verify (`Address`, `Endpoints`, `NatType`, `Seq`, `Timestamp`, `TTL`) |
+| `EndpointPayload` | `Endpoints []string` (use `quic://host:port`), `NatType uint8`, `Signal string` (ICE WebSocket base URL, optional), `Turns []string` (credential-free relay hints, optional) |
+| `EndpointRecord` | Decoded view after verify (`Address`, `Endpoints`, `NatType`, `Signal`, `Turns`, `Seq`, `Timestamp`, `TTL`) |
 | `SignEndpointRecord(priv, addr, payload, seq, timestamp, ttl)` | Build `SignedRecord` when the signing key is the AID's master key |
 | `SignEndpointRecordDelegated(opPriv, delegationCBOR, addr, payload, seq, timestamp, ttl)` | Build `SignedRecord` when an operational key publishes for a master-derived `addr` |
 | `ParseEndpointRecord(sr)` | Verify and decode to `EndpointRecord` |
@@ -170,15 +175,16 @@ Binds to `config.Config.APIAddr` (default `127.0.0.1:2121`). If `api_token` is s
 |--------|------|------|
 | `GET` | `/` | Embedded Web UI (HTML). |
 | `GET` | `/health` | `{"status":"ok"}`. |
-| `GET` | `/status` | Node status: `auto_publish`, `node_aid`, `node_seq`, `last_publish`, `next_publish`. |
+| `GET` | `/status` | Node status: `node_aid`, `auto_publish`, `node_seq`, `node_published` (bool), `node_last_publish_at` (RFC3339 or null), `node_next_republish_estimate` (RFC3339 or null), `republish_interval_s`, `endpoint_ttl_s`. |
 | `GET` | `/config` | Current config (`api_token` redacted as `***`). |
 | `PATCH` | `/config` | Partial update; response includes `restart_required` field names. |
 | `GET` | `/config/schema` | JSON Schema for config keys (UI / tooling). |
 | `POST` | `/identity/generate` | Generate Ed25519 master + operational keys and delegation proof; daemon does not retain the master key. |
-| `POST` | `/identity/generate-ethereum` | Generate Ethereum AID, secp256k1 owner key, Ed25519 op key, and EIP-191 delegation proof; keys are not stored. |
-| `POST` | `/ethereum/delegation-message` | Build EIP-191 `personal_sign` text from `agent`, `issued_at`, `expires_at`, and one of `operational_public_key_hex` / `operational_private_key_seed_hex`. |
-| `POST` | `/ethereum/register` | Register Ethereum-keyed agent after wallet `personal_sign`: `agent`, timestamps, `eth_signature_hex`, optional `service_tcp`, op key. |
-| `POST` | `/ethereum/proof` | Autonomous Ethereum delegation: `ethereum_private_key_hex` signs; op keys generated if omitted. |
+| `POST` | `/agents/generate` | Generate a blockchain-linked identity. Body: `{"chain":"ethereum"}` or `{"chain":"paralism"}`. Returns AID, keys, and delegation proof; keys are not stored. |
+| `POST` | `/agents/ethereum/delegation-message` | Build EIP-191 `personal_sign` text from `agent`, `issued_at`, `expires_at`, and one of `operational_public_key_hex` / `operational_private_key_seed_hex`. |
+| `POST` | `/agents/ethereum/register` | Register Ethereum-keyed agent after wallet `personal_sign`: `agent`, timestamps, `eth_signature_hex`, optional `service_tcp`, op key. |
+| `POST` | `/agents/ethereum/proof` | Autonomous Ethereum delegation: `ethereum_private_key_hex` signs; op keys generated if omitted. |
+| `POST` | `/agents/paralism/proof` | Autonomous Paralism delegation: `paralism_private_key_hex` signs; op keys generated if omitted. |
 | `POST` | `/agents` | Register delegated agent (`operational_private_key_hex`, `delegation_proof_hex`, `service_tcp` optional). |
 | `GET` | `/agents` | List registered agents with status (`service_tcp_ok`, `heartbeat_seconds_ago`, `last_publish`). |
 | `GET` | `/agents/{aid}` | Single agent status (reachability, publish info). |
@@ -245,7 +251,7 @@ When using `Host`, `Sense()` exposes consensus over reflected UDP endpoints:
 
 ## Not yet implemented (library / network)
 
-- **TURN relay** — no `pion/turn` integration or relay addresses in published records yet.  
+- **TURN relay** — `ICETURNURLs` / `ICEPublishTurns` config fields exist; relay addresses can be published and hinted, but `pion/turn` server-side relay is not yet integrated for the symmetric-NAT fallback path.
 - **IPv6 dual-stack `Host` listener** — wire format supports IPv6; `New()` currently uses `udp4` only.
 
 ---
