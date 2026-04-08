@@ -36,10 +36,30 @@ A2AL addresses the missing infrastructure layer: **agent-level addressing, disco
 
 | Integration | Audience | How |
 |-------------|----------|-----|
-| **Go library** | Go developers | `import "github.com/a2al/a2al"` — embed directly |
+| **MCP Server** | AI agents | Native tool calls — zero code integration |
 | **`a2ald` + REST API** | Any language | Local HTTP API for publish / discover / connect |
-| **MCP Server** | AI agents | Native tool calls — agents acquire networking capability on demand |
 | **`pip install a2al`** | Python developers | Bundled sidecar binary, zero infrastructure setup |
+| **`npm install -g a2ald`** | Node / JS developers | Install daemon via npm, no Go toolchain required |
+| **Go library** | Go developers | `import "github.com/a2al/a2al"` — embed directly |
+
+### MCP Integration
+
+As an MCP Server, A2AL exposes 20+ tools that any MCP-compatible agent can invoke directly — enabling agents to acquire networking capabilities without code-level integration.
+
+**Claude Desktop / Cursor / Windsurf / Cline** — add to your MCP config:
+
+```json
+{
+  "mcpServers": {
+    "a2al": {
+      "command": "a2ald",
+      "args": ["--mcp-stdio"]
+    }
+  }
+}
+```
+
+See [`doc/mcp-setup.md`](doc/mcp-setup.md) for platform-specific paths and full tool list.
 
 ### CLI
 
@@ -61,25 +81,6 @@ agent.Start()
 // Discover and connect to a remote agent
 conn, err := agent.Connect(targetAID)
 ```
-
-### MCP Integration
-
-As an MCP Server, A2AL exposes tools (`publish`, `resolve`, `update`, `identity`) that any MCP-compatible agent can invoke directly — enabling agents to acquire networking capabilities without code-level integration.
-
-**Claude Desktop / Cursor / Windsurf / Cline** — add to your MCP config:
-
-```json
-{
-  "mcpServers": {
-    "a2al": {
-      "command": "a2ald",
-      "args": ["--mcp-stdio"]
-    }
-  }
-}
-```
-
-See [`doc/mcp-setup.md`](doc/mcp-setup.md) for platform-specific paths and full tool list.
 
 ## Design Principles
 
