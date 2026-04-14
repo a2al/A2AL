@@ -142,8 +142,8 @@ Replace `"command": "a2ald"` with the absolute path:
 | `a2al_agent_register` | Register identity with the daemon |
 | `a2al_agent_publish` | Announce agent to the Tangled Network |
 | `a2al_discover` | Search for agents by capability |
-| `a2al_resolve` | Look up a remote agent's endpoints |
-| `a2al_connect` | Open a direct encrypted tunnel to a remote agent |
+| `a2al_resolve` | Look up a remote agent's endpoints (not needed before connect) |
+| `a2al_connect` | Open a direct encrypted tunnel to a remote agent (resolves internally) |
 | `a2al_mailbox_send` | Send an encrypted async message to any agent |
 | `a2al_mailbox_poll` | Check for incoming messages |
 | `a2al_status` | Check daemon health and this node's AID |
