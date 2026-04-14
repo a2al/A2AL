@@ -22,6 +22,7 @@ func runBootstrapChain(ctx context.Context, h *host.Host, cfg *config.Config, da
 	cachePath := filepath.Join(dataDir, "peers.cache")
 	if lines, err := peerscache.Load(cachePath); err == nil && len(lines) > 0 {
 		if addrs := resolveBootstrapAddrs(lines, log); len(addrs) > 0 {
+			log.Info("connecting to network", "source", "peers.cache", "peers", len(addrs))
 			if tryBootstrap(ctx, h, addrs, log, "peers.cache") {
 				return
 			}
@@ -32,17 +33,26 @@ func runBootstrapChain(ctx context.Context, h *host.Host, cfg *config.Config, da
 
 	if len(cfg.Bootstrap) > 0 {
 		addrs := resolveBootstrapAddrs(cfg.Bootstrap, log)
-		if len(addrs) > 0 && tryBootstrap(ctx, h, addrs, log, "config") {
-			return
+		if len(addrs) > 0 {
+			log.Info("connecting to network", "source", "config", "peers", len(addrs))
+			if tryBootstrap(ctx, h, addrs, log, "config") {
+				return
+			}
 		}
 	}
 
+	log.Info("looking up bootstrap peers")
 	if txt := lookupBootstrapTXT(dnsBootstrapName); len(txt) > 0 {
 		addrs := resolveBootstrapAddrs(txt, log)
-		if len(addrs) > 0 && tryBootstrap(ctx, h, addrs, log, "dns_txt") {
-			return
+		if len(addrs) > 0 {
+			log.Info("connecting to network", "source", "dns", "peers", len(addrs))
+			if tryBootstrap(ctx, h, addrs, log, "dns_txt") {
+				return
+			}
 		}
 	}
+
+	log.Info("no bootstrap peers reachable, starting as standalone node")
 }
 
 func addrToHostPort(a net.Addr) string {
