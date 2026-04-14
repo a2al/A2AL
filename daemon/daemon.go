@@ -149,6 +149,7 @@ func New(cfg Config) (*Daemon, error) {
 		ICETURNURLs:      nodeCfg.ICETURNURLs,
 		ICEPublishTurns:  nodeCfg.ICEPublishTurns,
 		Logger:           log,
+		SeenPeersPath:    filepath.Join(cfg.DataDir, "seen_peers.dat"),
 	})
 	if err != nil {
 		return nil, err

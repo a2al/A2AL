@@ -82,6 +82,9 @@ type Config struct {
 	// Logger is forwarded to the DHT node for diagnostic logging (reply failures, RPC retries).
 	// If nil, slog.Default() is used.
 	Logger *slog.Logger
+	// SeenPeersPath is forwarded to the DHT node for seenPeers persistence (spec §7.3).
+	// Empty disables persistence.
+	SeenPeersPath string
 }
 
 // agentRouteMagic is the 4-byte prefix of the agent-route control stream.
@@ -176,8 +179,9 @@ func New(cfg Config) (*Host, error) {
 		OnObservedAddr: func(reporter a2al.NodeID, wire []byte) {
 			sense.Record(reporter, wire)
 		},
-		RecordAuth: recordAuthPolicy,
-		Logger:     cfg.Logger,
+		RecordAuth:    recordAuthPolicy,
+		Logger:        cfg.Logger,
+		SeenPeersPath: cfg.SeenPeersPath,
 	}
 
 	var node *dht.Node
