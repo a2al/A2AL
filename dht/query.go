@@ -398,9 +398,10 @@ func (q *Query) FindRecords(ctx context.Context, target a2al.NodeID, recType uin
 }
 
 // AggregateRecords queries until the k-closest set is exhausted, merges and deduplicates (Phase 4 Topic/Mailbox).
-// Unlike FindRecords it does not short-circuit on the first response; all k-closest peers are queried
-// to maximise recall.  Bad peers are skipped (with fallback) and a per-batch timeout prevents
-// slow stragglers from stalling the whole traversal.
+// If the local store already holds valid records the network query is skipped — this fast-path is
+// correct for the common case where the querying node is itself a publisher or a replication target
+// (same a2ald, small network). Bad peers are skipped (with fallback) and a per-batch timeout
+// prevents slow stragglers from stalling the whole traversal.
 func (q *Query) AggregateRecords(ctx context.Context, target a2al.NodeID, recType uint8) ([]protocol.SignedRecord, error) {
 	if q.n == nil {
 		return nil, errors.New("dht: nil node")
@@ -408,6 +409,15 @@ func (q *Query) AggregateRecords(ctx context.Context, target a2al.NodeID, recTyp
 	merged := make(map[string]protocol.SignedRecord)
 	now := time.Now()
 	mergeAggregate(merged, filterRecordsAuth(q.n, target, q.n.store.GetAll(target, recType, now), now))
+	// Fast path: local store already has results — return immediately without
+	// querying the network. Same rationale as FindRecords local-first shortcut.
+	if len(merged) > 0 {
+		out := make([]protocol.SignedRecord, 0, len(merged))
+		for _, r := range merged {
+			out = append(out, r)
+		}
+		return out, nil
+	}
 	alpha := q.alpha()
 	stagger := q.stagger()
 	candidates := make(map[string]protocol.NodeInfo)
