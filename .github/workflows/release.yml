@@ -10,11 +10,19 @@ on:
         description: 'Dry run — build only, skip publish'
         type: boolean
         default: true
+      publish_packages:
+        description: 'Publish to npm and PyPI (opt-in)'
+        type: boolean
+        default: false
 
 # Dry run is active when:
 #   - triggered manually with dry_run=true (default)
 #   - tag name ends with '-test' (e.g. v0.1.0-test)
 # Dry run: goreleaser builds with --snapshot, publish jobs are skipped.
+#
+# publish_packages controls npm/PyPI publishing (default: false).
+# Normal v* tag pushes only update GitHub Releases.
+# To also publish to npm/PyPI, trigger manually with publish_packages=true.
 
 permissions:
   contents: write
@@ -54,7 +62,7 @@ jobs:
   publish-npm:
     runs-on: ubuntu-latest
     needs: release
-    if: ${{ !endsWith(github.ref_name, '-test') && inputs.dry_run != true }}
+    if: ${{ inputs.publish_packages == true && !endsWith(github.ref_name, '-test') && inputs.dry_run != true }}
     steps:
       - uses: actions/checkout@v4
 
@@ -128,7 +136,7 @@ jobs:
   publish-pypi:
     runs-on: ubuntu-latest
     needs: release
-    if: ${{ !endsWith(github.ref_name, '-test') && inputs.dry_run != true }}
+    if: ${{ inputs.publish_packages == true && !endsWith(github.ref_name, '-test') && inputs.dry_run != true }}
     steps:
       - uses: actions/checkout@v4
 
