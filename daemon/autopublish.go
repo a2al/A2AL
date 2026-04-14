@@ -122,7 +122,16 @@ func (d *Daemon) publishNodeOnce(ctx context.Context) error {
 	nextSeq := d.nodePublishSeq + 1
 	d.nodePublishMu.Unlock()
 
-	if err := d.h.PublishEndpoint(ctx, nextSeq, endpointRecordTTL); err != nil {
+	// Build payload once: used for both publishing and fingerprint caching.
+	ep, err := d.h.BuildEndpointPayload(ctx)
+	if err != nil {
+		return err
+	}
+	d.publishMetaMu.Lock()
+	d.lastEndpointsFP = endpointPayloadFingerprint(ep)
+	d.publishMetaMu.Unlock()
+
+	if err := d.h.PublishEndpointBuilt(ctx, ep, nextSeq, endpointRecordTTL); err != nil {
 		return err
 	}
 
@@ -135,16 +144,6 @@ func (d *Daemon) publishNodeOnce(ctx context.Context) error {
 	}
 
 	d.recordNodePublishTime()
-
-	pctx, cancel := context.WithTimeout(ctx, 45*time.Second)
-	ep, err := d.h.BuildEndpointPayload(pctx)
-	cancel()
-	if err == nil {
-		d.publishMetaMu.Lock()
-		d.lastEndpointsFP = endpointPayloadFingerprint(ep)
-		d.publishMetaMu.Unlock()
-	}
-
 	d.log.Info("node endpoint published to DHT", "seq", nextSeq)
 	return nil
 }
