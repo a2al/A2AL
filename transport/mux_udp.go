@@ -224,8 +224,9 @@ func (c *muxQUICConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 	return c.m.conn.WriteTo(b, addr)
 }
 
-func (c *muxQUICConn) Close() error   { return nil }
-func (c *muxQUICConn) LocalAddr() net.Addr { return c.m.conn.LocalAddr() }
+func (c *muxQUICConn) Close() error            { return nil }
+func (c *muxQUICConn) LocalAddr() net.Addr     { return c.m.conn.LocalAddr() }
+func (c *muxQUICConn) SetReadBuffer(n int) error { return c.m.conn.SetReadBuffer(n) }
 
 func (c *muxQUICConn) SetDeadline(t time.Time) error {
 	_ = c.SetReadDeadline(t)

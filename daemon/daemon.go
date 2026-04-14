@@ -176,6 +176,11 @@ func (d *Daemon) Run(ctx context.Context, mcpStdio bool) error {
 		_ = d.h.Close()
 	}()
 
+	d.log.Info("a2ald starting",
+		"node_aid", d.nodeAddr.String(),
+		"dht", d.cfg.ListenAddr,
+		"api", d.cfg.APIAddr,
+	)
 	runBootstrapChain(ctx, d.h, d.cfg, d.dataDir, d.log)
 
 	for _, e := range d.reg.List() {
@@ -215,9 +220,9 @@ func (d *Daemon) Run(ctx context.Context, mcpStdio bool) error {
 		}
 	}()
 
-	d.log.Info("a2ald started",
+	d.log.Info("a2ald ready",
 		"api", d.cfg.APIAddr,
-		"webui", "http://"+d.cfg.APIAddr,
+		"browser", "http://"+d.cfg.APIAddr,
 		"dht", d.cfg.ListenAddr,
 		"node_aid", d.nodeAddr.String(),
 	)
