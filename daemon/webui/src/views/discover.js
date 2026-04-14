@@ -2,6 +2,15 @@ import { esc, shortAid, setLoading } from '../util.js';
 
 const QUICK = ['lang', 'gen', 'sense', 'data', 'reason', 'code', 'tool'];
 
+function utf8ToBase64(s) {
+  const bytes = new TextEncoder().encode(s);
+  let bin = '';
+  bytes.forEach((b) => {
+    bin += String.fromCharCode(b);
+  });
+  return btoa(bin);
+}
+
 function parseCard(j) {
   if (!j || typeof j !== 'object') return null;
   const name = j.name || j.title || j.serverInfo?.name || '';
@@ -22,27 +31,124 @@ function parseCard(j) {
   return { name, version, caps, tools, url, raw: j };
 }
 
+async function fetchAgentCardThroughTunnel(api, aid) {
+  const paths = ['/.well-known/agent.json', '/.well-known/mcp.json'];
+  for (const path of paths) {
+    try {
+      const cr = await api(`/connect/${encodeURIComponent(aid)}`, {
+        method: 'POST',
+        body: '{}',
+      });
+      const res = await fetch('http://' + cr.tunnel + path, { mode: 'cors' });
+      if (res.ok) {
+        const j = await res.json();
+        return { json: j, path };
+      }
+    } catch (_) {}
+  }
+  return null;
+}
+
 export async function renderDiscover(mount, ctx) {
-  const { t, api, toast, relTime, copyText } = ctx;
+  const { t, api, toast, copyText } = ctx;
   let agents = [];
   try {
     const r = await api('/agents');
     agents = r.agents || [];
   } catch (_) {}
 
+  const agentOpts =
+    agents.length === 0
+      ? `<option value="">${esc(t('discover.myagent.empty'))}</option>`
+      : `<option value="">${esc(t('discover.myagent.pick'))}</option>${agents
+          .map((a) => `<option value="${esc(a.aid)}">${esc(shortAid(a.aid))}</option>`)
+          .join('')}`;
+
   const wrap = document.createElement('div');
   wrap.innerHTML = `
-    <p class="muted" style="margin-bottom:1rem">${esc(t('discover.subtitle'))}</p>
-    <div class="discover-search">
-      <input type="text" id="dq" placeholder="${esc(t('discover.placeholder'))}" />
-      <button type="button" class="btn btn-primary" id="ds">${esc(t('discover.search'))}</button>
+    <div class="discover-tabs" role="tablist">
+      <button type="button" class="active" data-tab="aid">${esc(t('discover.tab.aid'))}</button>
+      <button type="button" data-tab="svc">${esc(t('discover.tab.service'))}</button>
     </div>
-    <div class="cat-btns" style="margin-bottom:1rem" id="dqCat"></div>
-    <div id="dout"></div>`;
+    <div id="tabAid" class="discover-tab-panel">
+      <div class="discover-search" style="margin-top:1rem">
+        <input type="text" id="dAid" placeholder="${esc(t('discover.aid.placeholder'))}" class="mono" />
+        <select id="dMyAg">${agentOpts}</select>
+        <button type="button" class="btn btn-primary" id="dQuery">${esc(t('discover.query'))}</button>
+      </div>
+      <p class="muted aid-err hidden" id="dAidErr"></p>
+    </div>
+    <div id="tabSvc" class="discover-tab-panel hidden">
+      <p class="muted" style="margin:1rem 0 .5rem">${esc(t('discover.subtitle'))}</p>
+      <div class="discover-search">
+        <input type="text" id="dq" placeholder="${esc(t('discover.placeholder'))}" />
+        <button type="button" class="btn btn-primary" id="ds">${esc(t('discover.search'))}</button>
+      </div>
+      <div class="cat-btns" style="margin-bottom:1rem" id="dqCat"></div>
+      <div id="dSvcOut"></div>
+    </div>
+    <div id="dOp" class="hidden" style="margin-top:1.25rem">
+      <div class="card">
+        <div class="card-b">
+          <div style="display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;margin-bottom:1rem">
+            <strong>${esc(t('discover.target'))}</strong>
+            <span class="mono aid-short" id="dOpAid"></span>
+            <button type="button" class="btn btn-ghost btn-sm" id="dOpCp">\u29c9</button>
+          </div>
+          <h3 class="disc-op-h">${esc(t('discover.section.dht'))}</h3>
+          <div id="dResolve" class="disc-op-block muted">${esc(t('discover.resolve.idle'))}</div>
+          <div id="dLocalSvc" class="disc-op-block hidden"></div>
+          <div class="disc-op-block muted" style="margin-top:.75rem">
+            <strong>${esc(t('discover.profile'))}</strong> ${esc(t('discover.profile.wip'))}
+          </div>
+          <div id="dMsgWrap" class="disc-op-block" style="margin-top:.75rem">
+            <strong>${esc(t('discover.msg.send'))}</strong>
+            <div class="field" style="margin-top:.35rem">
+              <label>${esc(t('discover.msg.from'))}</label>
+              <select id="dMsgFrom">${agents.map((a) => `<option value="${esc(a.aid)}">${esc(shortAid(a.aid))}</option>`).join('')}</select>
+            </div>
+            <div class="field" style="display:flex;gap:.5rem;flex-wrap:wrap;align-items:flex-end">
+              <div style="flex:1;min-width:12rem">
+                <label>${esc(t('discover.msg.body'))}</label>
+                <input type="text" id="dMsgTxt" />
+              </div>
+              <button type="button" class="btn btn-secondary" id="dMsgGo">${esc(t('discover.msg.submit'))}</button>
+            </div>
+          </div>
+          <h3 class="disc-op-h" style="margin-top:1.25rem">${esc(t('discover.section.connect'))}</h3>
+          <div style="display:flex;flex-wrap:wrap;gap:.5rem;margin-bottom:.75rem">
+            <button type="button" class="btn btn-secondary btn-sm" id="dPing">${esc(t('discover.ping'))}</button>
+            <button type="button" class="btn btn-secondary btn-sm" id="dCard">${esc(t('discover.card'))}</button>
+            <button type="button" class="btn btn-secondary btn-sm" id="dShowReq">${esc(t('discover.req.title'))}</button>
+          </div>
+          <div id="dPingOut" class="disc-op-block muted"></div>
+          <div id="dCardOut" class="disc-op-block hidden"></div>
+          <div id="dReq" class="hidden disc-op-block"></div>
+        </div>
+      </div>
+    </div>`;
+
   mount.appendChild(wrap);
+
+  if (!agents.length) {
+    wrap.querySelector('#dMsgWrap').innerHTML = `<p class="muted">${esc(t('discover.msg.need_agent'))}</p>`;
+  }
+
+  const tabAid = wrap.querySelector('#tabAid');
+  const tabSvc = wrap.querySelector('#tabSvc');
+  const aidInput = wrap.querySelector('#dAid');
+  const myAg = wrap.querySelector('#dMyAg');
+  const opArea = wrap.querySelector('#dOp');
+  const opAidEl = wrap.querySelector('#dOpAid');
+  const resolveBox = wrap.querySelector('#dResolve');
+  const localSvcBox = wrap.querySelector('#dLocalSvc');
+  const aidErr = wrap.querySelector('#dAidErr');
+  const svcOut = wrap.querySelector('#dSvcOut');
   const q = wrap.querySelector('#dq');
-  const out = wrap.querySelector('#dout');
   const cat = wrap.querySelector('#dqCat');
+
+  let currentAid = '';
+
   for (const c of QUICK) {
     const b = document.createElement('button');
     b.type = 'button';
@@ -55,31 +161,122 @@ export async function renderDiscover(mount, ctx) {
     cat.appendChild(b);
   }
 
-  let selected = null;
-  let fetchAborter = null;
-  let tunnel = null;
+  function switchTab(which) {
+    wrap.querySelectorAll('.discover-tabs button').forEach((btn) => {
+      btn.classList.toggle('active', btn.getAttribute('data-tab') === which);
+    });
+    tabAid.classList.toggle('hidden', which !== 'aid');
+    tabSvc.classList.toggle('hidden', which !== 'svc');
+  }
 
+  wrap.querySelectorAll('.discover-tabs button').forEach((btn) => {
+    btn.onclick = () => switchTab(btn.getAttribute('data-tab'));
+  });
+
+  myAg.onchange = () => {
+    const v = myAg.value;
+    if (v) aidInput.value = v;
+  };
+
+  function fmtEndpoints(ep) {
+    if (ep == null) return '—';
+    if (Array.isArray(ep)) return ep.map((x) => esc(String(x))).join(', ') || '—';
+    return esc(String(ep));
+  }
+
+  function renderLocalServices(list) {
+    if (!list || !list.length) {
+      localSvcBox.innerHTML = `<p class="muted">${esc(t('discover.local_services.empty'))}</p>`;
+      localSvcBox.classList.remove('hidden');
+      return;
+    }
+    localSvcBox.classList.remove('hidden');
+    localSvcBox.innerHTML = `<h4 style="font-size:.95rem;margin:0 0 .5rem">${esc(t('discover.local_services'))}</h4>`;
+    for (const svc of list) {
+      const topic = svc.topic || svc.Topic || '';
+      const protos = (svc.protocols || []).map((p) => `<span class="badge b-gray">${esc(p)}</span>`).join(' ');
+      const tags = (svc.tags || []).map((x) => `<span class="muted">#${esc(x)}</span>`).join(' ');
+      const row = document.createElement('div');
+      row.className = 'result-row';
+      row.style.marginBottom = '0.5rem';
+      row.innerHTML = `
+        <div><span class="svc-name">${esc(topic)}</span> ${protos}</div>
+        <div><strong>${esc(svc.name || '')}</strong> ${tags}</div>
+        ${svc.brief ? `<div class="muted" style="margin-top:.25rem">${esc(svc.brief)}</div>` : ''}`;
+      localSvcBox.appendChild(row);
+    }
+  }
+
+  async function runQuery() {
+    const raw = aidInput.value.trim();
+    aidErr.classList.add('hidden');
+    if (!raw) {
+      aidErr.textContent = t('discover.aid.required');
+      aidErr.classList.remove('hidden');
+      return;
+    }
+    currentAid = raw;
+    opArea.classList.remove('hidden');
+    opAidEl.textContent = shortAid(currentAid);
+    wrap.querySelector('#dOpCp').onclick = () => copyText(currentAid);
+    resolveBox.textContent = t('common.loading');
+    localSvcBox.classList.add('hidden');
+    localSvcBox.innerHTML = '';
+    wrap.querySelector('#dPingOut').textContent = '';
+    wrap.querySelector('#dCardOut').classList.add('hidden');
+    wrap.querySelector('#dCardOut').innerHTML = '';
+    wrap.querySelector('#dReq').classList.add('hidden');
+    wrap.querySelector('#dReq').innerHTML = '';
+
+    const [resRes, agRes] = await Promise.allSettled([
+      api(`/resolve/${encodeURIComponent(currentAid)}`, { method: 'POST', body: '{}' }),
+      api(`/agents/${encodeURIComponent(currentAid)}`),
+    ]);
+
+    if (resRes.status === 'fulfilled') {
+      const r = resRes.value;
+      resolveBox.className = 'disc-op-block';
+      resolveBox.innerHTML = `
+        <div><strong>address</strong> <span class="mono">${esc(r.address || '')}</span></div>
+        <div><strong>endpoints</strong> ${fmtEndpoints(r.endpoints)}</div>
+        <div><strong>nat_type</strong> ${esc(String(r.nat_type ?? '—'))}</div>
+        <div><strong>seq</strong> ${esc(String(r.seq ?? '—'))} &nbsp; <strong>TTL</strong> ${esc(String(r.ttl ?? '—'))}</div>
+        <div><strong>timestamp</strong> ${esc(String(r.timestamp ?? '—'))}</div>`;
+    } else {
+      const e = resRes.reason;
+      resolveBox.className = 'disc-op-block';
+      resolveBox.innerHTML = `<p style="color:var(--error)">${esc(t('common.error', { msg: e.message }))}</p>`;
+    }
+
+    if (agRes.status === 'fulfilled') {
+      renderLocalServices(agRes.value.services || []);
+    } else {
+      localSvcBox.classList.add('hidden');
+    }
+  }
+
+  wrap.querySelector('#dQuery').onclick = runQuery;
+
+  /** Service search */
   async function search() {
     const term = q.value.trim();
     if (!term) return;
     const btn = wrap.querySelector('#ds');
     setLoading(btn, true);
-    selected = null;
-    tunnel = null;
-    out.innerHTML = `<p class="muted">${esc(t('common.loading'))}</p>`;
+    svcOut.innerHTML = `<p class="muted">${esc(t('common.loading'))}</p>`;
     try {
       const r = await api('/discover', {
         method: 'POST',
         body: JSON.stringify({ services: [term] }),
       });
       const entries = r.entries || [];
-      out.innerHTML = '';
+      svcOut.innerHTML = '';
       const count = document.createElement('p');
       count.className = 'muted';
       count.textContent = t('discover.results.count', { n: entries.length });
-      out.appendChild(count);
+      svcOut.appendChild(count);
       if (!entries.length) {
-        out.appendChild(
+        svcOut.appendChild(
           Object.assign(document.createElement('p'), {
             className: 'muted',
             textContent: t('discover.results.empty'),
@@ -99,16 +296,20 @@ export async function renderDiscover(mount, ctx) {
             <span class="svc-name">${esc(svc)}</span>
             ${protos}
             <span style="flex:1"></span>
-            <button type="button" class="btn btn-secondary btn-sm" data-det>${esc(t('discover.result.detail'))}</button>
+            <button type="button" class="btn btn-primary btn-sm" data-use>${esc(t('discover.result.use'))}</button>
           </div>
-          <div>${esc(e.name || '')} · ${esc(shortAid(aid))} <button type="button" class="btn btn-ghost btn-sm" data-cp>⧉</button></div>
+          <div>${esc(e.name || '')} · ${esc(shortAid(aid))} <button type="button" class="btn btn-ghost btn-sm" data-cp>\u29c9</button></div>
           ${e.brief ? `<div class="muted" style="margin-top:.35rem">${esc(e.brief)}</div>` : ''}`;
         row.querySelector('[data-cp]').onclick = () => copyText(aid);
-        row.querySelector('[data-det]').onclick = () => showDetail(e);
-        out.appendChild(row);
+        row.querySelector('[data-use]').onclick = () => {
+          aidInput.value = aid;
+          switchTab('aid');
+          runQuery();
+        };
+        svcOut.appendChild(row);
       }
     } catch (e) {
-      out.innerHTML = `<p style="color:var(--error)">${esc(t('common.error', { msg: e.message }))}</p>`;
+      svcOut.innerHTML = `<p style="color:var(--error)">${esc(t('common.error', { msg: e.message }))}</p>`;
     } finally {
       setLoading(btn, false);
     }
@@ -118,88 +319,108 @@ export async function renderDiscover(mount, ctx) {
   q.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') search();
   });
+  aidInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') runQuery();
+  });
 
-  function showDetail(entry) {
-    out.querySelectorAll('.detail-panel').forEach((el) => el.remove());
-    selected = entry;
-    tunnel = null;
-    if (fetchAborter) fetchAborter.abort();
-    const panel = document.createElement('div');
-    panel.className = 'detail-panel';
-    panel.innerHTML = `
-      <div><strong>AID</strong> ${esc(shortAid(entry.aid))} <button type="button" class="btn btn-ghost btn-sm" data-cp>⧉</button></div>
-      <div class="muted" style="margin:.5rem 0">${esc(entry.service || '')}</div>
-      ${entry.brief ? `<div>${esc(entry.brief)}</div>` : ''}
-      <p class="muted" id="dfetch">${esc(t('discover.detail.fetching'))}</p>
-      <div id="dcard" class="hidden"></div>
-      <div style="margin-top:.75rem;display:flex;gap:.5rem;flex-wrap:wrap">
-        <button type="button" class="btn btn-ghost btn-sm" id="dskip">${esc(t('discover.detail.skip'))}</button>
-        <button type="button" class="btn btn-primary btn-sm hidden" id="dconn">${esc(t('discover.detail.connect'))}</button>
-      </div>
-      <div id="dreq" class="hidden" style="margin-top:1rem;border-top:1px solid var(--border);padding-top:1rem"></div>`;
-    out.appendChild(panel);
-    panel.querySelector('[data-cp]').onclick = () => copyText(entry.aid);
-    panel.querySelector('#dskip').onclick = () => {
-      if (fetchAborter) fetchAborter.abort();
-      panel.querySelector('#dfetch').classList.add('hidden');
-    };
-
-    fetchAborter = new AbortController();
-    const sig = fetchAborter.signal;
-    (async () => {
-      try {
-        const r = await api(`/connect/${encodeURIComponent(entry.aid)}`, {
-          method: 'POST',
-          body: JSON.stringify({}),
-        });
-        if (sig.aborted) return;
-        tunnel = r.tunnel;
-        const base = 'http://' + tunnel;
-        let cardJ = null;
-        for (const path of ['/.well-known/agent.json', '/.well-known/mcp.json']) {
-          try {
-            const res = await fetch(base + path, { signal: sig, mode: 'cors' });
-            if (res.ok) {
-              cardJ = await res.json();
-              break;
-            }
-          } catch (_) {}
-        }
-        panel.querySelector('#dfetch').classList.add('hidden');
-        const slot = panel.querySelector('#dcard');
-        slot.classList.remove('hidden');
-        if (cardJ) {
-          const p = parseCard(cardJ);
-          slot.innerHTML = `
-            <div><strong>${esc(t('discover.detail.card.name'))}</strong> ${esc(p.name)}</div>
-            <div><strong>${esc(t('discover.detail.card.ver'))}</strong> ${esc(p.version)}</div>
-            <div><strong>${esc(t('discover.detail.card.caps'))}</strong> ${esc(p.caps)}</div>
-            <div><strong>${esc(t('discover.detail.card.tools'))}</strong> ${esc(p.tools.join(', '))}</div>
-            ${p.url ? `<div><a href="${esc(p.url)}" target="_blank" rel="noopener">${esc(p.url)}</a></div>` : ''}`;
-          panel.querySelector('#dconn').classList.remove('hidden');
-        } else {
-          slot.innerHTML = `<p class="muted">${esc(t('discover.card_failed'))}</p>`;
-          panel.querySelector('#dconn').classList.remove('hidden');
-        }
-      } catch (e) {
-        if (e.name === 'AbortError') return;
-        panel.querySelector('#dfetch').textContent = t('common.error', { msg: e.message });
+  /** Mailbox send */
+  const msgFromEl = wrap.querySelector('#dMsgFrom');
+  if (agents.length === 1 && msgFromEl) msgFromEl.value = agents[0].aid;
+  const dMsgGo = wrap.querySelector('#dMsgGo');
+  if (dMsgGo) {
+    dMsgGo.onclick = async (ev) => {
+      if (!currentAid) return;
+      const from = wrap.querySelector('#dMsgFrom')?.value;
+      if (!from) {
+        toast(t('discover.msg.need_from'), 'warn');
+        return;
       }
-    })();
-
-    panel.querySelector('#dconn').onclick = () => openReq(panel, entry);
+      const txt = wrap.querySelector('#dMsgTxt')?.value;
+      if (!txt) return;
+      const b = ev.currentTarget;
+      setLoading(b, true);
+      try {
+        await api(`/agents/${encodeURIComponent(from)}/mailbox/send`, {
+          method: 'POST',
+          body: JSON.stringify({
+            recipient: currentAid,
+            msg_type: 3,
+            body_base64: utf8ToBase64(txt),
+          }),
+        });
+        toast(t('common.sent'), 'ok');
+        const inp = wrap.querySelector('#dMsgTxt');
+        if (inp) inp.value = '';
+      } catch (e) {
+        toast(t('common.error', { msg: e.message }), 'err');
+      } finally {
+        setLoading(b, false);
+      }
+    };
   }
 
-  function openReq(panel, entry) {
-    if (!tunnel) {
-      toast(t('common.error', { msg: 'tunnel' }), 'err');
-      return;
+  /** Ping */
+  wrap.querySelector('#dPing').onclick = async (ev) => {
+    if (!currentAid) return;
+    const el = wrap.querySelector('#dPingOut');
+    const b = ev.currentTarget;
+    setLoading(b, true);
+    el.style.color = '';
+    el.textContent = t('common.loading');
+    const t0 = performance.now();
+    try {
+      await api(`/connect/${encodeURIComponent(currentAid)}`, {
+        method: 'POST',
+        body: JSON.stringify({}),
+      });
+      el.textContent = t('discover.ping.ok', { ms: Math.round(performance.now() - t0) });
+      el.style.color = 'var(--success)';
+    } catch (e) {
+      el.textContent = t('discover.ping.fail') + ': ' + e.message;
+      el.style.color = 'var(--error)';
+    } finally {
+      setLoading(b, false);
     }
-    const req = panel.querySelector('#dreq');
+  };
+
+  /** Agent card */
+  wrap.querySelector('#dCard').onclick = async (ev) => {
+    if (!currentAid) return;
+    const out = wrap.querySelector('#dCardOut');
+    const b = ev.currentTarget;
+    setLoading(b, true);
+    out.classList.remove('hidden');
+    out.innerHTML = `<p class="muted">${esc(t('discover.card.fetching'))}</p>`;
+    try {
+      const got = await fetchAgentCardThroughTunnel(api, currentAid);
+      if (!got) {
+        out.innerHTML = `<p class="muted">${esc(t('discover.card_failed'))}</p>`;
+        return;
+      }
+      const p = parseCard(got.json);
+      out.innerHTML = `
+        <div class="muted" style="font-size:.8rem;margin-bottom:.35rem">${esc(got.path)}</div>
+        <div><strong>${esc(t('discover.detail.card.name'))}</strong> ${esc(p.name)}</div>
+        <div><strong>${esc(t('discover.detail.card.ver'))}</strong> ${esc(p.version)}</div>
+        <div><strong>${esc(t('discover.detail.card.caps'))}</strong> ${esc(p.caps)}</div>
+        <div><strong>${esc(t('discover.detail.card.tools'))}</strong> ${esc(p.tools.join(', '))}</div>
+        ${p.url ? `<div><a href="${esc(p.url)}" target="_blank" rel="noopener">${esc(p.url)}</a></div>` : ''}`;
+    } catch (e) {
+      out.innerHTML = `<p style="color:var(--error)">${esc(t('common.error', { msg: e.message }))}</p>`;
+    } finally {
+      setLoading(b, false);
+    }
+  };
+
+  /** HTTP request panel */
+  function mountReq() {
+    const req = wrap.querySelector('#dReq');
     req.classList.remove('hidden');
+    if (req.dataset.mounted) return;
+    req.dataset.mounted = '1';
     const opts = `<option value="">${esc(t('discover.req.node_identity'))}</option>${agents.map((a) => `<option value="${esc(a.aid)}">${esc(shortAid(a.aid))}</option>`).join('')}`;
     req.innerHTML = `
-      <h3 style="font-size:1rem;margin-bottom:.75rem">${esc(t('discover.req.title'))}</h3>
+      <h4 style="font-size:.95rem;margin:0 0 .5rem">${esc(t('discover.req.title'))}</h4>
       <div class="field">
         <label>${esc(t('discover.req.identity'))}</label>
         <select id="rqAid">${opts}</select>
@@ -223,20 +444,20 @@ export async function renderDiscover(mount, ctx) {
       else bw.classList.add('hidden');
     };
     req.querySelector('#rqGo').onclick = async (ev) => {
-      const b = ev.currentTarget;
-      setLoading(b, true);
+      if (!currentAid) return;
+      const btn = ev.currentTarget;
+      setLoading(btn, true);
       const path = req.querySelector('#rqP').value.trim() || '/';
       const method = m.value;
       const localAid = req.querySelector('#rqAid').value;
       const t0 = performance.now();
       try {
         const connectBody = localAid ? { local_aid: localAid } : {};
-        const cr = await api(`/connect/${encodeURIComponent(entry.aid)}`, {
+        const cr = await api(`/connect/${encodeURIComponent(currentAid)}`, {
           method: 'POST',
           body: JSON.stringify(connectBody),
         });
-        tunnel = cr.tunnel;
-        const base = 'http://' + tunnel;
+        const base = 'http://' + cr.tunnel;
         const url = base + (path.startsWith('/') ? path : '/' + path);
         const opt = { method };
         if (method === 'POST') {
@@ -258,8 +479,10 @@ export async function renderDiscover(mount, ctx) {
         req.querySelector('#rqOut').textContent = e.message;
         req.querySelector('#rqMeta').textContent = '';
       } finally {
-        setLoading(b, false);
+        setLoading(btn, false);
       }
     };
   }
+
+  wrap.querySelector('#dShowReq').onclick = () => mountReq();
 }
