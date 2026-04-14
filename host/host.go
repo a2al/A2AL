@@ -348,13 +348,20 @@ func (h *Host) QUICLocalAddr() *net.UDPAddr {
 func (h *Host) LocalUDPAddr() *net.UDPAddr { return h.DHTLocalAddr() }
 
 func (h *Host) ObserveFromPeers(ctx context.Context, seeds []net.Addr) {
+	var wg sync.WaitGroup
 	for _, s := range seeds {
-		pi, err := h.node.PingIdentity(ctx, s)
-		if err != nil || len(pi.ObservedWire) == 0 {
-			continue
-		}
-		h.sense.Record(pi.NodeID, pi.ObservedWire)
+		s := s
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			pi, err := h.node.PingIdentity(ctx, s)
+			if err != nil || len(pi.ObservedWire) == 0 {
+				return
+			}
+			h.sense.Record(pi.NodeID, pi.ObservedWire)
+		}()
 	}
+	wg.Wait()
 }
 
 // BuildEndpointPayload builds ordered, deduplicated quic:// candidates (Phase 2b).
@@ -496,22 +503,36 @@ func (h *Host) PublishEndpoint(ctx context.Context, seq uint64, ttl uint32) erro
 	return h.PublishEndpointForAgent(ctx, h.addr, seq, ttl)
 }
 
+// PublishEndpointBuilt publishes the node endpoint using a pre-built EndpointPayload.
+// Use this when the payload has already been constructed (e.g. to avoid a redundant probe).
+func (h *Host) PublishEndpointBuilt(ctx context.Context, ep protocol.EndpointPayload, seq uint64, ttl uint32) error {
+	return h.publishEndpointForAgentWithPayload(ctx, h.addr, ep, seq, ttl)
+}
+
 // PublishEndpointForAgent publishes an endpoint record signed by the given registered agent.
 // For Phase 3 delegated agents (registered via RegisterDelegatedAgent), the record embeds
 // the DelegationProof so DHT nodes can verify the operational key's authority.
 func (h *Host) PublishEndpointForAgent(ctx context.Context, agentAddr a2al.Address, seq uint64, ttl uint32) error {
+	ep, err := h.BuildEndpointPayload(ctx)
+	if err != nil {
+		return err
+	}
+	return h.publishEndpointForAgentWithPayload(ctx, agentAddr, ep, seq, ttl)
+}
+
+// publishEndpointForAgentWithPayload signs and stores a pre-built EndpointPayload.
+func (h *Host) publishEndpointForAgentWithPayload(ctx context.Context, agentAddr a2al.Address, ep protocol.EndpointPayload, seq uint64, ttl uint32) error {
 	h.agentsMu.RLock()
 	ag, ok := h.agents[agentAddr]
 	h.agentsMu.RUnlock()
 	if !ok {
 		return fmt.Errorf("a2al/host: unknown agent %s", agentAddr)
 	}
-	ep, err := h.BuildEndpointPayload(ctx)
-	if err != nil {
-		return err
-	}
 	now := time.Now().Truncate(time.Second)
-	var rec protocol.SignedRecord
+	var (
+		rec protocol.SignedRecord
+		err error
+	)
 	if len(ag.delegationCBOR) > 0 {
 		rec, err = protocol.SignEndpointRecordDelegated(ag.priv, ag.delegationCBOR, agentAddr, ep, seq, uint64(now.Unix()), ttl)
 	} else {
