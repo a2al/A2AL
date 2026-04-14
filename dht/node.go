@@ -39,6 +39,10 @@ type Config struct {
 	// Logger is used for DHT-level diagnostics (send failures, RPC retries).
 	// If nil, slog.Default() is used.
 	Logger *slog.Logger
+	// SeenPeersPath is the file path for persisting the seenPeers sliding-window
+	// table across restarts (spec §7.3). Empty disables persistence (default in
+	// tests). The file is written with mode 0600.
+	SeenPeersPath string
 }
 
 // Node is a single DHT participant (routing + local store + wire handler).
@@ -75,6 +79,12 @@ type Node struct {
 	statsRPC atomic.Uint64 // outbound request/response pairs (sendAndWait success)
 
 	decodeErrNext atomic.Int64 // unix-nano: next time a decode-error WARN may fire
+
+	// seenPeers tracks unique NodeIDs contacted during this process lifetime.
+	// key: [32]byte (a2al.NodeID), value: time.Time (first contact).
+	// Used by /debug/stats to compute reach_1h/24h/7d.
+	seenPeers     sync.Map
+	seenPeersPath string // non-empty → persist to disk
 }
 
 type waitEntry struct {
@@ -116,6 +126,10 @@ func NewNode(cfg Config) (*Node, error) {
 		auth:           cfg.RecordAuth,
 	}
 	n.table = routing.NewTable(nid, nil)
+	if cfg.SeenPeersPath != "" {
+		n.seenPeersPath = cfg.SeenPeersPath
+		n.loadSeenPeers(cfg.SeenPeersPath)
+	}
 	return n, nil
 }
 
@@ -124,6 +138,9 @@ func (n *Node) Start() {
 	n.recvOnce.Do(func() {
 		n.wg.Add(1)
 		go n.recvLoop()
+		if n.seenPeersPath != "" {
+			n.startSeenPeersFlusher()
+		}
 	})
 }
 
@@ -215,6 +232,7 @@ func (n *Node) tabAdd(ni protocol.NodeInfo) {
 		return
 	}
 	copy(nid[:], ni.NodeID)
+	n.seenPeers.LoadOrStore(nid, time.Now())
 
 	n.tabMu.Lock()
 	if n.table.Contains(nid) {
@@ -250,6 +268,42 @@ func (n *Node) tabNearest(target a2al.NodeID, k int) []protocol.NodeInfo {
 	n.tabMu.RLock()
 	defer n.tabMu.RUnlock()
 	return n.table.NearestN(target, k)
+}
+
+// reachCounts returns the number of unique peers seen within 1h, 24h, and 7d
+// windows. Entries older than 7d are pruned during this scan (lazy cleanup).
+func (n *Node) reachCounts() (r1h, r24h, r7d int) {
+	now := time.Now()
+	cutoff7d := now.Add(-7 * 24 * time.Hour)
+	cutoff24h := now.Add(-24 * time.Hour)
+	cutoff1h := now.Add(-1 * time.Hour)
+	var toDelete []any
+	n.seenPeers.Range(func(k, v any) bool {
+		t := v.(time.Time)
+		if t.Before(cutoff7d) {
+			toDelete = append(toDelete, k)
+			return true
+		}
+		r7d++
+		if !t.Before(cutoff24h) {
+			r24h++
+		}
+		if !t.Before(cutoff1h) {
+			r1h++
+		}
+		return true
+	})
+	for _, k := range toDelete {
+		n.seenPeers.Delete(k)
+	}
+	return
+}
+
+// tabEstimatedNetworkSize returns the bucket-density estimate of network size.
+func (n *Node) tabEstimatedNetworkSize() int {
+	n.tabMu.RLock()
+	defer n.tabMu.RUnlock()
+	return n.table.EstimatedNetworkSize()
 }
 
 // absorbNodeInfo merges a contact into the routing table and, when IP:port looks usable, sets UDP dial address.

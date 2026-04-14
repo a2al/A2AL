@@ -29,12 +29,16 @@ type debugRoutingJSON struct {
 	TotalPeers    int                    `json:"total_peers"`
 }
 
-// debugStatsJSON is the payload for GET /debug/stats (spec §3.6).
+// debugStatsJSON is the payload for GET /debug/stats (spec §3.6, §7).
 type debugStatsJSON struct {
-	RxPackets  uint64 `json:"rx_packets_verified"`
-	TxPackets  uint64 `json:"tx_packets"`
-	RPCOK      uint64 `json:"rpc_completed"`
-	TotalPeers int    `json:"total_peers"`
+	RxPackets            uint64 `json:"rx_packets_verified"`
+	TxPackets            uint64 `json:"tx_packets"`
+	RPCOK                uint64 `json:"rpc_completed"`
+	TotalPeers           int    `json:"total_peers"`
+	Reach1h              int    `json:"reach_1h"`
+	Reach24h             int    `json:"reach_24h"`
+	Reach7d              int    `json:"reach_7d"`
+	EstimatedNetworkSize int    `json:"estimated_network_size"`
 }
 
 func (n *Node) tabDebugPeers() []routing.PeerDebugRow {
@@ -108,11 +112,16 @@ func (n *Node) serveDebugStats(w http.ResponseWriter, r *http.Request) {
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	peers := n.tabDebugPeers()
+	r1h, r24h, r7d := n.reachCounts()
 	_ = enc.Encode(debugStatsJSON{
-		RxPackets:  n.statsRx.Load(),
-		TxPackets:  n.statsTx.Load(),
-		RPCOK:      n.statsRPC.Load(),
-		TotalPeers: len(peers),
+		RxPackets:            n.statsRx.Load(),
+		TxPackets:            n.statsTx.Load(),
+		RPCOK:                n.statsRPC.Load(),
+		TotalPeers:           len(peers),
+		Reach1h:              r1h,
+		Reach24h:             r24h,
+		Reach7d:              r7d,
+		EstimatedNetworkSize: n.tabEstimatedNetworkSize(),
 	})
 }
 
