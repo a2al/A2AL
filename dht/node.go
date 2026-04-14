@@ -45,6 +45,26 @@ type Config struct {
 	SeenPeersPath string
 }
 
+// PeerHealthState classifies a peer's reachability based on observed RPC outcomes.
+type PeerHealthState uint8
+
+const (
+	PeerHealthUnknown PeerHealthState = iota // no RPC history yet
+	PeerHealthGood                           // last RPC succeeded, failCount == 0
+	PeerHealthBad                            // consecutive failures >= badHealthThreshold
+)
+
+// badHealthThreshold is the consecutive-failure count at which a peer is
+// considered unreachable. Reset to 0 on the next successful RPC.
+const badHealthThreshold = 2
+
+type peerHealthEntry struct {
+	lastSuccess time.Time
+	lastFailure time.Time
+	failCount   int
+	rtt         time.Duration // last successful RTT; reserved for future RTT-based sorting
+}
+
 // Node is a single DHT participant (routing + local store + wire handler).
 type Node struct {
 	tr     transport.Transport
@@ -62,6 +82,8 @@ type Node struct {
 
 	peerMu sync.Mutex
 	peers  map[string]net.Addr
+
+	addrToID sync.Map // addr.String() → a2al.NodeID (reverse of peers map)
 
 	recvOnce sync.Once
 	wg       sync.WaitGroup
@@ -85,6 +107,9 @@ type Node struct {
 	// Used by /debug/stats to compute reach_1h/24h/7d.
 	seenPeers     sync.Map
 	seenPeersPath string // non-empty → persist to disk
+
+	healthMu sync.RWMutex
+	health   map[string]*peerHealthEntry // key: nodeIDKey(id)
 }
 
 type waitEntry struct {
@@ -122,6 +147,7 @@ func NewNode(cfg Config) (*Node, error) {
 		log:            logger,
 		wait:           make(map[string]*waitEntry),
 		peers:          make(map[string]net.Addr),
+		health:         make(map[string]*peerHealthEntry),
 		onObservedAddr: cfg.OnObservedAddr,
 		auth:           cfg.RecordAuth,
 	}
@@ -219,10 +245,11 @@ func (n *Node) lookupPeer(id a2al.NodeID) (net.Addr, bool) {
 }
 
 func (n *Node) remember(from net.Addr, dec *protocol.DecodedMessage) {
-	n.peerMu.Lock()
 	id := a2al.NodeIDFromAddress(dec.SenderAddr)
+	n.peerMu.Lock()
 	n.peers[nodeIDKey(id)] = from
 	n.peerMu.Unlock()
+	n.addrToID.Store(from.String(), id)
 	n.tabAdd(nodeInfoFromMessage(dec, from))
 }
 
@@ -268,6 +295,93 @@ func (n *Node) tabNearest(target a2al.NodeID, k int) []protocol.NodeInfo {
 	n.tabMu.RLock()
 	defer n.tabMu.RUnlock()
 	return n.table.NearestN(target, k)
+}
+
+// lookupPeerID returns the NodeID associated with addr, if known.
+func (n *Node) lookupPeerID(addr net.Addr) (a2al.NodeID, bool) {
+	v, ok := n.addrToID.Load(addr.String())
+	if !ok {
+		return a2al.NodeID{}, false
+	}
+	return v.(a2al.NodeID), true
+}
+
+// recordSuccess marks the peer as healthy (failCount reset to 0, RTT updated).
+func (n *Node) recordSuccess(id a2al.NodeID, rtt time.Duration) {
+	key := nodeIDKey(id)
+	n.healthMu.Lock()
+	e := n.health[key]
+	if e == nil {
+		e = &peerHealthEntry{}
+		n.health[key] = e
+	}
+	e.lastSuccess = time.Now()
+	e.failCount = 0
+	if rtt > 0 {
+		e.rtt = rtt
+	}
+	n.healthMu.Unlock()
+}
+
+// recordFailure increments the peer's consecutive-failure counter.
+func (n *Node) recordFailure(id a2al.NodeID) {
+	key := nodeIDKey(id)
+	n.healthMu.Lock()
+	e := n.health[key]
+	if e == nil {
+		e = &peerHealthEntry{}
+		n.health[key] = e
+	}
+	e.lastFailure = time.Now()
+	e.failCount++
+	n.healthMu.Unlock()
+}
+
+// PeerHealthOf returns the observed health state for the given peer.
+func (n *Node) PeerHealthOf(id a2al.NodeID) PeerHealthState {
+	n.healthMu.RLock()
+	e := n.health[nodeIDKey(id)]
+	n.healthMu.RUnlock()
+	if e == nil {
+		return PeerHealthUnknown
+	}
+	if e.failCount >= badHealthThreshold {
+		return PeerHealthBad
+	}
+	if !e.lastSuccess.IsZero() {
+		return PeerHealthGood
+	}
+	return PeerHealthUnknown
+}
+
+// tabNearestHealthy returns up to k routing-table peers sorted first by
+// health state (Good → Unknown → Bad) and then by XOR distance within each
+// group.  This ensures StoreAt and query seeds prefer known-reachable nodes.
+func (n *Node) tabNearestHealthy(target a2al.NodeID, k int) []protocol.NodeInfo {
+	all := n.tabNearest(target, routing.K)
+	var good, unknown, bad []protocol.NodeInfo
+	for _, ni := range all {
+		var id a2al.NodeID
+		copy(id[:], ni.NodeID)
+		switch n.PeerHealthOf(id) {
+		case PeerHealthGood:
+			good = append(good, ni)
+		case PeerHealthBad:
+			bad = append(bad, ni)
+		default:
+			unknown = append(unknown, ni)
+		}
+	}
+	// tabNearest already returns nodes in XOR-ascending order; splitting into
+	// groups preserves that relative order within each group.
+	result := make([]protocol.NodeInfo, 0, len(all))
+	result = append(result, good...)
+	result = append(result, unknown...)
+	result = append(result, bad...)
+	if len(result) > k {
+		result = result[:k]
+	}
+	return result
 }
 
 // reachCounts returns the number of unique peers seen within 1h, 24h, and 7d
@@ -324,8 +438,9 @@ func (n *Node) absorbNodeInfo(ni protocol.NodeInfo) {
 // BindPeerAddr registers the transport dial address for a remote NodeID (e.g. MemTransport name lookup in tests).
 func (n *Node) BindPeerAddr(id a2al.NodeID, addr net.Addr) {
 	n.peerMu.Lock()
-	defer n.peerMu.Unlock()
 	n.peers[nodeIDKey(id)] = addr
+	n.peerMu.Unlock()
+	n.addrToID.Store(addr.String(), id)
 }
 
 // SetSelfExtIP records our own public IP (from STUN/HTTP probe). Used to detect
@@ -551,8 +666,12 @@ func (n *Node) PingIdentity(ctx context.Context, peer net.Addr) (*PeerIdentity, 
 	}
 	hdr := protocol.Header{Version: protocol.ProtocolVersion, MsgType: protocol.MsgPing, TxID: tx}
 	body := &protocol.BodyPing{Address: n.addr[:]}
+	t0 := time.Now()
 	dec, err := n.sendAndWait(ctx, peer, hdr, body, protocol.MsgPong)
 	if err != nil {
+		if id, ok := n.lookupPeerID(peer); ok {
+			n.recordFailure(id)
+		}
 		return nil, err
 	}
 	pong, ok := dec.Body.(*protocol.BodyPong)
@@ -561,6 +680,7 @@ func (n *Node) PingIdentity(ctx context.Context, peer net.Addr) (*PeerIdentity, 
 	}
 	peerAddr := dec.SenderAddr
 	peerNID := a2al.NodeIDFromAddress(peerAddr)
+	n.recordSuccess(peerNID, time.Since(t0))
 	ni := nodeInfoFromMessage(dec, peer)
 	n.BindPeerAddr(peerNID, peer)
 	n.tabAdd(ni)
@@ -579,10 +699,16 @@ func (n *Node) StoreAt(ctx context.Context, peer net.Addr, storeKey a2al.NodeID,
 		body.Key = storeKey[:]
 	}
 	hdr := protocol.Header{Version: protocol.ProtocolVersion, MsgType: protocol.MsgStore}
+	t0 := time.Now()
 	dec, err := n.sendAndWait(ctx, peer, hdr, body, protocol.MsgStoreResp)
 	if err != nil {
+		if id, ok := n.lookupPeerID(peer); ok {
+			n.recordFailure(id)
+		}
 		return false, err
 	}
+	peerNID := a2al.NodeIDFromAddress(dec.SenderAddr)
+	n.recordSuccess(peerNID, time.Since(t0))
 	return dec.Body.(*protocol.BodyStoreResp).Stored, nil
 }
 
@@ -590,12 +716,18 @@ func (n *Node) StoreAt(ctx context.Context, peer net.Addr, storeKey a2al.NodeID,
 func (n *Node) FindNode(ctx context.Context, peer net.Addr, target a2al.NodeID) ([]protocol.NodeInfo, error) {
 	hdr := protocol.Header{Version: protocol.ProtocolVersion, MsgType: protocol.MsgFindNode}
 	body := &protocol.BodyFindNode{Target: target[:]}
+	t0 := time.Now()
 	dec, err := n.sendAndWait(ctx, peer, hdr, body, protocol.MsgFindNodeResp)
 	if err != nil {
+		if id, ok := n.lookupPeerID(peer); ok {
+			n.recordFailure(id)
+		}
 		return nil, err
 	}
+	peerNID := a2al.NodeIDFromAddress(dec.SenderAddr)
+	n.recordSuccess(peerNID, time.Since(t0))
 	br := dec.Body.(*protocol.BodyFindNodeResp)
-	n.notifyObserved(a2al.NodeIDFromAddress(dec.SenderAddr), br.ObservedAddr)
+	n.notifyObserved(peerNID, br.ObservedAddr)
 	return br.Nodes, nil
 }
 
@@ -603,12 +735,18 @@ func (n *Node) FindNode(ctx context.Context, peer net.Addr, target a2al.NodeID) 
 func (n *Node) FindValueWithNodes(ctx context.Context, peer net.Addr, key a2al.NodeID, recType uint8) ([]protocol.SignedRecord, []protocol.NodeInfo, error) {
 	hdr := protocol.Header{Version: protocol.ProtocolVersion, MsgType: protocol.MsgFindValue}
 	body := &protocol.BodyFindValue{Target: key[:], RecType: recType}
+	t0 := time.Now()
 	dec, err := n.sendAndWait(ctx, peer, hdr, body, protocol.MsgFindValueResp)
 	if err != nil {
+		if id, ok := n.lookupPeerID(peer); ok {
+			n.recordFailure(id)
+		}
 		return nil, nil, err
 	}
+	peerNID := a2al.NodeIDFromAddress(dec.SenderAddr)
+	n.recordSuccess(peerNID, time.Since(t0))
 	br := dec.Body.(*protocol.BodyFindValueResp)
-	n.notifyObserved(a2al.NodeIDFromAddress(dec.SenderAddr), br.ObservedAddr)
+	n.notifyObserved(peerNID, br.ObservedAddr)
 	var out []protocol.SignedRecord
 	if len(br.Records) > 0 {
 		out = append(out, br.Records...)
