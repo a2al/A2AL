@@ -72,21 +72,32 @@ func (h *Host) orderedQUICEndpointStrings(extipSnapshot, upnpSnapshot string) ([
 	var out []string
 
 	// ① observed_addr consensus
-	if host, _, ok := h.sense.TrustedUDP(); ok {
+	// When DHT and QUIC share the same socket (UDPMux), the natsense-observed
+	// port IS the NAT-mapped external port for that socket — use it directly so
+	// that instances on the same host but different ports are correctly
+	// distinguished.  When DHT and QUIC are on separate sockets, natsense only
+	// reflects the DHT port and we fall back to the local QUIC port.
+	if host, natPort, ok := h.sense.TrustedUDP(); ok {
 		if ip := net.ParseIP(host); ip != nil && isPlausibleWANIP(ip) {
-			appendCandidateUnique(seen, &out, "quic://"+net.JoinHostPort(host, portStr))
+			extPort := portStr
+			if h.DHTLocalAddr().Port == h.QUICLocalAddr().Port && natPort > 0 {
+				extPort = strconv.Itoa(int(natPort))
+			}
+			appendCandidateUnique(seen, &out, "quic://"+net.JoinHostPort(host, extPort))
 		}
 	}
 
 	// ② STUN / HTTP external IP
+	// STUN returns the NAT-mapped address of an ephemeral probe socket, not the
+	// QUIC listener.  We only want the public IP; always pair with the actual
+	// QUIC port so we don't publish a stale/wrong port that may belong to a
+	// completely different host on the same NAT.
 	if extipSnapshot != "" {
-		if strings.Contains(extipSnapshot, ":") {
-			// STUN result includes port — use it directly.
-			appendCandidateUnique(seen, &out, "quic://"+extipSnapshot)
-		} else {
-			// HTTP result is IP only — pair with our local listen port.
-			appendCandidateUnique(seen, &out, "quic://"+net.JoinHostPort(extipSnapshot, portStr))
+		ipStr := extipSnapshot
+		if h, _, err := net.SplitHostPort(extipSnapshot); err == nil {
+			ipStr = h // strip STUN's ephemeral port
 		}
+		appendCandidateUnique(seen, &out, "quic://"+net.JoinHostPort(ipStr, portStr))
 	}
 
 	// ③ QUIC bind IP (direct public)
