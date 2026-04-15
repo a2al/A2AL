@@ -57,13 +57,14 @@ func QUICDialTargets(er *protocol.EndpointRecord) ([]*net.UDPAddr, error) {
 func (h *Host) ConnectFromRecord(ctx context.Context, expectRemote a2al.Address, er *protocol.EndpointRecord) (quic.Connection, error) {
 	targets, terr := QUICDialTargets(er)
 	var happyErr error
-	if len(targets) > 0 {
+	skipDirect := er != nil && er.NatType == protocol.NATSymmetric && er.Signal != ""
+	if !skipDirect && len(targets) > 0 {
 		c, err := h.connectHappy(ctx, h.priv, expectRemote, targets, DefaultConnectStagger)
 		if err == nil {
 			return c, nil
 		}
 		happyErr = err
-	} else {
+	} else if len(targets) == 0 {
 		happyErr = terr
 	}
 	if er == nil || er.Signal == "" {
@@ -93,13 +94,14 @@ func (h *Host) ConnectFromRecordFor(ctx context.Context, localAgent, expectRemot
 	}
 	targets, terr := QUICDialTargets(er)
 	var happyErr error
-	if len(targets) > 0 {
+	skipDirect := er != nil && er.NatType == protocol.NATSymmetric && er.Signal != ""
+	if !skipDirect && len(targets) > 0 {
 		c, err := h.connectHappy(ctx, ag.priv, expectRemote, targets, DefaultConnectStagger)
 		if err == nil {
 			return c, nil
 		}
 		happyErr = err
-	} else {
+	} else if len(targets) == 0 {
 		happyErr = terr
 	}
 	if er == nil || er.Signal == "" {

@@ -39,10 +39,40 @@ func (h *Host) DebugHTTPHandler() http.Handler {
 	mux.Handle("/debug/identity", dhtHandler)
 	mux.Handle("/debug/routing", dhtHandler)
 	mux.Handle("/debug/store", dhtHandler)
-	mux.Handle("/debug/stats", dhtHandler)
+	mux.HandleFunc("/debug/stats", h.serveDebugStatsMerged)
 	// Host-level (Phase 2) endpoint.
 	mux.HandleFunc("/debug/host", h.serveDebugHost)
 	return mux
+}
+
+func (h *Host) serveDebugStatsMerged(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	st := h.node.DebugStatsData()
+	out := map[string]any{
+		"rx_packets_verified":     st.RxPackets,
+		"tx_packets":              st.TxPackets,
+		"rpc_completed":           st.RPCOK,
+		"total_peers":             st.TotalPeers,
+		"reach_1h":                st.Reach1h,
+		"reach_24h":               st.Reach24h,
+		"reach_7d":                st.Reach7d,
+		"estimated_network_size":  st.EstimatedNetworkSize,
+	}
+	h.signalStatsMu.RLock()
+	fn := h.signalStats
+	h.signalStatsMu.RUnlock()
+	if fn != nil {
+		if sig := fn(); len(sig) > 0 {
+			out["signal"] = sig
+		}
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(out)
 }
 
 func (h *Host) serveDebugHost(w http.ResponseWriter, r *http.Request) {

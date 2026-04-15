@@ -264,7 +264,8 @@ func (d *Daemon) handleConfigSchema(w http.ResponseWriter, _ *http.Request) {
     "key_dir": {"type": "string"},
     "log_format": {"type": "string", "enum": ["text","json"]},
     "log_level": {"type": "string"},
-    "auto_publish": {"type": "boolean", "description": "Publish node AID to DHT on a schedule (default true)"}
+    "auto_publish": {"type": "boolean", "description": "Publish node AID to DHT on a schedule (default true)"},
+    "signal_listen_addr": {"type": "string", "description": "TCP address for embedded ICE hub; empty=same port as listen_addr; off=disable"}
   }
 }`
 	w.Header().Set("Content-Type", "application/json")

@@ -23,6 +23,7 @@ import (
 	"github.com/a2al/a2al/internal/nodeks"
 	"github.com/a2al/a2al/internal/peerscache"
 	"github.com/a2al/a2al/internal/registry"
+	"github.com/a2al/a2al/signaling"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -71,6 +72,8 @@ type Daemon struct {
 
 	heartbeatMu sync.Mutex
 	heartbeatAt map[a2al.Address]time.Time
+
+	iceRegNotify chan struct{} // ICE /signal registration refresh (buffered)
 }
 
 // APIAddr returns the REST API / Web UI listen address from the loaded config.
@@ -166,13 +169,28 @@ func New(cfg Config) (*Daemon, error) {
 		agentLastPublish: make(map[a2al.Address]time.Time),
 		heartbeatAt:      make(map[a2al.Address]time.Time),
 		mailboxSeen:      make(map[string]map[string]time.Time),
+		iceRegNotify:     make(chan struct{}, 1),
 	}, nil
 }
 
 // Run starts the daemon and blocks until ctx is cancelled. It saves the peers
 // cache and config on return.
 func (d *Daemon) Run(ctx context.Context, mcpStdio bool) error {
+	var closeSignalHub func()
+	if addr := resolveSignalListenAddr(d.cfg); addr != "" {
+		hub, err := signaling.ListenHub(addr)
+		if err != nil {
+			d.log.Warn("signal hub listen", "addr", addr, "err", err)
+		} else {
+			d.h.SetSignalStatsProvider(hub.StatsMap)
+			closeSignalHub = func() { _ = hub.Close() }
+			d.log.Info("signal hub listening", "addr", hub.Addr().String())
+		}
+	}
 	defer func() {
+		if closeSignalHub != nil {
+			closeSignalHub()
+		}
 		savePeersCache(filepath.Join(d.dataDir, "peers.cache"), d.h, d.log)
 		_ = d.h.Close()
 	}()
@@ -198,8 +216,11 @@ func (d *Daemon) Run(ctx context.Context, mcpStdio bool) error {
 	// (resolve, discover, publish) will return errors or empty results until
 	// bootstrap completes, which is correct behaviour.
 	go func() {
-		runBootstrapChain(netCtx, d.h, d.cfg, d.dataDir, d.log)
+		if derived := runBootstrapChain(netCtx, d.h, d.cfg, d.dataDir, d.log); derived != "" {
+			d.h.SetDerivedICESignalURL(derived)
+		}
 		d.initialAutoPublish(netCtx)
+		go d.runICEListener(netCtx)
 		d.autoPublishMainLoop(netCtx)
 	}()
 

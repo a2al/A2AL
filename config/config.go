@@ -6,6 +6,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -32,6 +33,10 @@ type Config struct {
 	ICESTUNURLs     []string `toml:"ice_stun_urls" json:"ice_stun_urls"`
 	ICETURNURLs     []string `toml:"ice_turn_urls" json:"ice_turn_urls"`
 	ICEPublishTurns []string `toml:"ice_publish_turns" json:"ice_publish_turns"`
+	// SignalListenAddr is the TCP listen address for the embedded ICE signaling hub.
+	// Empty or "off" disables the hub (default). Only enable on bootstrap/infrastructure nodes.
+	// E.g. ":4121" shares the DHT port over TCP.
+	SignalListenAddr string `toml:"signal_listen_addr" json:"signal_listen_addr"`
 	// AutoPublish controls whether the daemon publishes the node identity to the DHT
 	// on startup and on a schedule (default true). When false, the node stays off the DHT
 	// as a discoverable endpoint while still participating in routing.
@@ -53,6 +58,7 @@ func Default() Config {
 		LogFormat:        "text",
 		LogLevel:         "info",
 		AutoPublish:      true,
+		SignalListenAddr: "off",
 	}
 }
 
@@ -74,6 +80,15 @@ func (c *Config) Validate() error {
 		}
 		if u.Scheme != "ws" && u.Scheme != "wss" {
 			return fmt.Errorf("config: ice_signal_url must use ws:// or wss:// scheme")
+		}
+	}
+	if s := strings.TrimSpace(c.SignalListenAddr); s != "" && !strings.EqualFold(s, "off") {
+		addr := s
+		if strings.HasPrefix(addr, ":") {
+			addr = "0.0.0.0" + addr
+		}
+		if _, err := net.ResolveTCPAddr("tcp", addr); err != nil {
+			return fmt.Errorf("config: signal_listen_addr: %w", err)
 		}
 	}
 	for _, t := range c.ICEPublishTurns {
@@ -146,6 +161,9 @@ func ApplyEnv(c *Config) {
 	if v := os.Getenv("A2AL_ICE_SIGNAL_URL"); v != "" {
 		c.ICESignalURL = v
 	}
+	if v := os.Getenv("A2AL_SIGNAL_LISTEN_ADDR"); v != "" {
+		c.SignalListenAddr = v
+	}
 	if v := os.Getenv("A2AL_AUTO_PUBLISH"); v != "" {
 		switch strings.ToLower(strings.TrimSpace(v)) {
 		case "0", "false", "no", "off":
@@ -161,4 +179,5 @@ var RestartRequiredKeys = []string{
 	"listen_addr", "quic_listen_addr", "bootstrap", "api_addr", "key_dir",
 	"disable_upnp", "fallback_host", "min_observed_peers",
 	"ice_signal_url", "ice_stun_urls", "ice_turn_urls", "ice_publish_turns",
+	"signal_listen_addr",
 }

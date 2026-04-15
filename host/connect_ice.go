@@ -29,7 +29,15 @@ func (h *Host) connectViaICESignal(ctx context.Context, localPriv ed25519.Privat
 		return nil, errors.New("a2al/host: no signal url in record")
 	}
 	room := signaling.RoomID(localAgent.String(), expectRemote.String())
-	wsURL, err := signaling.AppendRoomQuery(er.Signal, room)
+	wsURL, err := signaling.AppendRoomToICEURL(er.Signal, room)
+	if err != nil {
+		return nil, fmt.Errorf("a2al/host: ice signal url: %w", err)
+	}
+	wsURL, err = signaling.AppendQuery(wsURL, "target", expectRemote.String())
+	if err != nil {
+		return nil, fmt.Errorf("a2al/host: ice signal url: %w", err)
+	}
+	wsURL, err = signaling.AppendQuery(wsURL, "caller", localAgent.String())
 	if err != nil {
 		return nil, fmt.Errorf("a2al/host: ice signal url: %w", err)
 	}
@@ -98,7 +106,7 @@ func (h *Host) AcceptICEViaSignal(ctx context.Context, localAgent, expectRemote 
 	}
 
 	room := signaling.RoomID(localAgent.String(), expectRemote.String())
-	wsURL, err := signaling.AppendRoomQuery(signalBase, room)
+	wsURL, err := signaling.AppendRoomToICEURL(signalBase, room)
 	if err != nil {
 		return nil, fmt.Errorf("a2al/host: ice signal url: %w", err)
 	}

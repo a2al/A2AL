@@ -131,6 +131,12 @@ type Host struct {
 	extipMu   sync.Mutex
 	extipSnap string    // "ip:port" (STUN) or "ip" (HTTP); empty = not yet resolved
 	extipExp  time.Time // cache expiry
+
+	iceMu            sync.RWMutex
+	derivedICESignal string // from bootstrap when cfg.ICESignalURL is empty
+
+	signalStatsMu sync.RWMutex
+	signalStats   func() map[string]any
 }
 
 // New creates a Host with one initial agent identity from cfg.KeyStore.
@@ -403,9 +409,42 @@ func (h *Host) BuildEndpointPayload(ctx context.Context) (protocol.EndpointPaylo
 	return protocol.EndpointPayload{
 		Endpoints: eps,
 		NatType:   h.sense.InferNATType(),
-		Signal:    h.cfg.ICESignalURL,
+		Signal:    h.effectiveICESignalBase(),
 		Turns:     turns,
 	}, nil
+}
+
+func (h *Host) effectiveICESignalBase() string {
+	h.iceMu.RLock()
+	defer h.iceMu.RUnlock()
+	if h.cfg.ICESignalURL != "" {
+		return h.cfg.ICESignalURL
+	}
+	return h.derivedICESignal
+}
+
+// EffectiveICESignalBase returns the ICE signaling WebSocket base URL (no path)
+// published in endpoint records: explicit config overrides bootstrap-derived value.
+func (h *Host) EffectiveICESignalBase() string {
+	return h.effectiveICESignalBase()
+}
+
+// SetDerivedICESignalURL sets the bootstrap-derived signal base when
+// Config.ICESignalURL is empty. Explicit config always wins and is not overwritten.
+func (h *Host) SetDerivedICESignalURL(s string) {
+	h.iceMu.Lock()
+	defer h.iceMu.Unlock()
+	if h.cfg.ICESignalURL != "" {
+		return
+	}
+	h.derivedICESignal = strings.TrimSpace(s)
+}
+
+// SetSignalStatsProvider merges hub stats into GET /debug/stats under "signal".
+func (h *Host) SetSignalStatsProvider(f func() map[string]any) {
+	h.signalStatsMu.Lock()
+	h.signalStats = f
+	h.signalStatsMu.Unlock()
 }
 
 const extipCacheTTL = 5 * time.Minute

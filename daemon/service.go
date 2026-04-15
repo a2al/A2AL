@@ -139,6 +139,7 @@ func (d *Daemon) persistDelegatedAgent(aid a2al.Address, opPriv ed25519.PrivateK
 		d.h.UnregisterAgent(aid)
 		return errPersist
 	}
+	d.bumpIceRegistry()
 	return nil
 }
 
@@ -675,6 +676,7 @@ func (d *Daemon) execAgentDelete(aidStr string) error {
 	d.publishMetaMu.Unlock()
 	// Stop background replication probing for this agent's records.
 	d.h.Node().RemoveRepSetsForPublisher(a2al.NodeIDFromAddress(aid))
+	d.bumpIceRegistry()
 	return nil
 }
 
