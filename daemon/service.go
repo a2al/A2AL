@@ -526,6 +526,17 @@ func (d *Daemon) execAgentPublish(ctx context.Context, aidStr string) (uint64, e
 	if err != nil {
 		return 0, errBadAID
 	}
+	// Allow the node AID itself to be passed to force an immediate node endpoint
+	// republish without adding a separate API route.
+	if aid == d.nodeAddr {
+		if err := d.publishNodeOnce(ctx); err != nil {
+			return 0, errPublish
+		}
+		d.nodePublishMu.Lock()
+		seq := d.nodePublishSeq
+		d.nodePublishMu.Unlock()
+		return seq, nil
+	}
 	d.regMu.RLock()
 	e := d.reg.Get(aid)
 	d.regMu.RUnlock()
@@ -662,6 +673,8 @@ func (d *Daemon) execAgentDelete(aidStr string) error {
 	d.publishMetaMu.Lock()
 	delete(d.agentLastPublish, aid)
 	d.publishMetaMu.Unlock()
+	// Stop background replication probing for this agent's records.
+	d.h.Node().RemoveRepSetsForPublisher(a2al.NodeIDFromAddress(aid))
 	return nil
 }
 
