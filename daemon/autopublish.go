@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	mrand "math/rand"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -122,7 +123,16 @@ func (d *Daemon) publishNodeOnce(ctx context.Context) error {
 	nextSeq := d.nodePublishSeq + 1
 	d.nodePublishMu.Unlock()
 
-	if err := d.h.PublishEndpoint(ctx, nextSeq, endpointRecordTTL); err != nil {
+	// Build payload once: used for both publishing and fingerprint caching.
+	ep, err := d.h.BuildEndpointPayload(ctx)
+	if err != nil {
+		return err
+	}
+	d.publishMetaMu.Lock()
+	d.lastEndpointsFP = endpointPayloadFingerprint(ep)
+	d.publishMetaMu.Unlock()
+
+	if err := d.h.PublishEndpointBuilt(ctx, ep, nextSeq, endpointRecordTTL); err != nil {
 		return err
 	}
 
@@ -135,16 +145,6 @@ func (d *Daemon) publishNodeOnce(ctx context.Context) error {
 	}
 
 	d.recordNodePublishTime()
-
-	pctx, cancel := context.WithTimeout(ctx, 45*time.Second)
-	ep, err := d.h.BuildEndpointPayload(pctx)
-	cancel()
-	if err == nil {
-		d.publishMetaMu.Lock()
-		d.lastEndpointsFP = endpointPayloadFingerprint(ep)
-		d.publishMetaMu.Unlock()
-	}
-
 	d.log.Info("node endpoint published to DHT", "seq", nextSeq)
 	return nil
 }
@@ -165,13 +165,24 @@ func (d *Daemon) maybeRepublishNodeOnEndpointChange(ctx context.Context) {
 	prev := d.lastEndpointsFP
 	d.publishMetaMu.Unlock()
 
-	if prev != "" && fp != prev {
-		pubCtx, pubCancel := context.WithTimeout(ctx, 90*time.Second)
-		err := d.publishNodeOnce(pubCtx)
-		pubCancel()
-		if err != nil {
-			d.log.Debug("node republish on endpoint change", "err", err)
-		}
+	if prev == "" || fp == prev {
+		return
+	}
+
+	// Endpoint (IP/port) changed: republish node record immediately.
+	pubCtx, pubCancel := context.WithTimeout(ctx, 90*time.Second)
+	if err := d.publishNodeOnce(pubCtx); err != nil {
+		d.log.Debug("node republish on endpoint change", "err", err)
+	}
+	pubCancel()
+
+	// Also push updated endpoint to all registered agents so their records
+	// reflect the new address without waiting for the next periodic tick.
+	d.regMu.RLock()
+	agents := d.reg.List()
+	d.regMu.RUnlock()
+	for _, e := range agents {
+		d.tryRepublishAgent(ctx, e)
 	}
 }
 
@@ -289,6 +300,8 @@ func (d *Daemon) initialAutoPublish(ctx context.Context) {
 		// (service_tcp reachable) recover without waiting for the first
 		// periodic tick (30 min). Self-service agents still require a fresh
 		// heartbeat before republish — no change in that behaviour.
+		// Each agent gets a random cold-start jitter (0–30 s) to spread
+		// publish traffic and avoid simultaneous bursts on restart.
 		go func() {
 			t := time.NewTimer(60 * time.Second)
 			defer t.Stop()
@@ -297,13 +310,22 @@ func (d *Daemon) initialAutoPublish(ctx context.Context) {
 				return
 			case <-t.C:
 			}
-			rctx, cancel := context.WithTimeout(ctx, 120*time.Second)
-			defer cancel()
 			d.regMu.RLock()
 			agents := d.reg.List()
 			d.regMu.RUnlock()
 			for _, e := range agents {
-				d.tryRepublishAgent(rctx, e)
+				e := e
+				go func() {
+					jitter := time.Duration(mrand.Int63n(int64(30 * time.Second)))
+					jt := time.NewTimer(jitter)
+					defer jt.Stop()
+					select {
+					case <-ctx.Done():
+						return
+					case <-jt.C:
+					}
+					d.tryRepublishAgent(ctx, e)
+				}()
 			}
 		}()
 	} else {

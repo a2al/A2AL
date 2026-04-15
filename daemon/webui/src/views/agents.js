@@ -196,10 +196,72 @@ export async function renderAgents(mount, ctx) {
       el.querySelector('[data-ed]').onclick = (ev) => {
         const aid = ev.currentTarget.getAttribute('data-ed');
         const s = ev.currentTarget.getAttribute('data-svc');
-        openServiceModal(agents, aid, svc);
+        openServiceModal(agents, aid, s);
       };
       svcBody.appendChild(el);
     }
+  }
+
+  const noteSection = document.createElement('div');
+  noteSection.className = 'card';
+  noteSection.innerHTML = `<div class="card-h">${esc(t('agent.note.title'))}</div><div class="card-b" id="noteInbox"></div>`;
+  frag.appendChild(noteSection);
+  const noteInbox = noteSection.querySelector('#noteInbox');
+  if (!agents.length) {
+    noteInbox.innerHTML = `<p class="muted">${esc(t('agent.note.need_agent'))}</p>`;
+  } else {
+    noteInbox.innerHTML = `
+      <div class="field" style="display:flex;flex-wrap:wrap;gap:.5rem;align-items:flex-end">
+        <div>
+          <label class="muted" style="display:block;margin-bottom:.25rem">${esc(t('service.modal.agent_pick'))}</label>
+          <select id="noteAid">${agents.map((a) => `<option value="${esc(a.aid)}">${esc(shortAid(a.aid))}</option>`).join('')}</select>
+        </div>
+        <button type="button" class="btn btn-primary" id="notePoll">${esc(t('agent.note.poll'))}</button>
+      </div>
+      <div id="noteList" style="margin-top:.75rem"></div>`;
+    noteInbox.querySelector('#notePoll').onclick = async (ev) => {
+      const aid = noteInbox.querySelector('#noteAid').value;
+      const b = ev.currentTarget;
+      setLoading(b, true);
+      const list = noteInbox.querySelector('#noteList');
+      list.innerHTML = `<p class="muted">${esc(t('common.loading'))}</p>`;
+      try {
+        const r = await api(`/agents/${encodeURIComponent(aid)}/mailbox/poll`, {
+          method: 'POST',
+          body: '{}',
+        });
+        const msgs = r.messages || [];
+        if (!msgs.length) {
+          list.innerHTML = `<p class="muted">${esc(t('agent.note.empty'))}</p>`;
+          return;
+        }
+        list.innerHTML = '';
+        for (const m of msgs) {
+          const row = document.createElement('div');
+          row.className = 'result-row';
+          row.style.marginBottom = '0.5rem';
+          let bodyText = m.body_base64 || '';
+          if (Number(m.msg_type) === 3 && bodyText) {
+            try {
+              const bin = atob(bodyText);
+              const bytes = new Uint8Array(bin.length);
+              for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+              bodyText = new TextDecoder().decode(bytes);
+            } catch (_) {
+              /* keep base64 */
+            }
+          }
+          row.innerHTML = `
+            <div class="muted" style="font-size:.82rem">${esc(t('agent.note.from'))} ${esc(shortAid(m.sender || ''))} · ${esc(t('agent.note.type'))} ${esc(String(m.msg_type))}</div>
+            <div style="margin-top:.35rem;white-space:pre-wrap">${esc(bodyText)}</div>`;
+          list.appendChild(row);
+        }
+      } catch (e) {
+        list.innerHTML = `<p style="color:var(--error)">${esc(t('common.error', { msg: e.message }))}</p>`;
+      } finally {
+        setLoading(b, false);
+      }
+    };
   }
 
   mount.appendChild(frag);

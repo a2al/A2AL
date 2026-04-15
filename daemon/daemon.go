@@ -149,6 +149,7 @@ func New(cfg Config) (*Daemon, error) {
 		ICETURNURLs:      nodeCfg.ICETURNURLs,
 		ICEPublishTurns:  nodeCfg.ICEPublishTurns,
 		Logger:           log,
+		SeenPeersPath:    filepath.Join(cfg.DataDir, "seen_peers.dat"),
 	})
 	if err != nil {
 		return nil, err
@@ -181,25 +182,34 @@ func (d *Daemon) Run(ctx context.Context, mcpStdio bool) error {
 		"dht", d.cfg.ListenAddr,
 		"api", d.cfg.APIAddr,
 	)
-	runBootstrapChain(ctx, d.h, d.cfg, d.dataDir, d.log)
 
+	// Re-register persisted agents (fast, local).
 	for _, e := range d.reg.List() {
 		if err := d.h.RegisterDelegatedAgent(e.AID, e.OpPriv, e.DelegationCBOR); err != nil {
 			d.log.Warn("re-register agent", "aid", e.AID.String(), "err", err)
 		}
 	}
 
-	d.initialAutoPublish(ctx)
-	loopCtx, loopCancel := context.WithCancel(ctx)
-	defer loopCancel()
-	go d.autoPublishMainLoop(loopCtx)
+	netCtx, netCancel := context.WithCancel(ctx)
+	defer netCancel()
 
-	gwCtx, gwCancel := context.WithCancel(ctx)
-	defer gwCancel()
-	go d.gatewayAcceptLoop(gwCtx)
+	// Network init runs fully in the background: bootstrap → initial publish →
+	// republish loop. HTTP / MCP server is available immediately; DHT operations
+	// (resolve, discover, publish) will return errors or empty results until
+	// bootstrap completes, which is correct behaviour.
+	go func() {
+		runBootstrapChain(netCtx, d.h, d.cfg, d.dataDir, d.log)
+		d.initialAutoPublish(netCtx)
+		d.autoPublishMainLoop(netCtx)
+	}()
+
+	go d.gatewayAcceptLoop(netCtx)
 
 	if mcpStdio {
-		d.log.Info("a2ald MCP stdio", "dht", d.cfg.ListenAddr, "node_aid", d.nodeAddr.String())
+		d.log.Info("a2ald ready",
+			"dht", d.cfg.ListenAddr,
+			"node_aid", d.nodeAddr.String(),
+		)
 		if err := d.mcpInstance().Run(ctx, mcp.NewStdioTransport()); mcpRunErr(err) {
 			return err
 		}
@@ -229,7 +239,7 @@ func (d *Daemon) Run(ctx context.Context, mcpStdio bool) error {
 
 	<-ctx.Done()
 	d.log.Info("shutting down")
-	gwCancel()
+	netCancel()
 	shctx, scancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer scancel()
 	_ = srv.Shutdown(shctx)
