@@ -30,8 +30,11 @@ func NewTable(self a2al.NodeID, ping PingFunc) *Table {
 // Self returns the local NodeID.
 func (t *Table) Self() a2al.NodeID { return t.self }
 
-// Add inserts or refreshes a peer. Returns false if the peer is self, invalid, or rejected when the bucket is full and the LRU peer answers PING.
-func (t *Table) Add(n protocol.NodeInfo) bool {
+// Add inserts or refreshes a peer. Returns false if the peer is self, invalid, or
+// rejected when the bucket is full and the LRU peer answers PING.
+// trusted must be true when the NodeInfo originates from direct communication
+// (see bucket.addOrTouch for semantics).
+func (t *Table) Add(n protocol.NodeInfo, trusted bool) bool {
 	if len(n.NodeID) != len(t.self) {
 		return false
 	}
@@ -44,7 +47,7 @@ func (t *Table) Add(n protocol.NodeInfo) bool {
 	if bi < 0 {
 		return false
 	}
-	return t.b[bi].addOrTouch(cloneNodeInfo(n), t.ping)
+	return t.b[bi].addOrTouch(cloneNodeInfo(n), t.ping, trusted)
 }
 
 func cloneNodeInfo(n protocol.NodeInfo) protocol.NodeInfo {
@@ -174,6 +177,26 @@ type PeerDebugRow struct {
 	NodeIDHex     string `json:"node_id_hex"`
 	IP            string `json:"ip"`
 	Port          uint16 `json:"port"`
+}
+
+// EstimatedNetworkSize estimates the total number of nodes in the network using
+// bucket density. For a bucket at CPL c with m nodes the estimate is m×2^(c+1).
+// Returns the estimate from the highest non-empty bucket (least noisy); 0 if the
+// table is empty.
+func (t *Table) EstimatedNetworkSize() int {
+	for c := len(t.b) - 1; c >= 0; c-- {
+		m := len(t.b[c].nodes)
+		if m == 0 {
+			continue
+		}
+		// 2^(c+1) via bit-shift, capped to avoid overflow for c≥62.
+		shift := c + 1
+		if shift >= 62 {
+			shift = 62
+		}
+		return m * (1 << shift)
+	}
+	return 0
 }
 
 // DebugPeerRows returns a flat list of peers with bucket index and XOR distance to local self (read-only snapshot; caller must serialize table access if concurrent).

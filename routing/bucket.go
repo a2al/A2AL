@@ -27,7 +27,11 @@ func (b *bucket) indexByID(id a2al.NodeID) int {
 
 // addOrTouch returns whether the node is present after the operation (new or touched).
 // If the bucket is full and LRU answers PING, the new node is dropped.
-func (b *bucket) addOrTouch(n protocol.NodeInfo, ping PingFunc) bool {
+// trusted must be true when the NodeInfo comes from direct communication with the
+// peer (observed UDP source address); in that case the stored IP:Port is refreshed
+// to the latest value.  Pass false for third-party NodeInfos received via FindNode
+// responses to avoid overwriting a directly-observed address with stale data.
+func (b *bucket) addOrTouch(n protocol.NodeInfo, ping PingFunc, trusted bool) bool {
 	var nid a2al.NodeID
 	if len(n.NodeID) != len(nid) {
 		return false
@@ -35,6 +39,10 @@ func (b *bucket) addOrTouch(n protocol.NodeInfo, ping PingFunc) bool {
 	copy(nid[:], n.NodeID)
 
 	if i := b.indexByID(nid); i >= 0 {
+		if trusted && len(n.IP) > 0 && n.Port != 0 {
+			b.nodes[i].IP = append([]byte(nil), n.IP...)
+			b.nodes[i].Port = n.Port
+		}
 		b.touch(i)
 		return true
 	}

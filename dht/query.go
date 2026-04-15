@@ -8,7 +8,6 @@ import (
 	"errors"
 	"net"
 	"sort"
-	"sync"
 	"time"
 
 	"github.com/a2al/a2al"
@@ -17,13 +16,19 @@ import (
 )
 
 const (
-	DefaultAlpha   = 3
-	DefaultStagger = 5 * time.Millisecond
+	DefaultAlpha = 3
+
+	// DefaultStagger is the inter-launch delay between successive RPCs within
+	// a single query batch (spec §3.2 "交错发射").  A peer that responds
+	// within this window prevents the next candidate from being contacted,
+	// saving bandwidth and avoiding unnecessary pressure on slow peers.
+	// Phase 1 fixed value; future versions derive from RTT median × 0.5.
+	DefaultStagger = 200 * time.Millisecond
 
 	// queryPeerTimeout is the per-peer deadline inside iterative queries.
-	// Shorter than sendAndWait's full 3×5 s = 15 s to avoid slow peers blocking
-	// entire query batches; allows one attempt with margin.
-	queryPeerTimeout = 6 * time.Second
+	// UDP responses from reachable peers typically arrive in <200ms even across
+	// continents. 2s gives 10× margin.
+	queryPeerTimeout = 2 * time.Second
 )
 
 // Query runs iterative FIND_NODE / FIND_VALUE (spec Step 8).
@@ -86,6 +91,10 @@ func (q *Query) stagger() time.Duration {
 }
 
 // FindNode runs iterative FIND_NODE until k-closest known nodes are exhausted or all have been queried.
+// Candidates are seeded from tabNearestHealthy (Good peers first).  Within each
+// batch, peers known to be Bad are skipped (tried last as fallback).  The
+// collection loop returns as soon as the first peer responds, allowing the
+// next round to start without waiting for slow/unreachable peers.
 func (q *Query) FindNode(ctx context.Context, target a2al.NodeID) ([]protocol.NodeInfo, error) {
 	if q.n == nil {
 		return nil, errors.New("dht: nil node")
@@ -96,7 +105,7 @@ func (q *Query) FindNode(ctx context.Context, target a2al.NodeID) ([]protocol.No
 	candidates := make(map[string]protocol.NodeInfo)
 	queried := make(map[string]struct{})
 
-	for _, ni := range q.n.tabNearest(target, routing.K) {
+	for _, ni := range q.n.tabNearestHealthy(target, routing.K) {
 		if k := infoKey(ni); k != "" {
 			candidates[k] = cloneNI(ni)
 		}
@@ -127,43 +136,13 @@ func (q *Query) FindNode(ctx context.Context, target a2al.NodeID) ([]protocol.No
 			break
 		}
 
-		var batch []protocol.NodeInfo
-		for _, ni := range kClosest {
-			if len(batch) >= alpha {
-				break
-			}
-			key := infoKey(ni)
-			if key == "" {
-				continue
-			}
-			if _, ok := queried[key]; ok {
-				continue
-			}
-			var peerID a2al.NodeID
-			copy(peerID[:], ni.NodeID)
-			if peerID == q.n.nid {
-				queried[key] = struct{}{}
-				continue
-			}
-			addr, ok := q.n.lookupPeer(peerID)
-			if !ok {
-				continue
-			}
-			if q.n.isHairpinAddr(addr) {
-				queried[key] = struct{}{} // treat as done, won't respond
-				continue
-			}
-			batch = append(batch, ni)
-		}
+		batch := q.buildBatch(kClosest, queried, alpha)
 		if len(batch) == 0 {
 			break
 		}
 
-		type res struct {
-			nodes []protocol.NodeInfo
-		}
-		ch := make(chan res, len(batch))
-		var wg sync.WaitGroup
+		// Launch with stagger; ch is buffered so goroutines never block.
+		ch := make(chan []protocol.NodeInfo, len(batch))
 		for i := range batch {
 			ni := batch[i]
 			key := infoKey(ni)
@@ -172,17 +151,14 @@ func (q *Query) FindNode(ctx context.Context, target a2al.NodeID) ([]protocol.No
 			copy(peerID[:], ni.NodeID)
 			addr, _ := q.n.lookupPeer(peerID)
 			d := time.Duration(i) * stagger
-			wg.Add(1)
 			go func(addr net.Addr, delay time.Duration) {
-				defer wg.Done()
 				if delay > 0 {
 					t := time.NewTimer(delay)
 					select {
 					case <-t.C:
 					case <-ctx.Done():
-						if !t.Stop() {
-							<-t.C
-						}
+						t.Stop()
+						ch <- nil
 						return
 					}
 				}
@@ -190,24 +166,29 @@ func (q *Query) FindNode(ctx context.Context, target a2al.NodeID) ([]protocol.No
 				defer peerCancel()
 				nodes, err := q.n.FindNode(peerCtx, addr, target)
 				if err != nil {
-					ch <- res{}
+					ch <- nil
 					return
 				}
-				ch <- res{nodes: nodes}
+				ch <- nodes
 			}(addr, d)
 		}
-		go func() {
-			wg.Wait()
-			close(ch)
-		}()
-		for r := range ch {
-			for _, x := range r.nodes {
+
+		// Collect responses; advance to next round on first successful response.
+		received := 0
+		for received < len(batch) {
+			nodes := <-ch
+			received++
+			for _, x := range nodes {
 				k := infoKey(x)
 				if k == "" {
 					continue
 				}
 				candidates[k] = cloneNI(x)
 				q.n.absorbNodeInfo(x)
+			}
+			if len(nodes) > 0 {
+				// Got a real response; remaining goroutines drain into buffered ch.
+				break
 			}
 		}
 	}
@@ -217,6 +198,51 @@ func (q *Query) FindNode(ctx context.Context, target a2al.NodeID) ([]protocol.No
 		out = out[:routing.K]
 	}
 	return out, nil
+}
+
+// buildBatch selects up to alpha unqueried candidates, preferring non-Bad peers.
+// If only Bad peers remain, they are included as a fallback.
+func (q *Query) buildBatch(kClosest []protocol.NodeInfo, queried map[string]struct{}, alpha int) []protocol.NodeInfo {
+	var batch []protocol.NodeInfo
+	var badFallback []protocol.NodeInfo
+	for _, ni := range kClosest {
+		key := infoKey(ni)
+		if key == "" {
+			continue
+		}
+		if _, ok := queried[key]; ok {
+			continue
+		}
+		var peerID a2al.NodeID
+		copy(peerID[:], ni.NodeID)
+		if peerID == q.n.nid {
+			queried[key] = struct{}{}
+			continue
+		}
+		addr, ok := q.n.lookupPeer(peerID)
+		if !ok {
+			continue
+		}
+		if q.n.isHairpinAddr(addr) {
+			queried[key] = struct{}{}
+			continue
+		}
+		if q.n.PeerHealthOf(peerID) == PeerHealthBad {
+			if len(badFallback) < alpha {
+				badFallback = append(badFallback, ni)
+			}
+			continue
+		}
+		batch = append(batch, ni)
+		if len(batch) >= alpha {
+			break
+		}
+	}
+	// If no non-Bad candidates, use Bad as last resort.
+	if len(batch) == 0 {
+		return badFallback
+	}
+	return batch
 }
 
 // ErrNoEndpoint is returned when iterative FIND_VALUE does not yield a valid endpoint record.
@@ -282,7 +308,7 @@ func (q *Query) FindRecords(ctx context.Context, target a2al.NodeID, recType uin
 	stagger := q.stagger()
 	candidates := make(map[string]protocol.NodeInfo)
 	queried := make(map[string]struct{})
-	for _, ni := range q.n.tabNearest(target, routing.K) {
+	for _, ni := range q.n.tabNearestHealthy(target, routing.K) {
 		if k := infoKey(ni); k != "" {
 			candidates[k] = cloneNI(ni)
 		}
@@ -309,34 +335,7 @@ func (q *Query) FindRecords(ctx context.Context, target a2al.NodeID, recType uin
 		if allDone {
 			return nil, ErrNoMatchingRecords
 		}
-		var batch []protocol.NodeInfo
-		for _, ni := range kClosest {
-			if len(batch) >= alpha {
-				break
-			}
-			key := infoKey(ni)
-			if key == "" {
-				continue
-			}
-			if _, ok := queried[key]; ok {
-				continue
-			}
-			var peerID a2al.NodeID
-			copy(peerID[:], ni.NodeID)
-			if peerID == q.n.nid {
-				queried[key] = struct{}{}
-				continue
-			}
-			addr, ok := q.n.lookupPeer(peerID)
-			if !ok {
-				continue
-			}
-			if q.n.isHairpinAddr(addr) {
-				queried[key] = struct{}{}
-				continue
-			}
-			batch = append(batch, ni)
-		}
+		batch := q.buildBatch(kClosest, queried, alpha)
 		if len(batch) == 0 {
 			return nil, ErrNoMatchingRecords
 		}
@@ -345,7 +344,6 @@ func (q *Query) FindRecords(ctx context.Context, target a2al.NodeID, recType uin
 			nodes []protocol.NodeInfo
 		}
 		ch := make(chan fvRes, len(batch))
-		var wg sync.WaitGroup
 		for i := range batch {
 			ni := batch[i]
 			key := infoKey(ni)
@@ -354,17 +352,14 @@ func (q *Query) FindRecords(ctx context.Context, target a2al.NodeID, recType uin
 			copy(peerID[:], ni.NodeID)
 			addr, _ := q.n.lookupPeer(peerID)
 			d := time.Duration(i) * stagger
-			wg.Add(1)
 			go func(addr net.Addr, delay time.Duration) {
-				defer wg.Done()
 				if delay > 0 {
 					t := time.NewTimer(delay)
 					select {
 					case <-t.C:
 					case <-ctx.Done():
-						if !t.Stop() {
-							<-t.C
-						}
+						t.Stop()
+						ch <- fvRes{}
 						return
 					}
 				}
@@ -378,12 +373,9 @@ func (q *Query) FindRecords(ctx context.Context, target a2al.NodeID, recType uin
 				ch <- fvRes{recs: recs, nodes: nodes}
 			}(addr, d)
 		}
-		go func() {
-			wg.Wait()
-			close(ch)
-		}()
 		var batchMerged []protocol.SignedRecord
-		for r := range ch {
+		for received := 0; received < len(batch); received++ {
+			r := <-ch
 			now := time.Now()
 			batchMerged = append(batchMerged, filterRecordsAuth(q.n, target, r.recs, now)...)
 			for _, x := range r.nodes {
@@ -395,7 +387,8 @@ func (q *Query) FindRecords(ctx context.Context, target a2al.NodeID, recType uin
 				q.n.absorbNodeInfo(x)
 			}
 			if len(batchMerged) > 0 {
-				break // fast path: got records, don't block on slow peers
+				// Got records; remaining goroutines drain into buffered ch.
+				break
 			}
 		}
 		if len(batchMerged) > 0 {
@@ -405,6 +398,10 @@ func (q *Query) FindRecords(ctx context.Context, target a2al.NodeID, recType uin
 }
 
 // AggregateRecords queries until the k-closest set is exhausted, merges and deduplicates (Phase 4 Topic/Mailbox).
+// If the local store already holds valid records the network query is skipped — this fast-path is
+// correct for the common case where the querying node is itself a publisher or a replication target
+// (same a2ald, small network). Bad peers are skipped (with fallback) and a per-batch timeout
+// prevents slow stragglers from stalling the whole traversal.
 func (q *Query) AggregateRecords(ctx context.Context, target a2al.NodeID, recType uint8) ([]protocol.SignedRecord, error) {
 	if q.n == nil {
 		return nil, errors.New("dht: nil node")
@@ -412,11 +409,20 @@ func (q *Query) AggregateRecords(ctx context.Context, target a2al.NodeID, recTyp
 	merged := make(map[string]protocol.SignedRecord)
 	now := time.Now()
 	mergeAggregate(merged, filterRecordsAuth(q.n, target, q.n.store.GetAll(target, recType, now), now))
+	// Fast path: local store already has results — return immediately without
+	// querying the network. Same rationale as FindRecords local-first shortcut.
+	if len(merged) > 0 {
+		out := make([]protocol.SignedRecord, 0, len(merged))
+		for _, r := range merged {
+			out = append(out, r)
+		}
+		return out, nil
+	}
 	alpha := q.alpha()
 	stagger := q.stagger()
 	candidates := make(map[string]protocol.NodeInfo)
 	queried := make(map[string]struct{})
-	for _, ni := range q.n.tabNearest(target, routing.K) {
+	for _, ni := range q.n.tabNearestHealthy(target, routing.K) {
 		if k := infoKey(ni); k != "" {
 			candidates[k] = cloneNI(ni)
 		}
@@ -443,34 +449,7 @@ func (q *Query) AggregateRecords(ctx context.Context, target a2al.NodeID, recTyp
 		if allDone {
 			break
 		}
-		var batch []protocol.NodeInfo
-		for _, ni := range kClosest {
-			if len(batch) >= alpha {
-				break
-			}
-			key := infoKey(ni)
-			if key == "" {
-				continue
-			}
-			if _, ok := queried[key]; ok {
-				continue
-			}
-			var peerID a2al.NodeID
-			copy(peerID[:], ni.NodeID)
-			if peerID == q.n.nid {
-				queried[key] = struct{}{}
-				continue
-			}
-			addr, ok := q.n.lookupPeer(peerID)
-			if !ok {
-				continue
-			}
-			if q.n.isHairpinAddr(addr) {
-				queried[key] = struct{}{}
-				continue
-			}
-			batch = append(batch, ni)
-		}
+		batch := q.buildBatch(kClosest, queried, alpha)
 		if len(batch) == 0 {
 			break
 		}
@@ -479,7 +458,6 @@ func (q *Query) AggregateRecords(ctx context.Context, target a2al.NodeID, recTyp
 			nodes []protocol.NodeInfo
 		}
 		ch := make(chan fvRes, len(batch))
-		var wg sync.WaitGroup
 		for i := range batch {
 			ni := batch[i]
 			key := infoKey(ni)
@@ -488,17 +466,14 @@ func (q *Query) AggregateRecords(ctx context.Context, target a2al.NodeID, recTyp
 			copy(peerID[:], ni.NodeID)
 			addr, _ := q.n.lookupPeer(peerID)
 			d := time.Duration(i) * stagger
-			wg.Add(1)
 			go func(addr net.Addr, delay time.Duration) {
-				defer wg.Done()
 				if delay > 0 {
 					t := time.NewTimer(delay)
 					select {
 					case <-t.C:
 					case <-ctx.Done():
-						if !t.Stop() {
-							<-t.C
-						}
+						t.Stop()
+						ch <- fvRes{}
 						return
 					}
 				}
@@ -512,19 +487,14 @@ func (q *Query) AggregateRecords(ctx context.Context, target a2al.NodeID, recTyp
 				ch <- fvRes{recs: recs, nodes: nodes}
 			}(addr, d)
 		}
-		go func() {
-			wg.Wait()
-			close(ch)
-		}()
-		batchTimer := time.NewTimer(queryPeerTimeout + 500*time.Millisecond)
+		// Per-batch timeout: last stagger delay + queryPeerTimeout.
+		batchDeadline := time.Duration(len(batch)-1)*stagger + queryPeerTimeout
+		batchTimer := time.NewTimer(batchDeadline)
 		received := 0
 	batchLoop:
 		for received < len(batch) {
 			select {
-			case r, ok := <-ch:
-				if !ok {
-					break batchLoop
-				}
+			case r := <-ch:
 				now := time.Now()
 				mergeAggregate(merged, filterRecordsAuth(q.n, target, r.recs, now))
 				for _, x := range r.nodes {
