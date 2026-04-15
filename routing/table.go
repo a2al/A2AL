@@ -30,8 +30,11 @@ func NewTable(self a2al.NodeID, ping PingFunc) *Table {
 // Self returns the local NodeID.
 func (t *Table) Self() a2al.NodeID { return t.self }
 
-// Add inserts or refreshes a peer. Returns false if the peer is self, invalid, or rejected when the bucket is full and the LRU peer answers PING.
-func (t *Table) Add(n protocol.NodeInfo) bool {
+// Add inserts or refreshes a peer. Returns false if the peer is self, invalid, or
+// rejected when the bucket is full and the LRU peer answers PING.
+// trusted must be true when the NodeInfo originates from direct communication
+// (see bucket.addOrTouch for semantics).
+func (t *Table) Add(n protocol.NodeInfo, trusted bool) bool {
 	if len(n.NodeID) != len(t.self) {
 		return false
 	}
@@ -44,7 +47,7 @@ func (t *Table) Add(n protocol.NodeInfo) bool {
 	if bi < 0 {
 		return false
 	}
-	return t.b[bi].addOrTouch(cloneNodeInfo(n), t.ping)
+	return t.b[bi].addOrTouch(cloneNodeInfo(n), t.ping, trusted)
 }
 
 func cloneNodeInfo(n protocol.NodeInfo) protocol.NodeInfo {

@@ -110,6 +110,11 @@ type Node struct {
 
 	healthMu sync.RWMutex
 	health   map[string]*peerHealthEntry // key: nodeIDKey(id)
+
+	repMu         sync.RWMutex
+	repSets       map[repKey]*repSet    // (storeKey, publisher) → replication tracking
+	replCh        chan replTask         // 过程一 → 过程二: replication work items
+	renewInFlight map[repKey]struct{}   // keys with a renewBackground goroutine running
 }
 
 type waitEntry struct {
@@ -137,17 +142,20 @@ func NewNode(cfg Config) (*Node, error) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	n := &Node{
-		tr:     cfg.Transport,
-		ks:     cfg.Keystore,
-		addr:   addr,
-		nid:    nid,
-		store:  NewStore(cfg.RecordAuth, cfg.MaxStoreKeys),
-		ctx:    ctx,
-		cancel: cancel,
+		tr:             cfg.Transport,
+		ks:             cfg.Keystore,
+		addr:           addr,
+		nid:            nid,
+		store:          NewStore(cfg.RecordAuth, cfg.MaxStoreKeys),
+		ctx:            ctx,
+		cancel:         cancel,
 		log:            logger,
 		wait:           make(map[string]*waitEntry),
 		peers:          make(map[string]net.Addr),
 		health:         make(map[string]*peerHealthEntry),
+		repSets:        make(map[repKey]*repSet),
+		replCh:         make(chan replTask, replChBuf),
+		renewInFlight:  make(map[repKey]struct{}),
 		onObservedAddr: cfg.OnObservedAddr,
 		auth:           cfg.RecordAuth,
 	}
@@ -159,7 +167,7 @@ func NewNode(cfg Config) (*Node, error) {
 	return n, nil
 }
 
-// Start begins the inbound packet loop.
+// Start begins the inbound packet loop and background maintenance workers.
 func (n *Node) Start() {
 	n.recvOnce.Do(func() {
 		n.wg.Add(1)
@@ -167,6 +175,7 @@ func (n *Node) Start() {
 		if n.seenPeersPath != "" {
 			n.startSeenPeersFlusher()
 		}
+		n.startReplicationWorkers()
 	})
 }
 
@@ -250,10 +259,14 @@ func (n *Node) remember(from net.Addr, dec *protocol.DecodedMessage) {
 	n.peers[nodeIDKey(id)] = from
 	n.peerMu.Unlock()
 	n.addrToID.Store(from.String(), id)
-	n.tabAdd(nodeInfoFromMessage(dec, from))
+	n.tabAdd(nodeInfoFromMessage(dec, from), true)
 }
 
-func (n *Node) tabAdd(ni protocol.NodeInfo) {
+// tabAdd inserts or refreshes ni in the routing table.  trusted must be true
+// when ni originates from direct communication with the peer (observed UDP
+// source address), so the stored IP:Port can be updated to the latest value.
+// Pass false for NodeInfos received indirectly via FindNode responses.
+func (n *Node) tabAdd(ni protocol.NodeInfo, trusted bool) {
 	var nid a2al.NodeID
 	if len(ni.NodeID) != len(nid) {
 		return
@@ -263,12 +276,12 @@ func (n *Node) tabAdd(ni protocol.NodeInfo) {
 
 	n.tabMu.Lock()
 	if n.table.Contains(nid) {
-		n.table.Add(ni)
+		n.table.Add(ni, trusted)
 		n.tabMu.Unlock()
 		return
 	}
 	if n.table.PeerBucketLen(nid) < routing.K {
-		n.table.Add(ni)
+		n.table.Add(ni, trusted)
 		n.tabMu.Unlock()
 		return
 	}
@@ -287,7 +300,7 @@ func (n *Node) tabAdd(ni protocol.NodeInfo) {
 	}
 	n.tabMu.Lock()
 	n.table.Remove(oldID)
-	n.table.Add(ni)
+	n.table.Add(ni, trusted)
 	n.tabMu.Unlock()
 }
 
@@ -422,7 +435,7 @@ func (n *Node) tabEstimatedNetworkSize() int {
 
 // absorbNodeInfo merges a contact into the routing table and, when IP:port looks usable, sets UDP dial address.
 func (n *Node) absorbNodeInfo(ni protocol.NodeInfo) {
-	n.tabAdd(ni)
+	n.tabAdd(ni, false)
 	if ni.Port == 0 || (len(ni.IP) != 4 && len(ni.IP) != 16) {
 		return
 	}
@@ -683,7 +696,7 @@ func (n *Node) PingIdentity(ctx context.Context, peer net.Addr) (*PeerIdentity, 
 	n.recordSuccess(peerNID, time.Since(t0))
 	ni := nodeInfoFromMessage(dec, peer)
 	n.BindPeerAddr(peerNID, peer)
-	n.tabAdd(ni)
+	n.tabAdd(ni, true)
 	var obs []byte
 	if len(pong.ObservedAddr) > 0 {
 		obs = append([]byte(nil), pong.ObservedAddr...)
@@ -787,7 +800,7 @@ func (n *Node) AddContact(addr net.Addr, ni protocol.NodeInfo) {
 	n.peerMu.Lock()
 	n.peers[nodeIDKey(peerID)] = addr
 	n.peerMu.Unlock()
-	n.tabAdd(ni)
+	n.tabAdd(ni, true)
 }
 
 // LocalAddr returns the underlying transport address.
