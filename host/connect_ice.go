@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"time"
 
 	"github.com/quic-go/quic-go"
 
@@ -16,6 +17,16 @@ import (
 	"github.com/a2al/a2al/protocol"
 	"github.com/a2al/a2al/signaling"
 )
+
+// noAgentRetries is the number of extra attempts after a "noagent" response.
+// A noagent reply means the callee is momentarily unregistered (e.g. reconnect
+// after keepalive gap). Two retries with a 3 s pause each cover the typical
+// 2–5 s reconnect window without significantly delaying callers in the normal
+// (non-noagent) path.
+const noAgentRetries = 2
+
+// noAgentRetryDelay is the pause between noagent retry attempts.
+const noAgentRetryDelay = 3 * time.Second
 
 // connectViaICESignal is the controlling (caller) ICE path:
 // WebSocket signaling → ICE pair selection → QUIC over ICE → agent-route.
@@ -42,8 +53,21 @@ func (h *Host) connectViaICESignal(ctx context.Context, localPriv ed25519.Privat
 		return nil, fmt.Errorf("a2al/host: ice signal url: %w", err)
 	}
 
-	urls := h.mergeICEURLs(er)
-	sess, err := runICESession(ctx, wsURL, urls, true, false)
+	urls := h.mergeICEURLs(ctx)
+	var sess *iceSession
+	for attempt := 0; attempt <= noAgentRetries; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(noAgentRetryDelay):
+			}
+		}
+		sess, err = runICESession(ctx, wsURL, urls, true, false)
+		if !errors.Is(err, ErrNoAgent) {
+			break
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -111,7 +135,7 @@ func (h *Host) AcceptICEViaSignal(ctx context.Context, localAgent, expectRemote 
 		return nil, fmt.Errorf("a2al/host: ice signal url: %w", err)
 	}
 
-	urls := h.mergeICEURLs(nil)
+	urls := h.mergeICEURLs(ctx)
 	sess, err := runICESession(ctx, wsURL, urls, false, false)
 	if err != nil {
 		return nil, err

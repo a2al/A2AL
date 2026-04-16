@@ -49,6 +49,40 @@ func defaultQUICConfig() *quic.Config {
 	}
 }
 
+// TURNCredentialType selects how TURN credentials are obtained per session.
+type TURNCredentialType int
+
+const (
+	// TURNCredentialStatic uses a fixed username and password stored in config.
+	TURNCredentialStatic TURNCredentialType = iota
+	// TURNCredentialHMAC generates time-limited credentials from a shared secret
+	// using the coturn use-auth-secret mechanism:
+	//   username = strconv.FormatInt(unix_expiry, 10) + ":" + Username
+	//   password = base64(HMAC-SHA1(Credential, username))
+	TURNCredentialHMAC
+	// TURNCredentialRESTAPI fetches short-lived credentials from an HTTP endpoint
+	// before each ICE session. The response must be JSON with "username" and
+	// "password" (or "credential") fields. Covers Twilio, Metered.ca, etc.
+	TURNCredentialRESTAPI
+)
+
+// TURNServer describes a TURN relay server and how to obtain credentials for it.
+// Credentials are resolved fresh per ICE session; they are never published to the DHT.
+type TURNServer struct {
+	// URL is the TURN server address without embedded credentials,
+	// e.g. "turn:turn.example.com:3478?transport=udp".
+	URL string
+	// CredentialType selects the credential acquisition method.
+	CredentialType TURNCredentialType
+	// Username is the static username (Static) or base username prefix (HMAC).
+	Username string
+	// Credential is the static password (Static), the HMAC shared secret (HMAC),
+	// or the Authorization header value for the REST API request (RESTAPI).
+	Credential string
+	// CredentialURL is the HTTP endpoint that returns short-lived credentials (RESTAPI only).
+	CredentialURL string
+}
+
 // Config wires DHT + QUIC.
 //
 // IPv6 note: currently Host binds udp4 sockets only. The Transport interface,
@@ -68,16 +102,27 @@ type Config struct {
 	PrivateKey       ed25519.PrivateKey
 	MinObservedPeers int
 	FallbackHost     string
-	// DisableUPnP skips IGD port mapping for the QUIC UDP port (Phase 2b). TURN is deferred.
+	// DisableUPnP skips IGD port mapping for the QUIC UDP port (Phase 2b).
 	DisableUPnP bool
 
-	// ICESignalURL is the WebSocket base URL published in endpoint records for ICE trickle (optional).
+	// ICESignalURL is the primary WebSocket base URL for ICE signaling (single URL, backward compat).
+	// Superseded by ICESignalURLs when that field is non-empty.
 	ICESignalURL string
+	// ICESignalURLs lists WebSocket base URLs for ICE signaling (multi-center support).
+	// When non-empty, supersedes ICESignalURL. The first URL is also written to
+	// EndpointPayload.Signal (CBOR key 3) for backward compatibility with old nodes.
+	ICESignalURLs []string
 	// ICESTUNURLs lists stun: URIs for ICE gathering; empty means default public STUN when no TURN is configured.
 	ICESTUNURLs []string
-	// ICETURNURLs lists turn: URIs (may include credentials) used locally for ICE relay; not published.
+	// ICETURNURLs lists turn: URIs with embedded credentials for ICE relay (legacy format).
+	// Use TURNServers for new deployments; both fields are processed when set.
 	ICETURNURLs []string
-	// ICEPublishTurns lists credential-free turn: hints stored in EndpointPayload.Turns.
+	// TURNServers lists TURN relay servers with structured credential configuration.
+	// Supports Static, HMAC (coturn use-auth-secret), and REST API credential types.
+	// Credentials are resolved per ICE session and never published to the DHT.
+	TURNServers []TURNServer
+	// ICEPublishTurns is retained for decoding old records; new nodes do not publish turns[].
+	// Deprecated: callee-pays TURN relay addresses are exchanged via trickle ICE, not the DHT.
 	ICEPublishTurns []string
 	// Logger is forwarded to the DHT node for diagnostic logging (reply failures, RPC retries).
 	// If nil, slog.Default() is used.
@@ -399,31 +444,49 @@ func (h *Host) BuildEndpointPayload(ctx context.Context) (protocol.EndpointPaylo
 	if err != nil {
 		return protocol.EndpointPayload{}, err
 	}
-	var turns []string
-	for _, t := range h.cfg.ICEPublishTurns {
-		if strings.Contains(t, "@") {
-			continue // never publish credentials to DHT (spec: "TURN凭证绝不进DHT")
-		}
-		turns = append(turns, t)
+
+	// Signal URLs: multi-center list, Signal = Signals[0] for backward compat.
+	// turns[] is intentionally not published: callee-pays TURN relay addresses are
+	// exchanged via trickle ICE during sessions, not stored in the DHT.
+	signals := h.effectiveICESignalURLs()
+	var signal string
+	if len(signals) > 0 {
+		signal = signals[0]
 	}
 	return protocol.EndpointPayload{
 		Endpoints: eps,
 		NatType:   h.sense.InferNATType(),
-		Signal:    h.effectiveICESignalBase(),
-		Turns:     turns,
+		Signal:    signal,
+		Signals:   signals,
 	}, nil
 }
 
-func (h *Host) effectiveICESignalBase() string {
+// effectiveICESignalURLs returns the ordered list of signal hub URLs to publish.
+// Priority: ICESignalURLs config > ICESignalURL config > bootstrap-derived value.
+func (h *Host) effectiveICESignalURLs() []string {
 	h.iceMu.RLock()
 	defer h.iceMu.RUnlock()
-	if h.cfg.ICESignalURL != "" {
-		return h.cfg.ICESignalURL
+	if len(h.cfg.ICESignalURLs) > 0 {
+		return h.cfg.ICESignalURLs
 	}
-	return h.derivedICESignal
+	if h.cfg.ICESignalURL != "" {
+		return []string{h.cfg.ICESignalURL}
+	}
+	if h.derivedICESignal != "" {
+		return []string{h.derivedICESignal}
+	}
+	return nil
 }
 
-// EffectiveICESignalBase returns the ICE signaling WebSocket base URL (no path)
+func (h *Host) effectiveICESignalBase() string {
+	urls := h.effectiveICESignalURLs()
+	if len(urls) > 0 {
+		return urls[0]
+	}
+	return ""
+}
+
+// EffectiveICESignalBase returns the primary ICE signaling WebSocket base URL
 // published in endpoint records: explicit config overrides bootstrap-derived value.
 func (h *Host) EffectiveICESignalBase() string {
 	return h.effectiveICESignalBase()
