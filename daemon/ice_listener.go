@@ -13,6 +13,13 @@ import (
 	"github.com/a2al/a2al/signaling"
 )
 
+// iceKeepaliveInterval is how often the daemon re-sends reg frames on an idle
+// /signal connection. Re-sending reg frames (application-layer data frames)
+// resets the server-side 60 s read deadline and traverses any intermediate
+// proxy idle timeouts (typically 90 s). 45 s satisfies both constraints with
+// comfortable margin and reduces ping frequency vs the original 30 s spec.
+const iceKeepaliveInterval = 45 * time.Second
+
 // runICEListener maintains a WebSocket subscription to /signal and spawns
 // AcceptICEViaSignal when the hub notifies this node of an inbound ICE session.
 func (d *Daemon) runICEListener(ctx context.Context) {
@@ -50,19 +57,36 @@ func (d *Daemon) runICEListener(ctx context.Context) {
 		go func() {
 			readErr <- d.readICELoop(ctx, conn)
 		}()
+		keepalive := time.NewTicker(iceKeepaliveInterval)
 	outer:
 		for {
 			select {
 			case <-ctx.Done():
+				keepalive.Stop()
 				_ = conn.CloseNow()
 				<-readErr
 				return
+			case <-keepalive.C:
+				// Re-send reg frames to keep the server-side read deadline alive
+				// and prevent intermediate proxies from closing the idle connection.
+				if err := d.sendICERegs(ctx, conn); err != nil {
+					keepalive.Stop()
+					_ = conn.CloseNow()
+					if ctx.Err() != nil {
+						<-readErr
+						return
+					}
+					d.log.Debug("ice listener keepalive", "err", err)
+					break outer
+				}
 			case <-d.iceRegNotify:
 				if err := d.sendICERegs(ctx, conn); err != nil {
+					keepalive.Stop()
 					_ = conn.CloseNow()
 					break outer
 				}
 			case err := <-readErr:
+				keepalive.Stop()
 				_ = conn.CloseNow()
 				if ctx.Err() != nil {
 					return
