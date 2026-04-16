@@ -1,0 +1,13 @@
+# Default: normalize line endings to LF on commit
+* text=auto eol=lf
+
+# Explicitly enforce LF for shell scripts and Linux deploy files
+*.sh        text eol=lf
+*.service   text eol=lf
+deploy/linux/postinst  text eol=lf
+deploy/linux/postrm    text eol=lf
+
+# Windows-native files keep CRLF
+*.bat       text eol=crlf
+*.cmd       text eol=crlf
+*.ps1       text eol=crlf

@@ -1,0 +1,108 @@
+# Example a2ald configuration
+#
+# TOML 1.0 allows # line comments and end-of-line comments (https://toml.io).
+#
+# Location: defaults to <data-dir>/config.toml (e.g. /opt/a2al/data/config.toml with the systemd package).
+# Override with: a2ald -config /path/to/config.toml
+# If missing, the daemon writes a default file on first start (no comments; key_dir may be absolute).
+
+# ---- Network / DHT (restart required after changing listen_addr, quic, bootstrap, etc.) ----
+
+# Tangled DHT (UDP) listen address.
+listen_addr = ":4121"
+
+# Empty: DHT and QUIC share one UDP port (UDPMux). Non-empty: separate QUIC bind.
+quic_listen_addr = ""
+
+# Bootstrap peer multiaddrs; empty uses built-in public bootstraps.
+bootstrap = [
+  # "/ip4/…/udp/…/quic-v1/p2p/…",
+]
+
+# Minimum observed peers (reachability-related logic).
+min_observed_peers = 3
+
+# Advertised host when no public IP is detected (empty: auto).
+fallback_host = ""
+
+# If true, disable UPnP port mapping.
+disable_upnp = false
+
+# ---- HTTP API ----
+
+# REST / Web UI listen address (loopback avoids direct exposure).
+api_addr = "127.0.0.1:2121"
+
+# If non-empty, HTTP API requires Authorization: Bearer <token>.
+api_token = ""
+
+# ---- Keys ----
+
+# Empty: use <data-dir>/keys; set to use another directory.
+key_dir = ""
+
+# ---- Logging ----
+
+# log_format: text or json
+log_format = "text"
+
+# log_level: debug / info / warn|warning / error
+log_level = "info"
+
+# ---- ICE / signaling (restart required after changing these) ----
+
+# Primary ICE signaling WebSocket (ws:// or wss://); empty: derived from node/network.
+ice_signal_url = ""
+
+# Multi-center signal hub URLs (supersedes ice_signal_url when non-empty).
+# Use 1-3 hubs from different ASes for resilience. First URL = primary.
+ice_signal_urls = [
+  # "wss://hub1.example.com",
+  # "wss://hub2.otherprovider.net",
+]
+
+# Empty with no TURN: built-in public STUN (e.g. stun.l.google.com:19302).
+ice_stun_urls = [
+  # "stun:stun.example.com:3478",
+]
+
+# Legacy TURN URLs with embedded credentials (still supported for compatibility).
+# Prefer [[turn_servers]] for new deployments.
+ice_turn_urls = [
+  # "turn:user:pass@turn.example.com:3478?transport=udp",
+]
+
+# TURN relay servers with structured credential support (callee-pays model).
+# Credentials are resolved per ICE session and never published to the DHT.
+# credential_type: "static" (default), "hmac" (coturn use-auth-secret), "rest_api"
+
+# Static credentials (any standard TURN service):
+# [[turn_servers]]
+# url = "turn:turn.example.com:3478?transport=udp"
+# username = "alice"
+# credential = "s3cr3t"
+
+# HMAC time-limited credentials (coturn with use-auth-secret):
+# [[turn_servers]]
+# url = "turn:coturn.example.com:3478"
+# credential_type = "hmac"
+# username = "a2ald"
+# credential = "hmac_shared_secret_matches_coturn_use-auth-secret"
+
+# REST API credentials (Twilio, Metered.ca, Xirsys, etc.):
+# [[turn_servers]]
+# url = "turn:global.turn.twilio.com:3478?transport=udp"
+# credential_type = "rest_api"
+# credential_url = "https://api.twilio.com/2010-04-01/Accounts/ACxxx/Tokens.json"
+# credential = "Basic base64(AccountSID:AuthToken)"
+
+# ice_publish_turns is deprecated; new nodes do not publish turns[] to the DHT.
+# (callee-pays relay addresses are exchanged via trickle ICE, not stored in DHT)
+ice_publish_turns = []
+
+# Embedded ICE signaling hub TCP listen address; empty or "off" disables (default).
+# Enable only on bootstrap/infrastructure nodes when needed, e.g. ":4121".
+signal_listen_addr = "off"
+
+# Periodically publish this node's AID to the DHT (can be toggled via PATCH /config without restart).
+auto_publish = true
