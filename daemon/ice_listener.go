@@ -67,8 +67,9 @@ func (d *Daemon) runICEListener(ctx context.Context) {
 				<-readErr
 				return
 			case <-keepalive.C:
-				// Re-send reg frames to keep the server-side read deadline alive
-				// and prevent intermediate proxies from closing the idle connection.
+				// Re-send reg frames to reset the server-side read deadline and
+				// keep intermediate proxies alive, then Ping to confirm the server
+				// is reachable (pong is processed by the concurrent Read goroutine).
 				if err := d.sendICERegs(ctx, conn); err != nil {
 					keepalive.Stop()
 					_ = conn.CloseNow()
@@ -77,6 +78,19 @@ func (d *Daemon) runICEListener(ctx context.Context) {
 						return
 					}
 					d.log.Debug("ice listener keepalive", "err", err)
+					break outer
+				}
+				pctx, pcancel := context.WithTimeout(ctx, 10*time.Second)
+				pingErr := conn.Ping(pctx)
+				pcancel()
+				if pingErr != nil {
+					keepalive.Stop()
+					_ = conn.CloseNow()
+					if ctx.Err() != nil {
+						<-readErr
+						return
+					}
+					d.log.Debug("ice listener ping", "err", pingErr)
 					break outer
 				}
 			case <-d.iceRegNotify:
@@ -134,9 +148,10 @@ func (d *Daemon) sendICERegs(ctx context.Context, conn *websocket.Conn) error {
 
 func (d *Daemon) readICELoop(ctx context.Context, conn *websocket.Conn) error {
 	for {
-		rctx, cancel := context.WithTimeout(ctx, 120*time.Second)
-		_, data, err := conn.Read(rctx)
-		cancel()
+		// No per-read deadline: keepalive sends reg frames every 45 s and Pings
+		// the server to confirm liveness. Dead connections are detected via Ping
+		// timeout rather than a read timeout, eliminating spurious reconnects.
+		_, data, err := conn.Read(ctx)
 		if err != nil {
 			return err
 		}
