@@ -20,8 +20,10 @@ const (
 	// RecTypeEndpoint is the Phase 1 endpoint advertisement (spec §7.6).
 	RecTypeEndpoint uint8 = 0x01
 
-	// MaxEndpointSignalURLLen caps EndpointPayload.Signal (WebSocket ICE signaling base URL).
+	// MaxEndpointSignalURLLen caps each URL in EndpointPayload.Signal / Signals.
 	MaxEndpointSignalURLLen = 2048
+	// MaxSignalURLs caps EndpointPayload.Signals entry count (multi-center signal URLs).
+	MaxSignalURLs = 8
 	// MaxTurnURLs caps EndpointPayload.Turns entry count (credential-free relay hints for DHT).
 	MaxTurnURLs = 16
 	// MaxTurnURLEntryLen caps each turn:// string length in Turns.
@@ -58,10 +60,15 @@ func init() {
 type EndpointPayload struct {
 	Endpoints []string `cbor:"1,keyasint"`
 	NatType   uint8    `cbor:"2,keyasint"`
-	// Signal is an optional WebSocket base URL for ICE trickle signaling (no query; room is appended by peers).
+	// Signal is the primary WebSocket base URL for ICE trickle signaling (no query; room is
+	// appended by peers). Kept for backward compatibility with nodes that only read key 3.
 	Signal string `cbor:"3,keyasint,omitempty"`
 	// Turns lists optional turn:// URLs without credentials (public relay hints).
 	Turns []string `cbor:"4,keyasint,omitempty"`
+	// Signals lists additional WebSocket base URLs for ICE signaling (multi-center).
+	// New nodes prefer this list; old nodes that only read Signal (key 3) still work.
+	// When non-empty, Signal should equal Signals[0] for maximum compatibility.
+	Signals []string `cbor:"5,keyasint,omitempty"`
 }
 
 // EndpointRecord is the decoded logical view (spec Step 4); no signature material.
@@ -71,6 +78,9 @@ type EndpointRecord struct {
 	NatType   uint8
 	Signal    string
 	Turns     []string
+	// Signals is the multi-center signal URL list from EndpointPayload.Signals (key 5).
+	// When non-empty, callers should prefer this over Signal. Signal is kept for compat.
+	Signals   []string
 	Timestamp uint64
 	Seq       uint64
 	TTL       uint32
@@ -243,6 +253,14 @@ func VerifySignedRecord(sr SignedRecord, now time.Time) error {
 				return fmt.Errorf("%w: turn url length", ErrInvalidRecord)
 			}
 		}
+		if len(ep.Signals) > MaxSignalURLs {
+			return fmt.Errorf("%w: signals count", ErrInvalidRecord)
+		}
+		for _, u := range ep.Signals {
+			if len(u) > MaxEndpointSignalURLLen {
+				return fmt.Errorf("%w: signals url length", ErrInvalidRecord)
+			}
+		}
 	}
 	if sr.RecType == RecTypeTopic {
 		if len(sr.Payload) > MaxTopicPayloadCBOR {
@@ -277,12 +295,14 @@ func ParseEndpointRecord(sr SignedRecord) (EndpointRecord, error) {
 	var addr a2al.Address
 	copy(addr[:], sr.Address)
 	turns := append([]string(nil), ep.Turns...)
+	signals := append([]string(nil), ep.Signals...)
 	return EndpointRecord{
 		Address:   addr,
 		Endpoints: ep.Endpoints,
 		NatType:   ep.NatType,
 		Signal:    ep.Signal,
 		Turns:     turns,
+		Signals:   signals,
 		Timestamp: sr.Timestamp,
 		Seq:       sr.Seq,
 		TTL:       sr.TTL,
