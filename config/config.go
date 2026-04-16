@@ -15,6 +15,18 @@ import (
 	"github.com/pelletier/go-toml/v2"
 )
 
+// TURNServerConfig is the TOML/JSON-serializable form of a TURN relay server.
+// CredentialType selects the credential method: "static" (default), "hmac", or "rest_api".
+type TURNServerConfig struct {
+	URL            string `toml:"url" json:"url"`
+	CredentialType string `toml:"credential_type" json:"credential_type"`
+	Username       string `toml:"username" json:"username"`
+	// Credential is the static password (static), HMAC shared secret (hmac),
+	// or Authorization header value for the REST API call (rest_api).
+	Credential    string `toml:"credential" json:"credential"`
+	CredentialURL string `toml:"credential_url" json:"credential_url"`
+}
+
 // Config is the a2ald configuration (spec Phase 3).
 type Config struct {
 	ListenAddr       string   `toml:"listen_addr" json:"listen_addr"`
@@ -29,9 +41,15 @@ type Config struct {
 	LogFormat        string   `toml:"log_format" json:"log_format"`
 	LogLevel         string   `toml:"log_level" json:"log_level"`
 
-	ICESignalURL    string   `toml:"ice_signal_url" json:"ice_signal_url"`
-	ICESTUNURLs     []string `toml:"ice_stun_urls" json:"ice_stun_urls"`
-	ICETURNURLs     []string `toml:"ice_turn_urls" json:"ice_turn_urls"`
+	ICESignalURL  string   `toml:"ice_signal_url" json:"ice_signal_url"`
+	ICESignalURLs []string `toml:"ice_signal_urls" json:"ice_signal_urls"`
+	ICESTUNURLs   []string `toml:"ice_stun_urls" json:"ice_stun_urls"`
+	// ICETURNURLs is the legacy TURN URL list with embedded credentials (user:pass@host).
+	// Use TURNServers for new deployments.
+	ICETURNURLs []string `toml:"ice_turn_urls" json:"ice_turn_urls"`
+	// TURNServers lists TURN relay servers with structured credential configuration.
+	TURNServers []TURNServerConfig `toml:"turn_servers" json:"turn_servers"`
+	// ICEPublishTurns is deprecated; new nodes do not publish turns[] to the DHT.
 	ICEPublishTurns []string `toml:"ice_publish_turns" json:"ice_publish_turns"`
 	// SignalListenAddr is the TCP listen address for the embedded ICE signaling hub.
 	// Empty or "off" disables the hub (default). Only enable on bootstrap/infrastructure nodes.
@@ -80,6 +98,32 @@ func (c *Config) Validate() error {
 		}
 		if u.Scheme != "ws" && u.Scheme != "wss" {
 			return fmt.Errorf("config: ice_signal_url must use ws:// or wss:// scheme")
+		}
+	}
+	for i, su := range c.ICESignalURLs {
+		u, err := url.Parse(su)
+		if err != nil {
+			return fmt.Errorf("config: invalid ice_signal_urls[%d]: %v", i, err)
+		}
+		if u.Scheme != "ws" && u.Scheme != "wss" {
+			return fmt.Errorf("config: ice_signal_urls[%d] must use ws:// or wss:// scheme", i)
+		}
+	}
+	for i, ts := range c.TURNServers {
+		if ts.URL == "" {
+			return fmt.Errorf("config: turn_servers[%d]: url required", i)
+		}
+		if strings.Contains(ts.URL, "@") {
+			return fmt.Errorf("config: turn_servers[%d]: url must not contain credentials (use username/credential fields)", i)
+		}
+		switch ts.CredentialType {
+		case "", "static", "hmac":
+		case "rest_api":
+			if ts.CredentialURL == "" {
+				return fmt.Errorf("config: turn_servers[%d]: credential_url required for rest_api", i)
+			}
+		default:
+			return fmt.Errorf("config: turn_servers[%d]: credential_type must be static, hmac, or rest_api", i)
 		}
 	}
 	if s := strings.TrimSpace(c.SignalListenAddr); s != "" && !strings.EqualFold(s, "off") {
@@ -178,6 +222,6 @@ func ApplyEnv(c *Config) {
 var RestartRequiredKeys = []string{
 	"listen_addr", "quic_listen_addr", "bootstrap", "api_addr", "key_dir",
 	"disable_upnp", "fallback_host", "min_observed_peers",
-	"ice_signal_url", "ice_stun_urls", "ice_turn_urls", "ice_publish_turns",
-	"signal_listen_addr",
+	"ice_signal_url", "ice_signal_urls", "ice_stun_urls", "ice_turn_urls",
+	"turn_servers", "ice_publish_turns", "signal_listen_addr",
 }

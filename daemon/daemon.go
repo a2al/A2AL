@@ -148,8 +148,10 @@ func New(cfg Config) (*Daemon, error) {
 		FallbackHost:     nodeCfg.FallbackHost,
 		DisableUPnP:      nodeCfg.DisableUPnP,
 		ICESignalURL:     nodeCfg.ICESignalURL,
+		ICESignalURLs:    nodeCfg.ICESignalURLs,
 		ICESTUNURLs:      nodeCfg.ICESTUNURLs,
 		ICETURNURLs:      nodeCfg.ICETURNURLs,
+		TURNServers:      toHostTURNServers(nodeCfg.TURNServers),
 		ICEPublishTurns:  nodeCfg.ICEPublishTurns,
 		Logger:           log,
 		SeenPeersPath:    filepath.Join(cfg.DataDir, "seen_peers.dat"),
@@ -171,6 +173,30 @@ func New(cfg Config) (*Daemon, error) {
 		mailboxSeen:      make(map[string]map[string]time.Time),
 		iceRegNotify:     make(chan struct{}, 1),
 	}, nil
+}
+
+// toHostTURNServers converts config.TURNServerConfig slice to host.TURNServer slice,
+// mapping the string credential_type field to the typed host constant.
+func toHostTURNServers(cfgs []config.TURNServerConfig) []host.TURNServer {
+	out := make([]host.TURNServer, 0, len(cfgs))
+	for _, c := range cfgs {
+		ts := host.TURNServer{
+			URL:           c.URL,
+			Username:      c.Username,
+			Credential:    c.Credential,
+			CredentialURL: c.CredentialURL,
+		}
+		switch c.CredentialType {
+		case "hmac":
+			ts.CredentialType = host.TURNCredentialHMAC
+		case "rest_api":
+			ts.CredentialType = host.TURNCredentialRESTAPI
+		default: // "static" or empty
+			ts.CredentialType = host.TURNCredentialStatic
+		}
+		out = append(out, ts)
+	}
+	return out
 }
 
 // Run starts the daemon and blocks until ctx is cancelled. It saves the peers
