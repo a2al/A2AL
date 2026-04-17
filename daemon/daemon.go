@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/a2al/a2al"
@@ -74,6 +75,7 @@ type Daemon struct {
 	heartbeatAt map[a2al.Address]time.Time
 
 	iceRegNotify chan struct{} // ICE /signal registration refresh (buffered)
+	gatewayConns atomic.Int64  // active gateway QUIC conns (direct + ICE)
 
 	netMu                sync.Mutex
 	netStableFP          string

@@ -22,7 +22,6 @@ const (
 )
 
 func (d *Daemon) gatewayAcceptLoop(ctx context.Context) {
-	var active atomic.Int64
 	for {
 		ac, err := d.h.Accept(ctx)
 		if err != nil {
@@ -32,17 +31,32 @@ func (d *Daemon) gatewayAcceptLoop(ctx context.Context) {
 			d.log.Debug("accept", "err", err)
 			continue
 		}
-		if active.Load() >= maxGatewayConns {
+		if !d.tryAcquireGatewayConn() {
 			d.log.Warn("gateway: max connections reached", "limit", maxGatewayConns)
 			_ = ac.CloseWithError(1, "too many connections")
 			continue
 		}
-		active.Add(1)
 		go func() {
-			defer active.Add(-1)
+			defer d.releaseGatewayConn()
 			d.serveGatewayConn(ctx, ac)
 		}()
 	}
+}
+
+func (d *Daemon) tryAcquireGatewayConn() bool {
+	for {
+		cur := d.gatewayConns.Load()
+		if cur >= maxGatewayConns {
+			return false
+		}
+		if d.gatewayConns.CompareAndSwap(cur, cur+1) {
+			return true
+		}
+	}
+}
+
+func (d *Daemon) releaseGatewayConn() {
+	d.gatewayConns.Add(-1)
 }
 
 func (d *Daemon) serveGatewayConn(ctx context.Context, ac *host.AgentConn) {

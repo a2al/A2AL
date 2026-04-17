@@ -147,14 +147,10 @@ func quicServerTLSWithSNI(fallbackCert tls.Certificate, getCert func(sni string)
 	}
 }
 
-// quicClientTLS returns a TLS config for dialing a specific remote agent.
-// The client presents its own self-signed certificate (mutual TLS) and
-// verifies the server's certificate matches expectRemote.
-func quicClientTLS(priv ed25519.PrivateKey, expectRemote a2al.Address) (*tls.Config, error) {
-	cert, err := selfSignedEd25519Cert(priv)
-	if err != nil {
-		return nil, err
-	}
+// quicClientTLSWithCert returns a TLS config for dialing a specific remote agent.
+// The client presents the provided certificate (mutual TLS) and verifies the
+// server's certificate matches expectRemote.
+func quicClientTLSWithCert(cert tls.Certificate, expectRemote a2al.Address) (*tls.Config, error) {
 	return &tls.Config{
 		Certificates:       []tls.Certificate{cert},
 		ServerName:         expectRemote.String(),
