@@ -13,6 +13,8 @@ const (
 	MsgFindValueResp  uint8 = 0x06
 	MsgStore          uint8 = 0x07
 	MsgStoreResp      uint8 = 0x08
+	MsgNATProbeReq    uint8 = 0x09 // NAT probe request: ask peer to echo to our claimed address
+	MsgNATProbeEcho   uint8 = 0x0A // NAT probe echo: sent by responder directly to claimed address
 )
 
 // ProtocolVersion is the wire protocol version (spec §7.3).
@@ -89,4 +91,17 @@ type BodyStore struct {
 
 type BodyStoreResp struct {
 	Stored bool `cbor:"1,keyasint"`
+}
+
+// BodyNATProbeReq asks the receiver to send a NATProbeEcho directly to ClaimedAddr.
+// Token (8 bytes) correlates the echo back to the requester's wait channel.
+type BodyNATProbeReq struct {
+	Token       []byte `cbor:"1,keyasint"` // 8-byte random nonce
+	ClaimedAddr []byte `cbor:"2,keyasint"` // wire-encoded UDP address (6 or 18 bytes)
+}
+
+// BodyNATProbeEcho is sent by the responder directly to the requester's claimed address.
+// Token echoes the nonce from the corresponding BodyNATProbeReq.
+type BodyNATProbeEcho struct {
+	Token []byte `cbor:"1,keyasint"` // 8-byte nonce echoed from BodyNATProbeReq
 }

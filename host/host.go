@@ -42,10 +42,10 @@ import (
 
 func defaultQUICConfig() *quic.Config {
 	return &quic.Config{
-		HandshakeIdleTimeout:    10 * time.Second,
-		MaxIdleTimeout:          90 * time.Second,
-		MaxIncomingStreams:       100,
-		MaxIncomingUniStreams:    10,
+		HandshakeIdleTimeout:  10 * time.Second,
+		MaxIdleTimeout:        90 * time.Second,
+		MaxIncomingStreams:    100,
+		MaxIncomingUniStreams: 10,
 	}
 }
 
@@ -98,7 +98,7 @@ type Config struct {
 	ListenAddr string
 	// QUICListenAddr, if non-empty, is a separate UDP bind for QUIC.
 	// Same udp4 constraint as ListenAddr.
-	QUICListenAddr string
+	QUICListenAddr   string
 	PrivateKey       ed25519.PrivateKey
 	MinObservedPeers int
 	FallbackHost     string
@@ -182,6 +182,8 @@ type Host struct {
 
 	signalStatsMu sync.RWMutex
 	signalStats   func() map[string]any
+
+	natProbeMu sync.Mutex // guards RunNATProbe (only one probe at a time)
 }
 
 // New creates a Host with one initial agent identity from cfg.KeyStore.
@@ -384,9 +386,9 @@ func (h *Host) RegisteredAgents() []a2al.Address {
 	return out
 }
 
-func (h *Host) Node() *dht.Node            { return h.node }
-func (h *Host) Sense() *natsense.Sense      { return h.sense }
-func (h *Host) Address() a2al.Address        { return h.addr }
+func (h *Host) Node() *dht.Node        { return h.node }
+func (h *Host) Sense() *natsense.Sense { return h.sense }
+func (h *Host) Address() a2al.Address  { return h.addr }
 
 func (h *Host) DHTLocalAddr() *net.UDPAddr {
 	return h.node.LocalAddr().(*net.UDPAddr)
@@ -413,6 +415,116 @@ func (h *Host) ObserveFromPeers(ctx context.Context, seeds []net.Addr) {
 		}()
 	}
 	wg.Wait()
+}
+
+// ObserveFromRouting samples current routing-table candidates and performs
+// passive observed_addr collection from them.
+func (h *Host) ObserveFromRouting(ctx context.Context, n int) int {
+	if n <= 0 {
+		n = 8
+	}
+	seeds := h.node.BootstrapCandidateAddrs(n)
+	if len(seeds) == 0 {
+		return 0
+	}
+	h.ObserveFromPeers(ctx, seeds)
+	return len(seeds)
+}
+
+// RunNATProbe performs an AutoNAT-style active reachability test to classify NAT type.
+// At most one probe runs at a time (TryLock); concurrent callers return immediately.
+//
+// Classification logic:
+//
+//	QUIC bind IP is public WAN              → sense.RecordBindPublic(true); return (no probe needed)
+//	probe echo received from ≥1 candidate   → sense.RecordProbeResult(true)  [Full Cone / cloud NAT]
+//	no echo despite known external address  → sense.RecordProbeResult(false) [Restricted]
+func (h *Host) RunNATProbe(ctx context.Context) {
+	if !h.natProbeMu.TryLock() {
+		return // another probe is already running
+	}
+	defer h.natProbeMu.Unlock()
+
+	// ① Detect public bind.
+	if qa := h.QUICLocalAddr(); qa != nil && isPlausibleWANIP(qa.IP) {
+		h.sense.RecordBindPublic(true)
+		h.log.Debug("nat probe: public bind", "ip", qa.IP)
+		return // directly reachable; no inbound echo probe needed
+	}
+	h.sense.RecordBindPublic(false)
+
+	// ② Get claimed external address: natsense consensus preferred, STUN as fallback.
+	claimedWire, ok := h.sense.TrustedWire()
+	if !ok {
+		sctx, cancel := context.WithTimeout(ctx, 4*time.Second)
+		stunIP, stunPort := probeSTUN(sctx)
+		cancel()
+		if stunIP != nil && isPlausibleWANIP(stunIP) {
+			if b, err := protocol.FormatObservedUDP(stunIP, stunPort); err == nil {
+				claimedWire = b
+			}
+		}
+	}
+	if len(claimedWire) == 0 {
+		h.log.Debug("nat probe: no claimed external address; skipping")
+		return // cannot probe without knowing external address
+	}
+
+	// ③ Select up to 3 candidates with public WAN IPs from the routing table.
+	candidates := h.selectNATProbeTargets(3)
+	if len(candidates) == 0 {
+		h.log.Debug("nat probe: no public-IP candidates in routing table; skipping")
+		return
+	}
+
+	// ④ Probe concurrently; ≥1 successful echo → reachable.
+	type result struct{ ok bool }
+	results := make(chan result, len(candidates))
+	for _, addr := range candidates {
+		addr := addr
+		go func() {
+			pCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			ok, _ := h.node.SendNATProbeReq(pCtx, addr, claimedWire)
+			results <- result{ok}
+		}()
+	}
+	var reachable bool
+	for range candidates {
+		if r := <-results; r.ok {
+			reachable = true
+		}
+	}
+	h.sense.RecordProbeResult(reachable)
+	h.log.Debug("nat probe done", "reachable", reachable, "candidates", len(candidates))
+}
+
+// InvalidateNetworkCaches clears short-lived external-network caches so
+// subsequent endpoint building uses fresh probes after network changes.
+func (h *Host) InvalidateNetworkCaches() {
+	h.extipMu.Lock()
+	h.extipSnap = ""
+	h.extipExp = time.Time{}
+	h.extipMu.Unlock()
+	h.sense.ClearProbeResult()
+	h.sense.InvalidateObservations()
+}
+
+// selectNATProbeTargets returns up to n UDP addresses of routing-table peers with public WAN IPs.
+func (h *Host) selectNATProbeTargets(n int) []net.Addr {
+	all := h.node.BootstrapCandidateAddrs(n * 5)
+	var out []net.Addr
+	for _, a := range all {
+		udp, ok := a.(*net.UDPAddr)
+		if !ok || !isPlausibleWANIP(udp.IP) {
+			continue
+		}
+		out = append(out, a)
+		if len(out) >= n {
+			break
+		}
+	}
+	return out
 }
 
 // BuildEndpointPayload builds ordered, deduplicated quic:// candidates (Phase 2b).

@@ -38,8 +38,11 @@ type vote struct {
 	at time.Time
 }
 
+// probeResultTTL is how long an active probe result is considered fresh.
+const probeResultTTL = 30 * time.Minute
+
 // Sense tracks distinct peers that reported the same reflected UDP endpoint (wire bytes)
-// and infers a basic NAT type from observed port consistency.
+// and infers NAT type from both passive mapping observation and active probe results.
 type Sense struct {
 	mu sync.Mutex
 	// min distinct NodeIDs that must have reported the same canonical key
@@ -48,6 +51,11 @@ type Sense struct {
 	votes map[string]map[nodeIDKey]vote
 	// distinct observed ports (for NAT type inference)
 	observedPorts map[uint16]struct{}
+
+	// Active classification state (set by host.RunNATProbe).
+	bindPublic  bool  // local socket is bound to a public WAN IP
+	probeResult *bool // nil=unknown, true=reachable, false=unreachable
+	probeAt     time.Time
 }
 
 type nodeIDKey [32]byte
@@ -80,6 +88,49 @@ func (s *Sense) SetMinAgreeing(n int) {
 	s.mu.Lock()
 	s.min = n
 	s.mu.Unlock()
+}
+
+// RecordBindPublic records whether the local UDP socket is bound to a public WAN IP.
+// Called by host.RunNATProbe after inspecting the QUIC listen address.
+func (s *Sense) RecordBindPublic(isPublic bool) {
+	s.mu.Lock()
+	s.bindPublic = isPublic
+	s.mu.Unlock()
+}
+
+// RecordProbeResult records the outcome of an active AutoNAT-style reachability probe.
+// reachable=true means at least one remote peer successfully sent an echo to our
+// claimed external address (Full Cone or equivalent); false means Restricted.
+func (s *Sense) RecordProbeResult(reachable bool) {
+	s.mu.Lock()
+	s.probeResult = &reachable
+	s.probeAt = time.Now()
+	s.mu.Unlock()
+}
+
+// ClearProbeResult discards cached active-probe classification so the next
+// probe result is used immediately after network changes.
+func (s *Sense) ClearProbeResult() {
+	s.mu.Lock()
+	s.probeResult = nil
+	s.probeAt = time.Time{}
+	s.mu.Unlock()
+}
+
+// InvalidateObservations clears passive observed_addr votes after confirmed
+// network changes so old mappings do not bias the next consensus cycle.
+func (s *Sense) InvalidateObservations() {
+	s.mu.Lock()
+	s.votes = make(map[string]map[nodeIDKey]vote)
+	s.observedPorts = make(map[uint16]struct{})
+	s.mu.Unlock()
+}
+
+// IsBindPublic returns true when the local socket has a direct public WAN IP.
+func (s *Sense) IsBindPublic() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.bindPublic
 }
 
 // Record adds one vote: reporter saw our endpoint as observed (wire encoding).
@@ -155,25 +206,42 @@ func (s *Sense) TrustedWire() ([]byte, bool) {
 	return b, true
 }
 
-// InferNATType returns a basic NAT type inference based on observed port
-// consistency across reporters (spec Phase 2a):
-//   - All reporters saw the same port → endpoint-independent mapping (FullCone/Restricted)
-//   - Different ports → NATSymmetric
-//   - Insufficient data → NATUnknown
+// InferNATType returns the current best NAT classification for hole-punch strategy.
 //
-// Distinguishing FullCone from Restricted requires active probing (Phase 2b).
+// Decision flow:
+//
+//  1. Public bind (QUIC socket on a WAN IP)  → NATFullCone (wire-compatible; host
+//     exposes IsBindPublic() for UI to show "public" separately).
+//  2. Symmetric mapping: ≥2 well-supported observed ports → NATSymmetric.
+//  3. Insufficient passive evidence           → NATUnknown.
+//  4. Active probe result (RecordProbeResult):
+//     reachable=true  → NATFullCone  (any peer can initiate; Full Cone or cloud NAT)
+//     reachable=false → NATRestricted
+//  5. No probe result yet                    → NATRestricted (conservative default).
 func (s *Sense) InferNATType() uint8 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// ① Public bind: local socket has a direct WAN IP — treated as Full Cone on wire.
+	if s.bindPublic {
+		return NATFullCone
+	}
+
+	// ② Passive mapping stability: count live votes per port bucket.
 	cutoff := time.Now().Add(-voteTTL)
 	total := 0
-	livePorts := make(map[uint16]struct{})
+	portReporters := make(map[uint16]map[nodeIDKey]struct{})
 	for key, m := range s.votes {
-		n := liveVotes(m, cutoff)
-		if n == 0 {
+		reporters := make(map[nodeIDKey]struct{})
+		for rid, v := range m {
+			if v.at.After(cutoff) {
+				reporters[rid] = struct{}{}
+			}
+		}
+		if len(reporters) == 0 {
 			continue
 		}
-		total += n
+		total += len(reporters)
 		_, ps, err := net.SplitHostPort(key)
 		if err != nil {
 			continue
@@ -182,18 +250,47 @@ func (s *Sense) InferNATType() uint8 {
 		if err != nil {
 			continue
 		}
-		livePorts[uint16(p64)] = struct{}{}
+		p := uint16(p64)
+		dst := portReporters[p]
+		if dst == nil {
+			dst = make(map[nodeIDKey]struct{})
+			portReporters[p] = dst
+		}
+		for rid := range reporters {
+			dst[rid] = struct{}{}
+		}
 	}
+
+	// Require each port bucket to have ≥2 independent reporters (1 in test mode).
+	minPerPort := 2
+	if s.min <= 1 {
+		minPerPort = 1
+	}
+	supportedPorts := 0
+	for _, reps := range portReporters {
+		if len(reps) >= minPerPort {
+			supportedPorts++
+		}
+	}
+	if supportedPorts >= 2 {
+		return NATSymmetric // different ports per destination → symmetric mapping
+	}
+
+	// ③ Not enough passive evidence to proceed.
 	if total < s.min {
 		return NATUnknown
 	}
-	if len(livePorts) == 1 {
-		return NATFullCone // or restricted — indistinguishable without active probing
+
+	// ④ Mapping is EIM (stable port); use active probe to classify filtering.
+	if s.probeResult != nil && time.Since(s.probeAt) < probeResultTTL {
+		if *s.probeResult {
+			return NATFullCone // echo received → EIF filtering (Full Cone / cloud NAT)
+		}
+		return NATRestricted // echo blocked → EIF filtering restricted
 	}
-	if len(livePorts) > 1 {
-		return NATSymmetric
-	}
-	return NATUnknown
+
+	// ⑤ No probe result available; conservative default.
+	return NATRestricted
 }
 
 func netParseHost(host string) net.IP {

@@ -32,6 +32,19 @@ func ParseObservedUDP(b []byte) (host string, port uint16, ok bool) {
 	}
 }
 
+// IsPublicIP reports whether ip is a routeable public WAN address — not loopback,
+// link-local, private, multicast, unspecified, or RFC 6598 CGNAT (100.64/10).
+// Used by both dht and host packages to validate observed / claimed addresses.
+func IsPublicIP(ip net.IP) bool {
+	if ip == nil || ip.IsUnspecified() || ip.IsLoopback() || ip.IsMulticast() || ip.IsLinkLocalUnicast() || ip.IsPrivate() {
+		return false
+	}
+	if ip4 := ip.To4(); ip4 != nil && ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127 {
+		return false // RFC 6598 CGNAT
+	}
+	return true
+}
+
 // FormatObservedUDP encodes IP:port to the same wire form as BodyPong.observed_addr.
 func FormatObservedUDP(ip net.IP, port uint16) ([]byte, error) {
 	if ip4 := ip.To4(); ip4 != nil {

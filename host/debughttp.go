@@ -9,15 +9,16 @@ import (
 )
 
 type debugHostJSON struct {
-	Address      string   `json:"address"`
-	DHTAddr      string   `json:"dht_addr"`
-	QUICAddr     string   `json:"quic_addr"`
-	Agents       []string `json:"agents"`
-	NATType      uint8    `json:"nat_type"`
-	NATTypeLabel string   `json:"nat_type_label"`
-	ObservedHost string   `json:"observed_host,omitempty"`
-	ObservedPort uint16   `json:"observed_port,omitempty"`
-	MinObserved  int      `json:"min_observed_peers"`
+	Address       string   `json:"address"`
+	DHTAddr       string   `json:"dht_addr"`
+	QUICAddr      string   `json:"quic_addr"`
+	Agents        []string `json:"agents"`
+	NATType       uint8    `json:"nat_type"`
+	NATTypeLabel  string   `json:"nat_type_label"`
+	NATBindPublic bool     `json:"nat_bind_public"` // true = QUIC socket is directly on a public WAN IP
+	ObservedHost  string   `json:"observed_host,omitempty"`
+	ObservedPort  uint16   `json:"observed_port,omitempty"`
+	MinObserved   int      `json:"min_observed_peers"`
 }
 
 var natLabels = [...]string{"unknown", "full_cone", "restricted", "port_restricted", "symmetric"}
@@ -93,14 +94,15 @@ func (h *Host) serveDebugHost(w http.ResponseWriter, r *http.Request) {
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	_ = enc.Encode(debugHostJSON{
-		Address:      h.addr.String(),
-		DHTAddr:      h.DHTLocalAddr().String(),
-		QUICAddr:     h.QUICLocalAddr().String(),
-		Agents:       agentStrs,
-		NATType:      natT,
-		NATTypeLabel: natLabel(natT),
-		ObservedHost: obsHost,
-		ObservedPort: obsPort,
-		MinObserved:  h.sense.MinAgreeing(),
+		Address:       h.addr.String(),
+		DHTAddr:       h.DHTLocalAddr().String(),
+		QUICAddr:      h.QUICLocalAddr().String(),
+		Agents:        agentStrs,
+		NATType:       natT,
+		NATTypeLabel:  natLabel(natT),
+		NATBindPublic: h.sense.IsBindPublic(),
+		ObservedHost:  obsHost,
+		ObservedPort:  obsPort,
+		MinObserved:   h.sense.MinAgreeing(),
 	})
 }
