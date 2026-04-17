@@ -176,13 +176,20 @@ func (d *Daemon) readICELoop(ctx context.Context, conn *websocket.Conn) error {
 		}
 		go func() {
 			actx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-			defer cancel()
 			ac, err := d.h.AcceptICEViaSignal(actx, localAgent, callerAID, base)
+			cancel() // handshake established (or failed); no longer need startup timeout context.
 			if err != nil {
 				d.log.Debug("ice accept", "err", err, "local", localAgent.String(), "remote", callerAID.String())
 				return
 			}
-			<-ac.Context().Done()
+			if !d.tryAcquireGatewayConn() {
+				d.log.Warn("gateway: max connections reached", "limit", maxGatewayConns)
+				_ = ac.CloseWithError(1, "too many connections")
+				return
+			}
+			defer d.releaseGatewayConn()
+			d.log.Debug("ice gateway: quic accepted", "local_aid", ac.Local.String(), "remote_aid", ac.Remote.String())
+			d.serveGatewayConn(ctx, ac)
 		}()
 	}
 }
