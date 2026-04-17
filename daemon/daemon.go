@@ -23,6 +23,7 @@ import (
 	"github.com/a2al/a2al/internal/nodeks"
 	"github.com/a2al/a2al/internal/peerscache"
 	"github.com/a2al/a2al/internal/registry"
+	"github.com/a2al/a2al/signaling"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -71,6 +72,22 @@ type Daemon struct {
 
 	heartbeatMu sync.Mutex
 	heartbeatAt map[a2al.Address]time.Time
+
+	iceRegNotify chan struct{} // ICE /signal registration refresh (buffered)
+
+	netMu                sync.Mutex
+	netStableFP          string
+	netPendingFP         string
+	netPendingAt         time.Time
+	netChangeTimes       []time.Time
+	nodePublishQuietTill time.Time
+	deferredEndpointEval bool
+	netChangeNotify      chan struct{} // confirmed network-change events (buffered)
+	netCascadeRunning    bool
+	netFingerprintFn     func() string
+	testNowFn            func() time.Time
+	testGuardRepublishFn func(context.Context)
+	testGuardCascadeFn   func(context.Context)
 }
 
 // APIAddr returns the REST API / Web UI listen address from the loaded config.
@@ -145,8 +162,10 @@ func New(cfg Config) (*Daemon, error) {
 		FallbackHost:     nodeCfg.FallbackHost,
 		DisableUPnP:      nodeCfg.DisableUPnP,
 		ICESignalURL:     nodeCfg.ICESignalURL,
+		ICESignalURLs:    nodeCfg.ICESignalURLs,
 		ICESTUNURLs:      nodeCfg.ICESTUNURLs,
 		ICETURNURLs:      nodeCfg.ICETURNURLs,
+		TURNServers:      toHostTURNServers(nodeCfg.TURNServers),
 		ICEPublishTurns:  nodeCfg.ICEPublishTurns,
 		Logger:           log,
 		SeenPeersPath:    filepath.Join(cfg.DataDir, "seen_peers.dat"),
@@ -166,13 +185,53 @@ func New(cfg Config) (*Daemon, error) {
 		agentLastPublish: make(map[a2al.Address]time.Time),
 		heartbeatAt:      make(map[a2al.Address]time.Time),
 		mailboxSeen:      make(map[string]map[string]time.Time),
+		iceRegNotify:     make(chan struct{}, 1),
+		netChangeNotify:  make(chan struct{}, 1),
 	}, nil
+}
+
+// toHostTURNServers converts config.TURNServerConfig slice to host.TURNServer slice,
+// mapping the string credential_type field to the typed host constant.
+func toHostTURNServers(cfgs []config.TURNServerConfig) []host.TURNServer {
+	out := make([]host.TURNServer, 0, len(cfgs))
+	for _, c := range cfgs {
+		ts := host.TURNServer{
+			URL:           c.URL,
+			Username:      c.Username,
+			Credential:    c.Credential,
+			CredentialURL: c.CredentialURL,
+		}
+		switch c.CredentialType {
+		case "hmac":
+			ts.CredentialType = host.TURNCredentialHMAC
+		case "rest_api":
+			ts.CredentialType = host.TURNCredentialRESTAPI
+		default: // "static" or empty
+			ts.CredentialType = host.TURNCredentialStatic
+		}
+		out = append(out, ts)
+	}
+	return out
 }
 
 // Run starts the daemon and blocks until ctx is cancelled. It saves the peers
 // cache and config on return.
 func (d *Daemon) Run(ctx context.Context, mcpStdio bool) error {
+	var closeSignalHub func()
+	if addr := resolveSignalListenAddr(d.cfg); addr != "" {
+		hub, err := signaling.ListenHub(addr)
+		if err != nil {
+			d.log.Warn("signal hub listen", "addr", addr, "err", err)
+		} else {
+			d.h.SetSignalStatsProvider(hub.StatsMap)
+			closeSignalHub = func() { _ = hub.Close() }
+			d.log.Info("signal hub listening", "addr", hub.Addr().String())
+		}
+	}
 	defer func() {
+		if closeSignalHub != nil {
+			closeSignalHub()
+		}
 		savePeersCache(filepath.Join(d.dataDir, "peers.cache"), d.h, d.log)
 		_ = d.h.Close()
 	}()
@@ -198,10 +257,15 @@ func (d *Daemon) Run(ctx context.Context, mcpStdio bool) error {
 	// (resolve, discover, publish) will return errors or empty results until
 	// bootstrap completes, which is correct behaviour.
 	go func() {
-		runBootstrapChain(netCtx, d.h, d.cfg, d.dataDir, d.log)
+		if derived := runBootstrapChain(netCtx, d.h, d.cfg, d.dataDir, d.log); derived != "" {
+			d.h.SetDerivedICESignalURL(derived)
+		}
+		d.h.RunNATProbe(netCtx) // active NAT classification after bootstrap
 		d.initialAutoPublish(netCtx)
+		go d.runICEListener(netCtx)
 		d.autoPublishMainLoop(netCtx)
 	}()
+	go d.runNetworkMonitor(netCtx)
 
 	go d.gatewayAcceptLoop(netCtx)
 

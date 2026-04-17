@@ -25,6 +25,7 @@ const (
 	republishPeriod     = time.Duration(endpointRecordTTL/2) * time.Second // 30m
 	endpointWatchPeriod = 60 * time.Second
 	heartbeatTTL        = time.Duration(endpointRecordTTL) * time.Second
+	guardTickPeriod     = 5 * time.Second
 )
 
 type nodePublishDisk struct {
@@ -113,9 +114,13 @@ func (d *Daemon) recordAgentPublishTime(aid a2al.Address) {
 }
 
 func (d *Daemon) recordNodePublishTime() {
+	now := d.now()
 	d.publishMetaMu.Lock()
-	d.nodeLastPublish = time.Now()
+	d.nodeLastPublish = now
 	d.publishMetaMu.Unlock()
+	d.netMu.Lock()
+	d.nodePublishQuietTill = now.Add(nodePostPublishQuiet)
+	d.netMu.Unlock()
 }
 
 func (d *Daemon) publishNodeOnce(ctx context.Context) error {
@@ -151,12 +156,18 @@ func (d *Daemon) publishNodeOnce(ctx context.Context) error {
 
 func (d *Daemon) maybeRepublishNodeOnEndpointChange(ctx context.Context) {
 	if !d.cfg.AutoPublish {
+		d.netMu.Lock()
+		d.deferredEndpointEval = false
+		d.netMu.Unlock()
 		return
 	}
 	pctx, cancel := context.WithTimeout(ctx, 45*time.Second)
 	ep, err := d.h.BuildEndpointPayload(pctx)
 	cancel()
 	if err != nil {
+		d.netMu.Lock()
+		d.deferredEndpointEval = false
+		d.netMu.Unlock()
 		return
 	}
 	fp := endpointPayloadFingerprint(ep)
@@ -166,15 +177,34 @@ func (d *Daemon) maybeRepublishNodeOnEndpointChange(ctx context.Context) {
 	d.publishMetaMu.Unlock()
 
 	if prev == "" || fp == prev {
+		d.netMu.Lock()
+		d.deferredEndpointEval = false
+		d.netMu.Unlock()
 		return
 	}
+
+	d.netMu.Lock()
+	if deferNow, reason := d.shouldDeferNodePublishLocked(d.now()); deferNow {
+		d.netMu.Unlock()
+		d.log.Debug("node republish deferred", "reason", reason)
+		return
+	}
+	d.netMu.Unlock()
 
 	// Endpoint (IP/port) changed: republish node record immediately.
 	pubCtx, pubCancel := context.WithTimeout(ctx, 90*time.Second)
 	if err := d.publishNodeOnce(pubCtx); err != nil {
 		d.log.Debug("node republish on endpoint change", "err", err)
+		d.netMu.Lock()
+		d.deferredEndpointEval = true
+		d.netMu.Unlock()
+		pubCancel()
+		return
 	}
 	pubCancel()
+	d.netMu.Lock()
+	d.deferredEndpointEval = false
+	d.netMu.Unlock()
 
 	// Also push updated endpoint to all registered agents so their records
 	// reflect the new address without waiting for the next periodic tick.
@@ -256,11 +286,18 @@ func (d *Daemon) republishAgentServices(ctx context.Context, e *registry.Entry) 
 
 func (d *Daemon) runPeriodicRepublish(ctx context.Context) {
 	if d.cfg.AutoPublish {
-		pubCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
-		if err := d.publishNodeOnce(pubCtx); err != nil {
-			d.log.Debug("periodic node publish", "err", err)
+		d.netMu.Lock()
+		if deferNow, reason := d.shouldDeferNodePublishLocked(d.now()); deferNow {
+			d.netMu.Unlock()
+			d.log.Debug("periodic node publish deferred", "reason", reason)
+		} else {
+			d.netMu.Unlock()
+			pubCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+			if err := d.publishNodeOnce(pubCtx); err != nil {
+				d.log.Debug("periodic node publish", "err", err)
+			}
+			cancel()
 		}
-		cancel()
 	}
 
 	d.regMu.RLock()
@@ -398,16 +435,26 @@ func (d *Daemon) publishNodeNowAsync() {
 	}()
 }
 
+// natProbePeriod is how often RunNATProbe is re-run in the main loop.
+// Kept below probeResultTTL (30 min) so the classification never goes stale.
+const natProbePeriod = 20 * time.Minute
+
 func (d *Daemon) autoPublishMainLoop(ctx context.Context) {
 	repub := time.NewTicker(republishPeriod)
 	defer repub.Stop()
 	watch := time.NewTicker(endpointWatchPeriod)
 	defer watch.Stop()
+	probe := time.NewTicker(natProbePeriod)
+	defer probe.Stop()
+	guard := time.NewTicker(guardTickPeriod)
+	defer guard.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-guard.C:
+			d.handleGuardTick(ctx)
 		case <-repub.C:
 			runCtx, cancel := context.WithTimeout(ctx, 150*time.Second)
 			d.runPeriodicRepublish(runCtx)
@@ -416,6 +463,12 @@ func (d *Daemon) autoPublishMainLoop(ctx context.Context) {
 			wctx, cancel := context.WithTimeout(ctx, 100*time.Second)
 			d.maybeRepublishNodeOnEndpointChange(wctx)
 			cancel()
+		case <-probe.C:
+			go func() {
+				pCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+				defer cancel()
+				d.h.RunNATProbe(pCtx)
+			}()
 		}
 	}
 }

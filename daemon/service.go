@@ -139,6 +139,7 @@ func (d *Daemon) persistDelegatedAgent(aid a2al.Address, opPriv ed25519.PrivateK
 		d.h.UnregisterAgent(aid)
 		return errPersist
 	}
+	d.bumpIceRegistry()
 	return nil
 }
 
@@ -675,6 +676,7 @@ func (d *Daemon) execAgentDelete(aidStr string) error {
 	d.publishMetaMu.Unlock()
 	// Stop background replication probing for this agent's records.
 	d.h.Node().RemoveRepSetsForPublisher(a2al.NodeIDFromAddress(aid))
+	d.bumpIceRegistry()
 	return nil
 }
 
@@ -737,11 +739,19 @@ func (d *Daemon) execConnect(ctx context.Context, remoteAidStr string, body conn
 	if err != nil {
 		return "", errResolve
 	}
+	d.log.Debug("connect resolve",
+		"local_aid", local.String(),
+		"remote_aid", remote.String(),
+		"nat_type", er.NatType,
+		"endpoints", len(er.Endpoints),
+		"has_signal", er.Signal != "",
+	)
 	qc, err := d.h.ConnectFromRecordFor(ctx, local, remote, er)
 	if err != nil {
 		d.log.Warn("connect quic", "remote", remote.String(), "err", err)
 		return "", errConnectQUIC
 	}
+	d.log.Debug("connect quic ok", "local_aid", local.String(), "remote_aid", remote.String())
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		_ = qc.CloseWithError(0, "listen failed")
@@ -751,18 +761,23 @@ func (d *Daemon) execConnect(ctx context.Context, remoteAidStr string, body conn
 		defer qc.CloseWithError(0, "tunnel done")
 		defer ln.Close()
 		_ = ln.(*net.TCPListener).SetDeadline(time.Now().Add(30 * time.Second))
+		d.log.Debug("tunnel local listen", "local_aid", local.String(), "remote_aid", remote.String(), "listen", ln.Addr().String(), "accept_timeout", "30s")
 		tcpConn, err := ln.Accept()
 		if err != nil {
+			d.log.Debug("tunnel accept done", "local_aid", local.String(), "remote_aid", remote.String(), "listen", ln.Addr().String(), "err", err)
 			return
 		}
 		qctx, qcancel := context.WithTimeout(context.Background(), 120*time.Second)
 		defer qcancel()
 		qs, err := qc.OpenStreamSync(qctx)
 		if err != nil {
+			d.log.Warn("tunnel open stream failed", "local_aid", local.String(), "remote_aid", remote.String(), "err", err)
 			_ = tcpConn.Close()
 			return
 		}
+		d.log.Debug("tunnel bridge start", "local_aid", local.String(), "remote_aid", remote.String())
 		bridgeTCPQUICStream(qs, tcpConn)
+		d.log.Debug("tunnel bridge done", "local_aid", local.String(), "remote_aid", remote.String())
 	}()
 	return ln.Addr().String(), nil
 }

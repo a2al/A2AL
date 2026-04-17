@@ -9,15 +9,16 @@ import (
 )
 
 type debugHostJSON struct {
-	Address      string   `json:"address"`
-	DHTAddr      string   `json:"dht_addr"`
-	QUICAddr     string   `json:"quic_addr"`
-	Agents       []string `json:"agents"`
-	NATType      uint8    `json:"nat_type"`
-	NATTypeLabel string   `json:"nat_type_label"`
-	ObservedHost string   `json:"observed_host,omitempty"`
-	ObservedPort uint16   `json:"observed_port,omitempty"`
-	MinObserved  int      `json:"min_observed_peers"`
+	Address       string   `json:"address"`
+	DHTAddr       string   `json:"dht_addr"`
+	QUICAddr      string   `json:"quic_addr"`
+	Agents        []string `json:"agents"`
+	NATType       uint8    `json:"nat_type"`
+	NATTypeLabel  string   `json:"nat_type_label"`
+	NATBindPublic bool     `json:"nat_bind_public"` // true = QUIC socket is directly on a public WAN IP
+	ObservedHost  string   `json:"observed_host,omitempty"`
+	ObservedPort  uint16   `json:"observed_port,omitempty"`
+	MinObserved   int      `json:"min_observed_peers"`
 }
 
 var natLabels = [...]string{"unknown", "full_cone", "restricted", "port_restricted", "symmetric"}
@@ -39,10 +40,41 @@ func (h *Host) DebugHTTPHandler() http.Handler {
 	mux.Handle("/debug/identity", dhtHandler)
 	mux.Handle("/debug/routing", dhtHandler)
 	mux.Handle("/debug/store", dhtHandler)
-	mux.Handle("/debug/stats", dhtHandler)
+	mux.HandleFunc("/debug/stats", h.serveDebugStatsMerged)
 	// Host-level (Phase 2) endpoint.
 	mux.HandleFunc("/debug/host", h.serveDebugHost)
 	return mux
+}
+
+func (h *Host) serveDebugStatsMerged(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	st := h.node.DebugStatsData()
+	out := map[string]any{
+		"rx_packets_verified":     st.RxPackets,
+		"tx_packets":              st.TxPackets,
+		"rpc_completed":           st.RPCOK,
+		"total_peers":             st.TotalPeers,
+		"reach_1h":                st.Reach1h,
+		"reach_24h":               st.Reach24h,
+		"reach_7d":                  st.Reach7d,
+		"estimated_network_size":    st.EstimatedNetworkSize,
+		"unique_nodes_since_start":  st.UniqueNodesSinceStart,
+	}
+	h.signalStatsMu.RLock()
+	fn := h.signalStats
+	h.signalStatsMu.RUnlock()
+	if fn != nil {
+		if sig := fn(); len(sig) > 0 {
+			out["signal"] = sig
+		}
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(out)
 }
 
 func (h *Host) serveDebugHost(w http.ResponseWriter, r *http.Request) {
@@ -62,14 +94,15 @@ func (h *Host) serveDebugHost(w http.ResponseWriter, r *http.Request) {
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	_ = enc.Encode(debugHostJSON{
-		Address:      h.addr.String(),
-		DHTAddr:      h.DHTLocalAddr().String(),
-		QUICAddr:     h.QUICLocalAddr().String(),
-		Agents:       agentStrs,
-		NATType:      natT,
-		NATTypeLabel: natLabel(natT),
-		ObservedHost: obsHost,
-		ObservedPort: obsPort,
-		MinObserved:  h.sense.MinAgreeing(),
+		Address:       h.addr.String(),
+		DHTAddr:       h.DHTLocalAddr().String(),
+		QUICAddr:      h.QUICLocalAddr().String(),
+		Agents:        agentStrs,
+		NATType:       natT,
+		NATTypeLabel:  natLabel(natT),
+		NATBindPublic: h.sense.IsBindPublic(),
+		ObservedHost:  obsHost,
+		ObservedPort:  obsPort,
+		MinObserved:   h.sense.MinAgreeing(),
 	})
 }

@@ -5,6 +5,7 @@ package dht
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"net"
 	"time"
@@ -46,7 +47,7 @@ func (n *Node) BootstrapAddrs(ctx context.Context, addrs []net.Addr) error {
 				ch <- pingResult{addr: a}
 				return
 			}
-			n.log.Debug("bootstrap ping ok", "addr", a, "peer", pi.NodeID)
+			n.log.Debug("bootstrap ping ok", "addr", a, "node_id", hex.EncodeToString(pi.NodeID[:]), "peer_aid", pi.Address.String())
 			ch <- pingResult{addr: a, ok: true}
 		}()
 	}
@@ -152,7 +153,6 @@ func (n *Node) PublishTopicRecord(ctx context.Context, storeKey a2al.NodeID, rec
 	}
 	return n.publishKeyedRecord(ctx, storeKey, rec)
 }
-
 
 // tabNeighbours returns the k-closest healthy routing table peers to target.
 // Convenience wrapper used by tests and the query engine.

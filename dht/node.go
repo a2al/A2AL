@@ -6,6 +6,7 @@ package dht
 import (
 	"context"
 	crand "crypto/rand"
+	"encoding/hex"
 	"errors"
 	"log/slog"
 	"net"
@@ -102,14 +103,25 @@ type Node struct {
 
 	decodeErrNext atomic.Int64 // unix-nano: next time a decode-error WARN may fire
 
-	// seenPeers tracks unique NodeIDs contacted during this process lifetime.
-	// key: [32]byte (a2al.NodeID), value: time.Time (first contact).
-	// Used by /debug/stats to compute reach_1h/24h/7d.
+	// seenPeers maps NodeID → last tabAdd observation time (sliding-window stats).
 	seenPeers     sync.Map
 	seenPeersPath string // non-empty → persist to disk
 
+	// seenThisBoot dedupes tabAdd-observed NodeIDs for unique_nodes_since_start.
+	seenThisBoot        sync.Map // a2al.NodeID → struct{}
+	seenUniqueSinceBoot atomic.Uint64
+
 	healthMu sync.RWMutex
 	health   map[string]*peerHealthEntry // key: nodeIDKey(id)
+
+	// NAT probe: SendNATProbeReq registers a token → notify channel here;
+	// onNATProbeEcho delivers incoming echoes to the matching channel.
+	natProbeMu   sync.Mutex
+	natProbeWait map[string]chan struct{} // hex(8-byte token) → notification channel
+
+	// Per-source-IP echo rate limit.
+	natProbeEchoMu  sync.Mutex
+	natProbeEchoMap map[string]*probeEchoEntry // srcIP string → rate entry
 
 	repMu         sync.RWMutex
 	repSets       map[repKey]*repSet    // (storeKey, publisher) → replication tracking
@@ -120,6 +132,12 @@ type Node struct {
 type waitEntry struct {
 	want uint8
 	ch   chan *protocol.DecodedMessage
+}
+
+// probeEchoEntry tracks the per-source-IP echo rate for NAT probe requests.
+type probeEchoEntry struct {
+	windowEnd time.Time
+	count     int
 }
 
 // NewNode builds a node; keystore must list exactly one address (Phase 1).
@@ -150,9 +168,11 @@ func NewNode(cfg Config) (*Node, error) {
 		ctx:            ctx,
 		cancel:         cancel,
 		log:            logger,
-		wait:           make(map[string]*waitEntry),
-		peers:          make(map[string]net.Addr),
-		health:         make(map[string]*peerHealthEntry),
+		wait:            make(map[string]*waitEntry),
+		peers:           make(map[string]net.Addr),
+		health:          make(map[string]*peerHealthEntry),
+		natProbeWait:    make(map[string]chan struct{}),
+		natProbeEchoMap: make(map[string]*probeEchoEntry),
 		repSets:        make(map[repKey]*repSet),
 		replCh:         make(chan replTask, replChBuf),
 		renewInFlight:  make(map[repKey]struct{}),
@@ -210,6 +230,10 @@ func (n *Node) recvLoop() {
 			n.onFindValue(from, dec)
 		case protocol.MsgStore:
 			n.onStore(from, dec)
+		case protocol.MsgNATProbeReq:
+			n.onNATProbeReq(from, dec)
+		case protocol.MsgNATProbeEcho:
+			n.onNATProbeEcho(from, dec)
 		default:
 		}
 	}
@@ -272,7 +296,7 @@ func (n *Node) tabAdd(ni protocol.NodeInfo, trusted bool) {
 		return
 	}
 	copy(nid[:], ni.NodeID)
-	n.seenPeers.LoadOrStore(nid, time.Now())
+	n.recordPeerSeen(nid)
 
 	n.tabMu.Lock()
 	if n.table.Contains(nid) {
@@ -397,8 +421,19 @@ func (n *Node) tabNearestHealthy(target a2al.NodeID, k int) []protocol.NodeInfo 
 	return result
 }
 
-// reachCounts returns the number of unique peers seen within 1h, 24h, and 7d
-// windows. Entries older than 7d are pruned during this scan (lazy cleanup).
+// recordPeerSeen updates last_seen for nid and increments seenUniqueSinceBoot
+// the first time this process observes nid via tabAdd (not via loadSeenPeers).
+func (n *Node) recordPeerSeen(nid a2al.NodeID) {
+	now := time.Now()
+	_, loaded := n.seenThisBoot.LoadOrStore(nid, struct{}{})
+	if !loaded {
+		n.seenUniqueSinceBoot.Add(1)
+	}
+	n.seenPeers.Store(nid, now)
+}
+
+// reachCounts counts unique peers whose last_seen falls within 1h, 24h, and 7d.
+// Entries older than 7d are pruned during this scan (lazy cleanup).
 func (n *Node) reachCounts() (r1h, r24h, r7d int) {
 	now := time.Now()
 	cutoff7d := now.Add(-7 * 24 * time.Hour)
@@ -588,6 +623,131 @@ func (n *Node) onStore(from net.Addr, dec *protocol.DecodedMessage) {
 	err := n.store.Put(key, body.Record, time.Now())
 	ok := err == nil
 	n.reply(from, dec, protocol.MsgStoreResp, &protocol.BodyStoreResp{Stored: ok})
+}
+
+// natProbeEchoMax is the maximum number of NAT probe echoes sent per source IP
+// per 10-second window.  Because ClaimedAddr.IP must equal the requester's source
+// IP (see below), this is effectively a per-peer cap.
+const natProbeEchoMax = 3
+
+// onNATProbeReq handles an incoming NATProbeReq: validates the claimed address,
+// enforces source-IP consistency (anti-reflection), applies a per-source rate
+// limit, then sends a NATProbeEcho directly to that address.
+// Old nodes never reach here (VerifyAndDecode returns ErrUnknownMsgType for 0x09).
+func (n *Node) onNATProbeReq(from net.Addr, dec *protocol.DecodedMessage) {
+	n.remember(from, dec)
+	body := dec.Body.(*protocol.BodyNATProbeReq)
+
+	host, port, ok := protocol.ParseObservedUDP(body.ClaimedAddr)
+	if !ok {
+		return
+	}
+	ip := net.ParseIP(host)
+	if !protocol.IsPublicIP(ip) {
+		return // reject private/loopback claimed addresses
+	}
+
+	// ClaimedAddr.IP must match the UDP source IP of the request.
+	// This ensures a peer can only trigger echoes to its own address,
+	// eliminating cross-IP reflection abuse while still supporting any claimed port.
+	fromUDP, ok := from.(*net.UDPAddr)
+	if !ok || !ip.Equal(fromUDP.IP) {
+		return
+	}
+
+	// Per-source-IP rate limit.
+	if !n.echoRateOK(fromUDP.IP.String()) {
+		return
+	}
+
+	target := &net.UDPAddr{IP: ip, Port: int(port)}
+	txID := make([]byte, 20)
+	if _, err := crand.Read(txID); err != nil {
+		return
+	}
+	hdr := protocol.Header{Version: protocol.ProtocolVersion, MsgType: protocol.MsgNATProbeEcho, TxID: txID}
+	raw, err := protocol.MarshalSignedMessageKeyStore(hdr, &protocol.BodyNATProbeEcho{Token: body.Token}, n.ks, n.addr)
+	if err != nil {
+		return
+	}
+	_ = n.tr.Send(target, raw)
+	n.statsTx.Add(1)
+}
+
+// echoRateOK returns true and increments the per-source counter if the source IP
+// is within its echo budget (natProbeEchoMax per 10 s).  Expired windows reset.
+func (n *Node) echoRateOK(srcIP string) bool {
+	n.natProbeEchoMu.Lock()
+	defer n.natProbeEchoMu.Unlock()
+	now := time.Now()
+	e := n.natProbeEchoMap[srcIP]
+	if e == nil || now.After(e.windowEnd) {
+		n.natProbeEchoMap[srcIP] = &probeEchoEntry{windowEnd: now.Add(10 * time.Second), count: 1}
+		return true
+	}
+	e.count++
+	return e.count <= natProbeEchoMax
+}
+
+// onNATProbeEcho receives an echo from a peer and notifies any waiter registered for the token.
+func (n *Node) onNATProbeEcho(from net.Addr, dec *protocol.DecodedMessage) {
+	n.remember(from, dec)
+	body := dec.Body.(*protocol.BodyNATProbeEcho)
+	key := hex.EncodeToString(body.Token)
+	n.natProbeMu.Lock()
+	ch, ok := n.natProbeWait[key]
+	n.natProbeMu.Unlock()
+	if ok {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// SendNATProbeReq asks probeAddr to send a NATProbeEcho to claimedAddr.
+// claimedAddr is the wire-encoded public UDP address (6 or 18 bytes).
+// Returns true if an echo arrived within the context deadline, nil error on timeout.
+func (n *Node) SendNATProbeReq(ctx context.Context, probeAddr net.Addr, claimedAddr []byte) (bool, error) {
+	token := make([]byte, 8)
+	if _, err := crand.Read(token); err != nil {
+		return false, err
+	}
+	key := hex.EncodeToString(token)
+	ch := make(chan struct{}, 1)
+
+	n.natProbeMu.Lock()
+	n.natProbeWait[key] = ch
+	n.natProbeMu.Unlock()
+	defer func() {
+		n.natProbeMu.Lock()
+		delete(n.natProbeWait, key)
+		n.natProbeMu.Unlock()
+	}()
+
+	txID := make([]byte, 20)
+	if _, err := crand.Read(txID); err != nil {
+		return false, err
+	}
+	hdr := protocol.Header{Version: protocol.ProtocolVersion, MsgType: protocol.MsgNATProbeReq, TxID: txID}
+	body := &protocol.BodyNATProbeReq{Token: token, ClaimedAddr: claimedAddr}
+	raw, err := protocol.MarshalSignedMessageKeyStore(hdr, body, n.ks, n.addr)
+	if err != nil {
+		return false, err
+	}
+	if err := n.tr.Send(probeAddr, raw); err != nil {
+		return false, err
+	}
+	n.statsTx.Add(1)
+
+	select {
+	case <-ch:
+		return true, nil
+	case <-ctx.Done():
+		return false, nil
+	case <-n.ctx.Done():
+		return false, n.ctx.Err()
+	}
 }
 
 // rpcAttemptTimeout is the per-attempt deadline for a single UDP RPC round-trip.

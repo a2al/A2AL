@@ -29,16 +29,34 @@ type debugRoutingJSON struct {
 	TotalPeers    int                    `json:"total_peers"`
 }
 
-// debugStatsJSON is the payload for GET /debug/stats (spec §3.6, §7).
-type debugStatsJSON struct {
+// DebugStats is the DHT portion of GET /debug/stats (spec §3.6, §7).
+type DebugStats struct {
 	RxPackets            uint64 `json:"rx_packets_verified"`
 	TxPackets            uint64 `json:"tx_packets"`
 	RPCOK                uint64 `json:"rpc_completed"`
 	TotalPeers           int    `json:"total_peers"`
 	Reach1h              int    `json:"reach_1h"`
 	Reach24h             int    `json:"reach_24h"`
-	Reach7d              int    `json:"reach_7d"`
-	EstimatedNetworkSize int    `json:"estimated_network_size"`
+	Reach7d               int    `json:"reach_7d"`
+	EstimatedNetworkSize  int    `json:"estimated_network_size"`
+	UniqueNodesSinceStart uint64 `json:"unique_nodes_since_start"`
+}
+
+// DebugStatsData returns a snapshot for embedding in host-level /debug/stats.
+func (n *Node) DebugStatsData() DebugStats {
+	peers := n.tabDebugPeers()
+	r1h, r24h, r7d := n.reachCounts()
+	return DebugStats{
+		RxPackets:              n.statsRx.Load(),
+		TxPackets:              n.statsTx.Load(),
+		RPCOK:                  n.statsRPC.Load(),
+		TotalPeers:             len(peers),
+		Reach1h:                r1h,
+		Reach24h:               r24h,
+		Reach7d:                r7d,
+		EstimatedNetworkSize:   n.tabEstimatedNetworkSize(),
+		UniqueNodesSinceStart: n.seenUniqueSinceBoot.Load(),
+	}
 }
 
 func (n *Node) tabDebugPeers() []routing.PeerDebugRow {
@@ -111,18 +129,7 @@ func (n *Node) serveDebugStats(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
-	peers := n.tabDebugPeers()
-	r1h, r24h, r7d := n.reachCounts()
-	_ = enc.Encode(debugStatsJSON{
-		RxPackets:            n.statsRx.Load(),
-		TxPackets:            n.statsTx.Load(),
-		RPCOK:                n.statsRPC.Load(),
-		TotalPeers:           len(peers),
-		Reach1h:              r1h,
-		Reach24h:             r24h,
-		Reach7d:              r7d,
-		EstimatedNetworkSize: n.tabEstimatedNetworkSize(),
-	})
+	_ = enc.Encode(n.DebugStatsData())
 }
 
 // StartDebugHTTP listens on addr and serves read-only /debug/* JSON (spec §3.6).
