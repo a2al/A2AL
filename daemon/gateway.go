@@ -46,6 +46,7 @@ func (d *Daemon) gatewayAcceptLoop(ctx context.Context) {
 }
 
 func (d *Daemon) serveGatewayConn(ctx context.Context, ac *host.AgentConn) {
+	d.log.Debug("gateway: quic accepted", "local_aid", ac.Local.String(), "remote_aid", ac.Remote.String())
 	d.regMu.RLock()
 	reg := d.reg.Get(ac.Local)
 	d.regMu.RUnlock()
@@ -59,6 +60,7 @@ func (d *Daemon) serveGatewayConn(ctx context.Context, ac *host.AgentConn) {
 	for {
 		str, err := ac.AcceptStream(ctx)
 		if err != nil {
+			d.log.Debug("gateway: accept stream done", "local_aid", ac.Local.String(), "remote_aid", ac.Remote.String(), "err", err)
 			return
 		}
 		if streamCount.Load() >= maxStreamsPerConn {
@@ -74,15 +76,21 @@ func (d *Daemon) serveGatewayConn(ctx context.Context, ac *host.AgentConn) {
 }
 
 func (d *Daemon) bridgeInboundStream(ac *host.AgentConn, str quic.Stream, serviceTCP string) {
+	if serviceTCP == "" {
+		d.log.Warn("gateway: empty service_tcp", "local_aid", ac.Local.String(), "remote_aid", ac.Remote.String())
+		_ = str.Close()
+		return
+	}
 	tcp, err := net.DialTimeout("tcp", serviceTCP, 5*time.Second)
 	if err != nil {
-		d.log.Warn("gateway: tcp dial", "target", serviceTCP, "err", err)
+		d.log.Warn("gateway: tcp dial", "local_aid", ac.Local.String(), "remote_aid", ac.Remote.String(), "target", serviceTCP, "err", err)
 		_ = str.Close()
 		return
 	}
 	var hdr [21]byte
 	copy(hdr[:], ac.Remote[:])
 	if _, err := tcp.Write(hdr[:]); err != nil {
+		d.log.Warn("gateway: write aid header failed", "local_aid", ac.Local.String(), "remote_aid", ac.Remote.String(), "target", serviceTCP, "err", err)
 		_ = str.Close()
 		_ = tcp.Close()
 		return

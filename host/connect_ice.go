@@ -56,6 +56,7 @@ func (h *Host) connectViaICESignal(ctx context.Context, localPriv ed25519.Privat
 	urls := h.mergeICEURLs(ctx)
 	var sess *iceSession
 	for attempt := 0; attempt <= noAgentRetries; attempt++ {
+		h.log.Debug("ice dial attempt", "local_aid", localAgent.String(), "remote_aid", expectRemote.String(), "attempt", attempt+1, "max_attempts", noAgentRetries+1)
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -67,8 +68,10 @@ func (h *Host) connectViaICESignal(ctx context.Context, localPriv ed25519.Privat
 		if !errors.Is(err, ErrNoAgent) {
 			break
 		}
+		h.log.Debug("ice dial retry on noagent", "local_aid", localAgent.String(), "remote_aid", expectRemote.String(), "attempt", attempt+1)
 	}
 	if err != nil {
+		h.log.Warn("ice session failed", "local_aid", localAgent.String(), "remote_aid", expectRemote.String(), "err", err)
 		return nil, err
 	}
 
@@ -94,10 +97,13 @@ func (h *Host) connectViaICESignal(ctx context.Context, localPriv ed25519.Privat
 	}
 	qc, err := tr.Dial(ctx, udpRA, cliTLS, defaultQUICConfig())
 	if err != nil {
+		h.log.Warn("quic dial over ice failed", "local_aid", localAgent.String(), "remote_aid", expectRemote.String(), "dst", udpRA, "err", err)
 		teardown()
 		return nil, err
 	}
+	h.log.Debug("quic dial over ice ok", "local_aid", localAgent.String(), "remote_aid", expectRemote.String(), "dst", udpRA)
 	if err := writeAgentRouteFrame(ctx, qc, expectRemote); err != nil {
+		h.log.Warn("agent-route over ice failed", "local_aid", localAgent.String(), "remote_aid", expectRemote.String(), "err", err)
 		_ = qc.CloseWithError(1, "agent-route")
 		teardown()
 		return nil, err
@@ -107,6 +113,7 @@ func (h *Host) connectViaICESignal(ctx context.Context, localPriv ed25519.Privat
 	// timeout, explicit close, error) the Transport and WS are cleaned up.
 	go func() {
 		<-qc.Context().Done()
+		h.log.Debug("ice quic closed", "local_aid", localAgent.String(), "remote_aid", expectRemote.String(), "err", qc.Context().Err())
 		_ = tr.Close()
 		sess.CloseSignaling()
 	}()
