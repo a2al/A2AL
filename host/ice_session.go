@@ -5,8 +5,15 @@ package host
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha1"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/coder/websocket"
@@ -14,7 +21,6 @@ import (
 	ice "github.com/pion/ice/v3"
 	"github.com/pion/stun/v2"
 
-	"github.com/a2al/a2al/protocol"
 	"github.com/a2al/a2al/signaling"
 )
 
@@ -22,6 +28,11 @@ import (
 // ICE credentials via the signaling WebSocket. If the caller's context already
 // carries a deadline, it takes precedence.
 const defaultICECredentialTimeout = 30 * time.Second
+
+// ErrNoAgent is returned by runICESession when the signaling hub reports that
+// the target agent is not currently registered ("noagent" frame). Callers may
+// retry after a brief delay to ride out a callee reconnect window.
+var ErrNoAgent = errors.New("a2al/host: target agent not registered")
 
 // iceSession holds resources created during ICE signaling that must outlive the
 // signaling exchange. The caller is responsible for calling Close (or
@@ -51,20 +62,17 @@ func (s *iceSession) Close() {
 	}
 }
 
-// mergeICEURLs builds a deduplicated list of STUN/TURN URIs from local config
-// and the remote endpoint record. Falls back to a public STUN server when no
-// URIs are configured.
-func (h *Host) mergeICEURLs(er *protocol.EndpointRecord) []*stun.URI {
+// mergeICEURLs builds a deduplicated list of STUN/TURN URIs from local config.
+// Falls back to a public STUN server when no URIs are configured.
+//
+// Note: er.Turns (callee's TURN server hints from the DHT record) are intentionally
+// NOT included. The caller has no credentials for callee's TURN server; callee-pays
+// relay candidates arrive via trickle ICE as remote candidates, not as local server URIs.
+func (h *Host) mergeICEURLs(ctx context.Context) []*stun.URI {
 	seen := make(map[string]struct{})
 	var out []*stun.URI
-	add := func(s string) {
-		if s == "" {
-			return
-		}
-		u, err := stun.ParseURI(s)
-		if err != nil {
-			return
-		}
+
+	addURI := func(u *stun.URI) {
 		key := u.String()
 		if _, ok := seen[key]; ok {
 			return
@@ -72,21 +80,107 @@ func (h *Host) mergeICEURLs(er *protocol.EndpointRecord) []*stun.URI {
 		seen[key] = struct{}{}
 		out = append(out, u)
 	}
-	for _, s := range h.cfg.ICESTUNURLs {
-		add(s)
-	}
-	for _, s := range h.cfg.ICETURNURLs {
-		add(s)
-	}
-	if er != nil {
-		for _, s := range er.Turns {
-			add(s)
+	addRaw := func(s string) {
+		if s == "" {
+			return
 		}
+		u, err := stun.ParseURI(s)
+		if err != nil {
+			return
+		}
+		addURI(u)
+	}
+
+	for _, s := range h.cfg.ICESTUNURLs {
+		addRaw(s)
+	}
+	// Legacy embedded-credential TURN URLs (ICETURNURLs).
+	for _, s := range h.cfg.ICETURNURLs {
+		addRaw(s)
+	}
+	// Structured TURN servers with HMAC / REST API credential support.
+	for _, ts := range h.cfg.TURNServers {
+		u, err := resolveTURNURI(ctx, ts)
+		if err != nil {
+			h.log.Warn("TURN credential resolution failed, skipping server",
+				"url", ts.URL, "err", err)
+			continue
+		}
+		addURI(u)
 	}
 	if len(out) == 0 {
-		add("stun:stun.l.google.com:19302")
+		addRaw("stun:stun.l.google.com:19302")
 	}
 	return out
+}
+
+// resolveTURNURI returns a *stun.URI with credentials populated for the given TURNServer.
+// For HMAC, credentials are generated locally. For REST API, the credential endpoint
+// is called with the configured Authorization header.
+func resolveTURNURI(ctx context.Context, ts TURNServer) (*stun.URI, error) {
+	u, err := stun.ParseURI(ts.URL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid TURN URL %q: %w", ts.URL, err)
+	}
+	switch ts.CredentialType {
+	case TURNCredentialStatic:
+		u.Username = ts.Username
+		u.Password = ts.Credential
+	case TURNCredentialHMAC:
+		// coturn use-auth-secret: username = unix_expiry:base_user, password = base64(HMAC-SHA1(secret, username)).
+		exp := time.Now().Add(time.Hour).Unix()
+		username := strconv.FormatInt(exp, 10) + ":" + ts.Username
+		mac := hmac.New(sha1.New, []byte(ts.Credential))
+		mac.Write([]byte(username))
+		u.Username = username
+		u.Password = base64.StdEncoding.EncodeToString(mac.Sum(nil))
+	case TURNCredentialRESTAPI:
+		user, pass, err := fetchTURNRESTCredentials(ctx, ts.CredentialURL, ts.Credential)
+		if err != nil {
+			return nil, fmt.Errorf("REST API credential fetch for %q: %w", ts.URL, err)
+		}
+		u.Username = user
+		u.Password = pass
+	default:
+		return nil, fmt.Errorf("unsupported TURN credential type %d for %q", ts.CredentialType, ts.URL)
+	}
+	return u, nil
+}
+
+// fetchTURNRESTCredentials calls a REST endpoint to retrieve short-lived TURN credentials.
+// auth is placed verbatim in the Authorization header (e.g. "Basic base64(sid:token)").
+// The JSON response must contain "username" and "password" (or "credential") fields.
+func fetchTURNRESTCredentials(ctx context.Context, apiURL, auth string) (username, password string, err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, nil)
+	if err != nil {
+		return "", "", err
+	}
+	if auth != "" {
+		req.Header.Set("Authorization", auth)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return "", "", fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	var body struct {
+		Username   string `json:"username"`
+		Password   string `json:"password"`
+		Credential string `json:"credential"` // Twilio / some providers use "credential"
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&body); err != nil {
+		return "", "", fmt.Errorf("decode response: %w", err)
+	}
+	if body.Password == "" {
+		body.Password = body.Credential
+	}
+	if body.Username == "" || body.Password == "" {
+		return "", "", errors.New("response missing username or password")
+	}
+	return body.Username, body.Password, nil
 }
 
 func newICEAgent(urls []*stun.URI, hostOnly bool) (*ice.Agent, error) {
@@ -198,6 +292,14 @@ func runICESession(ctx context.Context, wsURL string, urls []*stun.URI, controll
 				_ = agent.AddRemoteCandidate(cand)
 			case "eoc":
 				// Informational; ICE handles this naturally.
+			case "noagent":
+				// Target agent is not registered on the hub. Signal the caller
+				// with a typed error so it can decide whether to retry.
+				select {
+				case readErr <- ErrNoAgent:
+				default:
+				}
+				return
 			}
 		}
 	}()

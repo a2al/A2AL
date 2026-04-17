@@ -57,13 +57,28 @@ func QUICDialTargets(er *protocol.EndpointRecord) ([]*net.UDPAddr, error) {
 func (h *Host) ConnectFromRecord(ctx context.Context, expectRemote a2al.Address, er *protocol.EndpointRecord) (quic.Connection, error) {
 	targets, terr := QUICDialTargets(er)
 	var happyErr error
-	if len(targets) > 0 {
+	natType := protocol.NATUnknown
+	hasSignal := false
+	if er != nil {
+		natType = er.NatType
+		hasSignal = er.Signal != ""
+	}
+	skipDirect := er != nil && er.NatType == protocol.NATSymmetric && er.Signal != ""
+	h.log.Debug("connect path decision",
+		"remote_aid", expectRemote.String(),
+		"nat_type", natType,
+		"has_signal", hasSignal,
+		"quic_targets", len(targets),
+		"skip_direct", skipDirect,
+	)
+	if !skipDirect && len(targets) > 0 {
 		c, err := h.connectHappy(ctx, h.priv, expectRemote, targets, DefaultConnectStagger)
 		if err == nil {
 			return c, nil
 		}
+		h.log.Debug("connect direct failed, fallback maybe needed", "remote_aid", expectRemote.String(), "err", err)
 		happyErr = err
-	} else {
+	} else if len(targets) == 0 {
 		happyErr = terr
 	}
 	if er == nil || er.Signal == "" {
@@ -72,8 +87,10 @@ func (h *Host) ConnectFromRecord(ctx context.Context, expectRemote a2al.Address,
 		}
 		return nil, errors.New("a2al/host: no quic targets and no signal url")
 	}
+	h.log.Debug("connect via ice", "remote_aid", expectRemote.String(), "signal", hasSignal)
 	iceConn, err := h.connectViaICESignal(ctx, h.priv, h.addr, expectRemote, er)
 	if err != nil {
+		h.log.Warn("connect ice failed", "remote_aid", expectRemote.String(), "err", err)
 		if happyErr != nil {
 			return nil, errors.Join(happyErr, fmt.Errorf("ice: %w", err))
 		}
@@ -93,13 +110,29 @@ func (h *Host) ConnectFromRecordFor(ctx context.Context, localAgent, expectRemot
 	}
 	targets, terr := QUICDialTargets(er)
 	var happyErr error
-	if len(targets) > 0 {
+	natType := protocol.NATUnknown
+	hasSignal := false
+	if er != nil {
+		natType = er.NatType
+		hasSignal = er.Signal != ""
+	}
+	skipDirect := er != nil && er.NatType == protocol.NATSymmetric && er.Signal != ""
+	h.log.Debug("connect path decision",
+		"local_aid", localAgent.String(),
+		"remote_aid", expectRemote.String(),
+		"nat_type", natType,
+		"has_signal", hasSignal,
+		"quic_targets", len(targets),
+		"skip_direct", skipDirect,
+	)
+	if !skipDirect && len(targets) > 0 {
 		c, err := h.connectHappy(ctx, ag.priv, expectRemote, targets, DefaultConnectStagger)
 		if err == nil {
 			return c, nil
 		}
+		h.log.Debug("connect direct failed, fallback maybe needed", "local_aid", localAgent.String(), "remote_aid", expectRemote.String(), "err", err)
 		happyErr = err
-	} else {
+	} else if len(targets) == 0 {
 		happyErr = terr
 	}
 	if er == nil || er.Signal == "" {
@@ -108,8 +141,10 @@ func (h *Host) ConnectFromRecordFor(ctx context.Context, localAgent, expectRemot
 		}
 		return nil, errors.New("a2al/host: no quic targets and no signal url")
 	}
+	h.log.Debug("connect via ice", "local_aid", localAgent.String(), "remote_aid", expectRemote.String(), "signal", hasSignal)
 	iceConn, err := h.connectViaICESignal(ctx, ag.priv, localAgent, expectRemote, er)
 	if err != nil {
+		h.log.Warn("connect ice failed", "local_aid", localAgent.String(), "remote_aid", expectRemote.String(), "err", err)
 		if happyErr != nil {
 			return nil, errors.Join(happyErr, fmt.Errorf("ice: %w", err))
 		}

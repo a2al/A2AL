@@ -265,6 +265,24 @@ func decodeBody(msgType uint8, raw cbor.RawMessage) (any, error) {
 			return nil, err
 		}
 		return &b, nil
+	case MsgNATProbeReq:
+		var b BodyNATProbeReq
+		if err := cbor.Unmarshal(raw, &b); err != nil {
+			return nil, err
+		}
+		if len(b.Token) != 8 || !validObserved(b.ClaimedAddr) {
+			return nil, ErrInvalidMessage
+		}
+		return &b, nil
+	case MsgNATProbeEcho:
+		var b BodyNATProbeEcho
+		if err := cbor.Unmarshal(raw, &b); err != nil {
+			return nil, err
+		}
+		if len(b.Token) != 8 {
+			return nil, ErrInvalidMessage
+		}
+		return &b, nil
 	default:
 		return nil, ErrUnknownMsgType
 	}
@@ -355,6 +373,22 @@ func bodyWireCheck(msgType uint8, body any) error {
 		_, ok := body.(*BodyStoreResp)
 		if !ok {
 			return fmt.Errorf("%w: body type for STORE_RESP", ErrInvalidMessage)
+		}
+	case MsgNATProbeReq:
+		b, ok := body.(*BodyNATProbeReq)
+		if !ok {
+			return fmt.Errorf("%w: body type for NAT_PROBE_REQ", ErrInvalidMessage)
+		}
+		if len(b.Token) != 8 || !validObserved(b.ClaimedAddr) {
+			return ErrInvalidMessage
+		}
+	case MsgNATProbeEcho:
+		b, ok := body.(*BodyNATProbeEcho)
+		if !ok {
+			return fmt.Errorf("%w: body type for NAT_PROBE_ECHO", ErrInvalidMessage)
+		}
+		if len(b.Token) != 8 {
+			return ErrInvalidMessage
 		}
 	default:
 		return ErrUnknownMsgType

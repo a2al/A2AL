@@ -19,7 +19,7 @@ func TestICESessionHostOnlyLoopback(t *testing.T) {
 	defer relay.Close()
 
 	room := signaling.RoomID("aidaaaaaaaaaaaaaaaaaaaa", "aidbbbbbbbbbbbbbbbbbbbb")
-	wsURL, err := signaling.AppendRoomQuery(relay.BaseURL()+"/ice", room)
+	wsURL, err := signaling.AppendRoomToICEURL(relay.BaseURL(), room)
 	if err != nil {
 		t.Fatal(err)
 	}

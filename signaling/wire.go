@@ -11,12 +11,17 @@ import (
 const SubprotocolICE = "a2al.ice.v1"
 
 // Frame is a CBOR envelope on the signaling WebSocket.
-// T is "cred" | "cand" | "eoc".
+// T is "cred" | "cand" | "eoc" | "reg" | "incoming" | "noagent".
 type Frame struct {
 	T string `cbor:"t"`
 	U string `cbor:"u,omitempty"` // ufrag (cred)
 	P string `cbor:"p,omitempty"` // pwd (cred)
 	C string `cbor:"c,omitempty"` // ice candidate Marshal string
+	AID    string `cbor:"a,omitempty"` // reg: callee AID; reserved for future use
+	Sig    string `cbor:"s,omitempty"` // reg: reserved (AID squatting prevention)
+	Room   string `cbor:"r,omitempty"` // incoming: room id
+	Caller string `cbor:"f,omitempty"` // incoming: caller AID string
+	Target string `cbor:"g,omitempty"` // incoming: callee AID (hub lookup key)
 }
 
 // EncodeFrame CBOR-encodes a frame.

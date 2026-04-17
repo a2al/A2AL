@@ -42,11 +42,45 @@ import (
 
 func defaultQUICConfig() *quic.Config {
 	return &quic.Config{
-		HandshakeIdleTimeout:    10 * time.Second,
-		MaxIdleTimeout:          90 * time.Second,
-		MaxIncomingStreams:       100,
-		MaxIncomingUniStreams:    10,
+		HandshakeIdleTimeout:  10 * time.Second,
+		MaxIdleTimeout:        90 * time.Second,
+		MaxIncomingStreams:    100,
+		MaxIncomingUniStreams: 10,
 	}
+}
+
+// TURNCredentialType selects how TURN credentials are obtained per session.
+type TURNCredentialType int
+
+const (
+	// TURNCredentialStatic uses a fixed username and password stored in config.
+	TURNCredentialStatic TURNCredentialType = iota
+	// TURNCredentialHMAC generates time-limited credentials from a shared secret
+	// using the coturn use-auth-secret mechanism:
+	//   username = strconv.FormatInt(unix_expiry, 10) + ":" + Username
+	//   password = base64(HMAC-SHA1(Credential, username))
+	TURNCredentialHMAC
+	// TURNCredentialRESTAPI fetches short-lived credentials from an HTTP endpoint
+	// before each ICE session. The response must be JSON with "username" and
+	// "password" (or "credential") fields. Covers Twilio, Metered.ca, etc.
+	TURNCredentialRESTAPI
+)
+
+// TURNServer describes a TURN relay server and how to obtain credentials for it.
+// Credentials are resolved fresh per ICE session; they are never published to the DHT.
+type TURNServer struct {
+	// URL is the TURN server address without embedded credentials,
+	// e.g. "turn:turn.example.com:3478?transport=udp".
+	URL string
+	// CredentialType selects the credential acquisition method.
+	CredentialType TURNCredentialType
+	// Username is the static username (Static) or base username prefix (HMAC).
+	Username string
+	// Credential is the static password (Static), the HMAC shared secret (HMAC),
+	// or the Authorization header value for the REST API request (RESTAPI).
+	Credential string
+	// CredentialURL is the HTTP endpoint that returns short-lived credentials (RESTAPI only).
+	CredentialURL string
 }
 
 // Config wires DHT + QUIC.
@@ -64,20 +98,31 @@ type Config struct {
 	ListenAddr string
 	// QUICListenAddr, if non-empty, is a separate UDP bind for QUIC.
 	// Same udp4 constraint as ListenAddr.
-	QUICListenAddr string
+	QUICListenAddr   string
 	PrivateKey       ed25519.PrivateKey
 	MinObservedPeers int
 	FallbackHost     string
-	// DisableUPnP skips IGD port mapping for the QUIC UDP port (Phase 2b). TURN is deferred.
+	// DisableUPnP skips IGD port mapping for the QUIC UDP port (Phase 2b).
 	DisableUPnP bool
 
-	// ICESignalURL is the WebSocket base URL published in endpoint records for ICE trickle (optional).
+	// ICESignalURL is the primary WebSocket base URL for ICE signaling (single URL, backward compat).
+	// Superseded by ICESignalURLs when that field is non-empty.
 	ICESignalURL string
+	// ICESignalURLs lists WebSocket base URLs for ICE signaling (multi-center support).
+	// When non-empty, supersedes ICESignalURL. The first URL is also written to
+	// EndpointPayload.Signal (CBOR key 3) for backward compatibility with old nodes.
+	ICESignalURLs []string
 	// ICESTUNURLs lists stun: URIs for ICE gathering; empty means default public STUN when no TURN is configured.
 	ICESTUNURLs []string
-	// ICETURNURLs lists turn: URIs (may include credentials) used locally for ICE relay; not published.
+	// ICETURNURLs lists turn: URIs with embedded credentials for ICE relay (legacy format).
+	// Use TURNServers for new deployments; both fields are processed when set.
 	ICETURNURLs []string
-	// ICEPublishTurns lists credential-free turn: hints stored in EndpointPayload.Turns.
+	// TURNServers lists TURN relay servers with structured credential configuration.
+	// Supports Static, HMAC (coturn use-auth-secret), and REST API credential types.
+	// Credentials are resolved per ICE session and never published to the DHT.
+	TURNServers []TURNServer
+	// ICEPublishTurns is retained for decoding old records; new nodes do not publish turns[].
+	// Deprecated: callee-pays TURN relay addresses are exchanged via trickle ICE, not the DHT.
 	ICEPublishTurns []string
 	// Logger is forwarded to the DHT node for diagnostic logging (reply failures, RPC retries).
 	// If nil, slog.Default() is used.
@@ -131,6 +176,14 @@ type Host struct {
 	extipMu   sync.Mutex
 	extipSnap string    // "ip:port" (STUN) or "ip" (HTTP); empty = not yet resolved
 	extipExp  time.Time // cache expiry
+
+	iceMu            sync.RWMutex
+	derivedICESignal string // from bootstrap when cfg.ICESignalURL is empty
+
+	signalStatsMu sync.RWMutex
+	signalStats   func() map[string]any
+
+	natProbeMu sync.Mutex // guards RunNATProbe (only one probe at a time)
 }
 
 // New creates a Host with one initial agent identity from cfg.KeyStore.
@@ -333,9 +386,9 @@ func (h *Host) RegisteredAgents() []a2al.Address {
 	return out
 }
 
-func (h *Host) Node() *dht.Node            { return h.node }
-func (h *Host) Sense() *natsense.Sense      { return h.sense }
-func (h *Host) Address() a2al.Address        { return h.addr }
+func (h *Host) Node() *dht.Node        { return h.node }
+func (h *Host) Sense() *natsense.Sense { return h.sense }
+func (h *Host) Address() a2al.Address  { return h.addr }
 
 func (h *Host) DHTLocalAddr() *net.UDPAddr {
 	return h.node.LocalAddr().(*net.UDPAddr)
@@ -362,6 +415,116 @@ func (h *Host) ObserveFromPeers(ctx context.Context, seeds []net.Addr) {
 		}()
 	}
 	wg.Wait()
+}
+
+// ObserveFromRouting samples current routing-table candidates and performs
+// passive observed_addr collection from them.
+func (h *Host) ObserveFromRouting(ctx context.Context, n int) int {
+	if n <= 0 {
+		n = 8
+	}
+	seeds := h.node.BootstrapCandidateAddrs(n)
+	if len(seeds) == 0 {
+		return 0
+	}
+	h.ObserveFromPeers(ctx, seeds)
+	return len(seeds)
+}
+
+// RunNATProbe performs an AutoNAT-style active reachability test to classify NAT type.
+// At most one probe runs at a time (TryLock); concurrent callers return immediately.
+//
+// Classification logic:
+//
+//	QUIC bind IP is public WAN              → sense.RecordBindPublic(true); return (no probe needed)
+//	probe echo received from ≥1 candidate   → sense.RecordProbeResult(true)  [Full Cone / cloud NAT]
+//	no echo despite known external address  → sense.RecordProbeResult(false) [Restricted]
+func (h *Host) RunNATProbe(ctx context.Context) {
+	if !h.natProbeMu.TryLock() {
+		return // another probe is already running
+	}
+	defer h.natProbeMu.Unlock()
+
+	// ① Detect public bind.
+	if qa := h.QUICLocalAddr(); qa != nil && isPlausibleWANIP(qa.IP) {
+		h.sense.RecordBindPublic(true)
+		h.log.Debug("nat probe: public bind", "ip", qa.IP)
+		return // directly reachable; no inbound echo probe needed
+	}
+	h.sense.RecordBindPublic(false)
+
+	// ② Get claimed external address: natsense consensus preferred, STUN as fallback.
+	claimedWire, ok := h.sense.TrustedWire()
+	if !ok {
+		sctx, cancel := context.WithTimeout(ctx, 4*time.Second)
+		stunIP, stunPort := probeSTUN(sctx)
+		cancel()
+		if stunIP != nil && isPlausibleWANIP(stunIP) {
+			if b, err := protocol.FormatObservedUDP(stunIP, stunPort); err == nil {
+				claimedWire = b
+			}
+		}
+	}
+	if len(claimedWire) == 0 {
+		h.log.Debug("nat probe: no claimed external address; skipping")
+		return // cannot probe without knowing external address
+	}
+
+	// ③ Select up to 3 candidates with public WAN IPs from the routing table.
+	candidates := h.selectNATProbeTargets(3)
+	if len(candidates) == 0 {
+		h.log.Debug("nat probe: no public-IP candidates in routing table; skipping")
+		return
+	}
+
+	// ④ Probe concurrently; ≥1 successful echo → reachable.
+	type result struct{ ok bool }
+	results := make(chan result, len(candidates))
+	for _, addr := range candidates {
+		addr := addr
+		go func() {
+			pCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			ok, _ := h.node.SendNATProbeReq(pCtx, addr, claimedWire)
+			results <- result{ok}
+		}()
+	}
+	var reachable bool
+	for range candidates {
+		if r := <-results; r.ok {
+			reachable = true
+		}
+	}
+	h.sense.RecordProbeResult(reachable)
+	h.log.Debug("nat probe done", "reachable", reachable, "candidates", len(candidates))
+}
+
+// InvalidateNetworkCaches clears short-lived external-network caches so
+// subsequent endpoint building uses fresh probes after network changes.
+func (h *Host) InvalidateNetworkCaches() {
+	h.extipMu.Lock()
+	h.extipSnap = ""
+	h.extipExp = time.Time{}
+	h.extipMu.Unlock()
+	h.sense.ClearProbeResult()
+	h.sense.InvalidateObservations()
+}
+
+// selectNATProbeTargets returns up to n UDP addresses of routing-table peers with public WAN IPs.
+func (h *Host) selectNATProbeTargets(n int) []net.Addr {
+	all := h.node.BootstrapCandidateAddrs(n * 5)
+	var out []net.Addr
+	for _, a := range all {
+		udp, ok := a.(*net.UDPAddr)
+		if !ok || !isPlausibleWANIP(udp.IP) {
+			continue
+		}
+		out = append(out, a)
+		if len(out) >= n {
+			break
+		}
+	}
+	return out
 }
 
 // BuildEndpointPayload builds ordered, deduplicated quic:// candidates (Phase 2b).
@@ -393,19 +556,70 @@ func (h *Host) BuildEndpointPayload(ctx context.Context) (protocol.EndpointPaylo
 	if err != nil {
 		return protocol.EndpointPayload{}, err
 	}
-	var turns []string
-	for _, t := range h.cfg.ICEPublishTurns {
-		if strings.Contains(t, "@") {
-			continue // never publish credentials to DHT (spec: "TURN凭证绝不进DHT")
-		}
-		turns = append(turns, t)
+
+	// Signal URLs: multi-center list, Signal = Signals[0] for backward compat.
+	// turns[] is intentionally not published: callee-pays TURN relay addresses are
+	// exchanged via trickle ICE during sessions, not stored in the DHT.
+	signals := h.effectiveICESignalURLs()
+	var signal string
+	if len(signals) > 0 {
+		signal = signals[0]
 	}
 	return protocol.EndpointPayload{
 		Endpoints: eps,
 		NatType:   h.sense.InferNATType(),
-		Signal:    h.cfg.ICESignalURL,
-		Turns:     turns,
+		Signal:    signal,
+		Signals:   signals,
 	}, nil
+}
+
+// effectiveICESignalURLs returns the ordered list of signal hub URLs to publish.
+// Priority: ICESignalURLs config > ICESignalURL config > bootstrap-derived value.
+func (h *Host) effectiveICESignalURLs() []string {
+	h.iceMu.RLock()
+	defer h.iceMu.RUnlock()
+	if len(h.cfg.ICESignalURLs) > 0 {
+		return h.cfg.ICESignalURLs
+	}
+	if h.cfg.ICESignalURL != "" {
+		return []string{h.cfg.ICESignalURL}
+	}
+	if h.derivedICESignal != "" {
+		return []string{h.derivedICESignal}
+	}
+	return nil
+}
+
+func (h *Host) effectiveICESignalBase() string {
+	urls := h.effectiveICESignalURLs()
+	if len(urls) > 0 {
+		return urls[0]
+	}
+	return ""
+}
+
+// EffectiveICESignalBase returns the primary ICE signaling WebSocket base URL
+// published in endpoint records: explicit config overrides bootstrap-derived value.
+func (h *Host) EffectiveICESignalBase() string {
+	return h.effectiveICESignalBase()
+}
+
+// SetDerivedICESignalURL sets the bootstrap-derived signal base when
+// Config.ICESignalURL is empty. Explicit config always wins and is not overwritten.
+func (h *Host) SetDerivedICESignalURL(s string) {
+	h.iceMu.Lock()
+	defer h.iceMu.Unlock()
+	if h.cfg.ICESignalURL != "" {
+		return
+	}
+	h.derivedICESignal = strings.TrimSpace(s)
+}
+
+// SetSignalStatsProvider merges hub stats into GET /debug/stats under "signal".
+func (h *Host) SetSignalStatsProvider(f func() map[string]any) {
+	h.signalStatsMu.Lock()
+	h.signalStats = f
+	h.signalStatsMu.Unlock()
 }
 
 const extipCacheTTL = 5 * time.Minute

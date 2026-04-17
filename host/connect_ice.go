@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"time"
 
 	"github.com/quic-go/quic-go"
 
@@ -16,6 +17,16 @@ import (
 	"github.com/a2al/a2al/protocol"
 	"github.com/a2al/a2al/signaling"
 )
+
+// noAgentRetries is the number of extra attempts after a "noagent" response.
+// A noagent reply means the callee is momentarily unregistered (e.g. reconnect
+// after keepalive gap). Two retries with a 3 s pause each cover the typical
+// 2–5 s reconnect window without significantly delaying callers in the normal
+// (non-noagent) path.
+const noAgentRetries = 2
+
+// noAgentRetryDelay is the pause between noagent retry attempts.
+const noAgentRetryDelay = 3 * time.Second
 
 // connectViaICESignal is the controlling (caller) ICE path:
 // WebSocket signaling → ICE pair selection → QUIC over ICE → agent-route.
@@ -29,14 +40,38 @@ func (h *Host) connectViaICESignal(ctx context.Context, localPriv ed25519.Privat
 		return nil, errors.New("a2al/host: no signal url in record")
 	}
 	room := signaling.RoomID(localAgent.String(), expectRemote.String())
-	wsURL, err := signaling.AppendRoomQuery(er.Signal, room)
+	wsURL, err := signaling.AppendRoomToICEURL(er.Signal, room)
+	if err != nil {
+		return nil, fmt.Errorf("a2al/host: ice signal url: %w", err)
+	}
+	wsURL, err = signaling.AppendQuery(wsURL, "target", expectRemote.String())
+	if err != nil {
+		return nil, fmt.Errorf("a2al/host: ice signal url: %w", err)
+	}
+	wsURL, err = signaling.AppendQuery(wsURL, "caller", localAgent.String())
 	if err != nil {
 		return nil, fmt.Errorf("a2al/host: ice signal url: %w", err)
 	}
 
-	urls := h.mergeICEURLs(er)
-	sess, err := runICESession(ctx, wsURL, urls, true, false)
+	urls := h.mergeICEURLs(ctx)
+	var sess *iceSession
+	for attempt := 0; attempt <= noAgentRetries; attempt++ {
+		h.log.Debug("ice dial attempt", "local_aid", localAgent.String(), "remote_aid", expectRemote.String(), "attempt", attempt+1, "max_attempts", noAgentRetries+1)
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(noAgentRetryDelay):
+			}
+		}
+		sess, err = runICESession(ctx, wsURL, urls, true, false)
+		if !errors.Is(err, ErrNoAgent) {
+			break
+		}
+		h.log.Debug("ice dial retry on noagent", "local_aid", localAgent.String(), "remote_aid", expectRemote.String(), "attempt", attempt+1)
+	}
 	if err != nil {
+		h.log.Warn("ice session failed", "local_aid", localAgent.String(), "remote_aid", expectRemote.String(), "err", err)
 		return nil, err
 	}
 
@@ -62,10 +97,13 @@ func (h *Host) connectViaICESignal(ctx context.Context, localPriv ed25519.Privat
 	}
 	qc, err := tr.Dial(ctx, udpRA, cliTLS, defaultQUICConfig())
 	if err != nil {
+		h.log.Warn("quic dial over ice failed", "local_aid", localAgent.String(), "remote_aid", expectRemote.String(), "dst", udpRA, "err", err)
 		teardown()
 		return nil, err
 	}
+	h.log.Debug("quic dial over ice ok", "local_aid", localAgent.String(), "remote_aid", expectRemote.String(), "dst", udpRA)
 	if err := writeAgentRouteFrame(ctx, qc, expectRemote); err != nil {
+		h.log.Warn("agent-route over ice failed", "local_aid", localAgent.String(), "remote_aid", expectRemote.String(), "err", err)
 		_ = qc.CloseWithError(1, "agent-route")
 		teardown()
 		return nil, err
@@ -75,6 +113,7 @@ func (h *Host) connectViaICESignal(ctx context.Context, localPriv ed25519.Privat
 	// timeout, explicit close, error) the Transport and WS are cleaned up.
 	go func() {
 		<-qc.Context().Done()
+		h.log.Debug("ice quic closed", "local_aid", localAgent.String(), "remote_aid", expectRemote.String(), "err", qc.Context().Err())
 		_ = tr.Close()
 		sess.CloseSignaling()
 	}()
@@ -98,12 +137,12 @@ func (h *Host) AcceptICEViaSignal(ctx context.Context, localAgent, expectRemote 
 	}
 
 	room := signaling.RoomID(localAgent.String(), expectRemote.String())
-	wsURL, err := signaling.AppendRoomQuery(signalBase, room)
+	wsURL, err := signaling.AppendRoomToICEURL(signalBase, room)
 	if err != nil {
 		return nil, fmt.Errorf("a2al/host: ice signal url: %w", err)
 	}
 
-	urls := h.mergeICEURLs(nil)
+	urls := h.mergeICEURLs(ctx)
 	sess, err := runICESession(ctx, wsURL, urls, false, false)
 	if err != nil {
 		return nil, err
