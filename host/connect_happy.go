@@ -5,7 +5,7 @@ package host
 
 import (
 	"context"
-	"crypto/ed25519"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
@@ -72,7 +72,11 @@ func (h *Host) ConnectFromRecord(ctx context.Context, expectRemote a2al.Address,
 		"skip_direct", skipDirect,
 	)
 	if !skipDirect && len(targets) > 0 {
-		c, err := h.connectHappy(ctx, h.priv, expectRemote, targets, DefaultConnectStagger)
+		cert, err := h.defaultAgentCert()
+		if err != nil {
+			return nil, err
+		}
+		c, err := h.connectHappy(ctx, cert, expectRemote, targets, DefaultConnectStagger)
 		if err == nil {
 			return c, nil
 		}
@@ -88,7 +92,11 @@ func (h *Host) ConnectFromRecord(ctx context.Context, expectRemote a2al.Address,
 		return nil, errors.New("a2al/host: no quic targets and no signal url")
 	}
 	h.log.Debug("connect via ice", "remote_aid", expectRemote.String(), "signal", hasSignal)
-	iceConn, err := h.connectViaICESignal(ctx, h.priv, h.addr, expectRemote, er)
+	cert, err := h.defaultAgentCert()
+	if err != nil {
+		return nil, err
+	}
+	iceConn, err := h.connectViaICESignal(ctx, cert, h.addr, expectRemote, er)
 	if err != nil {
 		h.log.Warn("connect ice failed", "remote_aid", expectRemote.String(), "err", err)
 		if happyErr != nil {
@@ -126,7 +134,7 @@ func (h *Host) ConnectFromRecordFor(ctx context.Context, localAgent, expectRemot
 		"skip_direct", skipDirect,
 	)
 	if !skipDirect && len(targets) > 0 {
-		c, err := h.connectHappy(ctx, ag.priv, expectRemote, targets, DefaultConnectStagger)
+		c, err := h.connectHappy(ctx, ag.cert, expectRemote, targets, DefaultConnectStagger)
 		if err == nil {
 			return c, nil
 		}
@@ -142,7 +150,7 @@ func (h *Host) ConnectFromRecordFor(ctx context.Context, localAgent, expectRemot
 		return nil, errors.New("a2al/host: no quic targets and no signal url")
 	}
 	h.log.Debug("connect via ice", "local_aid", localAgent.String(), "remote_aid", expectRemote.String(), "signal", hasSignal)
-	iceConn, err := h.connectViaICESignal(ctx, ag.priv, localAgent, expectRemote, er)
+	iceConn, err := h.connectViaICESignal(ctx, ag.cert, localAgent, expectRemote, er)
 	if err != nil {
 		h.log.Warn("connect ice failed", "local_aid", localAgent.String(), "remote_aid", expectRemote.String(), "err", err)
 		if happyErr != nil {
@@ -153,7 +161,7 @@ func (h *Host) ConnectFromRecordFor(ctx context.Context, localAgent, expectRemot
 	return iceConn, nil
 }
 
-func (h *Host) connectHappy(ctx context.Context, localPriv ed25519.PrivateKey, expectRemote a2al.Address, targets []*net.UDPAddr, stagger time.Duration) (quic.Connection, error) {
+func (h *Host) connectHappy(ctx context.Context, localCert tls.Certificate, expectRemote a2al.Address, targets []*net.UDPAddr, stagger time.Duration) (quic.Connection, error) {
 	if len(targets) == 0 {
 		return nil, errors.New("a2al/host: no dial targets")
 	}
@@ -187,7 +195,7 @@ func (h *Host) connectHappy(ctx context.Context, localPriv ed25519.PrivateKey, e
 			if gctx.Err() != nil {
 				return
 			}
-			c, err := h.dialAndAgentRoute(gctx, localPriv, expectRemote, addr)
+			c, err := h.dialAndAgentRoute(gctx, localCert, expectRemote, addr)
 			resCh <- dialRes{c, err}
 		}()
 	}

@@ -154,6 +154,13 @@ type agentEntry struct {
 }
 
 // Host is the Phase 2a runtime.
+//
+// Identity layering strategy:
+//   - DHT and signaling transport use node identity.
+//   - QUIC mutual-TLS uses agent identity certificates (including delegated
+//     agent cert extensions when applicable).
+//   - Each QUIC connection represents a (localAgent, remoteAgent) pair.
+//   - The gateway relies on AgentConn.Remote as the authenticated caller AID.
 type Host struct {
 	cfg     Config
 	log     *slog.Logger
@@ -784,7 +791,11 @@ func (h *Host) FindRecords(ctx context.Context, target a2al.Address, recType uin
 // agent-route frame (4-byte magic + 21-byte target Address) so the
 // server can route the connection even when TLS SNI is camouflaged.
 func (h *Host) Connect(ctx context.Context, expectRemote a2al.Address, udpAddr *net.UDPAddr) (quic.Connection, error) {
-	return h.dialAndAgentRoute(ctx, h.priv, expectRemote, udpAddr)
+	cert, err := h.defaultAgentCert()
+	if err != nil {
+		return nil, err
+	}
+	return h.dialAndAgentRoute(ctx, cert, expectRemote, udpAddr)
 }
 
 func writeAgentRouteFrame(ctx context.Context, conn quic.Connection, target a2al.Address) error {
@@ -799,8 +810,8 @@ func writeAgentRouteFrame(ctx context.Context, conn quic.Connection, target a2al
 	return nil
 }
 
-func (h *Host) dialAndAgentRoute(ctx context.Context, localPriv ed25519.PrivateKey, expectRemote a2al.Address, udpAddr *net.UDPAddr) (quic.Connection, error) {
-	cliTLS, err := quicClientTLS(localPriv, expectRemote)
+func (h *Host) dialAndAgentRoute(ctx context.Context, localCert tls.Certificate, expectRemote a2al.Address, udpAddr *net.UDPAddr) (quic.Connection, error) {
+	cliTLS, err := quicClientTLSWithCert(localCert, expectRemote)
 	if err != nil {
 		return nil, err
 	}
@@ -814,6 +825,16 @@ func (h *Host) dialAndAgentRoute(ctx context.Context, localPriv ed25519.PrivateK
 		return nil, err
 	}
 	return conn, nil
+}
+
+func (h *Host) defaultAgentCert() (tls.Certificate, error) {
+	h.agentsMu.RLock()
+	ag, ok := h.agents[h.addr]
+	h.agentsMu.RUnlock()
+	if !ok {
+		return tls.Certificate{}, fmt.Errorf("a2al/host: unknown agent %s", h.addr)
+	}
+	return ag.cert, nil
 }
 
 // Accept waits for an incoming QUIC connection and returns an AgentConn.

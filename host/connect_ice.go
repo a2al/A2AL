@@ -5,7 +5,7 @@ package host
 
 import (
 	"context"
-	"crypto/ed25519"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
@@ -35,7 +35,7 @@ const noAgentRetryDelay = 3 * time.Second
 // to the returned quic.Connection via a background goroutine that cleans them
 // up when the connection closes. The caller must NOT close these resources
 // separately.
-func (h *Host) connectViaICESignal(ctx context.Context, localPriv ed25519.PrivateKey, localAgent, expectRemote a2al.Address, er *protocol.EndpointRecord) (quic.Connection, error) {
+func (h *Host) connectViaICESignal(ctx context.Context, localCert tls.Certificate, localAgent, expectRemote a2al.Address, er *protocol.EndpointRecord) (quic.Connection, error) {
 	if er == nil || er.Signal == "" {
 		return nil, errors.New("a2al/host: no signal url in record")
 	}
@@ -90,7 +90,7 @@ func (h *Host) connectViaICESignal(ctx context.Context, localPriv ed25519.Privat
 		teardown()
 		return nil, fmt.Errorf("a2al/host: ice remote addr is %T", ra)
 	}
-	cliTLS, err := quicClientTLS(localPriv, expectRemote)
+	cliTLS, err := quicClientTLSWithCert(localCert, expectRemote)
 	if err != nil {
 		teardown()
 		return nil, err
@@ -177,6 +177,7 @@ func (h *Host) AcceptICEViaSignal(ctx context.Context, localAgent, expectRemote 
 		return nil, err
 	}
 	if ac.Remote != expectRemote {
+		h.log.Warn("ice peer mismatch", "local_aid", localAgent.String(), "expected_remote", expectRemote.String(), "actual_remote", ac.Remote.String())
 		_ = qc.CloseWithError(1, "peer mismatch")
 		teardown()
 		return nil, fmt.Errorf("a2al/host: ICE quic peer want %s got %s", expectRemote, ac.Remote)
