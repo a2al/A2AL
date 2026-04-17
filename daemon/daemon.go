@@ -74,6 +74,20 @@ type Daemon struct {
 	heartbeatAt map[a2al.Address]time.Time
 
 	iceRegNotify chan struct{} // ICE /signal registration refresh (buffered)
+
+	netMu                sync.Mutex
+	netStableFP          string
+	netPendingFP         string
+	netPendingAt         time.Time
+	netChangeTimes       []time.Time
+	nodePublishQuietTill time.Time
+	deferredEndpointEval bool
+	netChangeNotify      chan struct{} // confirmed network-change events (buffered)
+	netCascadeRunning    bool
+	netFingerprintFn     func() string
+	testNowFn            func() time.Time
+	testGuardRepublishFn func(context.Context)
+	testGuardCascadeFn   func(context.Context)
 }
 
 // APIAddr returns the REST API / Web UI listen address from the loaded config.
@@ -172,6 +186,7 @@ func New(cfg Config) (*Daemon, error) {
 		heartbeatAt:      make(map[a2al.Address]time.Time),
 		mailboxSeen:      make(map[string]map[string]time.Time),
 		iceRegNotify:     make(chan struct{}, 1),
+		netChangeNotify:  make(chan struct{}, 1),
 	}, nil
 }
 
@@ -245,10 +260,12 @@ func (d *Daemon) Run(ctx context.Context, mcpStdio bool) error {
 		if derived := runBootstrapChain(netCtx, d.h, d.cfg, d.dataDir, d.log); derived != "" {
 			d.h.SetDerivedICESignalURL(derived)
 		}
+		d.h.RunNATProbe(netCtx) // active NAT classification after bootstrap
 		d.initialAutoPublish(netCtx)
 		go d.runICEListener(netCtx)
 		d.autoPublishMainLoop(netCtx)
 	}()
+	go d.runNetworkMonitor(netCtx)
 
 	go d.gatewayAcceptLoop(netCtx)
 
