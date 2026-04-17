@@ -102,11 +102,13 @@ type Node struct {
 
 	decodeErrNext atomic.Int64 // unix-nano: next time a decode-error WARN may fire
 
-	// seenPeers tracks unique NodeIDs contacted during this process lifetime.
-	// key: [32]byte (a2al.NodeID), value: time.Time (first contact).
-	// Used by /debug/stats to compute reach_1h/24h/7d.
+	// seenPeers maps NodeID → last tabAdd observation time (sliding-window stats).
 	seenPeers     sync.Map
 	seenPeersPath string // non-empty → persist to disk
+
+	// seenThisBoot dedupes tabAdd-observed NodeIDs for unique_nodes_since_start.
+	seenThisBoot        sync.Map // a2al.NodeID → struct{}
+	seenUniqueSinceBoot atomic.Uint64
 
 	healthMu sync.RWMutex
 	health   map[string]*peerHealthEntry // key: nodeIDKey(id)
@@ -272,7 +274,7 @@ func (n *Node) tabAdd(ni protocol.NodeInfo, trusted bool) {
 		return
 	}
 	copy(nid[:], ni.NodeID)
-	n.seenPeers.LoadOrStore(nid, time.Now())
+	n.recordPeerSeen(nid)
 
 	n.tabMu.Lock()
 	if n.table.Contains(nid) {
@@ -397,8 +399,19 @@ func (n *Node) tabNearestHealthy(target a2al.NodeID, k int) []protocol.NodeInfo 
 	return result
 }
 
-// reachCounts returns the number of unique peers seen within 1h, 24h, and 7d
-// windows. Entries older than 7d are pruned during this scan (lazy cleanup).
+// recordPeerSeen updates last_seen for nid and increments seenUniqueSinceBoot
+// the first time this process observes nid via tabAdd (not via loadSeenPeers).
+func (n *Node) recordPeerSeen(nid a2al.NodeID) {
+	now := time.Now()
+	_, loaded := n.seenThisBoot.LoadOrStore(nid, struct{}{})
+	if !loaded {
+		n.seenUniqueSinceBoot.Add(1)
+	}
+	n.seenPeers.Store(nid, now)
+}
+
+// reachCounts counts unique peers whose last_seen falls within 1h, 24h, and 7d.
+// Entries older than 7d are pruned during this scan (lazy cleanup).
 func (n *Node) reachCounts() (r1h, r24h, r7d int) {
 	now := time.Now()
 	cutoff7d := now.Add(-7 * 24 * time.Hour)

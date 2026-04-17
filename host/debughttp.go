@@ -58,8 +58,9 @@ func (h *Host) serveDebugStatsMerged(w http.ResponseWriter, r *http.Request) {
 		"total_peers":             st.TotalPeers,
 		"reach_1h":                st.Reach1h,
 		"reach_24h":               st.Reach24h,
-		"reach_7d":                st.Reach7d,
-		"estimated_network_size":  st.EstimatedNetworkSize,
+		"reach_7d":                  st.Reach7d,
+		"estimated_network_size":    st.EstimatedNetworkSize,
+		"unique_nodes_since_start":  st.UniqueNodesSinceStart,
 	}
 	h.signalStatsMu.RLock()
 	fn := h.signalStats

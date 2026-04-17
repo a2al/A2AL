@@ -37,8 +37,9 @@ type DebugStats struct {
 	TotalPeers           int    `json:"total_peers"`
 	Reach1h              int    `json:"reach_1h"`
 	Reach24h             int    `json:"reach_24h"`
-	Reach7d              int    `json:"reach_7d"`
-	EstimatedNetworkSize int    `json:"estimated_network_size"`
+	Reach7d               int    `json:"reach_7d"`
+	EstimatedNetworkSize  int    `json:"estimated_network_size"`
+	UniqueNodesSinceStart uint64 `json:"unique_nodes_since_start"`
 }
 
 // DebugStatsData returns a snapshot for embedding in host-level /debug/stats.
@@ -46,14 +47,15 @@ func (n *Node) DebugStatsData() DebugStats {
 	peers := n.tabDebugPeers()
 	r1h, r24h, r7d := n.reachCounts()
 	return DebugStats{
-		RxPackets:            n.statsRx.Load(),
-		TxPackets:            n.statsTx.Load(),
-		RPCOK:                n.statsRPC.Load(),
-		TotalPeers:           len(peers),
-		Reach1h:              r1h,
-		Reach24h:             r24h,
-		Reach7d:              r7d,
-		EstimatedNetworkSize: n.tabEstimatedNetworkSize(),
+		RxPackets:              n.statsRx.Load(),
+		TxPackets:              n.statsTx.Load(),
+		RPCOK:                  n.statsRPC.Load(),
+		TotalPeers:             len(peers),
+		Reach1h:                r1h,
+		Reach24h:               r24h,
+		Reach7d:                r7d,
+		EstimatedNetworkSize:   n.tabEstimatedNetworkSize(),
+		UniqueNodesSinceStart: n.seenUniqueSinceBoot.Load(),
 	}
 }
 

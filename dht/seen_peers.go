@@ -17,7 +17,7 @@ import (
 
 const seenPeersTTL = 7 * 24 * time.Hour
 
-// loadSeenPeers reads seen_peers.dat and populates n.seenPeers.
+// loadSeenPeers reads seen_peers.dat into n.seenPeers (hex_node_id unix_last_seen).
 // Lines that are malformed or older than 7d are silently skipped.
 // A missing or unreadable file is not an error.
 func (n *Node) loadSeenPeers(path string) {
@@ -55,8 +55,7 @@ func (n *Node) loadSeenPeers(path string) {
 	}
 }
 
-// flushSeenPeers writes all seenPeers entries within the 7d window to path
-// atomically (write tmp → rename). Entries older than 7d are dropped.
+// flushSeenPeers writes seenPeers entries within the 7d window (last_seen per line).
 func (n *Node) flushSeenPeers(path string) error {
 	cutoff := time.Now().Add(-seenPeersTTL)
 	tmp := path + ".tmp"
