@@ -1,7 +1,7 @@
 version: 2
 
 snapshot:
-  version_template: '0~{{ .ShortCommit }}'
+  version_template: 'dev-{{ .ShortCommit }}'
 
 builds:
   - id: a2ald
@@ -12,7 +12,10 @@ builds:
     env:
       - CGO_ENABLED=0
     ldflags:
-      - -s -w -X main.version={{.Version}}
+      - -s -w
+        -X github.com/a2al/a2al/internal/version.Version={{.Version}}
+        -X github.com/a2al/a2al/internal/version.Commit={{.ShortCommit}}
+        -X github.com/a2al/a2al/internal/version.BuildDate={{.Date}}
 
   - id: a2al
     main: ./cmd/a2al
@@ -22,7 +25,10 @@ builds:
     env:
       - CGO_ENABLED=0
     ldflags:
-      - -s -w -X main.version={{.Version}}
+      - -s -w
+        -X github.com/a2al/a2al/internal/version.Version={{.Version}}
+        -X github.com/a2al/a2al/internal/version.Commit={{.ShortCommit}}
+        -X github.com/a2al/a2al/internal/version.BuildDate={{.Date}}
 
 archives:
   - ids: [a2ald, a2al]

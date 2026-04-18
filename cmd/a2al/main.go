@@ -7,6 +7,8 @@ package main
 import (
 	"fmt"
 	"os"
+
+	"github.com/a2al/a2al/internal/version"
 )
 
 func main() {
@@ -21,6 +23,8 @@ func main() {
 	cli := newClient(g.API, g.Token, true)
 
 	switch cmd {
+	case "version", "--version", "-V":
+		fmt.Println(version.String("a2al"))
 	case "help", "-h", "--help":
 		cmdHelp()
 	case "status":

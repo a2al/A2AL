@@ -15,6 +15,7 @@ import (
 
 	"github.com/a2al/a2al/config"
 	"github.com/a2al/a2al/daemon"
+	"github.com/a2al/a2al/internal/version"
 )
 
 func main() {
@@ -26,6 +27,8 @@ func main() {
 	bootstrapFlag := flag.String("bootstrap", "", "comma-separated bootstrap peers (appended to config)")
 	mcpStdio := flag.Bool("mcp-stdio", false, "run MCP server on stdin/stdout instead of HTTP API")
 	flag.Parse()
+
+	fmt.Fprintln(os.Stderr, version.Banner("a2ald", "A2AL Daemon"))
 
 	dd := *dataDir
 	if dd == "" {
