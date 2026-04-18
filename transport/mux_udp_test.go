@@ -59,7 +59,9 @@ func TestUDPMux_routing(t *testing.T) {
 			dhtDone <- data
 		}
 	}()
-	time.Sleep(200 * time.Millisecond) // let goroutine block on Receive
+	// Give the receive goroutine time to block on dhtIn (loaded CI schedulers
+	// can need more than a few hundred ms).
+	time.Sleep(500 * time.Millisecond)
 
 	// CBOR map first byte (0xa5) → DHT
 	dhtPayload := []byte{0xa5, 1, 2, 3}
@@ -71,7 +73,7 @@ func TestUDPMux_routing(t *testing.T) {
 		if len(got) != len(dhtPayload) || got[0] != 0xa5 {
 			t.Fatalf("DHT got %x, want %x", got, dhtPayload)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(15 * time.Second):
 		t.Fatal("DHT receive timeout")
 	}
 

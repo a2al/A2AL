@@ -465,9 +465,12 @@ func (d *Daemon) autoPublishMainLoop(ctx context.Context) {
 			cancel()
 		case <-probe.C:
 			go func() {
-				pCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
-				defer cancel()
+				rbCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+				d.maybeRebootstrap(rbCtx)
+				cancel()
+				pCtx, cancel2 := context.WithTimeout(ctx, 20*time.Second)
 				d.h.RunNATProbe(pCtx)
+				cancel2()
 			}()
 		}
 	}

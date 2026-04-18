@@ -232,6 +232,17 @@ func (d *Daemon) tryConsumeNetChangeEvent() bool {
 
 func (d *Daemon) handleNetworkChangeCascade(ctx context.Context) {
 	start := d.now()
+
+	// Bootstrap recovery uses an independent goroutine so it cannot consume
+	// the cascade's budget (120 s, sized for observe+probe+publish).
+	// When there are no peers the normal cascade steps fail fast anyway;
+	// subsequent cascade or probe ticks will benefit from newly joined peers.
+	go func() {
+		rbCtx, rbCancel := context.WithTimeout(ctx, 90*time.Second)
+		defer rbCancel()
+		d.maybeRebootstrap(rbCtx)
+	}()
+
 	d.h.InvalidateNetworkCaches()
 
 	obsCtx, obsCancel := context.WithTimeout(ctx, 10*time.Second)

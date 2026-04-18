@@ -31,14 +31,24 @@ func runBootstrapChain(ctx context.Context, h *host.Host, cfg *config.Config, da
 	return deriveSignalURL(cfg, log)
 }
 
-// bootstrapDHT tries peers.cache → config → DNS TXT in order until one succeeds.
+// bootstrapDHT joins the DHT using persisted peers, then optional config seeds,
+// then optional DNS TXT seeds.
+//
+// If cfg.Bootstrap is non-empty, the user supplied their own seeds: we try
+// peers.cache then config only — no public DNS lookup (full operator control).
+//
+// If cfg.Bootstrap is empty, after peers.cache we always attempt DNS TXT once
+// when records exist: this heals splits and corrects a stale peers.cache without
+// requiring a config field.
 func bootstrapDHT(ctx context.Context, h *host.Host, cfg *config.Config, dataDir string, log *slog.Logger) bool {
+	var ok bool
+
 	cachePath := filepath.Join(dataDir, "peers.cache")
 	if lines, err := peerscache.Load(cachePath); err == nil && len(lines) > 0 {
 		if addrs := resolveBootstrapAddrs(lines, log); len(addrs) > 0 {
 			log.Info("connecting to network", "source", "peers.cache", "peers", len(addrs))
 			if tryBootstrap(ctx, h, addrs, log, "peers.cache") {
-				return true
+				ok = true
 			}
 		}
 	} else if err != nil {
@@ -49,22 +59,23 @@ func bootstrapDHT(ctx context.Context, h *host.Host, cfg *config.Config, dataDir
 		if addrs := resolveBootstrapAddrs(cfg.Bootstrap, log); len(addrs) > 0 {
 			log.Info("connecting to network", "source", "config", "peers", len(addrs))
 			if tryBootstrap(ctx, h, addrs, log, "config") {
-				return true
+				ok = true
 			}
 		}
+		return ok
 	}
 
-	log.Info("looking up bootstrap peers")
+	log.Info("looking up public peers (bootstrap)")
 	if txt := lookupBootstrapTXT(dnsBootstrapName); len(txt) > 0 {
 		if addrs := resolveBootstrapAddrs(txt, log); len(addrs) > 0 {
 			log.Info("connecting to network", "source", "dns", "peers", len(addrs))
 			if tryBootstrap(ctx, h, addrs, log, "dns_txt") {
-				return true
+				ok = true
 			}
 		}
 	}
 
-	return false
+	return ok
 }
 
 // deriveSignalURL returns a signal base URL from trusted infrastructure sources
@@ -169,4 +180,41 @@ func lookupBootstrapTXT(name string) []string {
 		}
 	}
 	return out
+}
+
+// rebootstrapMinGap limits how often we retry bootstrapDHT when the routing
+// table has no candidates (recovery path).
+const rebootstrapMinGap = 5 * time.Minute
+
+// maybeRebootstrap runs bootstrapDHT when there are no known DHT peers, subject
+// to rebootstrapMinGap. Used after network changes and on a long-period tick.
+func (d *Daemon) maybeRebootstrap(ctx context.Context) {
+	if d.testMaybeRebootstrapFn != nil {
+		d.testMaybeRebootstrapFn(ctx)
+		return
+	}
+	if len(d.h.Node().BootstrapCandidateAddrs(1)) > 0 {
+		return
+	}
+	d.rebootstrapMu.Lock()
+	now := d.now()
+	if !d.lastRebootstrapAt.IsZero() && now.Sub(d.lastRebootstrapAt) < rebootstrapMinGap {
+		d.rebootstrapMu.Unlock()
+		return
+	}
+	d.lastRebootstrapAt = now
+	d.rebootstrapMu.Unlock()
+
+	if bootstrapDHT(ctx, d.h, d.cfg, d.dataDir, d.log) {
+		if u := deriveSignalURL(d.cfg, d.log); u != "" {
+			d.h.SetDerivedICESignalURL(u)
+		}
+		d.log.Info("bootstrap recovery succeeded")
+		// Trigger a cascade so observe/probe/publish run with the newly joined
+		// peers. guard tick picks this up within guardTickPeriod (5 s).
+		select {
+		case d.netChangeNotify <- struct{}{}:
+		default:
+		}
+	}
 }
