@@ -33,6 +33,7 @@ jobs:
               EXT=""
               [[ "$GOOS" == "windows" ]] && EXT=".exe"
               (cd "./examples/$DEMO" && \
+                go mod tidy && \
                 GOOS=$GOOS GOARCH=$GOARCH CGO_ENABLED=0 \
                 go build -ldflags="-s -w" -o "../../$DIR/${DEMO}${EXT}" .)
             done
