@@ -28,7 +28,7 @@ func (d *Daemon) gatewayAcceptLoop(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
-			d.log.Debug("accept", "err", err)
+			d.log.Debug("accept", "reason", err)
 			continue
 		}
 		if !d.tryAcquireGatewayConn() {
@@ -74,7 +74,7 @@ func (d *Daemon) serveGatewayConn(ctx context.Context, ac *host.AgentConn) {
 	for {
 		str, err := ac.AcceptStream(ctx)
 		if err != nil {
-			d.log.Debug("gateway: accept stream done", "local_aid", ac.Local.String(), "remote_aid", ac.Remote.String(), "err", err)
+			d.log.Debug("gateway: accept stream done", "local_aid", ac.Local.String(), "remote_aid", ac.Remote.String(), "reason", err)
 			return
 		}
 		if streamCount.Load() >= maxStreamsPerConn {

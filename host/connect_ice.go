@@ -113,7 +113,7 @@ func (h *Host) connectViaICESignal(ctx context.Context, localCert tls.Certificat
 	// timeout, explicit close, error) the Transport and WS are cleaned up.
 	go func() {
 		<-qc.Context().Done()
-		h.log.Debug("ice quic closed", "local_aid", localAgent.String(), "remote_aid", expectRemote.String(), "err", qc.Context().Err())
+		h.log.Debug("ice quic closed", "local_aid", localAgent.String(), "remote_aid", expectRemote.String(), "close_reason", qc.Context().Err())
 		_ = tr.Close()
 		sess.CloseSignaling()
 	}()
