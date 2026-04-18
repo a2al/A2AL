@@ -32,8 +32,9 @@ jobs:
             for DEMO in "${DEMOS[@]}"; do
               EXT=""
               [[ "$GOOS" == "windows" ]] && EXT=".exe"
-              GOOS=$GOOS GOARCH=$GOARCH CGO_ENABLED=0 \
-                go build -ldflags="-s -w" -o "$DIR/${DEMO}${EXT}" "./examples/$DEMO"
+              (cd "./examples/$DEMO" && \
+                GOOS=$GOOS GOARCH=$GOARCH CGO_ENABLED=0 \
+                go build -ldflags="-s -w" -o "../../$DIR/${DEMO}${EXT}" .)
             done
           done
 
