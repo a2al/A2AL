@@ -90,6 +90,10 @@ type Daemon struct {
 	testNowFn            func() time.Time
 	testGuardRepublishFn func(context.Context)
 	testGuardCascadeFn   func(context.Context)
+
+	rebootstrapMu          sync.Mutex
+	lastRebootstrapAt      time.Time
+	testMaybeRebootstrapFn func(context.Context) // if set, maybeRebootstrap calls this instead
 }
 
 // APIAddr returns the REST API / Web UI listen address from the loaded config.
