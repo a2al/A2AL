@@ -126,7 +126,7 @@ go run ./examples/demo3-chat   # terminal 2: chat app (or use the pre-built bina
 
 Bob types Alice's AID → direct encrypted QUIC tunnel → chat.
 
-More scenarios (marketplace, swarm) and single-machine variants: [`examples/`](examples/).
+More scenarios (marketplace, swarm) and single-machine variants: [`examples/`](examples/) — see [`doc/examples.md`](doc/examples.md) for the full guide.
 
 ## Status
 

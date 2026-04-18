@@ -26,6 +26,31 @@
 // LAN 测试：--fallback-host 改为本机 LAN IP，--bootstrap 指向对端机 ip:4121。
 //
 // a2ald 若启用 api_token，给 chat 加 --token TOKEN。
+//
+// 【a2ald 参数说明】
+// 联网环境下 a2ald 无参启动即可。以下参数仅在单机测试或无公网时使用：
+//
+//   --fallback-host IP
+//       手动指定写入端点记录的可达 IP。公网时 STUN/UPnP 自动探测，无需设置。
+//       单机回环测试设为 127.0.0.1，LAN 测试设为本机 LAN IP，离线设为本机可达 IP。
+//
+//   --bootstrap ip:port
+//       手动指定种子节点以加入 DHT 网络。公网时 DNS 自动解析公共种子，无需设置。
+//       离线或单机测试时设为对端（或第一个 a2ald）的 IP:4121。
+//
+//   --data-dir PATH
+//       数据目录（身份、配置、路由缓存），默认 UserConfigDir/a2al。
+//       单机运行两个 a2ald 实例时，两者须各自使用不同目录。
+//
+//   --listen ADDR
+//       DHT UDP 监听地址，默认 :4121。单机第二实例须改端口（如 :4122）避免冲突。
+//
+//   --api-addr ADDR
+//       REST API 监听地址，默认 127.0.0.1:2121。单机第二实例须改端口（如 127.0.0.1:2122）。
+//
+// 【demo 参数】
+//   --api HOST:PORT   连接的 a2ald REST 地址（默认 127.0.0.1:2121）
+//   --token TOKEN     a2ald api_token（若配置了鉴权则填写）
 package main
 
 import (
