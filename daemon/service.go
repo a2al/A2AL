@@ -764,7 +764,7 @@ func (d *Daemon) execConnect(ctx context.Context, remoteAidStr string, body conn
 		d.log.Debug("tunnel local listen", "local_aid", local.String(), "remote_aid", remote.String(), "listen", ln.Addr().String(), "accept_timeout", "30s")
 		tcpConn, err := ln.Accept()
 		if err != nil {
-			d.log.Debug("tunnel accept done", "local_aid", local.String(), "remote_aid", remote.String(), "listen", ln.Addr().String(), "err", err)
+			d.log.Debug("tunnel accept done", "local_aid", local.String(), "remote_aid", remote.String(), "listen", ln.Addr().String(), "reason", err)
 			return
 		}
 		qctx, qcancel := context.WithTimeout(context.Background(), 120*time.Second)
