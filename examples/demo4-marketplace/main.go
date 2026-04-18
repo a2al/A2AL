@@ -1,46 +1,66 @@
 // Copyright 2026 The A2AL Authors. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 
-// demo4-marketplace: Phase 4（Mailbox + Topic + Sovereign Record）功能验证 demo。
+// demo4-marketplace: Functional verification demo — encrypted notes, named service, and Sovereign Record.
 //
-// 场景：Alice 是翻译服务提供方，Bob 是使用方。
+// Alice is the translation provider; Bob is the client.
 //
-//   - Alice 上线后发布 topic "lang.translate" 并持续 poll 收件箱，自动回复翻译请求。
-//   - Bob 通过 topic discover 找到 Alice，通过 DHT mailbox 发送翻译请求，等待并显示结果。
+//   - Alice registers the named service "lang.translate", polls encrypted notes, and auto-replies.
+//   - Bob discovers Alice by named service, sends a request via encrypted notes, and waits for the reply.
 //
-// 二者都只和本机 a2ald 通信，P2P 通信由两个 daemon 完成。
+// Both talk only to local a2ald; P2P is handled by the daemon. Start Bob after Alice prints that she is online.
+// Pre-built binary: demo4-marketplace from the demos-latest release (replace go run . with demo4-marketplace; same flags).
 //
-// 【单机双实例测试】（四个终端）
+// Recommended — two machines, each running a2ald:
 //
-//	Terminal 1 — Alice a2ald:
-//	  a2ald --data-dir ./tmp/alice --listen :4121 --fallback-host 127.0.0.1
+//	Machine A: a2ald  +  go run . --role alice
+//	Machine B: a2ald  +  go run . --role bob
 //
-//	Terminal 2 — Bob a2ald（bootstrap 指向 Alice）:
-//	  a2ald --data-dir ./tmp/bob --listen :4122 --api-addr 127.0.0.1:2122 \
-//	        --fallback-host 127.0.0.1 --bootstrap 127.0.0.1:4121
+// Single machine — shared a2ald (demo4 only needs DHT encrypted notes / named service; both processes may share one daemon):
 //
-//	Terminal 3 — Alice demo（先启动）:
-//	  go run . --role alice
+//	a2ald --fallback-host 127.0.0.1
+//	go run . --role alice   # terminal 2
+//	go run . --role bob     # terminal 3
 //
-//	Terminal 4 — Bob demo（等 Alice 打印 "已上线" 后启动）:
-//	  go run . --role bob --api 127.0.0.1:2122
+// Single machine — two a2alds (four terminals; simulates cross-node P2P):
 //
-// 【双机测试】
+//	Alice a2ald:  a2ald --data-dir ./tmp/a --fallback-host 127.0.0.1
+//	Bob   a2ald:  a2ald --data-dir ./tmp/b --listen :4122 --api-addr 127.0.0.1:2122 \
+//	              --fallback-host 127.0.0.1 --bootstrap 127.0.0.1:4121
+//	Alice demo:   go run . --role alice
+//	Bob   demo:   go run . --role bob --api 127.0.0.1:2122
 //
-//	机器A：a2ald --fallback-host <公网IP-A>
-//	       go run . --role alice
+// LAN/offline: set --fallback-host to this host's LAN IP; Bob adds --bootstrap <peer-ip>:4121.
 //
-//	机器B：a2ald --fallback-host <公网IP-B> --bootstrap <公网IP-A>:4121
-//	       go run . --role bob
+// a2ald parameters
+// On the public internet, a2ald can be started with no extra flags. The following matter mainly
+// for single-machine tests or when there is no public network access:
 //
-// （两台机器默认 API 都是 127.0.0.1:2121，无需额外参数）
+//   --fallback-host IP
+//       Manually set the reachable IP written into endpoint records. On the public WAN, STUN/UPnP
+//       discovery usually suffices without this. Use 127.0.0.1 on loopback, this host's LAN IP on a LAN,
+//       or another reachable address when offline.
 //
-// 【参数】
+//   --bootstrap ip:port
+//       Manually specify a seed peer to join the DHT. On the public internet, DNS resolves public
+//       seeds automatically. Offline or on one machine: set to the peer (or first a2ald) at IP:4121.
 //
-//	--role alice|bob   角色（必填）
-//	--api  HOST:PORT   本机 a2ald REST 地址（默认 127.0.0.1:2121）
-//	--token TOKEN      a2ald api_token（若配置了鉴权则填写）
-//	--id   FILE        身份文件路径（默认 identity-<role>-<port>.json）
+//   --data-dir PATH
+//       Data directory (identity, config, routing cache); default UserConfigDir/a2al.
+//       Two a2ald instances on one machine must use different directories.
+//
+//   --listen ADDR
+//       DHT UDP listen address; default :4121. A second instance needs another port (e.g. :4122).
+//
+//   --api-addr ADDR
+//       REST API listen address; default 127.0.0.1:2121. A second instance needs another port
+//       (e.g. 127.0.0.1:2122).
+//
+// demo parameters
+//   --role  alice|bob    role (required)
+//   --api   HOST:PORT    REST address of local a2ald (default 127.0.0.1:2121)
+//   --token TOKEN        a2ald api_token (if the daemon enables authentication)
+//   --id    FILE         identity file path (default identity-<role>-<port>.json)
 package main
 
 import (
@@ -118,11 +138,11 @@ func loadOrCreateIdentity(path string, c *client) (*savedIdentity, error) {
 	if b, err := os.ReadFile(path); err == nil {
 		var id savedIdentity
 		if json.Unmarshal(b, &id) == nil && id.AID != "" {
-			fmt.Printf("  已加载身份文件 %s\n  AID: %s\n", path, id.AID)
+			fmt.Printf("  Loaded identity %s\n  AID: %s\n", path, id.AID)
 			return &id, nil
 		}
 	}
-	fmt.Print("  生成新身份...")
+	fmt.Print("  Generating identity...")
 	var resp struct {
 		OperationalPrivateKeyHex string `json:"operational_private_key_hex"`
 		DelegationProofHex       string `json:"delegation_proof_hex"`
@@ -138,14 +158,14 @@ func loadOrCreateIdentity(path string, c *client) (*savedIdentity, error) {
 	}
 	b, _ := json.MarshalIndent(id, "", "  ")
 	_ = os.WriteFile(path, b, 0o600)
-	fmt.Printf(" OK\n  AID: %s\n  已保存到 %s\n", id.AID, path)
+	fmt.Printf(" OK\n  AID: %s\n  Saved to %s\n", id.AID, path)
 	return id, nil
 }
 
 // ─── TCP service shim ────────────────────────────────────────────────────────
 
 // openDummyTCP opens a TCP listener solely to satisfy a2ald's service_tcp
-// reachability check. This demo uses mailbox for messaging (not QUIC streams),
+// reachability check. This demo uses encrypted notes (mailbox API) for messaging (not QUIC streams),
 // so the listener accepts and immediately closes connections.
 func openDummyTCP() (net.Listener, string, error) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -168,7 +188,7 @@ func openDummyTCP() (net.Listener, string, error) {
 // ─── Agent setup ─────────────────────────────────────────────────────────────
 
 func setupAgent(c *client, id *savedIdentity, serviceTCP string) error {
-	fmt.Print("  注册 agent...")
+	fmt.Print("  Registering agent...")
 	regReq := map[string]string{
 		"operational_private_key_hex": id.OperationalPrivateKeyHex,
 		"delegation_proof_hex":        id.DelegationProofHex,
@@ -183,7 +203,7 @@ func setupAgent(c *client, id *savedIdentity, serviceTCP string) error {
 			if err2 := c.do("PATCH", "/agents/"+id.AID, patchReq, nil); err2 != nil {
 				return fmt.Errorf("patch service_tcp: %w", err2)
 			}
-			fmt.Println(" 已存在，已更新 service_tcp")
+			fmt.Println(" already exists; updated service_tcp")
 		} else {
 			return fmt.Errorf("register: %w", err)
 		}
@@ -191,7 +211,7 @@ func setupAgent(c *client, id *savedIdentity, serviceTCP string) error {
 		fmt.Println(" OK")
 	}
 
-	fmt.Print("  发布端点到 Tangled 网络...")
+	fmt.Print("  Publishing endpoint to Tangled...")
 	if err := c.do("POST", "/agents/"+id.AID+"/publish", struct{}{}, nil); err != nil {
 		return fmt.Errorf("publish endpoint: %w", err)
 	}
@@ -202,16 +222,16 @@ func setupAgent(c *client, id *savedIdentity, serviceTCP string) error {
 // ─── Alice (provider) ────────────────────────────────────────────────────────
 
 func runAlice(c *client, idPath string) {
-	fmt.Println("\n=== Alice — 翻译服务提供方 ===")
+	fmt.Println("\n=== Alice — translation provider ===")
 
 	id, err := loadOrCreateIdentity(idPath, c)
 	if err != nil {
-		fatal("身份初始化: %v", err)
+		fatal("identity init: %v", err)
 	}
 
 	ln, svcTCP, err := openDummyTCP()
 	if err != nil {
-		fatal("TCP 监听: %v", err)
+		fatal("TCP listen: %v", err)
 	}
 	defer ln.Close()
 
@@ -219,11 +239,11 @@ func runAlice(c *client, idPath string) {
 		fatal("%v", err)
 	}
 
-	// Publish sovereign service record (rec_type=2): application-defined metadata.
-	fmt.Print("  发布服务元数据 (sovereign record rec_type=2)...")
+	// Publish Sovereign Record (rec_type=2): application-defined metadata.
+	fmt.Print("  Publishing service metadata (Sovereign Record rec_type=2)...")
 	svcMeta, _ := json.Marshal(map[string]any{
 		"service": "translate",
-		"pairs":   []string{"en→zh", "zh→en"},
+		"pairs":   []string{"en→es", "es→en"},
 		"price":   "free",
 		"version": 1,
 	})
@@ -233,27 +253,27 @@ func runAlice(c *client, idPath string) {
 		"ttl":            3600,
 	}
 	if err := c.do("POST", "/agents/"+id.AID+"/records", pubRecReq, nil); err != nil {
-		fmt.Printf(" 警告（跳过）: %v\n", err)
+		fmt.Printf(" warning (skipped): %v\n", err)
 	} else {
 		fmt.Println(" OK")
 	}
 
-	// Register topic.
-	fmt.Print(`  注册 topic "lang.translate"...`)
+	// Register named service (lang.translate).
+	fmt.Print(`  Registering named service "lang.translate"...`)
 	topicReq := map[string]any{
 		"services":  []string{"lang.translate"},
 		"name":      "Alice Translate",
 		"protocols": []string{"mcp"},
-		"tags":      []string{"en", "zh"},
-		"brief":     "English ↔ Chinese translation service",
+		"tags":      []string{"en", "es"},
+		"brief":     "English ↔ Spanish (toy) translation service",
 		"ttl":       3600,
 	}
 	if err := c.do("POST", "/agents/"+id.AID+"/services", topicReq, nil); err != nil {
-		fatal("注册 topic: %v", err)
+		fatal("register service: %v", err)
 	}
 	fmt.Println(" OK")
 
-	fmt.Printf("\n✓ Alice 已上线\n  AID: %s\n  等待翻译请求（Ctrl-C 退出）...\n\n", id.AID)
+	fmt.Printf("\n✓ Alice is online\n  AID: %s\n  Waiting for translation requests (Ctrl-C to quit)...\n\n", id.AID)
 
 	// Poll inbox in a loop; auto-reply to every message.
 	for {
@@ -267,15 +287,15 @@ func runAlice(c *client, idPath string) {
 			} `json:"messages"`
 		}
 		if err := c.do("POST", "/agents/"+id.AID+"/mailbox/poll", struct{}{}, &pollResp); err != nil {
-			fmt.Printf("[Alice] poll 错误: %v\n", err)
+			fmt.Printf("[Alice] poll error: %v\n", err)
 			continue
 		}
 		for _, msg := range pollResp.Messages {
 			body, _ := base64.StdEncoding.DecodeString(msg.BodyBase64)
-			fmt.Printf("[Alice] 收到来自 %s 的消息: %q\n", shortAID(msg.Sender), string(body))
+			fmt.Printf("[Alice] message from %s: %q\n", shortAID(msg.Sender), string(body))
 
 			reply := doTranslate(string(body))
-			fmt.Printf("[Alice] 自动回复: %q\n\n", reply)
+			fmt.Printf("[Alice] auto-reply: %q\n\n", reply)
 
 			sendReq := map[string]any{
 				"recipient":   msg.Sender,
@@ -283,7 +303,7 @@ func runAlice(c *client, idPath string) {
 				"body_base64": base64.StdEncoding.EncodeToString([]byte(reply)),
 			}
 			if err := c.do("POST", "/agents/"+id.AID+"/mailbox/send", sendReq, nil); err != nil {
-				fmt.Printf("[Alice] 回复失败: %v\n", err)
+				fmt.Printf("[Alice] reply failed: %v\n", err)
 			}
 		}
 	}
@@ -292,14 +312,14 @@ func runAlice(c *client, idPath string) {
 // doTranslate simulates a translation service for demo purposes.
 func doTranslate(req string) string {
 	table := map[string]string{
-		"hello":         "你好",
-		"hello world":   "你好世界",
-		"good morning":  "早上好",
-		"good night":    "晚安",
-		"thank you":     "谢谢",
-		"how are you":   "你好吗",
-		"goodbye":       "再见",
-		"what is a2al":  "A2AL 是一个去中心化 AI Agent 通信协议",
+		"hello":         "hola",
+		"hello world":   "hola mundo",
+		"good morning":  "buenos días",
+		"good night":    "buenas noches",
+		"thank you":     "gracias",
+		"how are you":   "¿cómo estás?",
+		"goodbye":       "adiós",
+		"what is a2al":  "A2AL is a decentralized protocol for AI agent communication",
 	}
 	text := strings.TrimSpace(req)
 	// Strip "translate:" prefix if present.
@@ -315,16 +335,16 @@ func doTranslate(req string) string {
 // ─── Bob (consumer) ──────────────────────────────────────────────────────────
 
 func runBob(c *client, idPath string) {
-	fmt.Println("\n=== Bob — 翻译服务使用方 ===")
+	fmt.Println("\n=== Bob — translation client ===")
 
 	id, err := loadOrCreateIdentity(idPath, c)
 	if err != nil {
-		fatal("身份初始化: %v", err)
+		fatal("identity init: %v", err)
 	}
 
 	ln, svcTCP, err := openDummyTCP()
 	if err != nil {
-		fatal("TCP 监听: %v", err)
+		fatal("TCP listen: %v", err)
 	}
 	defer ln.Close()
 
@@ -332,11 +352,11 @@ func runBob(c *client, idPath string) {
 		fatal("%v", err)
 	}
 
-	// Discover translator via topic.
-	fmt.Print(`  discover "lang.translate" (tag=zh)`)
+	// Discover translator by named service.
+	fmt.Print(`  discover named service "lang.translate" (tag=es)`)
 	discoverReq := map[string]any{
 		"services": []string{"lang.translate"},
-		"filter": map[string]any{"tags": []string{"zh"}},
+		"filter": map[string]any{"tags": []string{"es"}},
 	}
 	var discoverResp struct {
 		Entries []struct {
@@ -364,42 +384,42 @@ func runBob(c *client, idPath string) {
 	fmt.Println()
 
 	if aliceAID == "" {
-		fatal("未找到翻译服务（topic: lang.translate, tag: zh）。\n请确认 Alice 已上线，且 Tangled 网络已同步（通常需等待数秒）。")
+		fatal("no translation service found (named service: lang.translate, tag: es).\nEnsure Alice is online and allow a few seconds for Tangled to sync.")
 	}
 
-	fmt.Printf("\n  找到 %d 个翻译服务:\n", len(discoverResp.Entries))
+	fmt.Printf("\n  Found %d translation service(s):\n", len(discoverResp.Entries))
 	for _, e := range discoverResp.Entries {
 		fmt.Printf("    %-20s  %s  tags=%v\n", shortAID(e.AID), e.Brief, e.Tags)
 	}
 
-	// Read Alice's sovereign record for extra service info.
-	fmt.Printf("\n  读取 Alice 的服务元数据 (rec_type=2)...")
+	// Read Alice's Sovereign Record for extra service info.
+	fmt.Printf("\n  Reading Alice's Sovereign Record (rec_type=2)...")
 	var recResp struct {
 		Records []struct {
 			PayloadBase64 string `json:"payload_base64"`
 		} `json:"records"`
 	}
 	if err := c.do("GET", "/resolve/"+aliceAID+"/records?type=2", nil, &recResp); err != nil {
-		fmt.Printf(" 跳过 (%v)\n", err)
+		fmt.Printf(" skipped (%v)\n", err)
 	} else if len(recResp.Records) > 0 {
 		payload, _ := base64.StdEncoding.DecodeString(recResp.Records[0].PayloadBase64)
-		fmt.Printf("\n  服务信息: %s\n", string(payload))
+		fmt.Printf("\n  Service info: %s\n", string(payload))
 	} else {
-		fmt.Println(" 暂无记录")
+		fmt.Println(" no records")
 	}
 
-	// Send mailbox message.
+	// Send encrypted note (mailbox API).
 	text := "translate: hello world"
-	fmt.Printf("\n[Bob] 发送翻译请求: %q\n", text)
+	fmt.Printf("\n[Bob] sending translation request: %q\n", text)
 	sendReq := map[string]any{
 		"recipient":   aliceAID,
 		"msg_type":    1,
 		"body_base64": base64.StdEncoding.EncodeToString([]byte(text)),
 	}
 	if err := c.do("POST", "/agents/"+id.AID+"/mailbox/send", sendReq, nil); err != nil {
-		fatal("发送失败: %v", err)
+		fatal("send failed: %v", err)
 	}
-	fmt.Println("[Bob] 请求已发送，等待翻译结果...")
+	fmt.Println("[Bob] request sent; waiting for translation...")
 
 	// Poll for Alice's reply.
 	deadline := time.Now().Add(60 * time.Second)
@@ -420,15 +440,15 @@ func runBob(c *client, idPath string) {
 		for _, msg := range pollResp.Messages {
 			if msg.Sender == aliceAID {
 				body, _ := base64.StdEncoding.DecodeString(msg.BodyBase64)
-				fmt.Printf("\n\n[Bob] 收到翻译结果: %q\n", string(body))
-				fmt.Println("\n✓ Phase 4 功能验证完成！")
-				fmt.Println("  验证链路：身份 → Tangled 端点发布 → Topic注册 → Discover → Sovereign记录 → 加密通信")
+				fmt.Printf("\n\n[Bob] translation result: %q\n", string(body))
+				fmt.Println("\n✓ demo4 verification complete")
+				fmt.Println("  Flow: identity → Tangled publish → named service → discover → Sovereign Record → encrypted notes")
 				return
 			}
 		}
 	}
-	fmt.Println("\n[Bob] 等待超时（60s），未收到 Alice 的回复。")
-	fmt.Println("  请检查 Alice 是否仍在运行，以及两个 daemon 是否互相连通。")
+	fmt.Println("\n[Bob] timed out (60s) waiting for Alice.")
+	fmt.Println("  Check that Alice is still running and both daemons can reach each other.")
 	os.Exit(1)
 }
 
@@ -442,7 +462,7 @@ func shortAID(aid string) string {
 }
 
 func fatal(format string, args ...any) {
-	fmt.Fprintf(os.Stderr, "\n错误: "+format+"\n", args...)
+	fmt.Fprintf(os.Stderr, "\nerror: "+format+"\n", args...)
 	os.Exit(1)
 }
 
@@ -459,7 +479,7 @@ func main() {
 		next := func() string {
 			i++
 			if i >= len(os.Args) {
-				fmt.Fprintf(os.Stderr, "参数 %s 缺少值\n", arg)
+				fmt.Fprintf(os.Stderr, "missing value for %s\n", arg)
 				os.Exit(1)
 			}
 			return os.Args[i]
@@ -482,13 +502,13 @@ func main() {
 		case strings.HasPrefix(arg, "--id="):
 			idPath = strings.TrimPrefix(arg, "--id=")
 		default:
-			fmt.Fprintf(os.Stderr, "未知参数: %s\n", arg)
+			fmt.Fprintf(os.Stderr, "unknown flag: %s\n", arg)
 			os.Exit(1)
 		}
 	}
 
 	if role == "" {
-		fmt.Fprintln(os.Stderr, "用法:")
+		fmt.Fprintln(os.Stderr, "Usage:")
 		fmt.Fprintln(os.Stderr, "  go run . --role alice [--api 127.0.0.1:2121] [--id FILE] [--token TOKEN]")
 		fmt.Fprintln(os.Stderr, "  go run . --role bob   [--api 127.0.0.1:2121] [--id FILE] [--token TOKEN]")
 		os.Exit(1)
@@ -500,8 +520,8 @@ func main() {
 
 	c := newClient(apiAddr, token)
 	if err := c.do("GET", "/health", nil, nil); err != nil {
-		fmt.Fprintf(os.Stderr, "错误: 无法连接到 a2ald (%s): %v\n", apiAddr, err)
-		fmt.Fprintln(os.Stderr, "请先启动 a2ald，例如: a2ald --data-dir ./tmp/alice --fallback-host 127.0.0.1")
+		fmt.Fprintf(os.Stderr, "error: cannot reach a2ald at %s: %v\n", apiAddr, err)
+		fmt.Fprintln(os.Stderr, "Start a2ald first, e.g.: a2ald --data-dir ./tmp/alice --fallback-host 127.0.0.1")
 		os.Exit(1)
 	}
 
@@ -511,7 +531,7 @@ func main() {
 	case "bob":
 		runBob(c, idPath)
 	default:
-		fmt.Fprintf(os.Stderr, "未知角色 %q，请使用 alice 或 bob\n", role)
+		fmt.Fprintf(os.Stderr, "unknown role %q; use alice or bob\n", role)
 		os.Exit(1)
 	}
 }

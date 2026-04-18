@@ -1,16 +1,18 @@
 // Copyright 2026 The A2AL Authors. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 
-// demo1-node: 单一 A2AL DHT 节点。
+// demo1-node: a minimal single A2AL DHT node.
 //
-// 启动后自动生成身份、监听 UDP、bootstrap（若提供种子）、发布自己的端点记录。
-// 然后等待用户在 stdin 输入 Address 进行解析查询。
+// On start it generates an identity, listens on UDP, bootstraps (if a seed is given),
+// publishes its endpoint record, then waits for Address lines on stdin to resolve.
 //
-// 用法:
+// Without Go, use the pre-built demo1-node binary from the demos-latest release (replace go run . with demo1-node; same flags).
+//
+// Usage:
 //   go run . -listen :4121 -ip 1.2.3.4 -debug :2634
 //   go run . -listen :4122 -ip 1.2.3.5 -bootstrap 1.2.3.4:4121 -debug :2635
 //
-// 浏览器查看节点状态:
+// View node state in a browser:
 //   http://127.0.0.1:2634/debug/identity
 //   http://127.0.0.1:2634/debug/routing
 //   http://127.0.0.1:2634/debug/store

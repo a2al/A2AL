@@ -1,47 +1,61 @@
 // Copyright 2026 The A2AL Authors. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 
-// demo5-marketplace: 通过 QUIC 隧道直连调用 HTTP 服务的端到端验证。
+// demo5-marketplace: end-to-end QUIC tunnel + HTTP to a remote service.
 //
-// 场景：Seller 提供一个问答服务（reason.qa），Buyer 通过 A2AL 网络
-// 发现 Seller 并通过 QUIC 隧道直接调用其 HTTP 接口，无需知道对方 IP。
+// Seller exposes a Q&A HTTP service (reason.qa). Buyer discovers Seller on the A2AL network
+// and calls /ask over a QUIC tunnel without knowing Seller’s IP.
 //
-// 与 demo4 的核心区别：
-//   demo4 — DHT Mailbox 异步通信（信件往来）
-//   demo5 — QUIC 隧道 + HTTP 同步调用（直接打电话）
+// vs demo4:
+//   demo4 — async DHT mailbox (like mail)
+//   demo5 — QUIC tunnel + synchronous HTTP (like a phone call)
 //
-// 【单机运行（4 个终端）】
+// Start Buyer after Seller prints that it is online. Pre-built: demo5-marketplace from the demos-latest release (replace go run . with demo5-marketplace; same flags).
 //
-// connect API 需要两个独立的 daemon 节点（QUIC 直连是跨节点操作）。
+// Recommended — two machines, each with a2ald:
 //
-//	Terminal 1 — Seller daemon:
-//	  a2ald --data-dir ./tmp/seller --fallback-host 127.0.0.1
+//	Machine A: a2ald  +  go run . --role seller
+//	Machine B: a2ald  +  go run . --role buyer
 //
-//	Terminal 2 — Buyer daemon（bootstrap 指向 Seller daemon）:
-//	  a2ald --data-dir ./tmp/buyer --listen 127.0.0.1:4122 \
-//	        --api-addr 127.0.0.1:2122 --fallback-host 127.0.0.1 \
-//	        --bootstrap 127.0.0.1:4121
+// Single machine — QUIC needs two daemons (four terminals):
 //
-//	Terminal 3 — Seller（等 Terminal 1 启动后运行）:
-//	  go run . --role seller
+//	Seller a2ald:  a2ald --data-dir ./tmp/a --fallback-host 127.0.0.1
+//	Buyer  a2ald:  a2ald --data-dir ./tmp/b --listen :4122 --api-addr 127.0.0.1:2122 \
+//	               --fallback-host 127.0.0.1 --bootstrap 127.0.0.1:4121
+//	Seller demo:   go run . --role seller
+//	Buyer  demo:   go run . --role buyer --api 127.0.0.1:2122
 //
-//	Terminal 4 — Buyer（等 Seller 打印「已上线」后运行）:
-//	  go run . --role buyer --api 127.0.0.1:2122
+// LAN/offline: set --fallback-host to this host's LAN IP; Buyer adds --bootstrap <peer-ip>:4121.
 //
-// 【双机运行】
+// a2ald parameters
+// On the public internet, a2ald can be started with no extra flags. The following matter mainly
+// for single-machine tests or when there is no public network access:
 //
-//	机器 A:  a2ald --fallback-host <公网IP-A>
-//	         go run . --role seller
+//   --fallback-host IP
+//       Manually set the reachable IP written into endpoint records. On the public WAN, STUN/UPnP
+//       discovery usually suffices without this. Use 127.0.0.1 on loopback, this host's LAN IP on a LAN,
+//       or another reachable address when offline.
 //
-//	机器 B:  a2ald --fallback-host <公网IP-B> --bootstrap <公网IP-A>:4121
-//	         go run . --role buyer
+//   --bootstrap ip:port
+//       Manually specify a seed peer to join the DHT. On the public internet, DNS resolves public
+//       seeds automatically. Offline or on one machine: set to the peer (or first a2ald) at IP:4121.
 //
-// 【参数】
+//   --data-dir PATH
+//       Data directory (identity, config, routing cache); default UserConfigDir/a2al.
+//       Two a2ald instances on one machine must use different directories.
 //
-//	--role  seller|buyer   角色（必填）
-//	--api   HOST:PORT      本机 a2ald REST 地址（默认 127.0.0.1:2121）
-//	--token TOKEN          a2ald api_token（若配置了鉴权则填写）
-//	--id    FILE           身份文件路径（默认 identity-<role>-<port>.json）
+//   --listen ADDR
+//       DHT UDP listen address; default :4121. A second instance needs another port (e.g. :4122).
+//
+//   --api-addr ADDR
+//       REST API listen address; default 127.0.0.1:2121. A second instance needs another port
+//       (e.g. 127.0.0.1:2122).
+//
+// demo parameters
+//   --role  seller|buyer  role (required)
+//   --api   HOST:PORT     REST address of local a2ald (default 127.0.0.1:2121)
+//   --token TOKEN        a2ald api_token (if the daemon enables authentication)
+//   --id    FILE          identity file path (default identity-<role>-<port>.json)
 package main
 
 import (
@@ -120,11 +134,11 @@ func loadOrCreateIdentity(path string, c *client) (*savedIdentity, error) {
 	if b, err := os.ReadFile(path); err == nil {
 		var id savedIdentity
 		if json.Unmarshal(b, &id) == nil && id.AID != "" {
-			fmt.Printf("  已加载身份文件 %s\n", path)
+			fmt.Printf("  Loaded identity %s\n", path)
 			return &id, nil
 		}
 	}
-	fmt.Print("  生成新身份...")
+	fmt.Print("  Generating identity...")
 	var resp struct {
 		OperationalPrivateKeyHex string `json:"operational_private_key_hex"`
 		DelegationProofHex       string `json:"delegation_proof_hex"`
@@ -140,14 +154,14 @@ func loadOrCreateIdentity(path string, c *client) (*savedIdentity, error) {
 	}
 	b, _ := json.MarshalIndent(id, "", "  ")
 	_ = os.WriteFile(path, b, 0o600)
-	fmt.Printf(" 已生成并保存到 %s\n", path)
+	fmt.Printf(" OK\n  saved to %s\n", path)
 	return id, nil
 }
 
 // ─── Agent setup ─────────────────────────────────────────────────────────────
 
 func setupAgent(c *client, id *savedIdentity, serviceTCP string) error {
-	fmt.Print("  注册 agent...")
+	fmt.Print("  Registering agent...")
 	regReq := map[string]any{
 		"operational_private_key_hex": id.OperationalPrivateKeyHex,
 		"delegation_proof_hex":        id.DelegationProofHex,
@@ -162,7 +176,7 @@ func setupAgent(c *client, id *savedIdentity, serviceTCP string) error {
 			if err2 := c.do("PATCH", "/agents/"+id.AID, patchReq, nil); err2 != nil {
 				return fmt.Errorf("patch agent: %w", err2)
 			}
-			fmt.Println(" 已存在，已更新")
+			fmt.Println(" already exists; updated")
 		} else {
 			return fmt.Errorf("register: %w", err)
 		}
@@ -170,7 +184,7 @@ func setupAgent(c *client, id *savedIdentity, serviceTCP string) error {
 		fmt.Println(" OK")
 	}
 
-	fmt.Print("  发布端点到 A2AL 网络...")
+	fmt.Print("  Publishing endpoint to A2AL...")
 	if err := c.do("POST", "/agents/"+id.AID+"/publish", struct{}{}, nil); err != nil {
 		return fmt.Errorf("publish: %w", err)
 	}
@@ -223,7 +237,7 @@ var answers = map[string]string{
 func startSellerHTTP() (net.Listener, string) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		fatal("无法启动 HTTP 服务: %v", err)
+		fatal("HTTP listen: %v", err)
 	}
 	addr := ln.Addr().(*net.TCPAddr)
 	svcAddr := fmt.Sprintf("127.0.0.1:%d", addr.Port)
@@ -244,18 +258,18 @@ func startSellerHTTP() (net.Listener, string) {
 		q := strings.ToLower(strings.TrimSpace(req.Question))
 		answer, ok := answers[q]
 		if !ok {
-			answer = fmt.Sprintf("(未收录问题，原样返回) %s", req.Question)
+			answer = fmt.Sprintf("(no canned answer; echo) %s", req.Question)
 		}
 		// Remote AID is injected by aidListener via ConnContext — cryptographically
 		// verified by the daemon's mutual-TLS QUIC handshake.
 		callerAID, _ := r.Context().Value(remoteAIDKey{}).(string)
 		callerLabel := shortAID(callerAID)
 		if callerAID == "" {
-			callerLabel = "(未知)"
+			callerLabel = "(unknown)"
 		}
-		fmt.Printf("\n[Seller] 收到来自 %s 的请求\n", callerLabel)
-		fmt.Printf("         问题: %q\n", req.Question)
-		fmt.Printf("[Seller] 返回答案\n")
+		fmt.Printf("\n[Seller] request from %s\n", callerLabel)
+		fmt.Printf("         question: %q\n", req.Question)
+		fmt.Printf("[Seller] sending answer\n")
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"answer": answer})
@@ -272,31 +286,31 @@ func startSellerHTTP() (net.Listener, string) {
 	}
 	go func() {
 		if err := srv.Serve(&aidListener{ln}); err != nil && !strings.Contains(err.Error(), "use of closed") {
-			fmt.Fprintf(os.Stderr, "[Seller] HTTP 服务错误: %v\n", err)
+			fmt.Fprintf(os.Stderr, "[Seller] HTTP error: %v\n", err)
 		}
 	}()
 	return ln, svcAddr
 }
 
 func runSeller(c *client, idPath string) {
-	fmt.Println("\n=== QA Seller — 问答服务提供方 ===")
+	fmt.Println("\n=== QA Seller ===")
 
 	id, err := loadOrCreateIdentity(idPath, c)
 	if err != nil {
-		fatal("身份初始化: %v", err)
+		fatal("identity init: %v", err)
 	}
 	fmt.Printf("  AID: %s\n", id.AID)
 
 	ln, svcAddr := startSellerHTTP()
 	defer ln.Close()
-	fmt.Printf("  本地 HTTP 服务: %s\n", svcAddr)
+	fmt.Printf("  Local HTTP: %s\n", svcAddr)
 
 	if err := setupAgent(c, id, svcAddr); err != nil {
 		fatal("%v", err)
 	}
 
 	// Register service on DHT.
-	fmt.Print(`  注册服务 "reason.qa" 到 A2AL 网络...`)
+	fmt.Print(`  Registering service "reason.qa"...`)
 	topicReq := map[string]any{
 		"services":  []string{"reason.qa"},
 		"name":      "QA Service",
@@ -306,17 +320,17 @@ func runSeller(c *client, idPath string) {
 		"ttl":       3600,
 	}
 	if err := c.do("POST", "/agents/"+id.AID+"/services", topicReq, nil); err != nil {
-		fatal("注册服务: %v", err)
+		fatal("register service: %v", err)
 	}
 	fmt.Println(" OK")
 
 	fmt.Printf(`
-✓ Seller 已上线
-  服务: reason.qa
-  AID:  %s
+✓ Seller online
+  service: reason.qa
+  AID:     %s
 
-  等待来自 Buyer 的直连调用（Ctrl-C 退出）...
-  可在 Web UI 的 Discover 标签页搜索 "reason.qa" 查看本服务。
+  Waiting for Buyer calls (Ctrl-C to quit)...
+  In the Web UI Discover tab, search "reason.qa" to see this service.
 
 `, id.AID)
 
@@ -336,16 +350,16 @@ var questions = []string{
 }
 
 func runBuyer(c *client, idPath string) {
-	fmt.Println("\n=== QA Buyer — 服务使用方 ===")
+	fmt.Println("\n=== QA Buyer ===")
 
 	id, err := loadOrCreateIdentity(idPath, c)
 	if err != nil {
-		fatal("身份初始化: %v", err)
+		fatal("identity init: %v", err)
 	}
 	fmt.Printf("  AID: %s\n\n", id.AID)
 
 	// Register buyer agent (needed to use as local_aid for connect).
-	fmt.Print("  注册 agent（用于 QUIC 身份验证）...")
+	fmt.Print("  Registering agent (for QUIC identity)...")
 	regReq := map[string]any{
 		"operational_private_key_hex": id.OperationalPrivateKeyHex,
 		"delegation_proof_hex":        id.DelegationProofHex,
@@ -358,7 +372,7 @@ func runBuyer(c *client, idPath string) {
 	fmt.Println(" OK")
 
 	// Discover seller.
-	fmt.Print("  搜索 A2AL 网络中的 \"reason.qa\" 服务")
+	fmt.Print("  Discovering \"reason.qa\" on A2AL")
 	var sellerAID string
 	var sellerName, sellerBrief string
 	for attempt := 0; attempt < 20; attempt++ {
@@ -383,16 +397,16 @@ func runBuyer(c *client, idPath string) {
 	fmt.Println()
 
 	if sellerAID == "" {
-		fatal("未找到 reason.qa 服务。\n请先启动 Seller 并等待其打印「已上线」后再运行 Buyer。")
+		fatal("reason.qa not found.\nStart Seller first and wait until it prints that it is online, then run Buyer.")
 	}
 
-	fmt.Printf("\n  找到服务方:\n")
+	fmt.Printf("\n  Found seller:\n")
 	fmt.Printf("    AID:   %s\n", sellerAID)
-	fmt.Printf("    名称:  %s\n", sellerName)
-	fmt.Printf("    描述:  %s\n", sellerBrief)
+	fmt.Printf("    name:  %s\n", sellerName)
+	fmt.Printf("    brief: %s\n", sellerBrief)
 
 	// Establish QUIC tunnel.
-	fmt.Printf("\n  建立 A2AL 直连隧道（身份: %s）...", shortAID(id.AID))
+	fmt.Printf("\n  Opening A2AL tunnel (local AID %s)...", shortAID(id.AID))
 	var connResp struct {
 		Tunnel string `json:"tunnel"`
 	}
@@ -400,24 +414,24 @@ func runBuyer(c *client, idPath string) {
 		"local_aid": id.AID,
 	}
 	if err := c.do("POST", "/connect/"+sellerAID, connectReq, &connResp); err != nil {
-		fatal("建立隧道失败: %v\n  请确认 Seller 仍在运行，且两个节点的 daemon 已互联。", err)
+		fatal("tunnel failed: %v\n  Keep Seller running and ensure both daemons can reach each other.", err)
 	}
 	tunnelBase := "http://" + connResp.Tunnel
-	fmt.Printf(" OK\n  隧道地址: %s\n", connResp.Tunnel)
+	fmt.Printf(" OK\n  tunnel: %s\n", connResp.Tunnel)
 
-	fmt.Printf("\n  ── 开始调用 ──────────────────────────────\n\n")
+	fmt.Printf("\n  ── calls ─────────────────────────────────\n\n")
 
 	// Call /ask for each question via the tunnel.
 	httpClient := &http.Client{Timeout: 15 * time.Second}
 	for _, q := range questions {
-		fmt.Printf("  问: %q\n", q)
+		fmt.Printf("  Q: %q\n", q)
 
 		body, _ := json.Marshal(map[string]string{
 			"question": q,
 		})
 		resp, err := httpClient.Post(tunnelBase+"/ask", "application/json", bytes.NewReader(body))
 		if err != nil {
-			fmt.Printf("  ✗ 请求失败: %v\n\n", err)
+			fmt.Printf("  ✗ request failed: %v\n\n", err)
 			continue
 		}
 		raw, _ := io.ReadAll(resp.Body)
@@ -427,23 +441,23 @@ func runBuyer(c *client, idPath string) {
 			Answer string `json:"answer"`
 		}
 		if err := json.Unmarshal(raw, &result); err != nil {
-			fmt.Printf("  ✗ 响应解析失败: %v\n\n", err)
+			fmt.Printf("  ✗ bad JSON: %v\n\n", err)
 			continue
 		}
-		fmt.Printf("  答: %s\n\n", result.Answer)
+		fmt.Printf("  A: %s\n\n", result.Answer)
 		time.Sleep(500 * time.Millisecond)
 	}
 
-	fmt.Println("  ── 完成 ──────────────────────────────────")
+	fmt.Println("  ── done ──────────────────────────────────")
 	fmt.Printf(`
-✓ Demo5 验证完成
-  验证链路:
-    1. 身份生成（AID + 委托证明）
-    2. 服务发布到 DHT（reason.qa）
-    3. Discover 搜索（无需知道 Seller IP）
-    4. QUIC 隧道建立（携带 Buyer AID 身份）
-    5. HTTP 直连调用（同步 RPC，非异步 mailbox）
-    6. Seller 可验证调用方身份
+✓ Demo5 complete
+  Flow:
+    1. Identity (AID + delegation proof)
+    2. Publish reason.qa to DHT
+    3. Discover (no Seller IP needed)
+    4. QUIC tunnel (Buyer AID)
+    5. HTTP /ask over tunnel (sync; not mailbox)
+    6. Seller sees caller AID
 
 `)
 }
@@ -458,7 +472,7 @@ func shortAID(aid string) string {
 }
 
 func fatal(format string, args ...any) {
-	fmt.Fprintf(os.Stderr, "\n错误: "+format+"\n", args...)
+	fmt.Fprintf(os.Stderr, "\nerror: "+format+"\n", args...)
 	os.Exit(1)
 }
 
@@ -475,7 +489,7 @@ func main() {
 		next := func() string {
 			i++
 			if i >= len(os.Args) {
-				fmt.Fprintf(os.Stderr, "参数 %s 缺少值\n", arg)
+				fmt.Fprintf(os.Stderr, "missing value for %s\n", arg)
 				os.Exit(1)
 			}
 			return os.Args[i]
@@ -498,13 +512,13 @@ func main() {
 		case strings.HasPrefix(arg, "--id="):
 			idPath = strings.TrimPrefix(arg, "--id=")
 		default:
-			fmt.Fprintf(os.Stderr, "未知参数: %s\n", arg)
+			fmt.Fprintf(os.Stderr, "unknown flag: %s\n", arg)
 			os.Exit(1)
 		}
 	}
 
 	if role == "" {
-		fmt.Fprintln(os.Stderr, "用法:")
+		fmt.Fprintln(os.Stderr, "Usage:")
 		fmt.Fprintln(os.Stderr, "  go run . --role seller  [--api 127.0.0.1:2121] [--id FILE] [--token TOKEN]")
 		fmt.Fprintln(os.Stderr, "  go run . --role buyer   [--api 127.0.0.1:2121] [--id FILE] [--token TOKEN]")
 		os.Exit(1)
@@ -516,8 +530,8 @@ func main() {
 
 	c := newClient(apiAddr, token)
 	if err := c.do("GET", "/health", nil, nil); err != nil {
-		fmt.Fprintf(os.Stderr, "错误: 无法连接到 a2ald (%s): %v\n", apiAddr, err)
-		fmt.Fprintln(os.Stderr, "请先启动 a2ald，例如: a2ald --data-dir ./tmp/node --fallback-host 127.0.0.1")
+		fmt.Fprintf(os.Stderr, "error: cannot reach a2ald at %s: %v\n", apiAddr, err)
+		fmt.Fprintln(os.Stderr, "Start a2ald first, e.g.: a2ald --data-dir ./tmp/node --fallback-host 127.0.0.1")
 		os.Exit(1)
 	}
 
@@ -527,7 +541,7 @@ func main() {
 	case "buyer":
 		runBuyer(c, idPath)
 	default:
-		fmt.Fprintf(os.Stderr, "未知角色 %q，请使用 seller 或 buyer\n", role)
+		fmt.Fprintf(os.Stderr, "unknown role %q; use seller or buyer\n", role)
 		os.Exit(1)
 	}
 }

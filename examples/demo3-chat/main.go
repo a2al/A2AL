@@ -1,55 +1,59 @@
 // Copyright 2026 The A2AL Authors. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 
-// demo3-chat: 通过 a2ald REST API 实现的聊天程序。
+// demo3-chat: chat via the a2ald REST API (stdlib only).
 //
-// 与 demo2-chat 的区别：本程序完全不依赖 a2al Go 库，只使用标准库。
-// 网络传输、DHT、QUIC、NAT 穿透全部由 a2ald 处理；
-// 本程序通过 REST API 控制 a2ald，通过 TCP 收发消息。
+// Unlike demo2-chat, this program does not import the a2al Go library (stdlib only).
+// Transport, DHT, QUIC, and NAT traversal are handled by a2ald; this demo controls a2ald via
+// its REST API and exchanges messages over TCP.
 //
-// 使用前提：先在另一个终端启动 a2ald。
+// Prerequisite: start a2ald in another terminal. Bob enters Alice’s printed AID to chat.
+// Without Go, use the pre-built demo3-chat binary from the demos-latest release (replace go run . with demo3-chat; same flags).
 //
-// 【Bootstrap 节点】
-// a2ald 需要至少一个已知节点来加入 DHT 网络。有三种方式：
-//  1. 默认：自动解析公共种子节点
-//  2. 显式指定：--bootstrap 127.0.0.1:4121（可多个，逗号分隔）
-//  3. 配置文件：在 config.toml 中设置 bootstrap 列表
+// Recommended — two machines, two terminals each:
 //
-// 本机两实例测试时，让 Bob 的 a2ald 用 --bootstrap 指向 Alice（或反向），
-// 二者即可互相发现。无需依赖公共种子节点。
+//	Machine A: a2ald  +  go run .
+//	Machine B: a2ald  +  go run .
 //
-// 【同一台机器两个实例测试】
-// a2ald 在发布端点时会过滤掉 loopback/私网 IP，本机测试须通过
-// --fallback-host 告知 a2ald 用哪个地址对外可达：
+// Single machine — four terminals (two daemons as each other’s bootstrap; needs --fallback-host):
 //
-//	Terminal 1 (Alice a2ald):
-//	  a2ald --data-dir /tmp/a2ald-alice --listen :4121 --fallback-host 127.0.0.1
-//	（Windows 可把目录换成例如 C:\tmp\a2ald-alice）
+//	Alice a2ald:  a2ald --data-dir ./tmp/a --fallback-host 127.0.0.1
+//	Alice chat:   go run .
+//	Bob a2ald:    a2ald --data-dir ./tmp/b --listen :4122 --api-addr 127.0.0.1:2122 \
+//	              --fallback-host 127.0.0.1 --bootstrap 127.0.0.1:4121
+//	Bob chat:     go run . --api 127.0.0.1:2122
 //
-//	Terminal 2 (Alice chat):
-//	  go run . --api 127.0.0.1:2121
+// LAN testing: set --fallback-host to this host's LAN IP; set --bootstrap to the peer's ip:4121.
 //
-//	Terminal 3 (Bob a2ald):
-//	  a2ald --data-dir /tmp/a2ald-bob --listen :4122 --api-addr 127.0.0.1:2122 \
-//	        --fallback-host 127.0.0.1 --bootstrap 127.0.0.1:4121
+// If a2ald enables api_token, add --token TOKEN to this demo.
 //
-//	Terminal 4 (Bob chat):
-//	  go run . --api 127.0.0.1:2122
+// a2ald parameters
+// On the public internet, a2ald can be started with no extra flags. The following matter mainly
+// for single-machine tests or when there is no public network access:
 //
-//	Bob 终端输入 Alice 打印的 AID，即可开始聊天。
+//   --fallback-host IP
+//       Manually set the reachable IP written into endpoint records. On the public WAN, STUN/UPnP
+//       discovery usually suffices without this. Use 127.0.0.1 on loopback, this host's LAN IP on a LAN,
+//       or another reachable address when offline.
 //
-// 同一 identity-*.json 多次启动本程序时，若 agent 已在 a2ald 注册过，会自动 PATCH
-// 更新 service_tcp（每次随机端口），一般无需删身份文件。
+//   --bootstrap ip:port
+//       Manually specify a seed peer to join the DHT. On the public internet, DNS resolves public
+//       seeds automatically. Offline or on one machine: set to the peer (or first a2ald) at IP:4121.
 //
-// 【跨机器 LAN 测试】把 --fallback-host 换成本机 LAN IP（如 192.168.1.10），
-// --bootstrap 指向对方机器的 ip:port（如 192.168.1.10:4121）。
+//   --data-dir PATH
+//       Data directory (identity, config, routing cache); default UserConfigDir/a2al.
+//       Two a2ald instances on one machine must use different directories.
 //
-// 【公网部署】a2ald 能自动检测公网 IP / UPnP，无需 --fallback-host；
-// 公共种子节点可达时也无需 --bootstrap。
+//   --listen ADDR
+//       DHT UDP listen address; default :4121. A second instance needs another port (e.g. :4122).
 //
-// 如果 a2ald 有 api_token，添加 --token 参数：
+//   --api-addr ADDR
+//       REST API listen address; default 127.0.0.1:2121. A second instance needs another port
+//       (e.g. 127.0.0.1:2122).
 //
-//	go run . --api 127.0.0.1:2121 --token mysecret
+// demo parameters
+//   --api HOST:PORT   REST address of the a2ald this demo talks to (default 127.0.0.1:2121)
+//   --token TOKEN     a2ald api_token (required if the daemon enables authentication)
 package main
 
 import (
