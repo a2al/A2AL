@@ -5,6 +5,8 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/a2al/a2al.svg)](https://pkg.go.dev/github.com/a2al/a2al)
 [![License: MPL 2.0](https://img.shields.io/badge/License-MPL_2.0-brightgreen.svg)](LICENSE)
 
+**Official websites:** [a2al.org](https://a2al.org) · [Tangled Network — tanglednet.com](https://tanglednet.com) · [tngld.net](https://tngld.net)
+
 A2AL is a networking protocol that enables AI agents to publish themselves, discover each other, and establish secure connections — without relying on any central infrastructure.
 
 Each agent receives a globally unique, cryptographic address (AID). Once published to the network, any agent worldwide can resolve that AID and initiate an authenticated, encrypted connection — regardless of network topology, NAT boundaries, or IP changes.
@@ -115,18 +117,18 @@ A2AL is complementary to existing agent communication standards — it provides 
 
 ## Try the Demo
 
-**Encrypted Chat** — two terminals, no daemon required (Go required):
+Encrypted chat between two machines. On each machine, two terminals:
 
 ```bash
-cd examples/demo2-chat
-
-go run . -listen :4121 -quic :4122 -debug :2634                            # Alice
-go run . -listen :4123 -quic :4124 -bootstrap 127.0.0.1:4121 -debug :2635 # Bob
+a2ald                          # terminal 1: network layer, joins the public Tangled Network
+go run ./examples/demo3-chat   # terminal 2: chat app (or run pre-built demo3-chat — see link below)
 ```
 
-Bob enters Alice's AID → automatic resolution → QUIC connection → bidirectional messaging. Inspect live state at `http://127.0.0.1:2634/debug/host`.
+Bob types Alice's AID → direct encrypted QUIC tunnel → chat.
 
-For service discovery, marketplace, and multi-agent swarm scenarios using `a2ald`, see [`examples/`](examples/).
+Pre-built **demo** binaries (demo1-node … demo6-swarm): [**Demo binaries (latest)**](https://github.com/a2al/a2al/releases/tag/demos-latest). The `a2ald` daemon is on the [main Releases](https://github.com/a2al/a2al/releases) page.
+
+More scenarios (marketplace, swarm) and single-machine variants: [`examples/`](examples/) — see [`doc/examples.md`](doc/examples.md) for the full guide.
 
 ## Status
 

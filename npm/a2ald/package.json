@@ -3,20 +3,33 @@
   "version": "0.0.0",
   "description": "A2AL daemon — decentralized agent networking for AI agents",
   "license": "MPL-2.0",
-  "homepage": "https://github.com/a2al/a2al",
+  "homepage": "https://a2al.org",
   "repository": {
     "type": "git",
     "url": "https://github.com/a2al/a2al.git",
     "directory": "npm/a2ald"
   },
-  "keywords": ["a2al", "agent", "mcp", "p2p", "decentralized", "ai"],
+  "keywords": [
+    "service-discovery",
+    "service-registry",
+    "decentralized",
+    "agent-networking",
+    "agent-to-agent",
+    "ai-agents",
+    "p2p",
+    "a2a",
+    "mcp",
+    "mcp-server",
+    "agents"
+  ],
   "bin": {
     "a2ald": "bin/a2ald"
   },
   "main": "index.js",
   "files": [
     "bin",
-    "index.js"
+    "index.js",
+    "README.md"
   ],
   "optionalDependencies": {
     "@a2al/a2ald-linux-x64":    "0.0.0",
