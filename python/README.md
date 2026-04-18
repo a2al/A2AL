@@ -39,3 +39,9 @@ with Daemon() as d:
 
 - Python 3.10+
 - No third-party dependencies (standard library only)
+
+## Links
+
+- **A2AL** — [a2al.org](https://a2al.org)
+- **Tangled Network** — [tanglednet.com](https://tanglednet.com) · [tngld.net](https://tngld.net)
+- **Source** — [GitHub](https://github.com/a2al/a2al)
