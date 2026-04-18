@@ -10,7 +10,17 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MPL-2.0" }
 authors = [{ name = "A2AL Authors" }]
-keywords = ["a2al", "a2a", "agent", "ai", "sidecar"]
+keywords = [
+  "service-discovery",
+  "service-registry",
+  "decentralized",
+  "agent-networking",
+  "a2a",
+  "ai-agents",
+  "p2p",
+  "mcp",
+  "mcp-server"
+]
 classifiers = [
   "Development Status :: 4 - Beta",
   "Intended Audience :: Developers",
@@ -25,9 +35,11 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/a2al/a2al"
+Homepage = "https://a2al.org"
 Repository = "https://github.com/a2al/a2al"
 "Bug Tracker" = "https://github.com/a2al/a2al/issues"
+"Tangled Network" = "https://tanglednet.com"
+"tngld.net" = "https://tngld.net"
 
 [tool.setuptools.packages.find]
 where = ["src"]
