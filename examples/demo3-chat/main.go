@@ -1,21 +1,21 @@
 // Copyright 2026 The A2AL Authors. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 
-// demo3-chat: 通过 a2ald REST API 实现的聊天程序。
+// demo3-chat: chat via the a2ald REST API (stdlib only).
 //
-// 与 demo2-chat 的区别：本程序完全不依赖 a2al Go 库，只使用标准库。
-// 网络传输、DHT、QUIC、NAT 穿透全部由 a2ald 处理；
-// 本程序通过 REST API 控制 a2ald，通过 TCP 收发消息。
+// Unlike demo2-chat, this program does not import the a2al Go library (stdlib only).
+// Transport, DHT, QUIC, and NAT traversal are handled by a2ald; this demo controls a2ald via
+// its REST API and exchanges messages over TCP.
 //
-// 使用前提：先在另一个终端启动 a2ald。Bob 输入 Alice 打印的 AID 即可聊天。
-// 无 Go 环境可从 Releases 下载预编译二进制，将 go run . 替换为 demo3-chat 即可。
+// Prerequisite: start a2ald in another terminal. Bob enters Alice’s printed AID to chat.
+// Without Go, use the pre-built demo3-chat binary from Releases instead of go run .
 //
-// 【推荐：双机运行】两台机器各两个终端：
+// Recommended — two machines, two terminals each:
 //
-//	机器A：a2ald  +  go run .
-//	机器B：a2ald  +  go run .
+//	Machine A: a2ald  +  go run .
+//	Machine B: a2ald  +  go run .
 //
-// 【单机运行】四个终端，两 daemon 互为 bootstrap，须 --fallback-host：
+// Single machine — four terminals (two daemons as each other’s bootstrap; needs --fallback-host):
 //
 //	Alice a2ald:  a2ald --data-dir ./tmp/a --fallback-host 127.0.0.1
 //	Alice chat:   go run .
@@ -23,34 +23,37 @@
 //	              --fallback-host 127.0.0.1 --bootstrap 127.0.0.1:4121
 //	Bob chat:     go run . --api 127.0.0.1:2122
 //
-// LAN 测试：--fallback-host 改为本机 LAN IP，--bootstrap 指向对端机 ip:4121。
+// LAN testing: set --fallback-host to this host's LAN IP; set --bootstrap to the peer's ip:4121.
 //
-// a2ald 若启用 api_token，给 chat 加 --token TOKEN。
+// If a2ald enables api_token, add --token TOKEN to this demo.
 //
-// 【a2ald 参数说明】
-// 联网环境下 a2ald 无参启动即可。以下参数仅在单机测试或无公网时使用：
+// a2ald parameters
+// On the public internet, a2ald can be started with no extra flags. The following matter mainly
+// for single-machine tests or when there is no public network access:
 //
 //   --fallback-host IP
-//       手动指定写入端点记录的可达 IP。公网时 STUN/UPnP 自动探测，无需设置。
-//       单机回环测试设为 127.0.0.1，LAN 测试设为本机 LAN IP，离线设为本机可达 IP。
+//       Manually set the reachable IP written into endpoint records. On the public WAN, STUN/UPnP
+//       discovery usually suffices without this. Use 127.0.0.1 on loopback, this host's LAN IP on a LAN,
+//       or another reachable address when offline.
 //
 //   --bootstrap ip:port
-//       手动指定种子节点以加入 DHT 网络。公网时 DNS 自动解析公共种子，无需设置。
-//       离线或单机测试时设为对端（或第一个 a2ald）的 IP:4121。
+//       Manually specify a seed peer to join the DHT. On the public internet, DNS resolves public
+//       seeds automatically. Offline or on one machine: set to the peer (or first a2ald) at IP:4121.
 //
 //   --data-dir PATH
-//       数据目录（身份、配置、路由缓存），默认 UserConfigDir/a2al。
-//       单机运行两个 a2ald 实例时，两者须各自使用不同目录。
+//       Data directory (identity, config, routing cache); default UserConfigDir/a2al.
+//       Two a2ald instances on one machine must use different directories.
 //
 //   --listen ADDR
-//       DHT UDP 监听地址，默认 :4121。单机第二实例须改端口（如 :4122）避免冲突。
+//       DHT UDP listen address; default :4121. A second instance needs another port (e.g. :4122).
 //
 //   --api-addr ADDR
-//       REST API 监听地址，默认 127.0.0.1:2121。单机第二实例须改端口（如 127.0.0.1:2122）。
+//       REST API listen address; default 127.0.0.1:2121. A second instance needs another port
+//       (e.g. 127.0.0.1:2122).
 //
-// 【demo 参数】
-//   --api HOST:PORT   连接的 a2ald REST 地址（默认 127.0.0.1:2121）
-//   --token TOKEN     a2ald api_token（若配置了鉴权则填写）
+// demo parameters
+//   --api HOST:PORT   REST address of the a2ald this demo talks to (default 127.0.0.1:2121)
+//   --token TOKEN     a2ald api_token (required if the daemon enables authentication)
 package main
 
 import (

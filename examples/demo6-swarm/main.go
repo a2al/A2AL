@@ -1,21 +1,20 @@
 // Copyright 2026 The A2AL Authors. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 
-// demo6-swarm: 多 Agent 协作出海决策 Swarm。
+// demo6-swarm: multi-agent “go-to-market” swarm demo.
 //
-// 场景：企业想将产品打入海外市场。Planner 搜索 Tangled 网络，动态发现已注册的
-// 各领域 Agent，组建 Swarm，并行建立 QUIC 隧道咨询，汇总为出海方案。
-// Agent 随时可下线，Planner 按实际发现情况动态处理，无需预先知道有多少个 Agent。
+// A company plans to sell overseas. Planner searches the Tangled network, discovers
+// registered specialists, opens parallel QUIC tunnels, and merges answers into one report.
+// Workers may go offline; Planner adapts to whatever is found.
 //
-// Planner 先等 Worker 打印「已上线」再启动。
-// 无 Go 环境可从 Releases 下载预编译二进制，将 go run . 替换为 demo6-swarm 即可。
+// Start Planner after Worker prints that agents are online. Pre-built: demo6-swarm from Releases.
 //
-// 【推荐：双机运行】两机各启动 a2ald：
+// Recommended — two machines:
 //
-//	Worker 机器:   a2ald  +  go run . --role worker
-//	Planner 机器:  a2ald  +  go run . --role planner
+//	Worker machine:  a2ald  +  go run . --role worker
+//	Planner machine: a2ald  +  go run . --role planner
 //
-// 【单机运行】四终端：
+// Single machine — four terminals:
 //
 //	Worker  a2ald:  a2ald --data-dir ./tmp/a --fallback-host 127.0.0.1
 //	Planner a2ald:  a2ald --data-dir ./tmp/b --listen :4122 --api-addr 127.0.0.1:2122 \
@@ -23,35 +22,38 @@
 //	Worker  demo:   go run . --role worker
 //	Planner demo:   go run . --role planner --api 127.0.0.1:2122
 //
-// LAN 或离线：--fallback-host 改为本机 LAN IP，Planner 加 --bootstrap <Worker机IP>:4121。
+// LAN/offline: set --fallback-host to this host's LAN IP; Planner adds --bootstrap <worker-ip>:4121.
 //
-// 【a2ald 参数说明】
-// 联网环境下 a2ald 无参启动即可。以下参数仅在单机测试或无公网时使用：
+// a2ald parameters
+// On the public internet, a2ald can be started with no extra flags. The following matter mainly
+// for single-machine tests or when there is no public network access:
 //
 //   --fallback-host IP
-//       手动指定写入端点记录的可达 IP。公网时 STUN/UPnP 自动探测，无需设置。
-//       单机回环测试设为 127.0.0.1，LAN 测试设为本机 LAN IP，离线设为本机可达 IP。
+//       Manually set the reachable IP written into endpoint records. On the public WAN, STUN/UPnP
+//       discovery usually suffices without this. Use 127.0.0.1 on loopback, this host's LAN IP on a LAN,
+//       or another reachable address when offline.
 //
 //   --bootstrap ip:port
-//       手动指定种子节点以加入 DHT 网络。公网时 DNS 自动解析公共种子，无需设置。
-//       离线或单机测试时设为对端（或第一个 a2ald）的 IP:4121。
+//       Manually specify a seed peer to join the DHT. On the public internet, DNS resolves public
+//       seeds automatically. Offline or on one machine: set to the peer (or first a2ald) at IP:4121.
 //
 //   --data-dir PATH
-//       数据目录（身份、配置、路由缓存），默认 UserConfigDir/a2al。
-//       单机运行两个 a2ald 实例时，两者须各自使用不同目录。
+//       Data directory (identity, config, routing cache); default UserConfigDir/a2al.
+//       Two a2ald instances on one machine must use different directories.
 //
 //   --listen ADDR
-//       DHT UDP 监听地址，默认 :4121。单机第二实例须改端口（如 :4122）避免冲突。
+//       DHT UDP listen address; default :4121. A second instance needs another port (e.g. :4122).
 //
 //   --api-addr ADDR
-//       REST API 监听地址，默认 127.0.0.1:2121。单机第二实例须改端口（如 127.0.0.1:2122）。
+//       REST API listen address; default 127.0.0.1:2121. A second instance needs another port
+//       (e.g. 127.0.0.1:2122).
 //
-// 【demo 参数】
-//   --role  worker|planner  角色（必填）
-//   --api   HOST:PORT       连接的 a2ald REST 地址（默认 127.0.0.1:2121）
-//   --token TOKEN           a2ald api_token（若配置了鉴权则填写）
+// demo parameters
+//   --role   worker|planner  role (required)
+//   --api    HOST:PORT       REST address of local a2ald (default 127.0.0.1:2121)
+//   --token  TOKEN           a2ald api_token (if the daemon enables authentication)
 //
-// 【Web UI 验证】在 Discover 标签页分别搜索以下服务名可看到对应 Agent：
+// Web UI verification — in the Discover tab, search for these service names to see each agent:
 //
 //	reason.evaluate  /  data.search  /  reason.analyze  /  reason.recommend
 package main
@@ -215,65 +217,76 @@ type expert struct {
 	consult func(product, market string) string
 }
 
+func marketIsEU(m string) bool {
+	m = strings.ToLower(m)
+	return strings.Contains(m, "eu") || strings.Contains(m, "europe")
+}
+
+func marketIsUS(m string) bool {
+	m = strings.ToLower(m)
+	return strings.Contains(m, "us") || strings.Contains(m, "united states") ||
+		strings.Contains(m, "north america")
+}
+
 var experts = []expert{
 	{
 		topic: "reason.evaluate",
-		name:  "国际合规认证 Agent",
-		brief: "产品准入合规评估，含认证标准与法规审查",
+		name:  "Compliance certification agent",
+		brief: "Market-access compliance: standards and regulatory review",
 		tags:  []string{"compliance", "certification", "regulation"},
 		consult: func(product, market string) string {
-			if strings.Contains(market, "欧") {
-				return "需 CE/RED/WEEE 认证，GDPR 隐私合规，认证周期约 6-8 周"
+			if marketIsEU(market) {
+				return "CE/RED/WEEE + GDPR; typical lead time ~6–8 weeks"
 			}
-			if strings.Contains(market, "美") || strings.Contains(market, "北美") {
-				return "需 FCC/UL 认证，加州 Prop 65 若含电池需 UN38.3，周期约 4-6 周"
+			if marketIsUS(market) {
+				return "FCC/UL; Prop 65 / UN38.3 if battery; ~4–6 weeks"
 			}
-			return "需目标市场准入认证，建议咨询当地合规机构"
+			return "Confirm target-market certification with local counsel"
 		},
 	},
 	{
 		topic: "data.search",
-		name:  "供应链物流 Agent",
-		brief: "跨境物流方案查询，含运输路线、仓储与末端配送",
+		name:  "Logistics agent",
+		brief: "Cross-border shipping, routes, warehousing, last mile",
 		tags:  []string{"logistics", "shipping", "supply-chain"},
 		consult: func(product, market string) string {
-			if strings.Contains(market, "欧") {
-				return "深圳→鹿特丹海运约 22 天，推荐 DHL 末端配送，鹿特丹仓储 €0.8/件/月"
+			if marketIsEU(market) {
+				return "Shenzhen→Rotterdam ~22d sea; DHL last mile; Rotterdam storage ~€0.8/unit/mo"
 			}
-			if strings.Contains(market, "美") || strings.Contains(market, "北美") {
-				return "深圳→洛杉矶海运约 15 天，亚马逊 FBA 入仓，头程海运 $1.2/kg"
+			if marketIsUS(market) {
+				return "Shenzhen→LA ~15d sea; FBA inbound; ocean ~$1.2/kg head haul"
 			}
-			return "建议海运+目的地本地仓，具体报价需目标港口确认"
+			return "Sea + local warehouse; confirm quotes at destination port"
 		},
 	},
 	{
 		topic: "reason.analyze",
-		name:  "关税贸易 Agent",
-		brief: "HS 编码与关税税率分析，含清关文件建议",
+		name:  "Tariffs & trade agent",
+		brief: "HS codes, duties, customs paperwork",
 		tags:  []string{"customs", "tariff", "trade"},
 		consult: func(product, market string) string {
-			if strings.Contains(market, "欧") {
-				return "HS 8517.62，欧盟关税 0%，荷兰 VAT 21%，需 EUR.1 产地证+CE 证书"
+			if marketIsEU(market) {
+				return "HS 8517.62; EU duty 0%; NL VAT 21%; EUR.1 + CE docs"
 			}
-			if strings.Contains(market, "美") || strings.Contains(market, "北美") {
-				return "HS 8517.62，美国关税 7.5%（301 税），需 FCC ID + 原产地申报"
+			if marketIsUS(market) {
+				return "HS 8517.62; US duty ~7.5% (301); FCC ID + origin declaration"
 			}
-			return "需确认 HS 编码和目标国税率，准备商业发票+装箱单"
+			return "Confirm HS and duty with broker; commercial invoice + packing list"
 		},
 	},
 	{
 		topic: "reason.recommend",
-		name:  "本地化市场 Agent",
-		brief: "目标市场定价策略与本地化适配建议",
+		name:  "Localization agent",
+		brief: "Pricing and localization fit for the target market",
 		tags:  []string{"localization", "market-fit", "pricing"},
 		consult: func(product, market string) string {
-			if strings.Contains(market, "欧") {
-				return "主要竞品 Amazfit €129/Garmin €199，建议定价 €119，DE/FR/ES 语言包已覆盖"
+			if marketIsEU(market) {
+				return "Peers ~€129–199; suggest €119; DE/FR/ES packs available"
 			}
-			if strings.Contains(market, "美") || strings.Contains(market, "北美") {
-				return "主要竞品 Garmin $199/Fitbit $149，建议定价 $129，英文本地化需强调健康追踪"
+			if marketIsUS(market) {
+				return "Peers ~$149–199; suggest $129; emphasize health tracking in US copy"
 			}
-			return "建议参考当地主流竞品定价，做本地语言+文化适配"
+			return "Benchmark local peers; adapt language and positioning"
 		},
 	},
 }
@@ -288,7 +301,7 @@ func shortAID(aid string) string {
 // ─── Worker ──────────────────────────────────────────────────────────────────
 
 func runWorker(c *client, apiPort string) {
-	fmt.Println("\n=== Agent 注册上线 ===")
+	fmt.Println("\n=== Registering agents ===")
 
 	type agentInfo struct {
 		id *savedIdentity
@@ -302,26 +315,26 @@ func runWorker(c *client, apiPort string) {
 
 		fmt.Printf("\n[%d/%d] %s\n", i+1, len(experts), exp.name)
 
-		fmt.Print("  生成身份...")
+		fmt.Print("  Generating identity...")
 		id, err := loadOrCreateIdentity(idPath, c)
 		if err != nil {
-			fatal("身份初始化 [%s]: %v", exp.name, err)
+			fatal("identity init [%s]: %v", exp.name, err)
 		}
 		fmt.Printf(" AID: %s\n", shortAID(id.AID))
 
 		ln, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
-			fatal("启动 HTTP 服务 [%s]: %v", exp.name, err)
+			fatal("HTTP listen [%s]: %v", exp.name, err)
 		}
 		svcAddr := fmt.Sprintf("127.0.0.1:%d", ln.Addr().(*net.TCPAddr).Port)
 
-		fmt.Print("  注册 agent...")
+		fmt.Print("  Registering agent...")
 		if err := setupAgent(c, id, svcAddr); err != nil {
-			fatal("注册 [%s]: %v", exp.name, err)
+			fatal("register [%s]: %v", exp.name, err)
 		}
 		fmt.Println(" OK")
 
-		fmt.Printf("  注册服务 %s...", shortTopic)
+		fmt.Printf("  Registering service %s...", shortTopic)
 		topicReq := map[string]any{
 			"services":  []string{exp.topic},
 			"name":      exp.name,
@@ -331,7 +344,7 @@ func runWorker(c *client, apiPort string) {
 			"ttl":       3600,
 		}
 		if err := c.do("POST", "/agents/"+id.AID+"/services", topicReq, nil); err != nil {
-			fatal("注册服务 [%s]: %v", exp.name, err)
+			fatal("register service [%s]: %v", exp.name, err)
 		}
 		fmt.Println(" OK")
 
@@ -351,7 +364,7 @@ func runWorker(c *client, apiPort string) {
 			}
 			callerAID, _ := r.Context().Value(remoteAIDKey{}).(string)
 			result := expCopy.consult(req.Product, req.Market)
-			fmt.Printf("\n  [%s] 收到来自 %s 的咨询\n  → %s\n",
+			fmt.Printf("\n  [%s] consult from %s\n  → %s\n",
 				expCopy.name, shortAID(callerAID), result)
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]string{"result": result})
@@ -369,18 +382,17 @@ func runWorker(c *client, apiPort string) {
 		go func() {
 			if err := srv.Serve(&aidListener{ln}); err != nil &&
 				!strings.Contains(err.Error(), "use of closed") {
-				fmt.Fprintf(os.Stderr, "[%s] HTTP 错误: %v\n", expCopy.name, err)
+				fmt.Fprintf(os.Stderr, "[%s] HTTP error: %v\n", expCopy.name, err)
 			}
 		}()
 
-		fmt.Printf("  ✓ 已上线\n")
+		fmt.Printf("  ✓ online\n")
 		agents[i] = agentInfo{id: id}
 	}
 
 	fmt.Printf(`
-Agent 已上线，等待调用（Ctrl-C 退出）
-可在 Web UI 的 Discover 标签页搜索以下服务名查看各 Agent:
-  reason.evaluate  /  data.search  /  reason.analyze  /  reason.recommend
+Agents online — waiting (Ctrl-C to quit)
+Web UI Discover tab: reason.evaluate / data.search / reason.analyze / reason.recommend
 
 `)
 
@@ -403,13 +415,13 @@ type expertResult struct {
 }
 
 func runPlanner(c *client, apiPort string) {
-	fmt.Println("\n=== 出海决策 — Planner ===")
+	fmt.Println("\n=== Go-to-market — Planner ===")
 	fmt.Println()
 
 	idPath := fmt.Sprintf("identity-planner-%s.json", apiPort)
 	id, err := loadOrCreateIdentity(idPath, c)
 	if err != nil {
-		fatal("身份初始化: %v", err)
+		fatal("identity init: %v", err)
 	}
 	fmt.Printf("  Planner AID: %s\n\n", shortAID(id.AID))
 
@@ -419,16 +431,16 @@ func runPlanner(c *client, apiPort string) {
 	}
 	if err := c.do("POST", "/agents", regReq, nil); err != nil {
 		if !strings.Contains(err.Error(), "409") && !strings.Contains(err.Error(), "conflict") {
-			fatal("注册 planner: %v", err)
+			fatal("register planner: %v", err)
 		}
 	}
 
-	product := "智能手表"
-	market := "欧盟"
-	fmt.Printf("  任务: %s → %s 市场\n\n", product, market)
+	product := "smartwatch"
+	market := "EU"
+	fmt.Printf("  Task: %s → %s market\n\n", product, market)
 
 	// Discover agents in parallel; print each as it's found.
-	fmt.Println("  搜索 Tangled 网络...")
+	fmt.Println("  Searching Tangled...")
 	type discovery struct {
 		topic string
 		aid   string
@@ -463,19 +475,19 @@ func runPlanner(c *client, apiPort string) {
 	for range experts {
 		d := <-discoveryCh
 		if d.aid != "" {
-			fmt.Printf("  发现: %-28s  %s  (%s)\n", d.name, shortAID(d.aid), d.topic)
+			fmt.Printf("  found: %-28s  %s  (%s)\n", d.name, shortAID(d.aid), d.topic)
 			discovered = append(discovered, d)
 		} else {
-			fmt.Printf("  未找到: %-26s  跳过\n", d.topic)
+			fmt.Printf("  not found: %-24s  skip\n", d.topic)
 		}
 	}
 
 	if len(discovered) == 0 {
-		fatal("未在网络中找到任何可用 Agent。\n请先启动 Worker 并等待其打印「已上线」后再运行 Planner。")
+		fatal("no agents found on the network.\nStart Worker first and wait until agents are online, then run Planner.")
 	}
 
-	fmt.Printf("\n  建立 Agent Swarm（%d 个 Agent）\n", len(discovered))
-	fmt.Println("  开始并行处理...\n")
+	fmt.Printf("\n  Building swarm (%d agents)\n", len(discovered))
+	fmt.Println("  Running parallel consults...\n")
 
 	// Connect + query all discovered experts in parallel.
 	results := make(chan expertResult, len(discovered))
@@ -491,7 +503,7 @@ func runPlanner(c *client, apiPort string) {
 			if err := c.do("POST", "/connect/"+d.aid,
 				map[string]any{"local_aid": id.AID}, &connResp); err != nil {
 				results <- expertResult{topic: d.topic, name: d.name, aid: d.aid,
-					err: fmt.Errorf("建立隧道失败: %w", err)}
+					err: fmt.Errorf("tunnel: %w", err)}
 				return
 			}
 
@@ -504,7 +516,7 @@ func runPlanner(c *client, apiPort string) {
 				"application/json", bytes.NewReader(body))
 			if err != nil {
 				results <- expertResult{topic: d.topic, name: d.name, aid: d.aid,
-					err: fmt.Errorf("HTTP 调用失败: %w", err)}
+					err: fmt.Errorf("HTTP call: %w", err)}
 				return
 			}
 			defer resp.Body.Close()
@@ -536,34 +548,34 @@ func runPlanner(c *client, apiPort string) {
 	// Final report.
 	fmt.Printf(`
   ══════════════════════════════════
-  出海方案汇总  %s → %s
+  Summary  %s → %s
   ══════════════════════════════════
 `, product, market)
 
 	labels := []struct{ topic, label string }{
-		{"reason.evaluate", "合规"},
-		{"data.search", "物流"},
-		{"reason.analyze", "关税"},
-		{"reason.recommend", "本地化"},
+		{"reason.evaluate", "Compliance"},
+		{"data.search", "Logistics"},
+		{"reason.analyze", "Tariffs"},
+		{"reason.recommend", "Localization"},
 	}
 	for _, l := range labels {
 		if r, ok := collected[l.topic]; ok && r.err == nil {
-			fmt.Printf("  %-6s: %s\n", l.label, r.result)
+			fmt.Printf("  %-12s: %s\n", l.label, r.result)
 		} else {
-			fmt.Printf("  %-6s: （专家离线，信息缺失）\n", l.label)
+			fmt.Printf("  %-12s: (expert offline — no data)\n", l.label)
 		}
 	}
 
 	fmt.Printf(`  ══════════════════════════════════
 
-✓ Demo6 验证完成
-  验证链路:
-    1. 多 Agent 身份生成与注册（Worker 内 4 个独立 AID）
-    2. 多 topic 服务发布到 DHT（domain.*）
-    3. Planner 并行 Discover 发现专家
-    4. 并行建立 %d 条 QUIC 隧道（携带 Planner 身份）
-    5. HTTP-over-QUIC 并发调用 + gateway AID 头验证
-    6. 结果聚合为出海方案
+✓ Demo6 complete
+  Flow:
+    1. Register multiple agents (4 AIDs on Worker)
+    2. Publish topics to DHT
+    3. Planner parallel discover
+    4. Open %d parallel QUIC tunnels (Planner identity)
+    5. Concurrent HTTP-over-QUIC + gateway AID header
+    6. Merge results into one report
 
 `, len(discovered))
 }
@@ -571,7 +583,7 @@ func runPlanner(c *client, apiPort string) {
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 func fatal(format string, args ...any) {
-	fmt.Fprintf(os.Stderr, "\n错误: "+format+"\n", args...)
+	fmt.Fprintf(os.Stderr, "\nerror: "+format+"\n", args...)
 	os.Exit(1)
 }
 
@@ -585,7 +597,7 @@ func main() {
 		next := func() string {
 			i++
 			if i >= len(os.Args) {
-				fmt.Fprintf(os.Stderr, "参数 %s 缺少值\n", arg)
+				fmt.Fprintf(os.Stderr, "missing value for %s\n", arg)
 				os.Exit(1)
 			}
 			return os.Args[i]
@@ -604,13 +616,13 @@ func main() {
 		case strings.HasPrefix(arg, "--token="):
 			token = strings.TrimPrefix(arg, "--token=")
 		default:
-			fmt.Fprintf(os.Stderr, "未知参数: %s\n", arg)
+			fmt.Fprintf(os.Stderr, "unknown flag: %s\n", arg)
 			os.Exit(1)
 		}
 	}
 
 	if role == "" {
-		fmt.Fprintln(os.Stderr, "用法:")
+		fmt.Fprintln(os.Stderr, "Usage:")
 		fmt.Fprintln(os.Stderr, "  go run . --role worker   [--api 127.0.0.1:2121] [--token TOKEN]")
 		fmt.Fprintln(os.Stderr, "  go run . --role planner  [--api 127.0.0.1:2122] [--token TOKEN]")
 		os.Exit(1)
@@ -619,8 +631,8 @@ func main() {
 	apiPort := apiAddr[strings.LastIndex(apiAddr, ":")+1:]
 	c := newClient(apiAddr, token)
 	if err := c.do("GET", "/health", nil, nil); err != nil {
-		fmt.Fprintf(os.Stderr, "错误: 无法连接到 a2ald (%s): %v\n", apiAddr, err)
-		fmt.Fprintln(os.Stderr, "请先启动 a2ald，例如: a2ald --data-dir ./tmp/worker --fallback-host 127.0.0.1")
+		fmt.Fprintf(os.Stderr, "error: cannot reach a2ald at %s: %v\n", apiAddr, err)
+		fmt.Fprintln(os.Stderr, "Start a2ald first, e.g.: a2ald --data-dir ./tmp/worker --fallback-host 127.0.0.1")
 		os.Exit(1)
 	}
 
@@ -630,7 +642,7 @@ func main() {
 	case "planner":
 		runPlanner(c, apiPort)
 	default:
-		fmt.Fprintf(os.Stderr, "未知角色 %q，请使用 worker 或 planner\n", role)
+		fmt.Fprintf(os.Stderr, "unknown role %q; use worker or planner\n", role)
 		os.Exit(1)
 	}
 }

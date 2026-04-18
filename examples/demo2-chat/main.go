@@ -1,36 +1,36 @@
 // Copyright 2026 The A2AL Authors. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 
-// demo2-chat: 双节点加密聊天，覆盖 Phase 2 核心能力（含 2b 多候选 + Happy Eyeballs）。
+// demo2-chat: Encrypted two-party chat over the Tangled network (multi-candidate QUIC endpoints; try multiple paths).
 //
-// 功能覆盖:
-//   Publish / Resolve / ConnectFromRecord / Accept / 双向 TLS / agent-route / nat-sense / UPnP(可选)
+// Covers:
+//   Publish / Resolve / ConnectFromRecord / Accept / mutual TLS / agent-route / nat-sense / UPnP (optional)
 //
-// 测试步骤:
+// Steps:
 //
-// 【推荐：双机运行】（两台机器各一个终端）
+// Recommended — two machines (one terminal each):
 //
-//   Alice 机器:  go run .
-//   Bob 机器:    go run . -bootstrap <Alice-IP>:4121
+//   Alice:  go run .
+//   Bob:    go run . -bootstrap <Alice-IP>:4121
 //
-// 【单机运行】（两个终端，需使用不同监听端口）
+// Single machine — two terminals (different listen ports):
 //
 //   Terminal 1 (Alice):  go run . -listen :4121
 //   Terminal 2 (Bob):    go run . -listen :4123 -bootstrap 127.0.0.1:4121
 //
-// 在 Bob 终端输入 Alice 的 AID → 自动 Resolve + QUIC Connect → 进入聊天。
-// 默认 QUIC 与 DHT 共用同一 UDP 端口；需要分开监听时再使用 -quic。
+// On Bob, enter Alice’s AID → resolve + QUIC connect → chat. Default QUIC shares the DHT UDP port;
+// use -quic if you need a separate QUIC listener.
 //
-// 可选参数：
-//   -debug :2634  启动调试 HTTP，浏览器访问 http://127.0.0.1:2634/debug/host 查看节点状态
-//   -ip           有多个网口、需要指定特定出口 IP 时使用
+// Optional flags:
+//   -debug :2634  start debug HTTP; open http://127.0.0.1:2634/debug/host for host state
+//   -ip            advertise this host when you must pin a specific egress IP / interface
 //
-// Debug HTTP (浏览器):
-//   http://127.0.0.1:2634/debug/host     ← Phase 2 状态
-//   http://127.0.0.1:2634/debug/identity  ← DHT 身份
-//   http://127.0.0.1:2634/debug/routing   ← 路由表
-//   http://127.0.0.1:2634/debug/store     ← 端点记录存储
-//   http://127.0.0.1:2634/debug/stats     ← 收发统计
+// Debug HTTP (browser):
+//   http://127.0.0.1:2634/debug/host     — host state
+//   http://127.0.0.1:2634/debug/identity — DHT identity
+//   http://127.0.0.1:2634/debug/routing  — routing table
+//   http://127.0.0.1:2634/debug/store    — endpoint record store
+//   http://127.0.0.1:2634/debug/stats    — traffic stats
 package main
 
 import (
@@ -57,7 +57,7 @@ func main() {
 	debugAddr := flag.String("debug", "", "debug HTTP address")
 	extIP := flag.String("ip", "", "advertise host (fallback)")
 	minObs := flag.Int("min-observed", 1, "nat-sense threshold")
-	noUPnP := flag.Bool("no-upnp", false, "disable UPnP port mapping (Phase 2b)")
+	noUPnP := flag.Bool("no-upnp", false, "disable UPnP port mapping")
 	flag.Parse()
 
 	ks, err := newSimpleKS()

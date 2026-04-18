@@ -23,9 +23,9 @@ You don't need to install Go. Download the pre-built demo binaries and `a2ald` f
 |------|-----------------|:---:|
 | `demo6-swarm` | Dynamic multi-agent discovery and parallel QUIC sessions | Yes |
 | `demo5-marketplace` | QUIC tunnel, direct HTTP service invocation | Yes |
-| `demo4-marketplace` | Service discovery (topic), offline mailbox delivery | Yes |
+| `demo4-marketplace` | Named service, encrypted notes, Sovereign Record | Yes |
 | `demo3-chat` | Encrypted chat via daemon REST API | Yes |
-| `demo2-chat` | QUIC connection, mutual TLS, NAT traversal (Go library) | No |
+| `demo2-chat` | QUIC, mutual TLS, NAT traversal; multi-candidate dial (try multiple paths) (Go library) | No |
 | `demo1-node` | DHT node bootstrap, AID publishing, iterative resolution | No |
 
 Demos 3–6 use `a2ald` as the network layer and focus on application-level behaviour. Demos 1–2 embed a DHT/QUIC node directly in the process and require no daemon.
@@ -103,11 +103,11 @@ Buyer  demo:   go run . --role buyer --api 127.0.0.1:2122
 
 ---
 
-## demo4-marketplace — service discovery and offline mailbox
+## demo4-marketplace — named service, encrypted notes, Sovereign Record
 
-**Verifies:** topic registration and discovery, DHT mailbox send and poll, sovereign records.
+**Verifies:** named service registration and discovery, encrypted notes send and poll, Sovereign Record metadata.
 
-Alice publishes a translation service under the topic `lang.translate`. Bob discovers it, sends a translation request via mailbox, and waits for the reply — without either party knowing the other's IP address.
+Alice publishes a translation service as the named service `lang.translate`. Bob discovers it, sends a translation request via encrypted notes, and waits for the reply — without either party knowing the other's IP address.
 
 **Two machines (recommended):**
 ```bash
@@ -166,7 +166,7 @@ Bob chat:     go run . --api 127.0.0.1:2122
 
 ## demo2-chat — encrypted chat (Go library)
 
-**Verifies:** `Publish`, `Resolve`, `ConnectFromRecord`, mutual TLS, agent-route, NAT sensing, UPnP, Happy Eyeballs multi-candidate dial.
+**Verifies:** `Publish`, `Resolve`, `ConnectFromRecord`, mutual TLS, agent-route, NAT sensing, UPnP, multi-candidate QUIC dial (try multiple paths).
 
 Two nodes connect directly — no daemon involved. Bob types Alice's AID and a QUIC-encrypted session opens.
 
