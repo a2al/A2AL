@@ -1,0 +1,91 @@
+name: demos
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: Build demos for all platforms
+        run: |
+          set -euo pipefail
+          DEMOS=(demo1-node demo2-chat demo3-chat demo4-marketplace demo5-marketplace demo6-swarm)
+          # windows has no arm64 (mirrors goreleaser.yaml)
+          PLATFORMS=(linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64)
+
+          for PLATFORM in "${PLATFORMS[@]}"; do
+            GOOS=${PLATFORM%/*}
+            GOARCH=${PLATFORM#*/}
+            DIR="out/${GOOS}-${GOARCH}"
+            mkdir -p "$DIR"
+            for DEMO in "${DEMOS[@]}"; do
+              EXT=""
+              [[ "$GOOS" == "windows" ]] && EXT=".exe"
+              (cd "./examples/$DEMO" && \
+                go mod tidy && \
+                GOOS=$GOOS GOARCH=$GOARCH CGO_ENABLED=0 \
+                go build -ldflags="-s -w" -o "../../$DIR/${DEMO}${EXT}" .)
+            done
+          done
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          cd out
+          for PLATFORM in linux-amd64 linux-arm64 darwin-amd64 darwin-arm64; do
+            tar czf "../a2al-demos-${PLATFORM}.tar.gz" "$PLATFORM/"
+          done
+          zip -r ../a2al-demos-windows-amd64.zip windows-amd64/
+
+      - name: Delete existing demos-latest release and tag
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            try {
+              const { data } = await github.rest.repos.getReleaseByTag({ owner, repo, tag: 'demos-latest' });
+              await github.rest.repos.deleteRelease({ owner, repo, release_id: data.id });
+            } catch (e) {
+              if (e.status !== 404) throw e;
+            }
+            try {
+              await github.rest.git.deleteRef({ owner, repo, ref: 'tags/demos-latest' });
+            } catch (e) {
+              if (e.status !== 404 && e.status !== 422) throw e;
+            }
+
+      - name: Publish demos-latest release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: demos-latest
+          name: Demo binaries (latest)
+          body: |
+            Pre-built binaries for demo1-node through demo6-swarm.
+            Replace every `go run .` in `examples/<demo>/` with the corresponding binary name.
+
+            | File | Platform |
+            |------|----------|
+            | `a2al-demos-linux-amd64.tar.gz`   | Linux x86-64 |
+            | `a2al-demos-linux-arm64.tar.gz`   | Linux ARM64 |
+            | `a2al-demos-darwin-amd64.tar.gz`  | macOS x86-64 |
+            | `a2al-demos-darwin-arm64.tar.gz`  | macOS Apple Silicon |
+            | `a2al-demos-windows-amd64.zip`    | Windows x86-64 |
+
+            Built from commit ${{ github.sha }} · ${{ github.run_id }}
+          files: |
+            a2al-demos-linux-amd64.tar.gz
+            a2al-demos-linux-arm64.tar.gz
+            a2al-demos-darwin-amd64.tar.gz
+            a2al-demos-darwin-arm64.tar.gz
+            a2al-demos-windows-amd64.zip
