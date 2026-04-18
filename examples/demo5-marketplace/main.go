@@ -10,31 +10,23 @@
 //   demo4 — DHT Mailbox 异步通信（信件往来）
 //   demo5 — QUIC 隧道 + HTTP 同步调用（直接打电话）
 //
-// 【单机运行（4 个终端）】
+// Buyer 先等 Seller 打印「已上线」再启动。
+// 无 Go 环境可从 Releases 下载预编译二进制，将 go run . 替换为 demo5-marketplace 即可。
 //
-// connect API 需要两个独立的 daemon 节点（QUIC 直连是跨节点操作）。
+// 【推荐：双机运行】两机各启动 a2ald：
 //
-//	Terminal 1 — Seller daemon:
-//	  a2ald --data-dir ./tmp/seller --fallback-host 127.0.0.1
+//	机器A：a2ald  +  go run . --role seller
+//	机器B：a2ald  +  go run . --role buyer
 //
-//	Terminal 2 — Buyer daemon（bootstrap 指向 Seller daemon）:
-//	  a2ald --data-dir ./tmp/buyer --listen 127.0.0.1:4122 \
-//	        --api-addr 127.0.0.1:2122 --fallback-host 127.0.0.1 \
-//	        --bootstrap 127.0.0.1:4121
+// 【单机运行】QUIC 直连是跨节点操作，须两个独立 a2ald，共四终端：
 //
-//	Terminal 3 — Seller（等 Terminal 1 启动后运行）:
-//	  go run . --role seller
+//	Seller a2ald:  a2ald --data-dir ./tmp/a --fallback-host 127.0.0.1
+//	Buyer  a2ald:  a2ald --data-dir ./tmp/b --listen :4122 --api-addr 127.0.0.1:2122 \
+//	               --fallback-host 127.0.0.1 --bootstrap 127.0.0.1:4121
+//	Seller demo:   go run . --role seller
+//	Buyer  demo:   go run . --role buyer --api 127.0.0.1:2122
 //
-//	Terminal 4 — Buyer（等 Seller 打印「已上线」后运行）:
-//	  go run . --role buyer --api 127.0.0.1:2122
-//
-// 【双机运行】
-//
-//	机器 A:  a2ald --fallback-host <公网IP-A>
-//	         go run . --role seller
-//
-//	机器 B:  a2ald --fallback-host <公网IP-B> --bootstrap <公网IP-A>:4121
-//	         go run . --role buyer
+// LAN 或离线：--fallback-host 改为本机 LAN IP，Buyer 加 --bootstrap <A的IP>:4121。
 //
 // 【参数】
 //

@@ -117,18 +117,16 @@ A2AL is complementary to existing agent communication standards — it provides 
 
 ## Try the Demo
 
-**Encrypted Chat** — two terminals, no daemon required (Go required):
+Encrypted chat between two machines. On each machine, two terminals:
 
 ```bash
-cd examples/demo2-chat
-
-go run . -listen :4121 -quic :4122 -debug :2634                            # Alice
-go run . -listen :4123 -quic :4124 -bootstrap 127.0.0.1:4121 -debug :2635 # Bob
+a2ald                          # terminal 1: network layer, joins the public Tangled Network
+go run ./examples/demo3-chat   # terminal 2: chat app (or use the pre-built binary from Releases)
 ```
 
-Bob enters Alice's AID → automatic resolution → QUIC connection → bidirectional messaging. Inspect live state at `http://127.0.0.1:2634/debug/host`.
+Bob types Alice's AID → direct encrypted QUIC tunnel → chat.
 
-For service discovery, marketplace, and multi-agent swarm scenarios using `a2ald`, see [`examples/`](examples/).
+More scenarios (marketplace, swarm) and single-machine variants: [`examples/`](examples/).
 
 ## Status
 

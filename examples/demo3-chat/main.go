@@ -7,49 +7,25 @@
 // 网络传输、DHT、QUIC、NAT 穿透全部由 a2ald 处理；
 // 本程序通过 REST API 控制 a2ald，通过 TCP 收发消息。
 //
-// 使用前提：先在另一个终端启动 a2ald。
+// 使用前提：先在另一个终端启动 a2ald。Bob 输入 Alice 打印的 AID 即可聊天。
+// 无 Go 环境可从 Releases 下载预编译二进制，将 go run . 替换为 demo3-chat 即可。
 //
-// 【Bootstrap 节点】
-// a2ald 需要至少一个已知节点来加入 DHT 网络。有三种方式：
-//  1. 默认：自动解析公共种子节点
-//  2. 显式指定：--bootstrap 127.0.0.1:4121（可多个，逗号分隔）
-//  3. 配置文件：在 config.toml 中设置 bootstrap 列表
+// 【推荐：双机运行】两台机器各两个终端：
 //
-// 本机两实例测试时，让 Bob 的 a2ald 用 --bootstrap 指向 Alice（或反向），
-// 二者即可互相发现。无需依赖公共种子节点。
+//	机器A：a2ald  +  go run .
+//	机器B：a2ald  +  go run .
 //
-// 【同一台机器两个实例测试】
-// a2ald 在发布端点时会过滤掉 loopback/私网 IP，本机测试须通过
-// --fallback-host 告知 a2ald 用哪个地址对外可达：
+// 【单机运行】四个终端，两 daemon 互为 bootstrap，须 --fallback-host：
 //
-//	Terminal 1 (Alice a2ald):
-//	  a2ald --data-dir /tmp/a2ald-alice --listen :4121 --fallback-host 127.0.0.1
-//	（Windows 可把目录换成例如 C:\tmp\a2ald-alice）
+//	Alice a2ald:  a2ald --data-dir ./tmp/a --fallback-host 127.0.0.1
+//	Alice chat:   go run .
+//	Bob a2ald:    a2ald --data-dir ./tmp/b --listen :4122 --api-addr 127.0.0.1:2122 \
+//	              --fallback-host 127.0.0.1 --bootstrap 127.0.0.1:4121
+//	Bob chat:     go run . --api 127.0.0.1:2122
 //
-//	Terminal 2 (Alice chat):
-//	  go run . --api 127.0.0.1:2121
+// LAN 测试：--fallback-host 改为本机 LAN IP，--bootstrap 指向对端机 ip:4121。
 //
-//	Terminal 3 (Bob a2ald):
-//	  a2ald --data-dir /tmp/a2ald-bob --listen :4122 --api-addr 127.0.0.1:2122 \
-//	        --fallback-host 127.0.0.1 --bootstrap 127.0.0.1:4121
-//
-//	Terminal 4 (Bob chat):
-//	  go run . --api 127.0.0.1:2122
-//
-//	Bob 终端输入 Alice 打印的 AID，即可开始聊天。
-//
-// 同一 identity-*.json 多次启动本程序时，若 agent 已在 a2ald 注册过，会自动 PATCH
-// 更新 service_tcp（每次随机端口），一般无需删身份文件。
-//
-// 【跨机器 LAN 测试】把 --fallback-host 换成本机 LAN IP（如 192.168.1.10），
-// --bootstrap 指向对方机器的 ip:port（如 192.168.1.10:4121）。
-//
-// 【公网部署】a2ald 能自动检测公网 IP / UPnP，无需 --fallback-host；
-// 公共种子节点可达时也无需 --bootstrap。
-//
-// 如果 a2ald 有 api_token，添加 --token 参数：
-//
-//	go run . --api 127.0.0.1:2121 --token mysecret
+// a2ald 若启用 api_token，给 chat 加 --token TOKEN。
 package main
 
 import (

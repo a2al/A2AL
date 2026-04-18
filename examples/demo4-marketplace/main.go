@@ -8,32 +8,29 @@
 //   - Alice 上线后发布 topic "lang.translate" 并持续 poll 收件箱，自动回复翻译请求。
 //   - Bob 通过 topic discover 找到 Alice，通过 DHT mailbox 发送翻译请求，等待并显示结果。
 //
-// 二者都只和本机 a2ald 通信，P2P 通信由两个 daemon 完成。
+// 二者都只和本机 a2ald 通信，P2P 由 daemon 完成。Bob 先等 Alice 打印「已上线」。
+// 无 Go 环境可从 Releases 下载预编译二进制，将 go run . 替换为 demo4-marketplace 即可。
 //
-// 【单机双实例测试】（四个终端）
+// 【推荐：双机运行】两机各启动 a2ald：
 //
-//	Terminal 1 — Alice a2ald:
-//	  a2ald --data-dir ./tmp/alice --listen :4121 --fallback-host 127.0.0.1
+//	机器A：a2ald  +  go run . --role alice
+//	机器B：a2ald  +  go run . --role bob
 //
-//	Terminal 2 — Bob a2ald（bootstrap 指向 Alice）:
-//	  a2ald --data-dir ./tmp/bob --listen :4122 --api-addr 127.0.0.1:2122 \
-//	        --fallback-host 127.0.0.1 --bootstrap 127.0.0.1:4121
+// 【单机：共用一个 a2ald】demo4 仅用 DHT mailbox/topic，两进程可共用同一 daemon：
 //
-//	Terminal 3 — Alice demo（先启动）:
-//	  go run . --role alice
+//	a2ald --fallback-host 127.0.0.1
+//	go run . --role alice          # 终端 2
+//	go run . --role bob            # 终端 3
 //
-//	Terminal 4 — Bob demo（等 Alice 打印 "已上线" 后启动）:
-//	  go run . --role bob --api 127.0.0.1:2122
+// 【单机：两个 a2ald】（模拟跨节点 P2P，四终端）
 //
-// 【双机测试】
+//	Alice a2ald:  a2ald --data-dir ./tmp/a --fallback-host 127.0.0.1
+//	Bob   a2ald:  a2ald --data-dir ./tmp/b --listen :4122 --api-addr 127.0.0.1:2122 \
+//	              --fallback-host 127.0.0.1 --bootstrap 127.0.0.1:4121
+//	Alice demo:   go run . --role alice
+//	Bob   demo:   go run . --role bob --api 127.0.0.1:2122
 //
-//	机器A：a2ald --fallback-host <公网IP-A>
-//	       go run . --role alice
-//
-//	机器B：a2ald --fallback-host <公网IP-B> --bootstrap <公网IP-A>:4121
-//	       go run . --role bob
-//
-// （两台机器默认 API 都是 127.0.0.1:2121，无需额外参数）
+// LAN 或离线：--fallback-host 改为本机 LAN IP，Bob 加 --bootstrap <A的IP>:4121。
 //
 // 【参数】
 //

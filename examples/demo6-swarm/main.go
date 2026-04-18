@@ -7,21 +7,23 @@
 // 各领域 Agent，组建 Swarm，并行建立 QUIC 隧道咨询，汇总为出海方案。
 // Agent 随时可下线，Planner 按实际发现情况动态处理，无需预先知道有多少个 Agent。
 //
-// 【单机运行（4 个终端）】
+// Planner 先等 Worker 打印「已上线」再启动。
+// 无 Go 环境可从 Releases 下载预编译二进制，将 go run . 替换为 demo6-swarm 即可。
 //
-//	Terminal 1 — Worker daemon:
-//	  a2ald --data-dir ./tmp/worker --fallback-host 127.0.0.1
+// 【推荐：双机运行】两机各启动 a2ald：
 //
-//	Terminal 2 — Planner daemon（bootstrap 指向 Worker daemon）:
-//	  a2ald --data-dir ./tmp/planner --listen 127.0.0.1:4122 \
-//	        --api-addr 127.0.0.1:2122 --fallback-host 127.0.0.1 \
-//	        --bootstrap 127.0.0.1:4121
+//	Worker 机器:   a2ald  +  go run . --role worker
+//	Planner 机器:  a2ald  +  go run . --role planner
 //
-//	Terminal 3 — Worker（等 Terminal 1 启动后运行）:
-//	  go run . --role worker
+// 【单机运行】四终端：
 //
-//	Terminal 4 — Planner（等 Worker 打印「已上线」后运行）:
-//	  go run . --role planner --api 127.0.0.1:2122
+//	Worker  a2ald:  a2ald --data-dir ./tmp/a --fallback-host 127.0.0.1
+//	Planner a2ald:  a2ald --data-dir ./tmp/b --listen :4122 --api-addr 127.0.0.1:2122 \
+//	                --fallback-host 127.0.0.1 --bootstrap 127.0.0.1:4121
+//	Worker  demo:   go run . --role worker
+//	Planner demo:   go run . --role planner --api 127.0.0.1:2122
+//
+// LAN 或离线：--fallback-host 改为本机 LAN IP，Planner 加 --bootstrap <Worker机IP>:4121。
 //
 // 【Web UI 验证】在 Discover 标签页分别搜索以下服务名可看到对应 Agent：
 //

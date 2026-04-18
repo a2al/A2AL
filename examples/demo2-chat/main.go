@@ -6,18 +6,24 @@
 // 功能覆盖:
 //   Publish / Resolve / ConnectFromRecord / Accept / 双向 TLS / agent-route / nat-sense / UPnP(可选)
 //
-// 测试步骤 (同一台机器, 两个终端, 无需指定 -ip):
+// 测试步骤:
 //
-//   Terminal 1 (Alice):
-//     go run . -listen :4121 -quic :4122 -debug :2634
+// 【推荐：双机运行】（两台机器各一个终端）
 //
-//   Terminal 2 (Bob):
-//     go run . -listen :4123 -quic :4124 -bootstrap 127.0.0.1:4121 -debug :2635
+//   Alice 机器:  go run .
+//   Bob 机器:    go run . -bootstrap <Alice-IP>:4121
 //
-//   在 Bob 终端输入 Alice 的 AID → 自动 Resolve + QUIC Connect → 进入聊天。
-//   Alice 终端自动 Accept 入站连接。双方可互发消息。空行退出聊天模式。
+// 【单机运行】（两个终端，需使用不同监听端口）
 //
-//   -ip 仅在生产环境有多个网口、需要指定特定出口 IP 时使用。
+//   Terminal 1 (Alice):  go run . -listen :4121
+//   Terminal 2 (Bob):    go run . -listen :4123 -bootstrap 127.0.0.1:4121
+//
+// 在 Bob 终端输入 Alice 的 AID → 自动 Resolve + QUIC Connect → 进入聊天。
+// 默认 QUIC 与 DHT 共用同一 UDP 端口；需要分开监听时再使用 -quic。
+//
+// 可选参数：
+//   -debug :2634  启动调试 HTTP，浏览器访问 http://127.0.0.1:2634/debug/host 查看节点状态
+//   -ip           有多个网口、需要指定特定出口 IP 时使用
 //
 // Debug HTTP (浏览器):
 //   http://127.0.0.1:2634/debug/host     ← Phase 2 状态
