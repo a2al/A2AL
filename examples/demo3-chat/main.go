@@ -8,7 +8,7 @@
 // its REST API and exchanges messages over TCP.
 //
 // Prerequisite: start a2ald in another terminal. Bob enters Alice’s printed AID to chat.
-// Without Go, use the pre-built demo3-chat binary from Releases instead of go run .
+// Without Go, use the pre-built demo3-chat binary from the demos-latest release (replace go run . with demo3-chat; same flags).
 //
 // Recommended — two machines, two terminals each:
 //

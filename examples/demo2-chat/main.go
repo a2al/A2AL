@@ -6,6 +6,8 @@
 // Covers:
 //   Publish / Resolve / ConnectFromRecord / Accept / mutual TLS / agent-route / nat-sense / UPnP (optional)
 //
+// Without Go, use the pre-built demo2-chat binary from the demos-latest release (replace go run . with demo2-chat; same flags).
+//
 // Steps:
 //
 // Recommended — two machines (one terminal each):

@@ -10,7 +10,7 @@
 //   demo4 — async DHT mailbox (like mail)
 //   demo5 — QUIC tunnel + synchronous HTTP (like a phone call)
 //
-// Start Buyer after Seller prints that it is online. Pre-built: demo5-marketplace from Releases.
+// Start Buyer after Seller prints that it is online. Pre-built: demo5-marketplace from the demos-latest release (replace go run . with demo5-marketplace; same flags).
 //
 // Recommended — two machines, each with a2ald:
 //

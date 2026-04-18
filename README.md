@@ -121,10 +121,12 @@ Encrypted chat between two machines. On each machine, two terminals:
 
 ```bash
 a2ald                          # terminal 1: network layer, joins the public Tangled Network
-go run ./examples/demo3-chat   # terminal 2: chat app (or use the pre-built binary from Releases)
+go run ./examples/demo3-chat   # terminal 2: chat app (or run pre-built demo3-chat — see link below)
 ```
 
 Bob types Alice's AID → direct encrypted QUIC tunnel → chat.
+
+Pre-built **demo** binaries (demo1-node … demo6-swarm): [**Demo binaries (latest)**](https://github.com/a2al/a2al/releases/tag/demos-latest). The `a2ald` daemon is on the [main Releases](https://github.com/a2al/a2al/releases) page.
 
 More scenarios (marketplace, swarm) and single-machine variants: [`examples/`](examples/) — see [`doc/examples.md`](doc/examples.md) for the full guide.
 

@@ -6,7 +6,7 @@ The `examples/` directory contains runnable demos that verify A2AL's core capabi
 
 ## Running without a Go environment
 
-You don't need to install Go. Download the pre-built demo binaries and `a2ald` from [GitHub Releases](https://github.com/a2al/a2al/releases), then follow the instructions below — just replace every `go run .` with the binary name.
+You don't need to install Go. Download the pre-built demo binaries from the [**Demo binaries (latest)**](https://github.com/a2al/a2al/releases/tag/demos-latest) release and `a2ald` from the [main Releases page](https://github.com/a2al/a2al/releases), then follow the instructions below — just replace every `go run .` with the binary name.
 
 | Instead of | Use |
 |------------|-----|
@@ -34,8 +34,8 @@ Demos 3–6 use `a2ald` as the network layer and focus on application-level beha
 
 ## Prerequisites
 
-- **Demos 1 and 2**: Go 1.22+ or pre-built binary from Releases.
-- **Demos 3–6**: `a2ald` running on each participating machine, plus Go 1.22+ or a pre-built demo binary from Releases.
+- **Demos 1 and 2**: Go 1.22+ or a pre-built binary from [**Demo binaries (latest)**](https://github.com/a2al/a2al/releases/tag/demos-latest).
+- **Demos 3–6**: `a2ald` running on each participating machine, plus Go 1.22+ or a pre-built demo binary from [**Demo binaries (latest)**](https://github.com/a2al/a2al/releases/tag/demos-latest).
 
 Start `a2ald` with no arguments on any internet-connected machine; it joins the public Tangled Network automatically.
 

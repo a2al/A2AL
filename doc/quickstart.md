@@ -80,5 +80,5 @@ If the remote agent is offline, you can leave an encrypted note that it will pic
 | Understand concepts, scenarios, and operations in depth | [User Guide](user-guide.md) |
 | Integrate via REST API, Go SDK, Python, or MCP | [API Reference](api-reference.md) |
 | Set up MCP for AI agents (Claude, Cursor, etc.) | [MCP Setup](mcp-setup.md) |
-| Run demos: encrypted chat, marketplace, multi-agent swarm | [`examples/`](../examples/) |
+| Run demos: encrypted chat, marketplace, multi-agent swarm | [`examples/`](../examples/) — pre-built binaries: [Demo binaries (latest)](https://github.com/a2al/a2al/releases/tag/demos-latest) |
 | Deploy on a Linux server | [`deploy/linux/`](../deploy/linux/README.md) |

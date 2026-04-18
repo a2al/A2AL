@@ -7,7 +7,7 @@
 // registered specialists, opens parallel QUIC tunnels, and merges answers into one report.
 // Workers may go offline; Planner adapts to whatever is found.
 //
-// Start Planner after Worker prints that agents are online. Pre-built: demo6-swarm from Releases.
+// Start Planner after Worker prints that agents are online. Pre-built: demo6-swarm from the demos-latest release (replace go run . with demo6-swarm; same flags).
 //
 // Recommended — two machines:
 //

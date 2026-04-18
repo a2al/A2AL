@@ -6,6 +6,8 @@
 // On start it generates an identity, listens on UDP, bootstraps (if a seed is given),
 // publishes its endpoint record, then waits for Address lines on stdin to resolve.
 //
+// Without Go, use the pre-built demo1-node binary from the demos-latest release (replace go run . with demo1-node; same flags).
+//
 // Usage:
 //   go run . -listen :4121 -ip 1.2.3.4 -debug :2634
 //   go run . -listen :4122 -ip 1.2.3.5 -bootstrap 1.2.3.4:4121 -debug :2635

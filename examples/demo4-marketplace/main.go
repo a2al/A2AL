@@ -9,7 +9,7 @@
 //   - Bob discovers Alice by named service, sends a request via encrypted notes, and waits for the reply.
 //
 // Both talk only to local a2ald; P2P is handled by the daemon. Start Bob after Alice prints that she is online.
-// Pre-built binary: demo4-marketplace from Releases (replace go run .).
+// Pre-built binary: demo4-marketplace from the demos-latest release (replace go run . with demo4-marketplace; same flags).
 //
 // Recommended — two machines, each running a2ald:
 //
