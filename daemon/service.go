@@ -544,6 +544,12 @@ func (d *Daemon) execAgentPublish(ctx context.Context, aidStr string) (uint64, e
 	if e == nil {
 		return 0, errNotFound
 	}
+	// Snapshot lastPublish before the endpoint publish so we can compare it
+	// after persist without reading our own just-written value.
+	d.publishMetaMu.Lock()
+	lastPub := d.agentLastPublish[aid]
+	d.publishMetaMu.Unlock()
+
 	// Warn when service_tcp is set but unreachable; still allow publish for agents with their own public URL.
 	if e.ServiceTCP != "" && !probeTCP(e.ServiceTCP, 2*time.Second) {
 		d.log.Warn("service_tcp unreachable at publish time; daemon gateway forwarding will not work", "aid", aid.String(), "service_tcp", e.ServiceTCP)
@@ -582,6 +588,21 @@ persist:
 		return 0, errPersist
 	}
 	d.recordAgentPublishTime(aid)
+	// Topic records share the same TTL as endpoint records (3600 s) and are
+	// normally renewed together in tryRepublishAgent every 30 min. When POST
+	// /publish is called but the last joint publish was more than republishPeriod
+	// ago — or never happened since daemon start (lastPub.IsZero(), e.g. after a
+	// restart) — topic records may be approaching TTL expiry. Use this endpoint
+	// refresh as an opportunity to renew them too. The check is a single O(1)
+	// in-memory map read; the renewal itself runs in a goroutine.
+	if len(e.Services) > 0 && (lastPub.IsZero() || time.Since(lastPub) > republishPeriod) {
+		snap := *e
+		go func() {
+			svcCtx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+			defer cancel()
+			d.republishAgentServices(svcCtx, &snap)
+		}()
+	}
 	return nextSeq, nil
 }
 
@@ -699,12 +720,30 @@ func (d *Daemon) execAgentPatch(aidStr string, req patchAgentReq) error {
 	if subtle.ConstantTimeCompare(e.OpPriv, opPriv) != 1 {
 		return errOpKeyMismatch
 	}
-	// service_tcp is optional; warn when set but unreachable, do not block.
-	if req.ServiceTCP != "" && !probeTCP(req.ServiceTCP, 2*time.Second) {
+	// service_tcp is optional; probe reachability before persisting so we can
+	// decide whether to trigger an immediate republish below.
+	tcpReachable := req.ServiceTCP == "" || probeTCP(req.ServiceTCP, 2*time.Second)
+	if req.ServiceTCP != "" && !tcpReachable {
 		d.log.Warn("service_tcp unreachable", "aid", aid.String(), "service_tcp", req.ServiceTCP)
 	}
 	e.ServiceTCP = req.ServiceTCP
-	return d.reg.Put(e)
+	if err := d.reg.Put(e); err != nil {
+		return err
+	}
+	// When the new service_tcp is confirmed reachable and the agent has already
+	// been published (seq > 0), trigger an immediate republish. This unblocks
+	// agents whose periodic republish was skipped because the old TCP address
+	// was unreachable (e.g. after a port change), without waiting for the next
+	// 30-minute tick.
+	if tcpReachable && req.ServiceTCP != "" && e.Seq > 0 {
+		snap := *e
+		go func() {
+			rCtx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+			defer cancel()
+			d.tryRepublishAgent(rCtx, &snap)
+		}()
+	}
+	return nil
 }
 
 func (d *Daemon) execResolve(ctx context.Context, aidStr string) (map[string]any, error) {
