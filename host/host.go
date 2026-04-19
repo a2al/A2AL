@@ -20,6 +20,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -132,9 +133,16 @@ type Config struct {
 	SeenPeersPath string
 }
 
-// agentRouteMagic is the 4-byte prefix of the agent-route control stream.
-// The client opens the first stream and writes: magic(4) + target_address(21).
+// agentRouteMagic is the legacy 4-byte prefix (a2r1). Still recognised on accept
+// for backward compatibility with nodes that have not yet upgraded.
 var agentRouteMagic = []byte{'a', '2', 'r', '1'}
+
+// agentRouteMagicV2 introduces the a2r2 control-plane protocol.  After the
+// 4-byte magic + 21-byte target address, both sides exchange length-prefixed
+// control messages (see control.go) and then close their write directions (FIN)
+// before opening data streams.  Future protocol extensions add new message
+// types without a new magic number.
+var agentRouteMagicV2 = []byte{'a', '2', 'r', '2'}
 
 // AgentConn wraps a QUIC connection with the resolved peer and local agent identities.
 type AgentConn struct {
@@ -174,6 +182,12 @@ type Host struct {
 
 	agentsMu sync.RWMutex
 	agents   map[a2al.Address]*agentEntry
+
+	// peerPubkeys caches the Ed25519 identity public key for each peer AID
+	// observed via verified incoming mailbox records.  A given AID always maps
+	// to the same key (the key is the AID's preimage), so no TTL is needed.
+	// Used by SendMailboxForAgent to skip a DHT endpoint lookup when possible.
+	peerPubkeys sync.Map // a2al.Address → ed25519.PublicKey
 
 	upnpMu             sync.Mutex
 	upnpURL            string
@@ -798,15 +812,61 @@ func (h *Host) Connect(ctx context.Context, expectRemote a2al.Address, udpAddr *
 	return h.dialAndAgentRoute(ctx, cert, expectRemote, udpAddr)
 }
 
-func writeAgentRouteFrame(ctx context.Context, conn quic.Connection, target a2al.Address) error {
+// doDialerControlStream opens Stream 0, writes the a2r2 route frame and dialer
+// control messages, then returns immediately.  Reading the acceptor's response
+// (ObservedAddr / AgentInfo) happens in a background goroutine so that the
+// caller can start opening data streams without waiting for the exchange.
+//
+// Only stream-open and route-frame failures are fatal; control-message errors
+// are logged and ignored — the connection is always usable without the bonus.
+func (h *Host) doDialerControlStream(ctx context.Context, conn quic.Connection, expectRemote a2al.Address) error {
 	str, err := conn.OpenStreamSync(ctx)
 	if err != nil {
-		return fmt.Errorf("a2al/host: open agent-route stream: %w", err)
+		return fmt.Errorf("a2al/host: open control stream: %w", err)
 	}
-	frame := append(agentRouteMagic, target[:]...)
-	if _, err := str.Write(frame); err != nil {
-		return fmt.Errorf("a2al/host: write agent-route frame: %w", err)
+
+	// Write route frame — acceptor needs this to resolve the target AID.
+	var frame [25]byte
+	copy(frame[:4], agentRouteMagicV2)
+	copy(frame[4:], expectRemote[:])
+	if _, err := str.Write(frame[:]); err != nil {
+		return fmt.Errorf("a2al/host: write route frame: %w", err)
 	}
+
+	// Snapshot the max topic seq held locally; fast in-memory scan.
+	// RecTypeTopic (0x10) is the only topic variant in current use; if future
+	// variants (0x11–0x1F) are introduced, switch to a category-based scan.
+	var heldSeq uint64
+	for _, r := range h.node.LocalStoreGetByAddress(expectRemote, protocol.RecTypeTopic) {
+		if r.Seq > heldSeq {
+			heldSeq = r.Seq
+		}
+	}
+
+	// The rest of the exchange is bonus: send our hint, read acceptor's reply.
+	// Run in a goroutine so the caller is not blocked on network round-trips.
+	// The goroutine terminates naturally when the stream closes (connection gone).
+	go func() {
+		if err := sendDialerMsgs(str, expectRemote, heldSeq); err != nil {
+			h.log.Debug("control: send dialer msgs", "remote_aid", expectRemote, "err", err)
+			return
+		}
+		observedWire, receivedRecs, err := readAcceptorMsgs(str)
+		if err != nil {
+			h.log.Debug("control: read acceptor msgs", "remote_aid", expectRemote, "err", err)
+		}
+		if len(observedWire) > 0 {
+			h.sense.Record(a2al.NodeIDFromAddress(expectRemote), observedWire)
+		}
+		for _, rec := range receivedRecs {
+			te, perr := protocol.ParseTopicRecord(rec)
+			if perr != nil {
+				continue
+			}
+			_ = h.node.LocalStorePut(protocol.TopicNodeID(te.Topic), rec)
+		}
+	}()
+
 	return nil
 }
 
@@ -820,8 +880,8 @@ func (h *Host) dialAndAgentRoute(ctx context.Context, localCert tls.Certificate,
 	if err != nil {
 		return nil, err
 	}
-	if err := writeAgentRouteFrame(ctx, conn, expectRemote); err != nil {
-		_ = conn.CloseWithError(1, "agent-route failed")
+	if err := h.doDialerControlStream(ctx, conn, expectRemote); err != nil {
+		_ = conn.CloseWithError(1, "control stream failed")
 		return nil, err
 	}
 	return conn, nil
@@ -861,8 +921,8 @@ func (h *Host) agentConnFromQUIC(ctx context.Context, conn quic.Connection, fall
 		ac.Remote = remote
 	}
 
-	// Try agent-route control stream (canonical).
-	if target, err := readAgentRouteFrame(ctx, conn); err == nil {
+	// Try agent-route control stream (canonical, a2r1 or a2r2).
+	if target, err := h.doAcceptorControlStream(ctx, conn); err == nil {
 		h.agentsMu.RLock()
 		_, ok := h.agents[target]
 		h.agentsMu.RUnlock()
@@ -883,29 +943,56 @@ func (h *Host) agentConnFromQUIC(ctx context.Context, conn quic.Connection, fall
 	return ac, nil
 }
 
-// readAgentRouteFrame reads the 25-byte agent-route frame (4 magic + 21 address)
-// from the first QUIC stream opened by the connecting peer.
-func readAgentRouteFrame(ctx context.Context, conn quic.Connection) (a2al.Address, error) {
+// doAcceptorControlStream accepts Stream 0, reads the route frame, and (for
+// a2r2 connections) runs the control message exchange.  Side effects:
+//   - Sends ObservedAddr (the dialer's public UDP address as seen by this node).
+//   - Sends AgentInfo records for the target agent if the dialer's held_seq is
+//     behind the local store, so the dialer's cache is refreshed transparently.
+//
+// Supports both a2r1 (legacy, no control exchange) and a2r2 (full exchange).
+// Unknown magic bytes are rejected; the caller falls back to SNI routing.
+func (h *Host) doAcceptorControlStream(ctx context.Context, conn quic.Connection) (a2al.Address, error) {
 	str, err := conn.AcceptStream(ctx)
 	if err != nil {
 		return a2al.Address{}, err
 	}
-	const frameLen = 4 + 21
-	buf := make([]byte, frameLen)
-	n := 0
-	for n < frameLen {
-		r, err := str.Read(buf[n:])
-		n += r
-		if err != nil {
-			return a2al.Address{}, err
-		}
+
+	// Read magic (4 B) + target address (21 B).
+	var header [25]byte
+	if _, err := io.ReadFull(str, header[:]); err != nil {
+		return a2al.Address{}, err
 	}
-	if string(buf[:4]) != string(agentRouteMagic) {
+	magic := header[:4]
+	var addr a2al.Address
+	copy(addr[:], header[4:])
+
+	switch string(magic) {
+	case string(agentRouteMagic): // a2r1: legacy — no control exchange
+		return addr, nil
+
+	case string(agentRouteMagicV2): // a2r2: full control exchange
+
+		// Read dialer's control messages (blocks until dialer FIN).
+		heldSeq, rerr := readDialerMsgs(str)
+		if rerr != nil {
+			h.log.Debug("control: read dialer msgs", "err", rerr)
+			heldSeq = 0 // assume dialer has nothing; push all records
+		}
+
+		// Look up fresh topic records for the target agent in the local store.
+		// See dialer-side comment: only 0x10 is in use; extend when 0x11–0x1F land.
+		localRecs := h.node.LocalStoreGetByAddress(addr, protocol.RecTypeTopic)
+
+		// Send acceptor's control messages and FIN.
+		if serr := sendAcceptorMsgs(str, conn.RemoteAddr(), localRecs, heldSeq); serr != nil {
+			h.log.Debug("control: send acceptor msgs", "err", serr)
+		}
+
+		return addr, nil
+
+	default:
 		return a2al.Address{}, errors.New("a2al/host: bad agent-route magic")
 	}
-	var addr a2al.Address
-	copy(addr[:], buf[4:])
-	return addr, nil
 }
 
 // StartDebugHTTP listens on addr and serves /debug/* JSON for both DHT

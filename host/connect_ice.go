@@ -102,7 +102,7 @@ func (h *Host) connectViaICESignal(ctx context.Context, localCert tls.Certificat
 		return nil, err
 	}
 	h.log.Debug("quic dial over ice ok", "local_aid", localAgent.String(), "remote_aid", expectRemote.String(), "dst", udpRA)
-	if err := writeAgentRouteFrame(ctx, qc, expectRemote); err != nil {
+	if err := h.doDialerControlStream(ctx, qc, expectRemote); err != nil {
 		h.log.Warn("agent-route over ice failed", "local_aid", localAgent.String(), "remote_aid", expectRemote.String(), "err", err)
 		_ = qc.CloseWithError(1, "agent-route")
 		teardown()
