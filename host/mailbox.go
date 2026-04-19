@@ -32,22 +32,35 @@ func (h *Host) SendMailboxForAgent(ctx context.Context, agentAddr, recipient a2a
 	if !ok {
 		return fmt.Errorf("a2al/host: unknown agent %s", agentAddr)
 	}
-	recs, err := h.FindRecords(ctx, recipient, protocol.RecTypeEndpoint)
-	if err != nil {
-		return fmt.Errorf("a2al/host: recipient endpoint: %w", err)
-	}
+
 	now := time.Now()
+
+	// Fast path: if we've previously received a mailbox message from this
+	// recipient, we already have their verified Ed25519 public key cached.
+	// Skip the DHT endpoint lookup entirely.
 	var recipientPub ed25519.PublicKey
-	for _, r := range recs {
-		if r.RecType != protocol.RecTypeEndpoint {
-			continue
-		}
-		if err := protocol.VerifySignedRecord(r, now); err != nil {
-			continue
-		}
-		recipientPub = append(ed25519.PublicKey(nil), r.Pubkey...)
-		break
+	if v, ok := h.peerPubkeys.Load(recipient); ok {
+		recipientPub = v.(ed25519.PublicKey)
 	}
+
+	if len(recipientPub) != ed25519.PublicKeySize {
+		// Slow path: look up the recipient's endpoint record on the DHT.
+		recs, err := h.FindRecords(ctx, recipient, protocol.RecTypeEndpoint)
+		if err != nil {
+			return fmt.Errorf("a2al/host: recipient endpoint: %w", err)
+		}
+		for _, r := range recs {
+			if r.RecType != protocol.RecTypeEndpoint {
+				continue
+			}
+			if err := protocol.VerifySignedRecord(r, now); err != nil {
+				continue
+			}
+			recipientPub = append(ed25519.PublicKey(nil), r.Pubkey...)
+			break
+		}
+	}
+
 	if len(recipientPub) != ed25519.PublicKeySize {
 		return errors.New("a2al/host: no valid endpoint for recipient")
 	}
@@ -103,6 +116,11 @@ func (h *Host) PollMailboxForAgent(ctx context.Context, agentAddr a2al.Address) 
 		msg, err := protocol.OpenMailboxRecord(ag.priv, agentAddr, sr)
 		if err != nil {
 			continue
+		}
+		// Cache the sender's verified public key so future replies to this
+		// peer can skip the DHT endpoint lookup in SendMailboxForAgent.
+		if len(msg.SenderPubkey) == ed25519.PublicKeySize {
+			h.peerPubkeys.Store(msg.Sender, msg.SenderPubkey)
 		}
 		out = append(out, msg)
 	}

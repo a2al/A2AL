@@ -5,7 +5,7 @@ package dht
 
 import (
 	"context"
-	"errors"
+	"net"
 	"sync"
 	"time"
 
@@ -19,7 +19,7 @@ const (
 	nRep              = 8                // soft replication target N_rep
 	repHardCap        = routing.K        // hard cap = K = 16
 	probeInitDelay    = 30 * time.Second // Unknown node: initial probe interval
-	probeMaxDelay     = 10 * time.Minute // Good node: ceiling for exponential back-off
+	probeMaxDelay     = 1 * time.Hour    // Good node: ceiling; in practice StoreAt (every 30 min) contacts the node first
 	probeBadDelay     = 30 * time.Minute // Bad node: grace window before eviction
 	probeTickInterval = 15 * time.Second // health probe loop wake-up interval
 	replChBuf         = 64              // replication task channel buffer
@@ -151,11 +151,19 @@ func (n *Node) processReplTask(ctx context.Context, task replTask) {
 	candidates := n.tabNearestHealthy(task.rk.storeKey, repHardCap)
 	var filtered []protocol.NodeInfo
 	for _, ni := range candidates {
-		if k := infoKey(ni); k != "" {
-			if _, inSet := existing[k]; !inSet {
-				filtered = append(filtered, ni)
-			}
+		k := infoKey(ni)
+		if k == "" {
+			continue
 		}
+		if _, inSet := existing[k]; inSet {
+			continue
+		}
+		var id a2al.NodeID
+		copy(id[:], ni.NodeID)
+		if !n.PeerAllowContact(id) {
+			continue
+		}
+		filtered = append(filtered, ni)
 	}
 	if len(filtered) > need {
 		filtered = filtered[:need]
@@ -245,10 +253,26 @@ func (n *Node) renewBackground(rk repKey, rs *repSet) {
 	existing := make(map[string]struct{}, len(rs.nodes))
 	// Snapshot confirmedAt so we can detect which renewals failed below.
 	preRenewConfirmed := make(map[string]time.Time, len(rs.nodes))
-	for k, e := range rs.nodes {
-		existingIDs = append(existingIDs, e.nodeID)
-		existing[k] = struct{}{}
-		preRenewConfirmed[k] = e.confirmedAt
+	{
+		now := time.Now()
+		for k, e := range rs.nodes {
+			existing[k] = struct{}{}
+			preRenewConfirmed[k] = e.confirmedAt
+		// For confirmed replicas (existing repSet members), skip renewal only
+		// when the repSet-level eviction grace window is active (badSince set
+		// by probeRepNode after repeated dedicated-probe failures).  The global
+		// PeerHealthBad flag is intentionally not checked here: it can be
+		// raised by health probes whose failures do not indicate that the peer
+		// is unreachable for StoreAt, and it has no recovery path for existing
+		// replicas (renewal success is the only thing that clears failCount).
+		// Relying on badSince keeps the two concerns separate: global health
+		// governs new candidate selection; repSet-level health governs eviction.
+		if !e.badSince.IsZero() {
+			e.nextProbeAt = now
+			continue
+		}
+			existingIDs = append(existingIDs, e.nodeID)
+		}
 	}
 	rs.mu.Unlock()
 
@@ -312,11 +336,11 @@ func (n *Node) renewBackground(rk repKey, rs *repSet) {
 			if _, inSet := existing[k]; inSet {
 				continue // already a confirmed replica
 			}
-			var id a2al.NodeID
-			copy(id[:], ni.NodeID)
-			if n.PeerHealthOf(id) == PeerHealthBad {
-				continue // skip known-unreachable peers
-			}
+		var id a2al.NodeID
+		copy(id[:], ni.NodeID)
+		if !n.PeerAllowContact(id) {
+			continue
+		}
 			if hasFarthest {
 				// repSet is full: only try peers closer than our farthest member.
 				d := xorNodeID(id, rk.storeKey)
@@ -375,6 +399,12 @@ func (n *Node) storeAndRecord(ctx context.Context, peers []protocol.NodeInfo, rk
 		if id == n.nid {
 			continue
 		}
+		// Global back-off gate: skip peers whose retry window has not expired.
+		// StoreAt will call recordFailure/recordSuccess internally, so health
+		// state is always updated regardless of the outcome.
+		if !n.PeerAllowContact(id) {
+			continue
+		}
 		addr, ok := n.lookupPeer(id)
 		if !ok {
 			continue
@@ -388,12 +418,6 @@ func (n *Node) storeAndRecord(ctx context.Context, peers []protocol.NodeInfo, rk
 		cancel()
 		if err != nil {
 			n.log.Debug("replication StoreAt failed", "peer", addr, "err", err)
-			// Timeout means the node didn't respond: feed the health system so
-			// future renewBackground runs will skip it via the PeerHealthBad
-			// filter once badHealthThreshold is reached.
-			if errors.Is(err, context.DeadlineExceeded) {
-				n.recordFailure(id)
-			}
 			continue
 		}
 		n.log.Debug("replication StoreAt ok", "peer", addr)
@@ -415,6 +439,22 @@ func (n *Node) storeAndRecord(ctx context.Context, peers []protocol.NodeInfo, rk
 		}
 		repSetEnforceHardCap(rs, rk.storeKey)
 		rs.mu.Unlock()
+
+		// Feed the confirmed-reachable peer back into the routing table.
+		// Every successful STORE is evidence of reachability; absorbing it here
+		// ensures the routing table reflects our actual communication outcomes
+		// (§4.4: every DHT interaction refreshes the routing table).
+		var tabNI protocol.NodeInfo
+		tabNI.NodeID = append([]byte(nil), id[:]...)
+		if ua, ok := addr.(*net.UDPAddr); ok {
+			if ip4 := ua.IP.To4(); ip4 != nil {
+				tabNI.IP = append([]byte(nil), ip4...)
+			} else {
+				tabNI.IP = append([]byte(nil), ua.IP.To16()...)
+			}
+			tabNI.Port = uint16(ua.Port)
+		}
+		n.tabAdd(tabNI, true)
 	}
 }
 
@@ -522,6 +562,14 @@ func (n *Node) probeRepNode(ctx context.Context, rk repKey, rs *repSet, e *repNo
 	pctx, cancel := context.WithTimeout(ctx, queryPeerTimeout)
 	_, err := n.PingIdentity(pctx, addr)
 	cancel()
+
+	if err != nil {
+		// PingIdentity called recordFailure internally (penalty++, backoff
+		// extended).  Since this is a dedicated health probe — not a "real"
+		// communication — undo the increment and halve the remaining back-off
+		// instead of growing it, giving the node a chance to recover.
+		n.recordProbeFailure(e.nodeID)
+	}
 
 	if err == nil {
 		// Success: advance the exponential back-off, clear bad state.

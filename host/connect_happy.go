@@ -54,7 +54,23 @@ func QUICDialTargets(er *protocol.EndpointRecord) ([]*net.UDPAddr, error) {
 // ConnectFromRecord dials expectRemote using the three-layer strategy:
 // ① Happy Eyeballs over quic:// candidates → ② ICE via signal (if record has Signal).
 // The host's default agent identity is used for mutual TLS.
-func (h *Host) ConnectFromRecord(ctx context.Context, expectRemote a2al.Address, er *protocol.EndpointRecord) (quic.Connection, error) {
+//
+// When all connection attempts fail the locally-cached endpoint record for
+// expectRemote is transparently invalidated so that the next Resolve call
+// fetches fresh data from the network rather than reusing the stale record.
+func (h *Host) ConnectFromRecord(ctx context.Context, expectRemote a2al.Address, er *protocol.EndpointRecord) (_ quic.Connection, err error) {
+	cert, certErr := h.defaultAgentCert()
+	if certErr != nil {
+		return nil, certErr
+	}
+	// Invalidate the cached endpoint on any connection failure so the next
+	// Resolve goes to the network for fresh data.  This is transparent to callers.
+	defer func() {
+		if err != nil {
+			h.node.LocalStoreInvalidate(a2al.NodeIDFromAddress(expectRemote), protocol.RecTypeEndpoint)
+		}
+	}()
+
 	targets, terr := QUICDialTargets(er)
 	var happyErr error
 	natType := protocol.NATUnknown
@@ -72,16 +88,12 @@ func (h *Host) ConnectFromRecord(ctx context.Context, expectRemote a2al.Address,
 		"skip_direct", skipDirect,
 	)
 	if !skipDirect && len(targets) > 0 {
-		cert, err := h.defaultAgentCert()
-		if err != nil {
-			return nil, err
-		}
-		c, err := h.connectHappy(ctx, cert, expectRemote, targets, DefaultConnectStagger)
-		if err == nil {
+		c, connErr := h.connectHappy(ctx, cert, expectRemote, targets, DefaultConnectStagger)
+		if connErr == nil {
 			return c, nil
 		}
-		h.log.Debug("connect direct failed, fallback maybe needed", "remote_aid", expectRemote.String(), "err", err)
-		happyErr = err
+		h.log.Debug("connect direct failed, fallback maybe needed", "remote_aid", expectRemote.String(), "err", connErr)
+		happyErr = connErr
 	} else if len(targets) == 0 {
 		happyErr = terr
 	}
@@ -92,30 +104,38 @@ func (h *Host) ConnectFromRecord(ctx context.Context, expectRemote a2al.Address,
 		return nil, errors.New("a2al/host: no quic targets and no signal url")
 	}
 	h.log.Debug("connect via ice", "remote_aid", expectRemote.String(), "signal", hasSignal)
-	cert, err := h.defaultAgentCert()
-	if err != nil {
-		return nil, err
-	}
-	iceConn, err := h.connectViaICESignal(ctx, cert, h.addr, expectRemote, er)
-	if err != nil {
-		h.log.Warn("connect ice failed", "remote_aid", expectRemote.String(), "err", err)
+	iceConn, iceErr := h.connectViaICESignal(ctx, cert, h.addr, expectRemote, er)
+	if iceErr != nil {
+		h.log.Warn("connect ice failed", "remote_aid", expectRemote.String(), "err", iceErr)
 		if happyErr != nil {
-			return nil, errors.Join(happyErr, fmt.Errorf("ice: %w", err))
+			return nil, errors.Join(happyErr, fmt.Errorf("ice: %w", iceErr))
 		}
-		return nil, err
+		return nil, iceErr
 	}
 	return iceConn, nil
 }
 
 // ConnectFromRecordFor dials as localAgent (must be registered) toward expectRemote.
-// After Happy Eyeballs over quic:// candidates fails, if the record includes Signal, falls back to ICE+QUIC over WebSocket signaling.
-func (h *Host) ConnectFromRecordFor(ctx context.Context, localAgent, expectRemote a2al.Address, er *protocol.EndpointRecord) (quic.Connection, error) {
+// After Happy Eyeballs over quic:// candidates fails, if the record includes Signal,
+// falls back to ICE+QUIC over WebSocket signaling.
+//
+// On failure the locally-cached endpoint record for expectRemote is transparently
+// invalidated (same as ConnectFromRecord).
+func (h *Host) ConnectFromRecordFor(ctx context.Context, localAgent, expectRemote a2al.Address, er *protocol.EndpointRecord) (_ quic.Connection, err error) {
 	h.agentsMu.RLock()
 	ag, ok := h.agents[localAgent]
 	h.agentsMu.RUnlock()
 	if !ok {
+		// Local configuration error — not a stale endpoint, no invalidation.
 		return nil, fmt.Errorf("a2al/host: unknown agent %s", localAgent)
 	}
+	// Invalidate the cached endpoint on any subsequent connection failure.
+	defer func() {
+		if err != nil {
+			h.node.LocalStoreInvalidate(a2al.NodeIDFromAddress(expectRemote), protocol.RecTypeEndpoint)
+		}
+	}()
+
 	targets, terr := QUICDialTargets(er)
 	var happyErr error
 	natType := protocol.NATUnknown
@@ -134,12 +154,12 @@ func (h *Host) ConnectFromRecordFor(ctx context.Context, localAgent, expectRemot
 		"skip_direct", skipDirect,
 	)
 	if !skipDirect && len(targets) > 0 {
-		c, err := h.connectHappy(ctx, ag.cert, expectRemote, targets, DefaultConnectStagger)
-		if err == nil {
+		c, connErr := h.connectHappy(ctx, ag.cert, expectRemote, targets, DefaultConnectStagger)
+		if connErr == nil {
 			return c, nil
 		}
-		h.log.Debug("connect direct failed, fallback maybe needed", "local_aid", localAgent.String(), "remote_aid", expectRemote.String(), "err", err)
-		happyErr = err
+		h.log.Debug("connect direct failed, fallback maybe needed", "local_aid", localAgent.String(), "remote_aid", expectRemote.String(), "err", connErr)
+		happyErr = connErr
 	} else if len(targets) == 0 {
 		happyErr = terr
 	}
@@ -150,13 +170,13 @@ func (h *Host) ConnectFromRecordFor(ctx context.Context, localAgent, expectRemot
 		return nil, errors.New("a2al/host: no quic targets and no signal url")
 	}
 	h.log.Debug("connect via ice", "local_aid", localAgent.String(), "remote_aid", expectRemote.String(), "signal", hasSignal)
-	iceConn, err := h.connectViaICESignal(ctx, ag.cert, localAgent, expectRemote, er)
-	if err != nil {
-		h.log.Warn("connect ice failed", "local_aid", localAgent.String(), "remote_aid", expectRemote.String(), "err", err)
+	iceConn, iceErr := h.connectViaICESignal(ctx, ag.cert, localAgent, expectRemote, er)
+	if iceErr != nil {
+		h.log.Warn("connect ice failed", "local_aid", localAgent.String(), "remote_aid", expectRemote.String(), "err", iceErr)
 		if happyErr != nil {
-			return nil, errors.Join(happyErr, fmt.Errorf("ice: %w", err))
+			return nil, errors.Join(happyErr, fmt.Errorf("ice: %w", iceErr))
 		}
-		return nil, err
+		return nil, iceErr
 	}
 	return iceConn, nil
 }
