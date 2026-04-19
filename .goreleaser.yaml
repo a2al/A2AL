@@ -80,7 +80,7 @@ nfpms:
         dependencies:
           - systemd
 
-checksums:
+checksum:
   # 固定文件名，便于本地 publish-packages.ps1 与 CI 下载校验
   name_template: 'a2al_{{ .Version }}_checksums.txt'
 
