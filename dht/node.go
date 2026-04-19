@@ -10,6 +10,7 @@ import (
 	"errors"
 	"log/slog"
 	"net"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -59,11 +60,22 @@ const (
 // considered unreachable. Reset to 0 on the next successful RPC.
 const badHealthThreshold = 2
 
+// maxBackoffShift caps the bit-shift in the exponential backoff so
+// nextRetryAt never overflows int64.  At shift=10 the penalty is
+// probeInitDelay<<10 ≈ 8.5 h, which is effectively "give up for now".
+const maxBackoffShift = 10
+
 type peerHealthEntry struct {
-	lastSuccess time.Time
-	lastFailure time.Time
-	failCount   int
-	rtt         time.Duration // last successful RTT; reserved for future RTT-based sorting
+	lastSuccess   time.Time
+	lastFailure   time.Time
+	failCount     int           // consecutive failures; reset to 0 on success
+	totalAttempts int           // lifetime RPC attempts (success + failure); never reset
+	rtt           time.Duration // last successful RTT; reserved for future RTT-based sorting
+	// nextRetryAt is the earliest time any channel may contact this peer.
+	// Zero means "contact freely".  Set by recordFailure (exponential back-off),
+	// cleared by recordSuccess.  Probes are allowed to halve the remaining
+	// duration via recordProbeFailure instead of growing it.
+	nextRetryAt time.Time
 }
 
 // Node is a single DHT participant (routing + local store + wire handler).
@@ -343,7 +355,8 @@ func (n *Node) lookupPeerID(addr net.Addr) (a2al.NodeID, bool) {
 	return v.(a2al.NodeID), true
 }
 
-// recordSuccess marks the peer as healthy (failCount reset to 0, RTT updated).
+// recordSuccess marks the peer as healthy: resets failCount, clears backoff,
+// and updates RTT.
 func (n *Node) recordSuccess(id a2al.NodeID, rtt time.Duration) {
 	key := nodeIDKey(id)
 	n.healthMu.Lock()
@@ -354,13 +367,17 @@ func (n *Node) recordSuccess(id a2al.NodeID, rtt time.Duration) {
 	}
 	e.lastSuccess = time.Now()
 	e.failCount = 0
+	e.totalAttempts++
+	e.nextRetryAt = time.Time{}
 	if rtt > 0 {
 		e.rtt = rtt
 	}
 	n.healthMu.Unlock()
 }
 
-// recordFailure increments the peer's consecutive-failure counter.
+// recordFailure increments the consecutive-failure counter and sets a global
+// exponential back-off on the peer.  All communication channels use the same
+// scale (probeInitDelay << shift) so the value remains a meaningful signal.
 func (n *Node) recordFailure(id a2al.NodeID) {
 	key := nodeIDKey(id)
 	n.healthMu.Lock()
@@ -371,7 +388,79 @@ func (n *Node) recordFailure(id a2al.NodeID) {
 	}
 	e.lastFailure = time.Now()
 	e.failCount++
+	e.totalAttempts++
+	shift := e.failCount - 1
+	if shift > maxBackoffShift {
+		shift = maxBackoffShift
+	}
+	e.nextRetryAt = time.Now().Add(probeInitDelay << shift)
 	n.healthMu.Unlock()
+}
+
+// PeerAllowContact returns true if the global back-off for this peer has
+// expired (or was never set).  Callers decide whether their own tolerance
+// permits contacting a peer whose back-off is still active; this gate
+// reflects the shared signal across all communication channels.
+func (n *Node) PeerAllowContact(id a2al.NodeID) bool {
+	n.healthMu.RLock()
+	e := n.health[nodeIDKey(id)]
+	n.healthMu.RUnlock()
+	if e == nil {
+		return true
+	}
+	return e.nextRetryAt.IsZero() || time.Now().After(e.nextRetryAt)
+}
+
+// peerHealthForSort returns the lastFailure time and totalAttempts for a peer,
+// used by the query engine to sort bad-node candidates.  Returns zero values
+// if no health entry exists yet.
+func (n *Node) peerHealthForSort(id a2al.NodeID) (lastFailure time.Time, totalAttempts int) {
+	n.healthMu.RLock()
+	e := n.health[nodeIDKey(id)]
+	n.healthMu.RUnlock()
+	if e == nil {
+		return
+	}
+	return e.lastFailure, e.totalAttempts
+}
+
+// recordProbeFailure is called by healthProbeLoop after a dedicated PING
+// fails.  A health probe is not a "real" contact attempt — its sole purpose
+// is to check liveness, not to transfer data — so its failure should not
+// carry the same weight as a failed StoreAt or FindNode.
+//
+// We therefore undo the failCount increment that PingIdentity's internal
+// recordFailure applied (net effect on failCount: zero) and halve the
+// remaining back-off instead of growing it.  This ensures that probe
+// failures cannot push a peer into PeerHealthBad on their own: only genuine
+// communication failures from data-plane RPCs accumulate failCount.
+//
+// A node that recently succeeded in StoreAt is thereby protected from being
+// misclassified as bad due to transient UDP probe losses, even in sparse
+// networks where probes fire more frequently.
+func (n *Node) recordProbeFailure(id a2al.NodeID) {
+	n.healthMu.Lock()
+	defer n.healthMu.Unlock()
+	e := n.health[nodeIDKey(id)]
+	if e == nil {
+		return
+	}
+	// Undo the failCount++ that PingIdentity's sendAndWait applied.
+	// Probes are health-checks, not data-plane RPCs; their failures must not
+	// accumulate toward the PeerHealthBad threshold.
+	if e.failCount > 0 {
+		e.failCount--
+	}
+	// Halve the remaining back-off window instead of growing it, so a
+	// temporarily unreachable peer returns to the retry pool sooner.
+	if !e.nextRetryAt.IsZero() {
+		remaining := time.Until(e.nextRetryAt)
+		if remaining <= 0 {
+			e.nextRetryAt = time.Time{}
+		} else {
+			e.nextRetryAt = time.Now().Add(remaining / 2)
+		}
+	}
 }
 
 // PeerHealthOf returns the observed health state for the given peer.
@@ -394,8 +483,15 @@ func (n *Node) PeerHealthOf(id a2al.NodeID) PeerHealthState {
 // tabNearestHealthy returns up to k routing-table peers sorted first by
 // health state (Good → Unknown → Bad) and then by XOR distance within each
 // group.  This ensures StoreAt and query seeds prefer known-reachable nodes.
+//
+// Scan width: routing.K*4 instead of routing.K.  The wider scan ensures that
+// reachable (Good/Unknown) nodes are always included in the candidate pool
+// even when unreachable (Bad) peers happen to be XOR-closer to the target.
+// An unreachable peer's effective distance is infinite, so it must not beat
+// a reachable peer simply by having a smaller XOR value.  In large networks
+// the extra overhead is negligible; in small networks it is essential.
 func (n *Node) tabNearestHealthy(target a2al.NodeID, k int) []protocol.NodeInfo {
-	all := n.tabNearest(target, routing.K)
+	all := n.tabNearest(target, routing.K*4)
 	var good, unknown, bad []protocol.NodeInfo
 	for _, ni := range all {
 		var id a2al.NodeID
@@ -559,7 +655,7 @@ func (n *Node) onFindNode(from net.Addr, dec *protocol.DecodedMessage) {
 	var tid a2al.NodeID
 	copy(tid[:], target)
 	resp := &protocol.BodyFindNodeResp{
-		Nodes:        n.tabNearest(tid, routing.K),
+		Nodes:        n.tabNearestHealthy(tid, routing.K),
 		ObservedAddr: ObservedAddr(from),
 	}
 	for len(resp.Nodes) > 1 {
@@ -582,7 +678,7 @@ func (n *Node) onFindValue(from net.Addr, dec *protocol.DecodedMessage) {
 	records := n.store.GetAll(tid, body.RecType, now)
 	best := n.store.Get(tid, now)
 	resp := &protocol.BodyFindValueResp{
-		Nodes:        n.tabNearest(tid, routing.K),
+		Nodes:        n.tabNearestHealthy(tid, routing.K),
 		ObservedAddr: ObservedAddr(from),
 		Records:      records,
 	}
@@ -974,6 +1070,11 @@ func (n *Node) NodeID() a2al.NodeID { return n.nid }
 
 // BootstrapCandidateAddrs returns up to max UDP addresses for cold-start bootstrap
 // (routing table + remembered peer addrs). Best-effort for persisting peers.cache.
+//
+// Candidates are sorted by observed health: Good → Unknown → Bad.  The max cap
+// therefore naturally favours peers we have successfully communicated with before,
+// so that the next cold-start spends its bootstrap window on the most promising
+// contacts rather than on known-dead nodes.
 func (n *Node) BootstrapCandidateAddrs(max int) []net.Addr {
 	if max <= 0 {
 		return nil
@@ -981,8 +1082,14 @@ func (n *Node) BootstrapCandidateAddrs(max int) []net.Addr {
 	n.tabMu.RLock()
 	peers := n.table.AllPeers()
 	n.tabMu.RUnlock()
-	var out []net.Addr
+
+	type candidate struct {
+		addr   *net.UDPAddr
+		health PeerHealthState
+	}
+	var candidates []candidate
 	seen := make(map[string]struct{})
+
 	for _, ni := range peers {
 		if len(ni.NodeID) != len(n.nid) {
 			continue
@@ -992,30 +1099,87 @@ func (n *Node) BootstrapCandidateAddrs(max int) []net.Addr {
 		if id == n.nid {
 			continue
 		}
+		var udp *net.UDPAddr
 		n.peerMu.Lock()
 		a, ok := n.peers[nodeIDKey(id)]
 		n.peerMu.Unlock()
 		if ok {
-			if udp, ok := a.(*net.UDPAddr); ok && udp.Port != 0 {
-				k := udp.String()
-				if _, dup := seen[k]; !dup {
-					seen[k] = struct{}{}
-					out = append(out, udp)
-				}
+			if u, ok := a.(*net.UDPAddr); ok && u.Port != 0 {
+				udp = u
 			}
 		} else if (len(ni.IP) == 4 || len(ni.IP) == 16) && ni.Port != 0 {
-			udp := &net.UDPAddr{IP: append([]byte(nil), ni.IP...), Port: int(ni.Port)}
-			k := udp.String()
-			if _, dup := seen[k]; !dup {
-				seen[k] = struct{}{}
-				out = append(out, udp)
-			}
+			udp = &net.UDPAddr{IP: append([]byte(nil), ni.IP...), Port: int(ni.Port)}
 		}
+		if udp == nil {
+			continue
+		}
+		k := udp.String()
+		if _, dup := seen[k]; dup {
+			continue
+		}
+		seen[k] = struct{}{}
+		candidates = append(candidates, candidate{addr: udp, health: n.PeerHealthOf(id)})
+	}
+
+	// Sort Good first, Unknown second, Bad last so the max cap retains the
+	// healthiest peers when the routing table is larger than max.
+	healthPriority := func(h PeerHealthState) int {
+		switch h {
+		case PeerHealthGood:
+			return 0
+		case PeerHealthUnknown:
+			return 1
+		default: // PeerHealthBad
+			return 2
+		}
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		return healthPriority(candidates[i].health) < healthPriority(candidates[j].health)
+	})
+
+	out := make([]net.Addr, 0, min(len(candidates), max))
+	for _, c := range candidates {
 		if len(out) >= max {
 			break
 		}
+		out = append(out, c.addr)
 	}
 	return out
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// LocalStoreGet returns verified non-expired records at the given DHT key,
+// with optional RecType filter (0 = all types).
+func (n *Node) LocalStoreGet(key a2al.NodeID, recType uint8) []protocol.SignedRecord {
+	return n.store.GetAll(key, recType, time.Now())
+}
+
+// LocalStoreGetByAddress returns verified non-expired records where sr.Address
+// matches addr, with optional RecType filter (0 = all types). Scans all store
+// buckets; intended for low-frequency paths such as the QUIC control exchange.
+func (n *Node) LocalStoreGetByAddress(addr a2al.Address, recType uint8) []protocol.SignedRecord {
+	return n.store.GetAllByAddress(addr, recType, time.Now())
+}
+
+// LocalStoreInvalidate removes locally-cached records for key and recType (0 = all
+// types).  Used internally by the host layer to clear stale endpoint records when a
+// connection attempt fails, so the next Resolve fetches fresh data from the network.
+func (n *Node) LocalStoreInvalidate(key a2al.NodeID, recType uint8) {
+	n.store.Invalidate(key, recType)
+}
+
+// LocalStorePut writes rec into the local store without triggering replication.
+// Use this to seed records received via an out-of-band channel (e.g. QUIC
+// control plane AgentInfo push) so that subsequent AggregateRecords queries
+// return the fresh data immediately.
+func (n *Node) LocalStorePut(storeKey a2al.NodeID, rec protocol.SignedRecord) error {
+	return n.store.Put(storeKey, rec, time.Now())
 }
 
 // Close stops the node, closes the transport, and waits for the receive loop to exit.

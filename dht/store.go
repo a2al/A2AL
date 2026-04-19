@@ -4,6 +4,7 @@
 package dht
 
 import (
+	"bytes"
 	"encoding/hex"
 	"errors"
 	"slices"
@@ -387,6 +388,59 @@ func (s *Store) filterExpiredLocked(list []protocol.SignedRecord, now time.Time)
 		}
 	}
 	return u
+}
+
+// GetAllByAddress returns verified non-expired records where sr.Address == addr,
+// with optional RecType filter (0 = all types). Scans all key buckets; intended
+// for low-frequency use (e.g. QUIC control plane exchange on connection setup).
+func (s *Store) GetAllByAddress(addr a2al.Address, recType uint8, now time.Time) []protocol.SignedRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []protocol.SignedRecord
+	for _, list := range s.m {
+		for _, r := range list {
+			if recType != 0 && r.RecType != recType {
+				continue
+			}
+			if !bytes.Equal(r.Address, addr[:]) {
+				continue
+			}
+			if protocol.VerifySignedRecord(r, now) != nil {
+				continue
+			}
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// Invalidate removes locally-cached records for key, optionally filtered by
+// recType (0 = all types).  Called internally when a connection attempt to
+// the peer fails, ensuring the next Resolve goes to the network for fresh data.
+func (s *Store) Invalidate(key a2al.NodeID, recType uint8) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k := nodeIDKey(key)
+	if _, ok := s.m[k]; !ok {
+		return
+	}
+	if recType == 0 {
+		delete(s.m, k)
+		delete(s.lastAccess, k)
+		return
+	}
+	newList := s.m[k][:0]
+	for _, r := range s.m[k] {
+		if r.RecType != recType {
+			newList = append(newList, r)
+		}
+	}
+	if len(newList) == 0 {
+		delete(s.m, k)
+		delete(s.lastAccess, k)
+	} else {
+		s.m[k] = newList
+	}
 }
 
 // Len is the number of distinct key buckets with at least one record.
