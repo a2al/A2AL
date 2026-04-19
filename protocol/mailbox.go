@@ -50,6 +50,11 @@ type MailboxMessage struct {
 	// Seq is copied from the outer SignedRecord.Seq; it is monotonically
 	// increasing per sender and serves as a unique record identifier.
 	Seq uint64
+	// SenderPubkey is the sender's Ed25519 identity public key, taken from
+	// SignedRecord.Pubkey after signature verification.  It is guaranteed to
+	// correspond to Sender (same key that derived the AID).  Callers may use
+	// this to encrypt a reply without an extra DHT lookup.
+	SenderPubkey ed25519.PublicKey
 }
 
 // EncodeMailboxPayload encrypts (msgType, body) and returns canonical CBOR MailboxPayload.
@@ -112,5 +117,6 @@ func OpenMailboxRecord(recipientPriv ed25519.PrivateKey, recipientAddr a2al.Addr
 	if err := cbor.Unmarshal(plain, &mw); err != nil {
 		return empty, err
 	}
-	return MailboxMessage{Sender: senderAddr, MsgType: mw.MsgType, Body: mw.Body, Seq: sr.Seq}, nil
+	senderPub := append(ed25519.PublicKey(nil), sr.Pubkey...)
+	return MailboxMessage{Sender: senderAddr, MsgType: mw.MsgType, Body: mw.Body, Seq: sr.Seq, SenderPubkey: senderPub}, nil
 }
