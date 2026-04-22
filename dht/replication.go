@@ -244,8 +244,8 @@ func (n *Node) renewBackground(rk repKey, rs *repSet) {
 	}
 
 	// FindNode discovers the current k-closest peers to the key.
-	// In passive (beacon) mode skip the iterative query: the beacon already has
-	// the most complete routing table in the network (all nodes contact it), so
+	// In passive mode skip the iterative query: a well-connected passive node
+	// accumulates a dense local routing table through incoming traffic, so
 	// tabNearestHealthy gives an equally good result without any outbound RPCs.
 	var found []protocol.NodeInfo
 	if n.passiveRouting.Load() {
@@ -673,7 +673,7 @@ func (n *Node) runRoutingMaintenance(ctx context.Context) {
 	// Sort descending by bucket index so higher-CPL (closer-to-self, routing-critical)
 	// buckets are served first when the cap binds.
 	//
-	// Skipped in passive (beacon) mode: beacon routing tables fill naturally
+	// Skipped in passive mode: passive node routing tables fill naturally
 	// through incoming traffic; proactive FindNode is unnecessary and noisy.
 	if !n.passiveRouting.Load() {
 		refill := work.BucketsToRefill

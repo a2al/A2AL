@@ -59,7 +59,7 @@ type Config struct {
 	// on startup and on a schedule (default true). When false, the node stays off the DHT
 	// as a discoverable endpoint while still participating in routing.
 	AutoPublish bool `toml:"auto_publish" json:"auto_publish"`
-	// BeaconMode forces beacon operation regardless of DNS self-identification.
+	// BootstrapAssistMode enables passive routing and supplemental store writes for network resilience.
 	// Not included in user-facing documentation.
 	BeaconMode bool `toml:"beacon_mode" json:"beacon_mode,omitempty"`
 	// BootstrapNodeIDs lists NodeID hex strings that bootstrap peers must match.

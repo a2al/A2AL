@@ -141,7 +141,7 @@ type Node struct {
 	renewInFlight map[repKey]struct{}   // keys with a renewBackground goroutine running
 
 	// passiveRouting suppresses proactive FindNode queries when true.
-	// Set via SetPassiveRouting; used by beacon-mode nodes that fill their
+	// Set via SetPassiveRouting; used by passive-mode nodes that fill their
 	// routing table naturally through incoming traffic and do not need to
 	// search for peers themselves.
 	passiveRouting atomic.Bool
@@ -1277,7 +1277,7 @@ func min(a, b int) int {
 func (n *Node) SetMaxStoreKeys(max int) { n.store.SetMaxKeys(max) }
 
 // SetPassiveRouting controls whether this node suppresses proactive FindNode
-// queries. When true (beacon mode), the node fills its routing table naturally
+// queries. When true (passive mode), the node fills its routing table naturally
 // through incoming traffic and skips active bucket-refill and topology scans.
 func (n *Node) SetPassiveRouting(passive bool) { n.passiveRouting.Store(passive) }
 

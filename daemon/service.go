@@ -753,7 +753,7 @@ func (d *Daemon) execResolve(ctx context.Context, aidStr string) (map[string]any
 	}
 	er, err := d.h.Resolve(ctx, aid)
 	if err != nil {
-		// DHT returned empty — try beacon last-resort.
+		// DHT returned empty — try supplemental bootstrap nodes as last resort.
 		if d.beacon != nil {
 			er, err = d.resolveFromBeacon(ctx, aid)
 		}
@@ -1044,7 +1044,7 @@ func (d *Daemon) execDiscover(ctx context.Context, req discoverReq) ([]map[strin
 	if err != nil {
 		return nil, err
 	}
-	// Beacon fallback: supplement with results from beacon when DHT returns empty.
+	// Bootstrap backup fallback: supplement with results from bootstrap nodes when DHT returns empty.
 	if len(entries) == 0 && d.beacon != nil && len(d.beacon.Addrs()) > 0 {
 		entries = d.discoverFromBeacon(ctx, req.Services)
 	}
@@ -1131,7 +1131,7 @@ func (d *Daemon) execResolveRecords(ctx context.Context, aidStr string, recType 
 	if err != nil && !errors.Is(err, dht.ErrNoMatchingRecords) {
 		return nil, err
 	}
-	// Beacon fallback when DHT returned nothing.
+	// Bootstrap backup fallback when DHT returned nothing.
 	if len(recs) == 0 && d.beacon != nil {
 		key := a2al.NodeIDFromAddress(aid)
 		if brecs, berr := d.beacon.FindRecords(ctx, key, recType); berr == nil {

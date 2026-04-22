@@ -82,7 +82,7 @@ func bootstrapDHT(ctx context.Context, h *host.Host, cfg *config.Config, dataDir
 		}
 	}
 
-	// Last resort: beacon infrastructure addresses — only when all earlier steps failed.
+	// Last resort: supplemental bootstrap node addresses — only when all earlier steps failed.
 	if !ok {
 		if beaconAddrs := bm.refreshAddrs(); len(beaconAddrs) > 0 {
 			log.Info("connecting to network", "source", "beacon")
