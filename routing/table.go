@@ -400,11 +400,37 @@ func (t *Table) CollectMaintenanceWork(now, freshCutoff, staleCutoff time.Time) 
 			}
 		}
 
-		// Flag buckets with too few fresh verified nodes for FindNode refill.
-		// Only consider buckets that already have at least one entry (empty high-CPL
-		// buckets are expected in Kademlia and don't need proactive refill).
-		if len(b.nodes) > 0 && b.verifiedFreshCount(freshCutoff) < K/2 {
-			work.BucketsToRefill = append(work.BucketsToRefill, bi)
+		// Refill logic with per-bucket back-off.
+		//
+		// State machine (all state lives in the bucket struct):
+		//
+		//   healthy   (verifiedFreshCount >= K/2):
+		//     Mark refillWasHealthy=true.  No refill needed; cooldown is irrelevant.
+		//
+		//   unhealthy (verifiedFreshCount < K/2) after being healthy:
+		//     Reset cooldown to 0 so the first re-attempt is immediate.
+		//     This ensures accumulated small-network back-off never persists into
+		//     a phase where the network has grown enough to fill the bucket.
+		//
+		//   unhealthy, repeated misses:
+		//     cooldown doubles (30s → 60s → … → 10 min) so a persistently sparse
+		//     bucket stops generating FindNode traffic proportional to tick rate.
+		if freshCount := b.verifiedFreshCount(freshCutoff); len(b.nodes) > 0 {
+			if freshCount >= K/2 {
+				// Bucket healthy: remember so the next decline gets a free reset.
+				b.refillWasHealthy = true
+			} else {
+				if b.refillWasHealthy {
+					// Healthy → Unhealthy transition: wipe accumulated back-off.
+					b.refillCooldown = 0
+					b.refillWasHealthy = false
+				}
+				if now.Sub(b.lastRefillAt) >= b.refillCooldown {
+					work.BucketsToRefill = append(work.BucketsToRefill, bi)
+					b.lastRefillAt = now
+					b.refillCooldown = nextRefillCooldown(b.refillCooldown)
+				}
+			}
 		}
 	}
 	return work
@@ -439,6 +465,20 @@ func (t *Table) DebugPeerRows() []PeerDebugRow {
 		}
 	}
 	return out
+}
+
+// nextRefillCooldown returns the next back-off duration after a refill attempt
+// that did not improve the bucket.  The sequence is:
+//
+//	0 → refillInitCooldown → 2× → 4× … → refillMaxCooldown
+func nextRefillCooldown(current time.Duration) time.Duration {
+	if current < refillInitCooldown {
+		return refillInitCooldown
+	}
+	if next := current * 2; next < refillMaxCooldown {
+		return next
+	}
+	return refillMaxCooldown
 }
 
 func formatIP(ip []byte) string {

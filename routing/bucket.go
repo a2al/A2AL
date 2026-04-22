@@ -15,6 +15,15 @@ const (
 	K          = 16
 	pendingCap = 5
 	pendingTTL = 2 * time.Hour
+
+	// refillInitCooldown is the minimum interval between two consecutive refill
+	// attempts for the same bucket (roughly 2 × probeTickInterval = 30 s).
+	// After each unsuccessful attempt the cooldown doubles up to refillMaxCooldown.
+	// The cooldown resets to zero whenever the bucket transitions from healthy
+	// (verifiedFreshCount >= K/2) to unhealthy, so accumulated back-off from a
+	// small-network phase never persists into a large-network phase.
+	refillInitCooldown = 30 * time.Second
+	refillMaxCooldown  = 10 * time.Minute
 )
 
 // EntryMeta holds routing-quality metadata for a routing table entry.
@@ -50,6 +59,12 @@ type pendingEntry struct {
 type bucket struct {
 	nodes   []bucketEntry  // main K-bucket; oldest (LRU) at [0], MRU at [len-1]
 	pending []pendingEntry // hearsay nodes awaiting verification; capacity pendingCap
+
+	// Refill back-off state.  All fields are managed exclusively by
+	// CollectMaintenanceWork; nothing outside that call should write them.
+	lastRefillAt    time.Time
+	refillCooldown  time.Duration // 0 = eligible immediately; doubles after each miss
+	refillWasHealthy bool          // true when bucket was last seen with verifiedFreshCount >= K/2
 }
 
 func (b *bucket) indexByID(id a2al.NodeID) int {

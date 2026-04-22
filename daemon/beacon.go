@@ -210,10 +210,11 @@ func (b *beaconManager) FindRecords(ctx context.Context, key a2al.NodeID, recTyp
 	return nil, nil
 }
 
-// Stats returns a map for merging into /debug/stats. Returns nil when beacon
-// is not active, producing no output in the JSON response.
+// Stats returns a map for merging into /debug/stats. Returns nil when this
+// node is not operating in beacon mode, producing no output in the JSON
+// response and keeping the beacon mechanism transparent to regular nodes.
 func (b *beaconManager) Stats() map[string]any {
-	if !b.active.Load() && b.storeSent.Load() == 0 && b.queryHits.Load() == 0 {
+	if !b.active.Load() {
 		return nil
 	}
 	b.mu.RLock()
