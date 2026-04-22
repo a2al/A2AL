@@ -17,6 +17,7 @@ if command -v semanage >/dev/null 2>&1 && command -v restorecon >/dev/null 2>&1;
 fi
 
 systemctl daemon-reload
-systemctl enable --now a2ald
+systemctl enable a2ald
+systemctl restart a2ald
 
 echo "a2ald started. Config: /opt/a2al/data/config.toml"
