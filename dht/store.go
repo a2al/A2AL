@@ -40,6 +40,14 @@ type Store struct {
 	maxKeys     int
 }
 
+// SetMaxKeys updates the maximum number of distinct DHT keys stored in-place.
+// Safe to call concurrently; takes effect on the next eviction cycle.
+func (s *Store) SetMaxKeys(n int) {
+	s.mu.Lock()
+	s.maxKeys = n
+	s.mu.Unlock()
+}
+
 // NewStore creates an empty Store. auth is optional (see Config.RecordAuth).
 // maxKeys limits distinct key count; 0 uses DefaultMaxTotalKeys.
 func NewStore(auth RecordAuthFunc, maxKeys int) *Store {

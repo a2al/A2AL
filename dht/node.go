@@ -346,6 +346,22 @@ func (n *Node) tabNearest(target a2al.NodeID, k int) []protocol.NodeInfo {
 	return n.table.NearestN(target, k)
 }
 
+// PeerRTT returns the last measured round-trip time for addr, or 0 if the
+// address is not yet known or has never completed a successful exchange.
+func (n *Node) PeerRTT(addr net.Addr) time.Duration {
+	id, ok := n.lookupPeerID(addr)
+	if !ok {
+		return 0
+	}
+	n.healthMu.RLock()
+	e := n.health[nodeIDKey(id)]
+	n.healthMu.RUnlock()
+	if e == nil {
+		return 0
+	}
+	return e.rtt
+}
+
 // lookupPeerID returns the NodeID associated with addr, if known.
 func (n *Node) lookupPeerID(addr net.Addr) (a2al.NodeID, bool) {
 	v, ok := n.addrToID.Load(addr.String())
@@ -556,6 +572,10 @@ func (n *Node) reachCounts() (r1h, r24h, r7d int) {
 	}
 	return
 }
+
+// EstimatedNetworkSize returns the bucket-density estimate of the current
+// number of active nodes in the DHT.
+func (n *Node) EstimatedNetworkSize() int { return n.tabEstimatedNetworkSize() }
 
 // tabEstimatedNetworkSize returns the bucket-density estimate of network size.
 func (n *Node) tabEstimatedNetworkSize() int {
@@ -1152,6 +1172,17 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// SetMaxStoreKeys updates the maximum number of distinct keys in the local store.
+func (n *Node) SetMaxStoreKeys(max int) { n.store.SetMaxKeys(max) }
+
+// SelfExtIP returns the node's current public IP as seen by STUN/HTTP probe,
+// or nil if not yet known.
+func (n *Node) SelfExtIP() net.IP {
+	n.selfExtMu.RLock()
+	defer n.selfExtMu.RUnlock()
+	return n.selfExtIP
 }
 
 // LocalStoreGet returns verified non-expired records at the given DHT key,

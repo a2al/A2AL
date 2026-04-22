@@ -204,6 +204,9 @@ type Host struct {
 	signalStatsMu sync.RWMutex
 	signalStats   func() map[string]any
 
+	beaconStatsMu sync.RWMutex
+	beaconStats   func() map[string]any
+
 	natProbeMu sync.Mutex // guards RunNATProbe (only one probe at a time)
 }
 
@@ -641,6 +644,14 @@ func (h *Host) SetSignalStatsProvider(f func() map[string]any) {
 	h.signalStatsMu.Lock()
 	h.signalStats = f
 	h.signalStatsMu.Unlock()
+}
+
+// SetBeaconStatsProvider registers a provider for beacon fields in GET /debug/stats.
+// Fields are omitted when fn returns nil or empty map.
+func (h *Host) SetBeaconStatsProvider(fn func() map[string]any) {
+	h.beaconStatsMu.Lock()
+	h.beaconStats = fn
+	h.beaconStatsMu.Unlock()
 }
 
 const extipCacheTTL = 5 * time.Minute
