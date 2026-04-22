@@ -15,16 +15,25 @@ const (
 	K          = 16
 	pendingCap = 5
 	pendingTTL = 2 * time.Hour
-
-	// refillInitCooldown is the minimum interval between two consecutive refill
-	// attempts for the same bucket (roughly 2 × probeTickInterval = 30 s).
-	// After each unsuccessful attempt the cooldown doubles up to refillMaxCooldown.
-	// The cooldown resets to zero whenever the bucket transitions from healthy
-	// (verifiedFreshCount >= K/2) to unhealthy, so accumulated back-off from a
-	// small-network phase never persists into a large-network phase.
-	refillInitCooldown = 30 * time.Second
-	refillMaxCooldown  = 10 * time.Minute
 )
+
+// refillFutileCooldowns maps the number of consecutive futile FindNode attempts
+// for a bucket to the minimum wait before the next attempt.
+//
+//	futileCount=0: normal cadence; first attempt is immediate after election
+//	futileCount=1: one miss → wait 2 min before retrying
+//	futileCount=2: two misses → wait 10 min
+//	futileCount=3+: accept the network is sparse; back off to 15 min and stay there
+//
+// A "futile" attempt is one where the verifiedFreshCount did not improve after
+// the FindNode completed.  The counter resets to zero when the bucket improves
+// (via RecordRefillOutcome) or when a healthy→unhealthy transition occurs.
+var refillFutileCooldowns = [...]time.Duration{
+	30 * time.Second, // futileCount=0
+	2 * time.Minute,  // futileCount=1
+	10 * time.Minute, // futileCount=2
+	15 * time.Minute, // futileCount=3+ (cap)
+}
 
 // EntryMeta holds routing-quality metadata for a routing table entry.
 // Values are supplied by the dht layer; the routing layer only stores and
@@ -61,10 +70,10 @@ type bucket struct {
 	pending []pendingEntry // hearsay nodes awaiting verification; capacity pendingCap
 
 	// Refill back-off state.  All fields are managed exclusively by
-	// CollectMaintenanceWork; nothing outside that call should write them.
-	lastRefillAt    time.Time
-	refillCooldown  time.Duration // 0 = eligible immediately; doubles after each miss
-	refillWasHealthy bool          // true when bucket was last seen with verifiedFreshCount >= K/2
+	// CollectMaintenanceWork and RecordRefillOutcome; nothing else should write them.
+	lastRefillAt     time.Time
+	refillWasHealthy bool // true when bucket was last seen with verifiedFreshCount >= K/2
+	futileCount      int  // consecutive FindNode attempts that yielded no improvement
 }
 
 func (b *bucket) indexByID(id a2al.NodeID) int {

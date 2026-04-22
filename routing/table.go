@@ -400,35 +400,40 @@ func (t *Table) CollectMaintenanceWork(now, freshCutoff, staleCutoff time.Time) 
 			}
 		}
 
-		// Refill logic with per-bucket back-off.
+		// Refill logic with outcome-aware back-off.
 		//
 		// State machine (all state lives in the bucket struct):
 		//
 		//   healthy   (verifiedFreshCount >= K/2):
-		//     Mark refillWasHealthy=true.  No refill needed; cooldown is irrelevant.
+		//     Mark refillWasHealthy=true.  No refill needed.
 		//
 		//   unhealthy (verifiedFreshCount < K/2) after being healthy:
-		//     Reset cooldown to 0 so the first re-attempt is immediate.
-		//     This ensures accumulated small-network back-off never persists into
-		//     a phase where the network has grown enough to fill the bucket.
+		//     Reset futileCount to 0 (give a fresh attempt at normal cadence).
+		//     This ensures back-off accumulated in a small-network phase never
+		//     persists into a phase where the network has grown.
 		//
 		//   unhealthy, repeated misses:
-		//     cooldown doubles (30s → 60s → … → 10 min) so a persistently sparse
-		//     bucket stops generating FindNode traffic proportional to tick rate.
+		//     futileCount drives the cooldown via refillFutileCooldowns:
+		//       0→30s  1→2min  2→10min  3+→15min
+		//     futileCount is incremented by RecordRefillOutcome when the FindNode
+		//     that was launched for this bucket did not improve verifiedFreshCount.
 		if freshCount := b.verifiedFreshCount(freshCutoff); len(b.nodes) > 0 {
 			if freshCount >= K/2 {
 				// Bucket healthy: remember so the next decline gets a free reset.
 				b.refillWasHealthy = true
 			} else {
 				if b.refillWasHealthy {
-					// Healthy → Unhealthy transition: wipe accumulated back-off.
-					b.refillCooldown = 0
+					// Healthy → Unhealthy transition: reset futile counter so the
+					// first re-attempt fires at normal cadence (30 s).
+					b.futileCount = 0
 					b.refillWasHealthy = false
 				}
-				if now.Sub(b.lastRefillAt) >= b.refillCooldown {
+				cooldown := refillFutileCooldown(b.futileCount)
+				if now.Sub(b.lastRefillAt) >= cooldown {
 					work.BucketsToRefill = append(work.BucketsToRefill, bi)
 					b.lastRefillAt = now
-					b.refillCooldown = nextRefillCooldown(b.refillCooldown)
+					// futileCount is updated by RecordRefillOutcome after the
+					// FindNode goroutine completes; we do not touch it here.
 				}
 			}
 		}
@@ -467,18 +472,52 @@ func (t *Table) DebugPeerRows() []PeerDebugRow {
 	return out
 }
 
-// nextRefillCooldown returns the next back-off duration after a refill attempt
-// that did not improve the bucket.  The sequence is:
+// refillFutileCooldown returns the minimum wait before the next refill attempt
+// given the number of consecutive futile attempts so far.
+func refillFutileCooldown(futileCount int) time.Duration {
+	idx := futileCount
+	if idx >= len(refillFutileCooldowns) {
+		idx = len(refillFutileCooldowns) - 1
+	}
+	return refillFutileCooldowns[idx]
+}
+
+// BucketDiscoveryCount returns the total number of distinct peers known to
+// bucket bi, counting both main-bucket entries (verified or stale) and
+// pending-list entries (unverified hearsay awaiting a probe).
 //
-//	0 → refillInitCooldown → 2× → 4× … → refillMaxCooldown
-func nextRefillCooldown(current time.Duration) time.Duration {
-	if current < refillInitCooldown {
-		return refillInitCooldown
+// This is the metric the dht layer uses before/after a refill FindNode to
+// decide whether the query actually discovered new peers.  verifiedFreshCount
+// would be the wrong choice here: FindNode results enter the table as hearsay
+// (VerifiedAt = 0) via absorbNodeInfo, so they cannot influence
+// verifiedFreshCount until a later PING promotes them — by which point the
+// outcome record is long since written.
+//
+// Caller must hold the table lock.
+func (t *Table) BucketDiscoveryCount(bi int) int {
+	if bi < 0 || bi >= len(t.b) {
+		return 0
 	}
-	if next := current * 2; next < refillMaxCooldown {
-		return next
+	return len(t.b[bi].nodes) + len(t.b[bi].pending)
+}
+
+// RecordRefillOutcome updates the futile-attempt counter for bucket bi based on
+// whether a recent FindNode improved its verifiedFreshCount.
+//   - improved=true:  reset futileCount to 0 (back to normal cadence)
+//   - improved=false: increment futileCount (longer wait before next attempt)
+//
+// Called by the dht layer after a maintenance FindNode goroutine completes.
+// Caller must hold the table write lock.
+func (t *Table) RecordRefillOutcome(bi int, improved bool) {
+	if bi < 0 || bi >= len(t.b) {
+		return
 	}
-	return refillMaxCooldown
+	b := &t.b[bi]
+	if improved {
+		b.futileCount = 0
+	} else {
+		b.futileCount++
+	}
 }
 
 func formatIP(ip []byte) string {

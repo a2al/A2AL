@@ -139,6 +139,12 @@ type Node struct {
 	repSets       map[repKey]*repSet    // (storeKey, publisher) → replication tracking
 	replCh        chan replTask         // 过程一 → 过程二: replication work items
 	renewInFlight map[repKey]struct{}   // keys with a renewBackground goroutine running
+
+	// passiveRouting suppresses proactive FindNode queries when true.
+	// Set via SetPassiveRouting; used by beacon-mode nodes that fill their
+	// routing table naturally through incoming traffic and do not need to
+	// search for peers themselves.
+	passiveRouting atomic.Bool
 }
 
 type waitEntry struct {
@@ -1269,6 +1275,11 @@ func min(a, b int) int {
 
 // SetMaxStoreKeys updates the maximum number of distinct keys in the local store.
 func (n *Node) SetMaxStoreKeys(max int) { n.store.SetMaxKeys(max) }
+
+// SetPassiveRouting controls whether this node suppresses proactive FindNode
+// queries. When true (beacon mode), the node fills its routing table naturally
+// through incoming traffic and skips active bucket-refill and topology scans.
+func (n *Node) SetPassiveRouting(passive bool) { n.passiveRouting.Store(passive) }
 
 // SelfExtIP returns the node's current public IP as seen by STUN/HTTP probe,
 // or nil if not yet known.

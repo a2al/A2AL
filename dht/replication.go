@@ -244,10 +244,19 @@ func (n *Node) renewBackground(rk repKey, rs *repSet) {
 	}
 
 	// FindNode discovers the current k-closest peers to the key.
-	q := NewQuery(n)
-	found, err := q.FindNode(ctx, rk.storeKey)
-	if err != nil || ctx.Err() != nil {
+	// In passive (beacon) mode skip the iterative query: the beacon already has
+	// the most complete routing table in the network (all nodes contact it), so
+	// tabNearestHealthy gives an equally good result without any outbound RPCs.
+	var found []protocol.NodeInfo
+	if n.passiveRouting.Load() {
 		found = n.tabNearestHealthy(rk.storeKey, repHardCap)
+	} else {
+		q := NewQuery(n)
+		var fnErr error
+		found, fnErr = q.FindNode(ctx, rk.storeKey)
+		if fnErr != nil || ctx.Err() != nil {
+			found = n.tabNearestHealthy(rk.storeKey, repHardCap)
+		}
 	}
 
 	rs.mu.Lock()
@@ -663,24 +672,46 @@ func (n *Node) runRoutingMaintenance(ctx context.Context) {
 	// 3. Refill under-filled buckets — at most maintRefillPerCycle FindNode queries.
 	// Sort descending by bucket index so higher-CPL (closer-to-self, routing-critical)
 	// buckets are served first when the cap binds.
-	refill := work.BucketsToRefill
-	if len(refill) > 1 {
-		sort.Sort(sort.Reverse(sort.IntSlice(refill)))
-	}
-	if len(refill) > maintRefillPerCycle {
-		refill = refill[:maintRefillPerCycle]
-	}
-	for _, bi := range refill {
-		if ctx.Err() != nil {
-			return
+	//
+	// Skipped in passive (beacon) mode: beacon routing tables fill naturally
+	// through incoming traffic; proactive FindNode is unnecessary and noisy.
+	if !n.passiveRouting.Load() {
+		refill := work.BucketsToRefill
+		if len(refill) > 1 {
+			sort.Sort(sort.Reverse(sort.IntSlice(refill)))
 		}
-		target := randomIDInBucket(n.nid, bi)
-		go func(t a2al.NodeID) {
-			qctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-			defer cancel()
-			q := NewQuery(n)
-			_, _ = q.FindNode(qctx, t)
-		}(target)
+		if len(refill) > maintRefillPerCycle {
+			refill = refill[:maintRefillPerCycle]
+		}
+		for _, bi := range refill {
+			if ctx.Err() != nil {
+				return
+			}
+			target := randomIDInBucket(n.nid, bi)
+
+			// Snapshot the bucket's discovery count (main + pending) before the
+			// FindNode.  We compare it with the count after the goroutine
+			// returns to decide whether the query actually brought in any new
+			// peers — verifiedFreshCount would never reflect FindNode results
+			// in time because those results enter as hearsay (VerifiedAt = 0).
+			n.tabMu.RLock()
+			beforeCount := n.table.BucketDiscoveryCount(bi)
+			n.tabMu.RUnlock()
+
+			go func(bucketIdx int, before int, t a2al.NodeID) {
+				qctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+				defer cancel()
+				q := NewQuery(n)
+				_, _ = q.FindNode(qctx, t)
+
+				// Record whether the bucket grew so CollectMaintenanceWork can
+				// adjust the futile-attempt counter and cooldown accordingly.
+				n.tabMu.Lock()
+				after := n.table.BucketDiscoveryCount(bucketIdx)
+				n.table.RecordRefillOutcome(bucketIdx, after > before)
+				n.tabMu.Unlock()
+			}(bi, beforeCount, target)
+		}
 	}
 }
 

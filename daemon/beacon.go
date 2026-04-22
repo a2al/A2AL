@@ -59,6 +59,7 @@ func (b *beaconManager) start(ctx context.Context, agentKeysFn func() []a2al.Nod
 	if b.cfg.BeaconMode {
 		b.active.Store(true)
 		b.node.SetMaxStoreKeys(beaconMaxStoreKeys)
+		b.node.SetPassiveRouting(true)
 		b.log.Info("beacon: operator-configured beacon mode active")
 	}
 	go func() {
@@ -88,6 +89,7 @@ func (b *beaconManager) trySelfIdentify(addrs []net.Addr) {
 		if selfIP.Equal(udp.IP) {
 			b.active.Store(true)
 			b.node.SetMaxStoreKeys(beaconMaxStoreKeys)
+			b.node.SetPassiveRouting(true)
 			b.log.Info("beacon: self-identified via DNS, expanding store capacity")
 			return
 		}
@@ -144,7 +146,15 @@ func (b *beaconManager) shuffledAddrs() []net.Addr {
 
 // StoreAll fires fire-and-forget STORE to every beacon address for each key,
 // skipping any address that belongs to this node itself.
+// When this node is itself a beacon it skips entirely: all publishers send
+// StoreAt to every beacon directly, so beacon-to-beacon synchronisation is
+// redundant and only adds unnecessary traffic.
 func (b *beaconManager) StoreAll(ctx context.Context, keys []a2al.NodeID) {
+	if b.active.Load() {
+		// Self is a beacon node: other beacons already receive StoreAt from
+		// every publisher. There is nothing useful to push.
+		return
+	}
 	addrs := b.shuffledAddrs()
 	if len(addrs) == 0 {
 		return
