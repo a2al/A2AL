@@ -5,6 +5,8 @@ package daemon
 
 import (
 	"context"
+	"slices"
+	"sync"
 	"time"
 
 	"github.com/a2al/a2al"
@@ -20,20 +22,153 @@ import (
 // comfortable margin and reduces ping frequency vs the original 30 s spec.
 const iceKeepaliveInterval = 45 * time.Second
 
-// runICEListener maintains a WebSocket subscription to /signal and spawns
-// AcceptICEViaSignal when the hub notifies this node of an inbound ICE session.
+// incomingDedup tracks active ICE rooms across all signal hubs.
+// When multiple hubs simultaneously deliver incoming for the same room,
+// only the first one triggers AcceptICEViaSignal. The entry is released
+// once AcceptICEViaSignal returns, so subsequent sessions for the same
+// pair are never blocked.
+type incomingDedup struct {
+	mu   sync.Mutex
+	seen map[string]struct{} // rooms currently being accepted
+}
+
+func newIncomingDedup() *incomingDedup {
+	return &incomingDedup{seen: make(map[string]struct{})}
+}
+
+// tryMark returns true if room was not already in-flight (caller should proceed).
+func (d *incomingDedup) tryMark(room string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if _, ok := d.seen[room]; ok {
+		return false
+	}
+	d.seen[room] = struct{}{}
+	return true
+}
+
+// release removes a room from the dedup set once AcceptICEViaSignal has
+// finished, allowing new accept attempts for the same peer pair.
+func (d *incomingDedup) release(room string) {
+	d.mu.Lock()
+	delete(d.seen, room)
+	d.mu.Unlock()
+}
+
+// runICEListener manages per-hub /signal subscriptions. It monitors the
+// effective signal URL list; when the list changes all active subscribers
+// are cancelled and a new set is started. The shared incomingDedup prevents
+// duplicate AcceptICEViaSignal calls when multiple hubs deliver the same
+// incoming notification.
+//
+// d.iceRegNotify is broadcast to all active subscriber notify channels so
+// that every hub re-sends reg frames immediately when agent registration changes.
 func (d *Daemon) runICEListener(ctx context.Context) {
-	backoff := 2 * time.Second
+	var (
+		notifyMu  sync.Mutex
+		notifyChs []chan struct{} // one per active subscriber goroutine
+	)
+
+	// broadcast forwards iceRegNotify to all active subscriber goroutines.
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-d.iceRegNotify:
+				notifyMu.Lock()
+				for _, ch := range notifyChs {
+					select {
+					case ch <- struct{}{}:
+					default:
+					}
+				}
+				notifyMu.Unlock()
+			}
+		}
+	}()
+
+	seen := newIncomingDedup()
+
+	var (
+		lastURLs     []string
+		workerCancel context.CancelFunc
+		workerDone   <-chan struct{}
+	)
+
+	stopWorkers := func() {
+		if workerCancel != nil {
+			workerCancel()
+			<-workerDone
+			workerCancel = nil
+			workerDone = nil
+		}
+		notifyMu.Lock()
+		notifyChs = nil
+		notifyMu.Unlock()
+	}
+
 	for ctx.Err() == nil {
-		base := d.h.EffectiveICESignalBase()
-		if base == "" || len(d.reg.List()) == 0 {
+		hasAgents := len(d.reg.List()) > 0
+		urls := d.h.EffectiveICESignalURLs()
+
+		if !hasAgents || len(urls) == 0 {
+			stopWorkers()
+			lastURLs = nil
 			d.sleepICE(ctx, time.Second)
-			backoff = 2 * time.Second
 			continue
 		}
+
+		urlsChanged := !slices.Equal(urls, lastURLs)
+
+		if urlsChanged {
+			stopWorkers()
+			lastURLs = slices.Clone(urls)
+
+			workerCtx, cancel := context.WithCancel(ctx)
+			workerCancel = cancel
+			done := make(chan struct{})
+			workerDone = done
+
+			chs := make([]chan struct{}, len(urls))
+			for i := range chs {
+				chs[i] = make(chan struct{}, 1)
+			}
+			notifyMu.Lock()
+			notifyChs = chs
+			notifyMu.Unlock()
+
+			var wg sync.WaitGroup
+			for i, base := range urls {
+				wg.Add(1)
+				go func(base string, notify <-chan struct{}) {
+					defer wg.Done()
+					d.runSingleICESubscriber(workerCtx, base, seen, notify)
+				}(base, chs[i])
+			}
+			go func() { wg.Wait(); close(done) }()
+		}
+
+		// Poll for URL / agent-list changes once per second.
+		select {
+		case <-ctx.Done():
+			stopWorkers()
+			return
+		case <-time.After(time.Second):
+		}
+	}
+	stopWorkers()
+}
+
+// runSingleICESubscriber maintains a persistent /signal WebSocket to one hub.
+// It reconnects with exponential backoff on any connection failure.
+// Incoming notifications are deduplicated via seen before spawning AcceptICEViaSignal.
+func (d *Daemon) runSingleICESubscriber(ctx context.Context, base string, seen *incomingDedup, notify <-chan struct{}) {
+	backoff := 2 * time.Second
+	for ctx.Err() == nil {
 		subURL, err := signaling.SubscribeURL(base)
 		if err != nil {
-			d.log.Debug("ice listener subscribe url", "err", err)
+			d.log.Debug("ice listener subscribe url", "base", base, "err", err)
 			d.sleepICE(ctx, backoff)
 			backoff = nextICEBackoff(backoff)
 			continue
@@ -42,7 +177,7 @@ func (d *Daemon) runICEListener(ctx context.Context) {
 			Subprotocols: []string{signaling.SubprotocolICE},
 		})
 		if err != nil {
-			d.log.Debug("ice listener dial", "err", err)
+			d.log.Debug("ice listener dial", "base", base, "err", err)
 			d.sleepICE(ctx, backoff)
 			backoff = nextICEBackoff(backoff)
 			continue
@@ -55,7 +190,7 @@ func (d *Daemon) runICEListener(ctx context.Context) {
 		}
 		readErr := make(chan error, 1)
 		go func() {
-			readErr <- d.readICELoop(ctx, conn)
+			readErr <- d.readICELoopFor(ctx, conn, base, seen)
 		}()
 		keepalive := time.NewTicker(iceKeepaliveInterval)
 	outer:
@@ -77,7 +212,7 @@ func (d *Daemon) runICEListener(ctx context.Context) {
 						<-readErr
 						return
 					}
-					d.log.Debug("ice listener keepalive", "err", err)
+					d.log.Debug("ice listener keepalive", "base", base, "err", err)
 					break outer
 				}
 				pctx, pcancel := context.WithTimeout(ctx, 10*time.Second)
@@ -90,10 +225,10 @@ func (d *Daemon) runICEListener(ctx context.Context) {
 						<-readErr
 						return
 					}
-					d.log.Debug("ice listener ping", "err", pingErr)
+					d.log.Debug("ice listener ping", "base", base, "err", pingErr)
 					break outer
 				}
-			case <-d.iceRegNotify:
+			case <-notify:
 				if err := d.sendICERegs(ctx, conn); err != nil {
 					keepalive.Stop()
 					_ = conn.CloseNow()
@@ -106,7 +241,7 @@ func (d *Daemon) runICEListener(ctx context.Context) {
 					return
 				}
 				if err != nil {
-					d.log.Debug("ice listener read", "err", err)
+					d.log.Debug("ice listener read", "base", base, "err", err)
 				}
 				break outer
 			}
@@ -146,7 +281,11 @@ func (d *Daemon) sendICERegs(ctx context.Context, conn *websocket.Conn) error {
 	return nil
 }
 
-func (d *Daemon) readICELoop(ctx context.Context, conn *websocket.Conn) error {
+// readICELoopFor reads incoming frames from a /signal connection and dispatches
+// AcceptICEViaSignal for each new ICE session. base is the hub that sent the
+// incoming frame; the callee must join the same hub's /ice room as the caller.
+// seen deduplicates across hubs so only one goroutine accepts per session.
+func (d *Daemon) readICELoopFor(ctx context.Context, conn *websocket.Conn, base string, seen *incomingDedup) error {
 	for {
 		// No per-read deadline: keepalive sends reg frames every 45 s and Pings
 		// the server to confirm liveness. Dead connections are detected via Ping
@@ -170,11 +309,18 @@ func (d *Daemon) readICELoop(ctx context.Context, conn *websocket.Conn) error {
 		if err != nil {
 			continue
 		}
-		base := d.h.EffectiveICESignalBase()
-		if base == "" {
+		// Compute room locally (same formula as caller) rather than trusting
+		// fr.Room from the hub, which may be absent in non-conformant servers.
+		// Dedup: only the first hub to deliver incoming for this room triggers Accept.
+		room := signaling.RoomID(localAgent.String(), callerAID.String())
+		if !seen.tryMark(room) {
+			d.log.Debug("ice incoming dedup", "base", base, "room", room)
 			continue
 		}
 		go func() {
+			// Release the dedup entry when Accept finishes (success or failure)
+			// so that a subsequent session for the same peer pair is never blocked.
+			defer seen.release(room)
 			actx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 			ac, err := d.h.AcceptICEViaSignal(actx, localAgent, callerAID, base)
 			cancel() // handshake established (or failed); no longer need startup timeout context.

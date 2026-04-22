@@ -11,6 +11,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/pion/stun/v2"
 	"github.com/quic-go/quic-go"
 
 	"github.com/a2al/a2al"
@@ -31,16 +32,42 @@ const noAgentRetryDelay = 3 * time.Second
 // connectViaICESignal is the controlling (caller) ICE path:
 // WebSocket signaling → ICE pair selection → QUIC over ICE → agent-route.
 //
+// Signal hub selection: prefer er.Signals (multi-center list); fall back to
+// er.Signal for backward compatibility with old peers. Hubs are tried in order;
+// the first successful ICE session wins. noAgentRetries are applied per hub.
+//
 // Resource lifecycle: the ICE session (agent, WS) and quic.Transport are tied
 // to the returned quic.Connection via a background goroutine that cleans them
 // up when the connection closes. The caller must NOT close these resources
 // separately.
 func (h *Host) connectViaICESignal(ctx context.Context, localCert tls.Certificate, localAgent, expectRemote a2al.Address, er *protocol.EndpointRecord) (quic.Connection, error) {
-	if er == nil || er.Signal == "" {
+	signalURLs := er.Signals
+	if len(signalURLs) == 0 && er.Signal != "" {
+		signalURLs = []string{er.Signal}
+	}
+	if len(signalURLs) == 0 {
 		return nil, errors.New("a2al/host: no signal url in record")
 	}
+
 	room := signaling.RoomID(localAgent.String(), expectRemote.String())
-	wsURL, err := signaling.AppendRoomToICEURL(er.Signal, room)
+	iceURLs := h.mergeICEURLs(ctx)
+
+	var lastErr error
+	for _, signalBase := range signalURLs {
+		qc, err := h.tryICEViaHub(ctx, localCert, localAgent, expectRemote, signalBase, room, iceURLs)
+		if err == nil {
+			return qc, nil
+		}
+		h.log.Debug("ice signal hub failed, trying next", "base", signalBase, "err", err)
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
+// tryICEViaHub attempts a full ICE → QUIC handshake through one signal hub.
+// noAgentRetries are applied when the hub reports the callee is not registered.
+func (h *Host) tryICEViaHub(ctx context.Context, localCert tls.Certificate, localAgent, expectRemote a2al.Address, signalBase, room string, iceURLs []*stun.URI) (quic.Connection, error) {
+	wsURL, err := signaling.AppendRoomToICEURL(signalBase, room)
 	if err != nil {
 		return nil, fmt.Errorf("a2al/host: ice signal url: %w", err)
 	}
@@ -53,10 +80,9 @@ func (h *Host) connectViaICESignal(ctx context.Context, localCert tls.Certificat
 		return nil, fmt.Errorf("a2al/host: ice signal url: %w", err)
 	}
 
-	urls := h.mergeICEURLs(ctx)
 	var sess *iceSession
 	for attempt := 0; attempt <= noAgentRetries; attempt++ {
-		h.log.Debug("ice dial attempt", "local_aid", localAgent.String(), "remote_aid", expectRemote.String(), "attempt", attempt+1, "max_attempts", noAgentRetries+1)
+		h.log.Debug("ice dial attempt", "local_aid", localAgent.String(), "remote_aid", expectRemote.String(), "hub", signalBase, "attempt", attempt+1, "max_attempts", noAgentRetries+1)
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -64,21 +90,20 @@ func (h *Host) connectViaICESignal(ctx context.Context, localCert tls.Certificat
 			case <-time.After(noAgentRetryDelay):
 			}
 		}
-		sess, err = runICESession(ctx, wsURL, urls, true, false)
+		sess, err = runICESession(ctx, wsURL, iceURLs, true, false)
 		if !errors.Is(err, ErrNoAgent) {
 			break
 		}
-		h.log.Debug("ice dial retry on noagent", "local_aid", localAgent.String(), "remote_aid", expectRemote.String(), "attempt", attempt+1)
+		h.log.Debug("ice dial retry on noagent", "local_aid", localAgent.String(), "remote_aid", expectRemote.String(), "hub", signalBase, "attempt", attempt+1)
 	}
 	if err != nil {
-		h.log.Warn("ice session failed", "local_aid", localAgent.String(), "remote_aid", expectRemote.String(), "err", err)
+		h.log.Warn("ice session failed", "local_aid", localAgent.String(), "remote_aid", expectRemote.String(), "hub", signalBase, "err", err)
 		return nil, err
 	}
 
 	pconn := &icePacketConn{c: sess.iceConn}
 	tr := &quic.Transport{Conn: pconn}
 
-	// From here, cleanup on error via this helper.
 	teardown := func() {
 		_ = tr.Close()
 		sess.CloseSignaling()
@@ -97,23 +122,22 @@ func (h *Host) connectViaICESignal(ctx context.Context, localCert tls.Certificat
 	}
 	qc, err := tr.Dial(ctx, udpRA, cliTLS, defaultQUICConfig())
 	if err != nil {
-		h.log.Warn("quic dial over ice failed", "local_aid", localAgent.String(), "remote_aid", expectRemote.String(), "dst", udpRA, "err", err)
+		h.log.Warn("quic dial over ice failed", "local_aid", localAgent.String(), "remote_aid", expectRemote.String(), "hub", signalBase, "dst", udpRA, "err", err)
 		teardown()
 		return nil, err
 	}
-	h.log.Debug("quic dial over ice ok", "local_aid", localAgent.String(), "remote_aid", expectRemote.String(), "dst", udpRA)
+	h.log.Debug("quic dial over ice ok", "local_aid", localAgent.String(), "remote_aid", expectRemote.String(), "hub", signalBase, "dst", udpRA)
 	if err := h.doDialerControlStream(ctx, qc, expectRemote); err != nil {
-		h.log.Warn("agent-route over ice failed", "local_aid", localAgent.String(), "remote_aid", expectRemote.String(), "err", err)
+		h.log.Warn("agent-route over ice failed", "local_aid", localAgent.String(), "remote_aid", expectRemote.String(), "hub", signalBase, "err", err)
 		_ = qc.CloseWithError(1, "agent-route")
 		teardown()
 		return nil, err
 	}
 
-	// Tie resource lifetime to the QUIC connection: when it closes (idle
-	// timeout, explicit close, error) the Transport and WS are cleaned up.
+	// Tie resource lifetime to the QUIC connection.
 	go func() {
 		<-qc.Context().Done()
-		h.log.Debug("ice quic closed", "local_aid", localAgent.String(), "remote_aid", expectRemote.String(), "close_reason", qc.Context().Err())
+		h.log.Debug("ice quic closed", "local_aid", localAgent.String(), "remote_aid", expectRemote.String(), "hub", signalBase, "close_reason", qc.Context().Err())
 		_ = tr.Close()
 		sess.CloseSignaling()
 	}()
