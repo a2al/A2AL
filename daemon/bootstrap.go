@@ -82,11 +82,12 @@ func bootstrapDHT(ctx context.Context, h *host.Host, cfg *config.Config, dataDir
 		}
 	}
 
-	// Last resort: supplemental bootstrap node addresses — only when all earlier steps failed.
+	// Last resort: infrastructure DNS TXT for well-known DHT peer addresses (auxiliary
+	// read/store and this bootstrap attempt) — only when all earlier steps failed.
 	if !ok {
 		if beaconAddrs := bm.refreshAddrs(); len(beaconAddrs) > 0 {
-			log.Info("connecting to network", "source", "beacon")
-			if tryBootstrap(ctx, h, beaconAddrs, log, "beacon") {
+			log.Info("connecting to network", "source", "aux_dht_bootstrap")
+			if tryBootstrap(ctx, h, beaconAddrs, log, "aux_dht_bootstrap") {
 				ok = true
 			}
 		}

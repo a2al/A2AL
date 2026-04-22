@@ -653,8 +653,9 @@ func (h *Host) SetSignalStatsProvider(f func() map[string]any) {
 	h.signalStatsMu.Unlock()
 }
 
-// SetBeaconStatsProvider registers a provider for supplemental node fields in GET /debug/stats.
-// Fields are omitted when fn returns nil or empty map.
+// SetBeaconStatsProvider registers fn to supply optional extra key-value fields merged into
+// GET /debug/stats (e.g. metrics for the high-capacity auxiliary DHT path). Omitted when fn
+// is nil; fields omitted when the callback returns nil or an empty map.
 func (h *Host) SetBeaconStatsProvider(fn func() map[string]any) {
 	h.beaconStatsMu.Lock()
 	h.beaconStats = fn

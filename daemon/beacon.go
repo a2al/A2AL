@@ -26,14 +26,15 @@ const (
 	beaconMaxStoreKeys = 5_000_000
 
 	// beaconMultiServiceSizeThreshold is the estimated network size above which
-	// multi-service discover queries skip the beacon fallback. Below this the
-	// DHT may not have enough density to cover all keys; above it the
-	// intersection can be computed reliably from DHT results alone.
+	// multi-service discover queries skip the optional DNS-announced infrastructure
+	// read path. Below this the DHT may not have enough density to cover all keys; above
+	// it the intersection can be computed reliably from DHT results alone.
 	beaconMultiServiceSizeThreshold = 500
 )
 
-// beaconManager handles supplemental store writes and last-resort read fallback
-// via a set of infrastructure addresses resolved from DNS.
+// beaconManager handles supplemental DHT store fan-out and last-resort read fallback
+// against a dedicated DNS TXT name (well-known multi-address list, same origin as
+// cold-start bootstrap when no other path succeeds).
 type beaconManager struct {
 	mu        sync.RWMutex
 	addrs     []net.Addr
@@ -60,7 +61,7 @@ func (b *beaconManager) start(ctx context.Context, agentKeysFn func() []a2al.Nod
 		b.active.Store(true)
 		b.node.SetMaxStoreKeys(beaconMaxStoreKeys)
 		b.node.SetPassiveRouting(true)
-		b.log.Info("beacon: operator-configured beacon mode active")
+		b.log.Info("aux-dht: operator-configured high-capacity passive local store active")
 	}
 	go func() {
 		addrs := b.refreshAddrs()
@@ -75,7 +76,8 @@ func (b *beaconManager) start(ctx context.Context, agentKeysFn func() []a2al.Nod
 }
 
 // trySelfIdentify checks whether this node's public IP appears in addrs.
-// If so, activates beacon mode and expands store capacity.
+// If so, enables the high-capacity local store path (same behavior as the operator
+// high-capacity role in config).
 func (b *beaconManager) trySelfIdentify(addrs []net.Addr) {
 	selfIP := b.node.SelfExtIP()
 	if selfIP == nil {
@@ -90,14 +92,14 @@ func (b *beaconManager) trySelfIdentify(addrs []net.Addr) {
 			b.active.Store(true)
 			b.node.SetMaxStoreKeys(beaconMaxStoreKeys)
 			b.node.SetPassiveRouting(true)
-			b.log.Info("beacon: self-identified via DNS, expanding store capacity")
+			b.log.Info("aux-dht: public IP in well-known DNS TXT, expanded local store")
 			return
 		}
 	}
 }
 
 // RefreshAndStore re-resolves DNS (if stale) then fires StoreAll. Called each
-// republish tick so beaconAddrs stay current without a dedicated timer.
+// republish tick so the cached well-known address list stays current without an extra timer.
 func (b *beaconManager) RefreshAndStore(ctx context.Context, keys []a2al.NodeID) {
 	addrs := b.refreshAddrs()
 	if len(addrs) == 0 {
@@ -106,19 +108,19 @@ func (b *beaconManager) RefreshAndStore(ctx context.Context, keys []a2al.NodeID)
 	b.StoreAll(ctx, keys)
 }
 
-// Addrs returns the current resolved beacon addresses.
+// Addrs returns the current well-known peer addresses from the last DNS resolution.
 func (b *beaconManager) Addrs() []net.Addr {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	return b.addrs
 }
 
-// shuffledAddrs returns beacon addresses sorted by ascending RTT (fastest
-// first), excluding this node's own address. Addresses for which no RTT has
-// been measured yet (never contacted) are appended after the known-RTT set.
+// shuffledAddrs returns the well-known address set sorted by ascending RTT
+// (fastest first), excluding this node's own address. Addresses for which no
+// RTT has been measured yet (never contacted) are appended after the known-RTT set.
 // This gives a deterministic, performance-based preference without introducing
-// random state, and naturally provides load spreading when the fastest beacon
-// is consistently responsive.
+// extra random state, and naturally spreads load when the top-ranked address is
+// consistently responsive.
 func (b *beaconManager) shuffledAddrs() []net.Addr {
 	selfIP := b.node.SelfExtIP()
 	b.mu.RLock()
@@ -144,15 +146,14 @@ func (b *beaconManager) shuffledAddrs() []net.Addr {
 	return append(known, unknown...)
 }
 
-// StoreAll fires fire-and-forget STORE to every beacon address for each key,
-// skipping any address that belongs to this node itself.
-// When this node is itself a beacon it skips entirely: all publishers send
-// StoreAt to every beacon directly, so beacon-to-beacon synchronisation is
-// redundant and only adds unnecessary traffic.
+// StoreAll issues fire-and-forget STORE to every listed well-known address for each key,
+// skipping any address that belongs to this node.
+// When this process runs the high-capacity local-store role, it no-ops: every
+// other node already issues StoreAt to the full set, so extra copies would only add traffic.
 func (b *beaconManager) StoreAll(ctx context.Context, keys []a2al.NodeID) {
 	if b.active.Load() {
-		// Self is a beacon node: other beacons already receive StoreAt from
-		// every publisher. There is nothing useful to push.
+		// This instance participates in the high-capacity store role: peers
+		// already replicate here via StoreAt; nothing useful to push.
 		return
 	}
 	addrs := b.shuffledAddrs()
@@ -174,7 +175,7 @@ func (b *beaconManager) StoreAll(ctx context.Context, keys []a2al.NodeID) {
 					sctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 					defer cancel()
 					if _, err := b.node.StoreAt(sctx, a, k, r); err != nil {
-						b.log.Debug("beacon store", "addr", a, "err", err)
+						b.log.Debug("aux-dht store", "addr", a, "err", err)
 					}
 				}()
 				b.storeSent.Add(1)
@@ -183,10 +184,10 @@ func (b *beaconManager) StoreAll(ctx context.Context, keys []a2al.NodeID) {
 	}
 }
 
-// FindRecords tries beacon addresses in random order and returns results from
-// the first address that responds without error. Because all beacon nodes
-// receive the same STORE pushes they hold equivalent records; querying one is
-// sufficient and the random order provides load balancing.
+// FindRecords walks the well-known address set in RTT order (shuffledAddrs) and
+// returns results from the first peer that responds without error. Peers in
+// this set receive the same replication traffic, so a single successful read
+// suffices; ordering spreads load.
 func (b *beaconManager) FindRecords(ctx context.Context, key a2al.NodeID, recType uint8) ([]protocol.SignedRecord, error) {
 	addrs := b.shuffledAddrs()
 	if len(addrs) == 0 {
@@ -196,8 +197,8 @@ func (b *beaconManager) FindRecords(ctx context.Context, key a2al.NodeID, recTyp
 	for _, addr := range addrs {
 		recs, _, err := b.node.FindValueWithNodes(ctx, addr, key, recType)
 		if err != nil {
-			b.log.Debug("beacon find", "addr", addr, "err", err)
-			continue // beacon unreachable, try next
+			b.log.Debug("aux-dht find", "addr", addr, "err", err)
+			continue // listed peer unreachable, try next
 		}
 		seen := map[string]struct{}{}
 		var out []protocol.SignedRecord
@@ -221,8 +222,8 @@ func (b *beaconManager) FindRecords(ctx context.Context, key a2al.NodeID, recTyp
 }
 
 // Stats returns a map for merging into /debug/stats. Returns nil when this
-// node is not operating in beacon mode, producing no output in the JSON
-// response and keeping the beacon mechanism transparent to regular nodes.
+// process is not on the high-capacity auxiliary path, so regular nodes see no
+// extra keys in the response.
 func (b *beaconManager) Stats() map[string]any {
 	if !b.active.Load() {
 		return nil
@@ -276,7 +277,7 @@ func (b *beaconManager) refreshAddrs() []net.Addr {
 	if err != nil {
 		var dnsErr *net.DNSError
 		if errors.As(err, &dnsErr) && dnsErr.IsNotFound {
-			// NXDOMAIN: record actively removed — disable beacon.
+			// NXDOMAIN: record actively removed — clear cached well-known addresses.
 			b.mu.Lock()
 			b.addrs = nil
 			b.lastDNSAt = time.Now()
@@ -332,7 +333,8 @@ func min(a, b int) int {
 	return b
 }
 
-// resolveFromBeacon attempts to resolve an endpoint record via beacon nodes.
+// resolveFromBeacon resolves an endpoint record through the optional DNS-announced
+// read path, using the well-known address set and the same lookup as FindRecords.
 func (d *Daemon) resolveFromBeacon(ctx context.Context, aid a2al.Address) (*protocol.EndpointRecord, error) {
 	key := a2al.NodeIDFromAddress(aid)
 	recs, err := d.beacon.FindRecords(ctx, key, protocol.RecTypeEndpoint)
@@ -355,15 +357,14 @@ func (d *Daemon) resolveFromBeacon(ctx context.Context, aid a2al.Address) (*prot
 	return nil, dht.ErrNoEndpoint
 }
 
-// discoverFromBeacon queries a single randomly-chosen reachable beacon for all
-// requested services and returns the AID intersection. Because every beacon
-// receives STORE pushes from all nodes it holds equivalent records; using one
-// beacon avoids redundant parallel queries while the random selection provides
-// load balancing across multiple beacon addresses.
+// discoverFromBeacon issues multi-service find traffic against the first
+// responsive well-known address in RTT order (shuffledAddrs) and returns the
+// AID intersection. The listed peers are targets of the same store fan-out, so
+// one responder is enough; the ordering still spreads work across the set.
 //
 // When the estimated network size exceeds beaconMultiServiceSizeThreshold and
 // len(services) > 1, the DHT is dense enough to serve the intersection reliably,
-// so beacon is skipped to avoid inflating results from an auxiliary source.
+// so the infrastructure read path is skipped to avoid biasing the result mix.
 func (d *Daemon) discoverFromBeacon(ctx context.Context, services []string) []protocol.TopicEntry {
 	if len(services) == 0 {
 		return nil
@@ -375,7 +376,7 @@ func (d *Daemon) discoverFromBeacon(ctx context.Context, services []string) []pr
 		}
 	}
 
-	// Try beacons in random order; use the first one that responds.
+	// Well-known set in RTT order; use the first that returns a usable result.
 	for _, addr := range d.beacon.shuffledAddrs() {
 		entries := beaconQueryServicesAt(ctx, d.beacon, addr, services)
 		if entries != nil {
@@ -387,9 +388,8 @@ func (d *Daemon) discoverFromBeacon(ctx context.Context, services []string) []pr
 }
 
 // beaconQueryServicesAt queries addr for each service in sequence and returns
-// the AID intersection. Returns nil if the beacon is unreachable on any query.
-// Returns an empty (non-nil) slice when the beacon is reachable but no results
-// match.
+// the AID intersection. Returns nil if addr is unreachable on a query. Returns
+// an empty (non-nil) slice when the peer is reachable but no AIDs match.
 func beaconQueryServicesAt(ctx context.Context, b *beaconManager, addr net.Addr, services []string) []protocol.TopicEntry {
 	now := time.Now()
 
@@ -427,7 +427,7 @@ func beaconQueryServicesAt(ctx context.Context, b *beaconManager, addr net.Addr,
 	for _, svc := range services[1:] {
 		recs, _, err = b.node.FindValueWithNodes(ctx, addr, protocol.TopicNodeID(svc), protocol.RecTypeTopic)
 		if err != nil {
-			return nil // beacon went away mid-query; let caller try next
+			return nil // well-known address dropped mid-query; let caller try next
 		}
 		present := filterEntries(recs, svc)
 		for aid := range candidates {
@@ -436,7 +436,7 @@ func beaconQueryServicesAt(ctx context.Context, b *beaconManager, addr net.Addr,
 			}
 		}
 		if len(candidates) == 0 {
-			return []protocol.TopicEntry{} // definitive empty from this beacon
+			return []protocol.TopicEntry{} // empty intersection for this address
 		}
 	}
 
