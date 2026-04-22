@@ -109,7 +109,8 @@ func sortedByDistance(c map[string]protocol.NodeInfo, target a2al.NodeID) []prot
 type slotRes struct {
 	nodes []protocol.NodeInfo
 	recs  []protocol.SignedRecord
-	track int // trackGood | trackUnknown | trackBad
+	track int         // trackGood | trackUnknown | trackBad
+	from  a2al.NodeID // NodeID of the peer that returned nodes (zero if unknown)
 }
 
 // reachCandItem is a candidate with pre-computed XOR distance (good or unknown track).
@@ -273,7 +274,7 @@ func (q *Query) runIterQuery(
 	// Use tabNearest so Bad peers are also seeded into the bad track;
 	// tabNearestHealthy truncates at K and can silently drop all Bad peers.
 	for _, ni := range n.tabNearest(target, routing.K) {
-		n.absorbNodeInfo(ni)
+		n.absorbNodeInfo(ni, a2al.NodeID{}) // local table: no specific source
 		addCand(ni)
 	}
 
@@ -314,14 +315,14 @@ func (q *Query) runIterQuery(
 				resultCh <- slotRes{track: track}
 				return
 			}
-			resultCh <- slotRes{recs: recs, nodes: nodes, track: track}
+			resultCh <- slotRes{recs: recs, nodes: nodes, track: track, from: id}
 		} else {
 			nodes, rpcErr := n.FindNode(pctx, addr, target)
 			if rpcErr != nil {
 				resultCh <- slotRes{track: track}
 				return
 			}
-			resultCh <- slotRes{nodes: nodes, track: track}
+			resultCh <- slotRes{nodes: nodes, track: track, from: id}
 		}
 	}
 
@@ -368,7 +369,7 @@ func (q *Query) runIterQuery(
 
 	processResult := func(r slotRes) {
 		for _, ni := range r.nodes {
-			n.absorbNodeInfo(ni)
+			n.absorbNodeInfo(ni, r.from) // r.from = NodeID of peer that returned ni
 			if k := infoKey(ni); k != "" {
 				allSeen[k] = cloneNI(ni)
 			}
@@ -459,7 +460,7 @@ mainLoop:
 				case r := <-resultCh:
 					drained++
 					for _, ni := range r.nodes {
-						n.absorbNodeInfo(ni)
+						n.absorbNodeInfo(ni, r.from)
 					}
 					if findValue {
 						for _, rec := range r.recs {

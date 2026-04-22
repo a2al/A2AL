@@ -5,7 +5,9 @@ package dht
 
 import (
 	"context"
+	crand "crypto/rand"
 	"net"
+	"sort"
 	"sync"
 	"time"
 
@@ -454,7 +456,7 @@ func (n *Node) storeAndRecord(ctx context.Context, peers []protocol.NodeInfo, rk
 			}
 			tabNI.Port = uint16(ua.Port)
 		}
-		n.tabAdd(tabNI, true)
+		n.tabAdd(tabNI, routing.EntryMeta{VerifiedAt: time.Now()})
 	}
 }
 
@@ -534,6 +536,179 @@ func (n *Node) runHealthProbes(ctx context.Context) {
 			n.probeRepNode(ctx, rk, rs, e)
 		}
 	}
+
+	// Run routing table maintenance in the same heartbeat (no extra goroutine).
+	n.runRoutingMaintenance(ctx)
+}
+
+// Per-cycle resource limits for the routing maintenance loop.
+// The loop fires every probeTickInterval (15 s); these caps bound the total
+// PING time per cycle to roughly:
+//   max = (maintPendingPerCycle + maintStalePerCycle) × 3 s = 45 s
+// In practice most PINGs complete in < 100 ms (LAN/good-WAN), so a typical
+// cycle finishes well within the 15 s tick.  Nodes not probed this cycle
+// remain in pending/main and will be re-evaluated next cycle.
+const (
+	maintPendingPerCycle = 5  // max pending-list PINGs per heartbeat
+	maintStalePerCycle   = 10 // max stale-unverified main-bucket PINGs per heartbeat
+	maintRefillPerCycle  = 2  // max FindNode refill queries launched per heartbeat
+)
+
+// runRoutingMaintenance performs one pass of routing table upkeep:
+//  1. PINGs a capped batch of pending-list nodes; promotes successful ones.
+//  2. PINGs a capped batch of stale unverified main-bucket nodes; removes failures.
+//  3. Launches at most maintRefillPerCycle background FindNode queries for
+//     under-filled buckets, prioritising higher-CPL (closer-to-self) buckets.
+//
+// Called by runHealthProbes every probeTickInterval (15 s).
+// All three steps are strictly rate-limited to prevent blocking repSet probing
+// and to avoid sending a FindNode storm during startup or after large network churn.
+func (n *Node) runRoutingMaintenance(ctx context.Context) {
+	now := time.Now()
+	freshCutoff := now.Add(-verifiedFreshWindow)
+	staleCutoff := now.Add(-verifiedFreshWindow) // same threshold: 30 min unverified → probe
+
+	n.tabMu.Lock()
+	work := n.table.CollectMaintenanceWork(now, freshCutoff, staleCutoff)
+	n.tabMu.Unlock()
+
+	// 1. PING pending entries — at most maintPendingPerCycle per heartbeat.
+	// Remainder stays in the pending list and is retried next cycle.
+	pending := work.PendingToProbe
+	if len(pending) > maintPendingPerCycle {
+		pending = pending[:maintPendingPerCycle]
+	}
+	for _, ni := range pending {
+		if ctx.Err() != nil {
+			return
+		}
+		var id a2al.NodeID
+		if len(ni.NodeID) != len(id) {
+			continue
+		}
+		copy(id[:], ni.NodeID)
+		addr, ok := n.lookupPeer(id)
+		if !ok {
+			// No dial address yet: try to use the IP:Port from NodeInfo.
+			if len(ni.IP) > 0 && ni.Port != 0 {
+				addr = &net.UDPAddr{IP: append([]byte(nil), ni.IP...), Port: int(ni.Port)}
+				n.BindPeerAddr(id, addr)
+			} else {
+				n.tabMu.Lock()
+				n.table.MarkPendingFailed(id)
+				n.tabMu.Unlock()
+				continue
+			}
+		}
+		pctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		_, err := n.PingIdentity(pctx, addr)
+		cancel()
+		if err == nil {
+			// PingIdentity → recordSuccess → UpdateVerifiedAt already ran.
+			// Now move the entry from pending to the main bucket.
+			n.tabMu.Lock()
+			n.table.MarkPendingVerified(id, routing.EntryMeta{VerifiedAt: time.Now()}, time.Now())
+			n.tabMu.Unlock()
+		} else {
+			// Probe failure: undo the failCount++ that PingIdentity's recordFailure
+			// applied.  Pending nodes have no prior communication history; their
+			// failure must not push them into PeerHealthBad.
+			n.recordProbeFailure(id)
+			n.tabMu.Lock()
+			n.table.MarkPendingFailed(id)
+			n.tabMu.Unlock()
+		}
+	}
+
+	// 2. PING stale unverified main-bucket entries — at most maintStalePerCycle.
+	stale := work.StaleToProbe
+	if len(stale) > maintStalePerCycle {
+		stale = stale[:maintStalePerCycle]
+	}
+	for _, ni := range stale {
+		if ctx.Err() != nil {
+			return
+		}
+		var id a2al.NodeID
+		if len(ni.NodeID) != len(id) {
+			continue
+		}
+		copy(id[:], ni.NodeID)
+		addr, ok := n.lookupPeer(id)
+		if !ok {
+			if len(ni.IP) > 0 && ni.Port != 0 {
+				addr = &net.UDPAddr{IP: append([]byte(nil), ni.IP...), Port: int(ni.Port)}
+				n.BindPeerAddr(id, addr)
+			} else {
+				// No address available: treat as failed, remove from main bucket.
+				n.tabMu.Lock()
+				n.table.Remove(id)
+				n.tabMu.Unlock()
+				continue
+			}
+		}
+		pctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		_, err := n.PingIdentity(pctx, addr)
+		cancel()
+		if err != nil {
+			// Probe failure: undo failCount increment (same reasoning as pending).
+			n.recordProbeFailure(id)
+			n.tabMu.Lock()
+			n.table.Remove(id)
+			n.tabMu.Unlock()
+		}
+		// Success: PingIdentity → recordSuccess → UpdateVerifiedAt handled it.
+	}
+
+	// 3. Refill under-filled buckets — at most maintRefillPerCycle FindNode queries.
+	// Sort descending by bucket index so higher-CPL (closer-to-self, routing-critical)
+	// buckets are served first when the cap binds.
+	refill := work.BucketsToRefill
+	if len(refill) > 1 {
+		sort.Sort(sort.Reverse(sort.IntSlice(refill)))
+	}
+	if len(refill) > maintRefillPerCycle {
+		refill = refill[:maintRefillPerCycle]
+	}
+	for _, bi := range refill {
+		if ctx.Err() != nil {
+			return
+		}
+		target := randomIDInBucket(n.nid, bi)
+		go func(t a2al.NodeID) {
+			qctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+			defer cancel()
+			q := NewQuery(n)
+			_, _ = q.FindNode(qctx, t)
+		}(target)
+	}
+}
+
+// randomIDInBucket generates a random NodeID whose BucketIndex relative to self
+// equals bi.  The first bi bits match self; bit bi is flipped; remaining bits
+// are random.
+func randomIDInBucket(self a2al.NodeID, bi int) a2al.NodeID {
+	var id a2al.NodeID
+	copy(id[:], self[:])
+
+	// Flip bit bi (most-significant bit = 0).
+	byteIdx := bi / 8
+	bitIdx := uint(7 - (bi % 8))
+	id[byteIdx] ^= 1 << bitIdx
+
+	// Randomise all bits after position bi.
+	startByte := byteIdx + 1
+	if _, err := crand.Read(id[startByte:]); err == nil {
+		// Also randomise the low bits of byteIdx (after bit bi).
+		mask := byte((1 << bitIdx) - 1)
+		if mask > 0 {
+			var b [1]byte
+			if _, err := crand.Read(b[:]); err == nil {
+				id[byteIdx] = (id[byteIdx] &^ mask) | (b[0] & mask)
+			}
+		}
+	}
+	return id
 }
 
 // probeRepNode probes one replica node with PING, updating its probe schedule.

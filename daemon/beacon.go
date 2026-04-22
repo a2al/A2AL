@@ -357,8 +357,11 @@ func (d *Daemon) discoverFromBeacon(ctx context.Context, services []string) []pr
 	if len(services) == 0 {
 		return nil
 	}
-	if len(services) > 1 && d.beacon.node.EstimatedNetworkSize() >= beaconMultiServiceSizeThreshold {
-		return nil
+	if len(services) > 1 {
+		est, conf := d.beacon.node.EstimatedNetworkSizeFiltered(time.Now().Add(-30 * time.Minute))
+		if est >= beaconMultiServiceSizeThreshold && conf >= 0.6 {
+			return nil
+		}
 	}
 
 	// Try beacons in random order; use the first one that responds.

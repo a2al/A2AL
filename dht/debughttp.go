@@ -31,30 +31,35 @@ type debugRoutingJSON struct {
 
 // DebugStats is the DHT portion of GET /debug/stats (spec §3.6, §7).
 type DebugStats struct {
-	RxPackets            uint64 `json:"rx_packets_verified"`
-	TxPackets            uint64 `json:"tx_packets"`
-	RPCOK                uint64 `json:"rpc_completed"`
-	TotalPeers           int    `json:"total_peers"`
-	Reach1h              int    `json:"reach_1h"`
-	Reach24h             int    `json:"reach_24h"`
-	Reach7d               int    `json:"reach_7d"`
-	EstimatedNetworkSize  int    `json:"estimated_network_size"`
-	UniqueNodesSinceStart uint64 `json:"unique_nodes_since_start"`
+	RxPackets             uint64  `json:"rx_packets_verified"`
+	TxPackets             uint64  `json:"tx_packets"`
+	RPCOK                 uint64  `json:"rpc_completed"`
+	TotalPeers            int     `json:"total_peers"`
+	Reach1h               int     `json:"reach_1h"`
+	Reach24h              int     `json:"reach_24h"`
+	Reach7d               int     `json:"reach_7d"`
+	EstimatedNetworkSize  int     `json:"estimated_network_size"`
+	EstimateConfidence    float64 `json:"estimate_confidence,omitempty"`
+	VerifiedPeers1h       int     `json:"verified_peers_1h,omitempty"`
+	UniqueNodesSinceStart uint64  `json:"unique_nodes_since_start"`
 }
 
 // DebugStatsData returns a snapshot for embedding in host-level /debug/stats.
 func (n *Node) DebugStatsData() DebugStats {
 	peers := n.tabDebugPeers()
 	r1h, r24h, r7d := n.reachCounts()
+	est, conf := n.EstimatedNetworkSizeFiltered(time.Now().Add(-30 * time.Minute))
 	return DebugStats{
-		RxPackets:              n.statsRx.Load(),
-		TxPackets:              n.statsTx.Load(),
-		RPCOK:                  n.statsRPC.Load(),
-		TotalPeers:             len(peers),
-		Reach1h:                r1h,
-		Reach24h:               r24h,
-		Reach7d:                r7d,
-		EstimatedNetworkSize:   n.tabEstimatedNetworkSize(),
+		RxPackets:             n.statsRx.Load(),
+		TxPackets:             n.statsTx.Load(),
+		RPCOK:                 n.statsRPC.Load(),
+		TotalPeers:            len(peers),
+		Reach1h:               r1h,
+		Reach24h:              r24h,
+		Reach7d:               r7d,
+		EstimatedNetworkSize:  est,
+		EstimateConfidence:    conf,
+		VerifiedPeers1h:       r1h, // seenPeers now counts only verified contacts (P0 fix)
 		UniqueNodesSinceStart: n.seenUniqueSinceBoot.Load(),
 	}
 }
