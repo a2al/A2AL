@@ -309,6 +309,11 @@ func (d *Daemon) runPeriodicRepublish(ctx context.Context) {
 	for _, e := range agents {
 		d.tryRepublishAgent(agCtx, e)
 	}
+
+	// Refresh supplemental bootstrap addresses and push locally-published records.
+	if d.beacon != nil {
+		d.beacon.RefreshAndStore(ctx, d.allAgentKeys())
+	}
 }
 
 func (d *Daemon) initialAutoPublish(ctx context.Context) {

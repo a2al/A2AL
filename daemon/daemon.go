@@ -94,10 +94,23 @@ type Daemon struct {
 	rebootstrapMu          sync.Mutex
 	lastRebootstrapAt      time.Time
 	testMaybeRebootstrapFn func(context.Context) // if set, maybeRebootstrap calls this instead
+
+	beacon *beaconManager
 }
 
 // APIAddr returns the REST API / Web UI listen address from the loaded config.
 func (d *Daemon) APIAddr() string { return d.cfg.APIAddr }
+
+// allAgentKeys returns DHT keys for the node identity and all registered agents.
+func (d *Daemon) allAgentKeys() []a2al.NodeID {
+	keys := []a2al.NodeID{a2al.NodeIDFromAddress(d.nodeAddr)}
+	d.regMu.RLock()
+	for _, e := range d.reg.List() {
+		keys = append(keys, a2al.NodeIDFromAddress(e.AID))
+	}
+	d.regMu.RUnlock()
+	return keys
+}
 
 // New loads config, generates or loads the node key, and initialises the host.
 // Call Run to start serving.
@@ -193,6 +206,7 @@ func New(cfg Config) (*Daemon, error) {
 		mailboxSeen:      make(map[string]map[string]time.Time),
 		iceRegNotify:     make(chan struct{}, 1),
 		netChangeNotify:  make(chan struct{}, 1),
+		beacon:           newBeaconManager(h.Node(), &nodeCfg, log),
 	}, nil
 }
 
@@ -263,11 +277,13 @@ func (d *Daemon) Run(ctx context.Context, mcpStdio bool) error {
 	// (resolve, discover, publish) will return errors or empty results until
 	// bootstrap completes, which is correct behaviour.
 	go func() {
-		if derived := runBootstrapChain(netCtx, d.h, d.cfg, d.dataDir, d.log); derived != "" {
+		if derived := runBootstrapChain(netCtx, d.h, d.cfg, d.dataDir, d.log, d.beacon); derived != "" {
 			d.h.SetDerivedICESignalURL(derived)
 		}
 		d.h.RunNATProbe(netCtx) // active NAT classification after bootstrap
 		d.initialAutoPublish(netCtx)
+		d.beacon.start(netCtx, func() []a2al.NodeID { return d.allAgentKeys() })
+		d.h.SetBeaconStatsProvider(d.beacon.Stats)
 		go d.runICEListener(netCtx)
 		d.autoPublishMainLoop(netCtx)
 	}()

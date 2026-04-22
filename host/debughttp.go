@@ -71,6 +71,14 @@ func (h *Host) serveDebugStatsMerged(w http.ResponseWriter, r *http.Request) {
 			out["signal"] = sig
 		}
 	}
+	h.beaconStatsMu.RLock()
+	bfn := h.beaconStats
+	h.beaconStatsMu.RUnlock()
+	if bfn != nil {
+		for k, v := range bfn() {
+			out[k] = v
+		}
+	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")

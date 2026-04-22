@@ -139,6 +139,12 @@ type Node struct {
 	repSets       map[repKey]*repSet    // (storeKey, publisher) → replication tracking
 	replCh        chan replTask         // 过程一 → 过程二: replication work items
 	renewInFlight map[repKey]struct{}   // keys with a renewBackground goroutine running
+
+	// passiveRouting suppresses proactive FindNode queries when true.
+	// Set via SetPassiveRouting; used by passive-mode nodes that fill their
+	// routing table naturally through incoming traffic and do not need to
+	// search for peers themselves.
+	passiveRouting atomic.Bool
 }
 
 type waitEntry struct {
@@ -295,29 +301,50 @@ func (n *Node) remember(from net.Addr, dec *protocol.DecodedMessage) {
 	n.peers[nodeIDKey(id)] = from
 	n.peerMu.Unlock()
 	n.addrToID.Store(from.String(), id)
-	n.tabAdd(nodeInfoFromMessage(dec, from), true)
+	// Inbound message = direct-contact evidence; set VerifiedAt now.
+	n.tabAdd(nodeInfoFromMessage(dec, from), routing.EntryMeta{VerifiedAt: time.Now()})
 }
 
-// tabAdd inserts or refreshes ni in the routing table.  trusted must be true
-// when ni originates from direct communication with the peer (observed UDP
-// source address), so the stored IP:Port can be updated to the latest value.
-// Pass false for NodeInfos received indirectly via FindNode responses.
-func (n *Node) tabAdd(ni protocol.NodeInfo, trusted bool) {
+// tabAdd inserts or refreshes ni in the routing table.
+//
+// For direct-contact entries (meta.VerifiedAt != zero), the full LRU-eviction
+// path is used: if the bucket is full, the LRU node is PINGed; if it does not
+// respond, it is evicted and ni takes its slot.
+//
+// For hearsay entries (meta.VerifiedAt.IsZero()), the routing layer places ni
+// into the main bucket if there is space, or into the per-bucket pending list
+// if the bucket is full.  Hearsay nodes never trigger LRU eviction.
+func (n *Node) tabAdd(ni protocol.NodeInfo, meta routing.EntryMeta) {
 	var nid a2al.NodeID
 	if len(ni.NodeID) != len(nid) {
 		return
 	}
 	copy(nid[:], ni.NodeID)
-	n.recordPeerSeen(nid)
 
+	// P0: only record verified (direct) contact in seenPeers statistics.
+	if !meta.VerifiedAt.IsZero() {
+		n.recordPeerSeen(nid)
+	}
+
+	now := time.Now()
+
+	if meta.VerifiedAt.IsZero() {
+		// Hearsay path: delegate entirely to the routing layer (main or pending).
+		n.tabMu.Lock()
+		n.table.Add(ni, meta, now)
+		n.tabMu.Unlock()
+		return
+	}
+
+	// Direct-contact path: existing manual LRU-eviction logic.
 	n.tabMu.Lock()
 	if n.table.Contains(nid) {
-		n.table.Add(ni, trusted)
+		n.table.Add(ni, meta, now) // touch + update IP:Port + update VerifiedAt
 		n.tabMu.Unlock()
 		return
 	}
 	if n.table.PeerBucketLen(nid) < routing.K {
-		n.table.Add(ni, trusted)
+		n.table.Add(ni, meta, now)
 		n.tabMu.Unlock()
 		return
 	}
@@ -336,7 +363,7 @@ func (n *Node) tabAdd(ni protocol.NodeInfo, trusted bool) {
 	}
 	n.tabMu.Lock()
 	n.table.Remove(oldID)
-	n.table.Add(ni, trusted)
+	n.table.Add(ni, meta, now)
 	n.tabMu.Unlock()
 }
 
@@ -344,6 +371,72 @@ func (n *Node) tabNearest(target a2al.NodeID, k int) []protocol.NodeInfo {
 	n.tabMu.RLock()
 	defer n.tabMu.RUnlock()
 	return n.table.NearestN(target, k)
+}
+
+// verifiedFreshWindow is the age threshold for Verified-Fresh classification.
+// Aligns with endpointRecordTTL/2 (3600s / 2 = 1800s = 30 min).
+const verifiedFreshWindow = 30 * time.Minute
+
+// tabNearestVerified returns up to k verified nodes closest to target, ordered
+// Verified-Fresh first.  Used for FIND_NODE and FIND_VALUE responses to ensure
+// only directly-verified nodes are propagated (one-hop communication principle).
+//
+// Starvation protection: if the verified pool is smaller than k/2, the result
+// is padded with entries from tabNearestHealthy (which includes unverified nodes)
+// to avoid returning an empty response during cold-start or sparse-network periods.
+func (n *Node) tabNearestVerified(target a2al.NodeID, k int) []protocol.NodeInfo {
+	cutoff := time.Now().Add(-verifiedFreshWindow)
+	n.tabMu.RLock()
+	all := n.table.NearestNVerified(target, routing.K*4, cutoff)
+	n.tabMu.RUnlock()
+
+	// Apply dht-layer PeerHealth filter: exclude Bad nodes.
+	var result []protocol.NodeInfo
+	for _, ni := range all {
+		var id a2al.NodeID
+		copy(id[:], ni.NodeID)
+		if n.PeerHealthOf(id) == PeerHealthBad {
+			continue
+		}
+		result = append(result, ni)
+	}
+	if len(result) > k {
+		result = result[:k]
+	}
+
+	// Starvation fallback: pad with healthy nodes if verified pool is small.
+	if len(result) < k/2 {
+		extra := n.tabNearestHealthy(target, k)
+		seen := make(map[string]struct{}, len(result))
+		for _, ni := range result {
+			seen[string(ni.NodeID)] = struct{}{}
+		}
+		for _, ni := range extra {
+			if _, ok := seen[string(ni.NodeID)]; !ok {
+				result = append(result, ni)
+				if len(result) >= k {
+					break
+				}
+			}
+		}
+	}
+	return result
+}
+
+// PeerRTT returns the last measured round-trip time for addr, or 0 if the
+// address is not yet known or has never completed a successful exchange.
+func (n *Node) PeerRTT(addr net.Addr) time.Duration {
+	id, ok := n.lookupPeerID(addr)
+	if !ok {
+		return 0
+	}
+	n.healthMu.RLock()
+	e := n.health[nodeIDKey(id)]
+	n.healthMu.RUnlock()
+	if e == nil {
+		return 0
+	}
+	return e.rtt
 }
 
 // lookupPeerID returns the NodeID associated with addr, if known.
@@ -356,16 +449,17 @@ func (n *Node) lookupPeerID(addr net.Addr) (a2al.NodeID, bool) {
 }
 
 // recordSuccess marks the peer as healthy: resets failCount, clears backoff,
-// and updates RTT.
+// updates RTT, and refreshes the routing table VerifiedAt timestamp.
 func (n *Node) recordSuccess(id a2al.NodeID, rtt time.Duration) {
 	key := nodeIDKey(id)
+	now := time.Now()
 	n.healthMu.Lock()
 	e := n.health[key]
 	if e == nil {
 		e = &peerHealthEntry{}
 		n.health[key] = e
 	}
-	e.lastSuccess = time.Now()
+	e.lastSuccess = now
 	e.failCount = 0
 	e.totalAttempts++
 	e.nextRetryAt = time.Time{}
@@ -373,6 +467,12 @@ func (n *Node) recordSuccess(id a2al.NodeID, rtt time.Duration) {
 		e.rtt = rtt
 	}
 	n.healthMu.Unlock()
+
+	// Update the routing layer's freshness timestamp.  This covers the outbound
+	// RPC path; the inbound path (remember) is covered by tabAdd with VerifiedAt=now.
+	n.tabMu.Lock()
+	n.table.UpdateVerifiedAt(id, now)
+	n.tabMu.Unlock()
 }
 
 // recordFailure increments the consecutive-failure counter and sets a global
@@ -557,6 +657,11 @@ func (n *Node) reachCounts() (r1h, r24h, r7d int) {
 	return
 }
 
+// EstimatedNetworkSize returns the bucket-density estimate of the current
+// number of active nodes in the DHT (includes all nodes; for freshness-filtered
+// estimate use EstimatedNetworkSizeFiltered).
+func (n *Node) EstimatedNetworkSize() int { return n.tabEstimatedNetworkSize() }
+
 // tabEstimatedNetworkSize returns the bucket-density estimate of network size.
 func (n *Node) tabEstimatedNetworkSize() int {
 	n.tabMu.RLock()
@@ -564,9 +669,22 @@ func (n *Node) tabEstimatedNetworkSize() int {
 	return n.table.EstimatedNetworkSize()
 }
 
-// absorbNodeInfo merges a contact into the routing table and, when IP:port looks usable, sets UDP dial address.
-func (n *Node) absorbNodeInfo(ni protocol.NodeInfo) {
-	n.tabAdd(ni, false)
+// EstimatedNetworkSizeFiltered returns the network size estimate restricted to
+// nodes verified within the past 30 minutes, along with a confidence score in
+// [0, 1].  Higher confidence means more sample buckets contributed to the median.
+func (n *Node) EstimatedNetworkSizeFiltered(cutoff time.Time) (int, float64) {
+	n.tabMu.RLock()
+	defer n.tabMu.RUnlock()
+	return n.table.EstimatedNetworkSizeFiltered(cutoff)
+}
+
+// absorbNodeInfo merges a contact into the routing table (hearsay path) and,
+// when IP:port looks usable, registers the UDP dial address.
+// learnedFrom is the NodeID of the peer whose FIND_NODE response included ni
+// (zero value if the source is unknown or it is a local routing-table seed).
+func (n *Node) absorbNodeInfo(ni protocol.NodeInfo, learnedFrom a2al.NodeID) {
+	meta := routing.EntryMeta{LearnedFrom: learnedFrom} // VerifiedAt zero = hearsay
+	n.tabAdd(ni, meta)
 	if ni.Port == 0 || (len(ni.IP) != 4 && len(ni.IP) != 16) {
 		return
 	}
@@ -655,7 +773,7 @@ func (n *Node) onFindNode(from net.Addr, dec *protocol.DecodedMessage) {
 	var tid a2al.NodeID
 	copy(tid[:], target)
 	resp := &protocol.BodyFindNodeResp{
-		Nodes:        n.tabNearestHealthy(tid, routing.K),
+		Nodes:        n.tabNearestVerified(tid, routing.K),
 		ObservedAddr: ObservedAddr(from),
 	}
 	for len(resp.Nodes) > 1 {
@@ -678,7 +796,7 @@ func (n *Node) onFindValue(from net.Addr, dec *protocol.DecodedMessage) {
 	records := n.store.GetAll(tid, body.RecType, now)
 	best := n.store.Get(tid, now)
 	resp := &protocol.BodyFindValueResp{
-		Nodes:        n.tabNearestHealthy(tid, routing.K),
+		Nodes:        n.tabNearestVerified(tid, routing.K),
 		ObservedAddr: ObservedAddr(from),
 		Records:      records,
 	}
@@ -952,7 +1070,7 @@ func (n *Node) PingIdentity(ctx context.Context, peer net.Addr) (*PeerIdentity, 
 	n.recordSuccess(peerNID, time.Since(t0))
 	ni := nodeInfoFromMessage(dec, peer)
 	n.BindPeerAddr(peerNID, peer)
-	n.tabAdd(ni, true)
+	n.tabAdd(ni, routing.EntryMeta{VerifiedAt: time.Now()})
 	var obs []byte
 	if len(pong.ObservedAddr) > 0 {
 		obs = append([]byte(nil), pong.ObservedAddr...)
@@ -1050,13 +1168,14 @@ func (n *Node) FindValue(ctx context.Context, peer net.Addr, key a2al.NodeID) (*
 }
 
 // AddContact pins a peer's dial address and seeds the routing table.
+// Treated as a trusted (user-configured) contact: VerifiedAt is set to now.
 func (n *Node) AddContact(addr net.Addr, ni protocol.NodeInfo) {
 	var peerID a2al.NodeID
 	copy(peerID[:], ni.NodeID)
 	n.peerMu.Lock()
 	n.peers[nodeIDKey(peerID)] = addr
 	n.peerMu.Unlock()
-	n.tabAdd(ni, true)
+	n.tabAdd(ni, routing.EntryMeta{VerifiedAt: time.Now()})
 }
 
 // LocalAddr returns the underlying transport address.
@@ -1152,6 +1271,22 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// SetMaxStoreKeys updates the maximum number of distinct keys in the local store.
+func (n *Node) SetMaxStoreKeys(max int) { n.store.SetMaxKeys(max) }
+
+// SetPassiveRouting controls whether this node suppresses proactive FindNode
+// queries. When true (passive mode), the node fills its routing table naturally
+// through incoming traffic and skips active bucket-refill and topology scans.
+func (n *Node) SetPassiveRouting(passive bool) { n.passiveRouting.Store(passive) }
+
+// SelfExtIP returns the node's current public IP as seen by STUN/HTTP probe,
+// or nil if not yet known.
+func (n *Node) SelfExtIP() net.IP {
+	n.selfExtMu.RLock()
+	defer n.selfExtMu.RUnlock()
+	return n.selfExtIP
 }
 
 // LocalStoreGet returns verified non-expired records at the given DHT key,

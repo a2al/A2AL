@@ -753,7 +753,13 @@ func (d *Daemon) execResolve(ctx context.Context, aidStr string) (map[string]any
 	}
 	er, err := d.h.Resolve(ctx, aid)
 	if err != nil {
-		return nil, errResolve
+		// DHT returned empty — try supplemental bootstrap nodes as last resort.
+		if d.beacon != nil {
+			er, err = d.resolveFromBeacon(ctx, aid)
+		}
+		if err != nil {
+			return nil, errResolve
+		}
 	}
 	return map[string]any{
 		"address":   er.Address.String(),
@@ -776,7 +782,12 @@ func (d *Daemon) execConnect(ctx context.Context, remoteAidStr string, body conn
 	}
 	er, err := d.h.Resolve(ctx, remote)
 	if err != nil {
-		return "", errResolve
+		if d.beacon != nil {
+			er, err = d.resolveFromBeacon(ctx, remote)
+		}
+		if err != nil {
+			return "", errResolve
+		}
 	}
 	d.log.Debug("connect resolve",
 		"local_aid", local.String(),
@@ -853,6 +864,13 @@ func (d *Daemon) execMailboxPoll(ctx context.Context, aidStr string) ([]map[stri
 	msgs, err := d.h.PollMailboxForAgent(ctx, aid)
 	if err != nil {
 		return nil, err
+	}
+	if d.beacon != nil && len(msgs) == 0 {
+		if recs, _ := d.beacon.FindRecords(ctx, a2al.NodeIDFromAddress(aid), protocol.RecTypeMailbox); len(recs) > 0 {
+			if extra, e2 := d.h.DecryptMailboxRecords(aid, recs); e2 == nil {
+				msgs = extra
+			}
+		}
 	}
 
 	d.mailboxSeenMu.Lock()
@@ -1026,6 +1044,10 @@ func (d *Daemon) execDiscover(ctx context.Context, req discoverReq) ([]map[strin
 	if err != nil {
 		return nil, err
 	}
+	// Bootstrap backup fallback: supplement with results from bootstrap nodes when DHT returns empty.
+	if len(entries) == 0 && d.beacon != nil && len(d.beacon.Addrs()) > 0 {
+		entries = d.discoverFromBeacon(ctx, req.Services)
+	}
 	if req.Filter != nil {
 		entries = protocol.FilterTopicEntries(entries, req.Filter)
 	}
@@ -1106,11 +1128,15 @@ func (d *Daemon) execResolveRecords(ctx context.Context, aidStr string, recType 
 		return nil, errBadAID
 	}
 	recs, err := d.h.FindRecords(ctx, aid, recType)
-	if err != nil {
-		if errors.Is(err, dht.ErrNoMatchingRecords) {
-			return []map[string]any{}, nil
-		}
+	if err != nil && !errors.Is(err, dht.ErrNoMatchingRecords) {
 		return nil, err
+	}
+	// Bootstrap backup fallback when DHT returned nothing.
+	if len(recs) == 0 && d.beacon != nil {
+		key := a2al.NodeIDFromAddress(aid)
+		if brecs, berr := d.beacon.FindRecords(ctx, key, recType); berr == nil {
+			recs = append(recs, brecs...)
+		}
 	}
 	now := time.Now()
 	out := make([]map[string]any, 0, len(recs))

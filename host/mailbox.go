@@ -126,3 +126,35 @@ func (h *Host) PollMailboxForAgent(ctx context.Context, agentAddr a2al.Address) 
 	}
 	return out, nil
 }
+
+// DecryptMailboxRecords decrypts the given raw SignedRecords using the private
+// key of agentAddr. Callers that obtained records from an out-of-band source
+// (e.g. fallback infrastructure) can use this to reuse the standard decryption
+// path without triggering a DHT query.
+func (h *Host) DecryptMailboxRecords(agentAddr a2al.Address, recs []protocol.SignedRecord) ([]protocol.MailboxMessage, error) {
+	if h == nil || h.node == nil {
+		return nil, errors.New("a2al/host: nil host")
+	}
+	h.agentsMu.RLock()
+	ag, ok := h.agents[agentAddr]
+	h.agentsMu.RUnlock()
+	if !ok {
+		return nil, fmt.Errorf("a2al/host: unknown agent %s", agentAddr)
+	}
+	now := time.Now()
+	var out []protocol.MailboxMessage
+	for _, sr := range recs {
+		if err := protocol.VerifySignedRecord(sr, now); err != nil {
+			continue
+		}
+		msg, err := protocol.OpenMailboxRecord(ag.priv, agentAddr, sr)
+		if err != nil {
+			continue
+		}
+		if len(msg.SenderPubkey) == ed25519.PublicKeySize {
+			h.peerPubkeys.Store(msg.Sender, msg.SenderPubkey)
+		}
+		out = append(out, msg)
+	}
+	return out, nil
+}

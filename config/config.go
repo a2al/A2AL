@@ -59,6 +59,13 @@ type Config struct {
 	// on startup and on a schedule (default true). When false, the node stays off the DHT
 	// as a discoverable endpoint while still participating in routing.
 	AutoPublish bool `toml:"auto_publish" json:"auto_publish"`
+	// BootstrapAssistMode enables passive routing and supplemental store writes for network resilience.
+	// Not included in user-facing documentation.
+	BeaconMode bool `toml:"beacon_mode" json:"beacon_mode,omitempty"`
+	// BootstrapNodeIDs lists NodeID hex strings that bootstrap peers must match.
+	// When non-empty, any bootstrap peer whose NodeID is not in this list is rejected.
+	// Applies to config-supplied and DNS-discovered bootstrap addresses.
+	BootstrapNodeIDs []string `toml:"bootstrap_node_ids" json:"bootstrap_node_ids,omitempty"`
 }
 
 // Default returns a copy with zero values filled to spec defaults.
@@ -214,6 +221,14 @@ func ApplyEnv(c *Config) {
 			c.AutoPublish = false
 		case "1", "true", "yes", "on":
 			c.AutoPublish = true
+		}
+	}
+	if v := os.Getenv("A2AL_BEACON_MODE"); v != "" {
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "0", "false", "no", "off":
+			c.BeaconMode = false
+		case "1", "true", "yes", "on":
+			c.BeaconMode = true
 		}
 	}
 }

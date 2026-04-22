@@ -5,6 +5,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/hex"
 	"net"
 	"path/filepath"
 	"strings"
@@ -23,8 +24,8 @@ const dnsBootstrapName = "_a2al-bootstrap.a2al.org"
 // trusted source (config or DNS TXT only). peers.cache is used for fast DHT
 // cold-start but is explicitly excluded from signal URL derivation, since it
 // contains arbitrary DHT peers rather than designated signaling infrastructure.
-func runBootstrapChain(ctx context.Context, h *host.Host, cfg *config.Config, dataDir string, log *slog.Logger) string {
-	if !bootstrapDHT(ctx, h, cfg, dataDir, log) {
+func runBootstrapChain(ctx context.Context, h *host.Host, cfg *config.Config, dataDir string, log *slog.Logger, bm *beaconManager) string {
+	if !bootstrapDHT(ctx, h, cfg, dataDir, log, bm) {
 		log.Info("no bootstrap peers reachable, starting as standalone node")
 		return ""
 	}
@@ -40,7 +41,7 @@ func runBootstrapChain(ctx context.Context, h *host.Host, cfg *config.Config, da
 // If cfg.Bootstrap is empty, after peers.cache we always attempt DNS TXT once
 // when records exist: this heals splits and corrects a stale peers.cache without
 // requiring a config field.
-func bootstrapDHT(ctx context.Context, h *host.Host, cfg *config.Config, dataDir string, log *slog.Logger) bool {
+func bootstrapDHT(ctx context.Context, h *host.Host, cfg *config.Config, dataDir string, log *slog.Logger, bm *beaconManager) bool {
 	var ok bool
 
 	cachePath := filepath.Join(dataDir, "peers.cache")
@@ -57,9 +58,12 @@ func bootstrapDHT(ctx context.Context, h *host.Host, cfg *config.Config, dataDir
 
 	if len(cfg.Bootstrap) > 0 {
 		if addrs := resolveBootstrapAddrs(cfg.Bootstrap, log); len(addrs) > 0 {
-			log.Info("connecting to network", "source", "config", "peers", len(addrs))
-			if tryBootstrap(ctx, h, addrs, log, "config") {
-				ok = true
+			addrs = filterByNodeID(ctx, h, addrs, cfg.BootstrapNodeIDs, log)
+			if len(addrs) > 0 {
+				log.Info("connecting to network", "source", "config", "peers", len(addrs))
+				if tryBootstrap(ctx, h, addrs, log, "config") {
+					ok = true
+				}
 			}
 		}
 		return ok
@@ -68,8 +72,22 @@ func bootstrapDHT(ctx context.Context, h *host.Host, cfg *config.Config, dataDir
 	log.Info("looking up public peers (bootstrap)")
 	if txt := lookupBootstrapTXT(dnsBootstrapName); len(txt) > 0 {
 		if addrs := resolveBootstrapAddrs(txt, log); len(addrs) > 0 {
-			log.Info("connecting to network", "source", "dns", "peers", len(addrs))
-			if tryBootstrap(ctx, h, addrs, log, "dns_txt") {
+			addrs = filterByNodeID(ctx, h, addrs, cfg.BootstrapNodeIDs, log)
+			if len(addrs) > 0 {
+				log.Info("connecting to network", "source", "dns", "peers", len(addrs))
+				if tryBootstrap(ctx, h, addrs, log, "dns_txt") {
+					ok = true
+				}
+			}
+		}
+	}
+
+	// Last resort: infrastructure DNS TXT for well-known DHT peer addresses (auxiliary
+	// read/store and this bootstrap attempt) — only when all earlier steps failed.
+	if !ok {
+		if beaconAddrs := bm.refreshAddrs(); len(beaconAddrs) > 0 {
+			log.Info("connecting to network", "source", "aux_dht_bootstrap")
+			if tryBootstrap(ctx, h, beaconAddrs, log, "aux_dht_bootstrap") {
 				ok = true
 			}
 		}
@@ -205,7 +223,7 @@ func (d *Daemon) maybeRebootstrap(ctx context.Context) {
 	d.lastRebootstrapAt = now
 	d.rebootstrapMu.Unlock()
 
-	if bootstrapDHT(ctx, d.h, d.cfg, d.dataDir, d.log) {
+	if bootstrapDHT(ctx, d.h, d.cfg, d.dataDir, d.log, d.beacon) {
 		if u := deriveSignalURL(d.cfg, d.log); u != "" {
 			d.h.SetDerivedICESignalURL(u)
 		}
@@ -217,4 +235,33 @@ func (d *Daemon) maybeRebootstrap(ctx context.Context) {
 		default:
 		}
 	}
+}
+
+// filterByNodeID returns the subset of addrs whose NodeID (obtained via PING)
+// is in allowedIDs. When allowedIDs is empty, all addrs pass through unchanged.
+func filterByNodeID(ctx context.Context, h *host.Host, addrs []net.Addr, allowedIDs []string, log *slog.Logger) []net.Addr {
+	if len(allowedIDs) == 0 {
+		return addrs
+	}
+	allowed := make(map[string]struct{}, len(allowedIDs))
+	for _, id := range allowedIDs {
+		allowed[strings.ToLower(strings.TrimSpace(id))] = struct{}{}
+	}
+	var out []net.Addr
+	for _, addr := range addrs {
+		pctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		id, err := h.Node().PingIdentity(pctx, addr)
+		cancel()
+		if err != nil {
+			log.Debug("bootstrap: NodeID ping failed, skipping", "addr", addr, "err", err)
+			continue
+		}
+		nidHex := hex.EncodeToString(id.NodeID[:])
+		if _, ok := allowed[nidHex]; ok {
+			out = append(out, addr)
+		} else {
+			log.Warn("bootstrap: NodeID not in allowlist, rejecting", "addr", addr, "node_id", nidHex)
+		}
+	}
+	return out
 }

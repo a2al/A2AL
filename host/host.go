@@ -204,6 +204,9 @@ type Host struct {
 	signalStatsMu sync.RWMutex
 	signalStats   func() map[string]any
 
+	beaconStatsMu sync.RWMutex
+	beaconStats   func() map[string]any
+
 	natProbeMu sync.Mutex // guards RunNATProbe (only one probe at a time)
 }
 
@@ -625,6 +628,13 @@ func (h *Host) EffectiveICESignalBase() string {
 	return h.effectiveICESignalBase()
 }
 
+// EffectiveICESignalURLs returns the full ordered list of ICE signaling base URLs.
+// Callee subscribers should open one /signal connection per URL.
+// Callers should try each URL in order until one succeeds.
+func (h *Host) EffectiveICESignalURLs() []string {
+	return h.effectiveICESignalURLs()
+}
+
 // SetDerivedICESignalURL sets the bootstrap-derived signal base when
 // Config.ICESignalURL is empty. Explicit config always wins and is not overwritten.
 func (h *Host) SetDerivedICESignalURL(s string) {
@@ -641,6 +651,15 @@ func (h *Host) SetSignalStatsProvider(f func() map[string]any) {
 	h.signalStatsMu.Lock()
 	h.signalStats = f
 	h.signalStatsMu.Unlock()
+}
+
+// SetBeaconStatsProvider registers fn to supply optional extra key-value fields merged into
+// GET /debug/stats (e.g. metrics for the high-capacity auxiliary DHT path). Omitted when fn
+// is nil; fields omitted when the callback returns nil or an empty map.
+func (h *Host) SetBeaconStatsProvider(fn func() map[string]any) {
+	h.beaconStatsMu.Lock()
+	h.beaconStats = fn
+	h.beaconStatsMu.Unlock()
 }
 
 const extipCacheTTL = 5 * time.Minute
