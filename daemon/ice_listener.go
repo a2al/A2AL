@@ -22,39 +22,37 @@ import (
 // comfortable margin and reduces ping frequency vs the original 30 s spec.
 const iceKeepaliveInterval = 45 * time.Second
 
-// incomingDeduplicateTTL is how long a seen (room) entry is remembered.
-// Covers the AcceptICEViaSignal timeout (90 s) with margin to prevent duplicate
-// accept attempts when multiple hubs deliver the same incoming notification.
-const incomingDeduplicateTTL = 2 * time.Minute
-
-// incomingDedup tracks recently-seen ICE rooms across all signal hubs.
+// incomingDedup tracks active ICE rooms across all signal hubs.
 // When multiple hubs simultaneously deliver incoming for the same room,
-// only the first one triggers AcceptICEViaSignal.
+// only the first one triggers AcceptICEViaSignal. The entry is released
+// once AcceptICEViaSignal returns, so subsequent sessions for the same
+// pair are never blocked.
 type incomingDedup struct {
 	mu   sync.Mutex
-	seen map[string]time.Time // room → first-seen time
+	seen map[string]struct{} // rooms currently being accepted
 }
 
 func newIncomingDedup() *incomingDedup {
-	return &incomingDedup{seen: make(map[string]time.Time)}
+	return &incomingDedup{seen: make(map[string]struct{})}
 }
 
-// tryMark returns true if room was not seen before (caller should proceed).
-// Entries older than incomingDeduplicateTTL are evicted opportunistically.
+// tryMark returns true if room was not already in-flight (caller should proceed).
 func (d *incomingDedup) tryMark(room string) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	now := time.Now()
-	for r, t := range d.seen {
-		if now.Sub(t) > incomingDeduplicateTTL {
-			delete(d.seen, r)
-		}
-	}
 	if _, ok := d.seen[room]; ok {
 		return false
 	}
-	d.seen[room] = now
+	d.seen[room] = struct{}{}
 	return true
+}
+
+// release removes a room from the dedup set once AcceptICEViaSignal has
+// finished, allowing new accept attempts for the same peer pair.
+func (d *incomingDedup) release(room string) {
+	d.mu.Lock()
+	delete(d.seen, room)
+	d.mu.Unlock()
 }
 
 // runICEListener manages per-hub /signal subscriptions. It monitors the
@@ -122,9 +120,8 @@ func (d *Daemon) runICEListener(ctx context.Context) {
 		}
 
 		urlsChanged := !slices.Equal(urls, lastURLs)
-		allExited := workerDone != nil && isDone(workerDone)
 
-		if urlsChanged || allExited {
+		if urlsChanged {
 			stopWorkers()
 			lastURLs = slices.Clone(urls)
 
@@ -161,16 +158,6 @@ func (d *Daemon) runICEListener(ctx context.Context) {
 		}
 	}
 	stopWorkers()
-}
-
-// isDone reports whether a channel has been closed without blocking.
-func isDone(ch <-chan struct{}) bool {
-	select {
-	case <-ch:
-		return true
-	default:
-		return false
-	}
 }
 
 // runSingleICESubscriber maintains a persistent /signal WebSocket to one hub.
@@ -322,13 +309,18 @@ func (d *Daemon) readICELoopFor(ctx context.Context, conn *websocket.Conn, base 
 		if err != nil {
 			continue
 		}
-		// Dedup: if another hub already triggered Accept for this room, skip.
-		// fr.Room is the canonical room ID computed by the caller.
-		if !seen.tryMark(fr.Room) {
-			d.log.Debug("ice incoming dedup", "base", base, "room", fr.Room)
+		// Compute room locally (same formula as caller) rather than trusting
+		// fr.Room from the hub, which may be absent in non-conformant servers.
+		// Dedup: only the first hub to deliver incoming for this room triggers Accept.
+		room := signaling.RoomID(localAgent.String(), callerAID.String())
+		if !seen.tryMark(room) {
+			d.log.Debug("ice incoming dedup", "base", base, "room", room)
 			continue
 		}
 		go func() {
+			// Release the dedup entry when Accept finishes (success or failure)
+			// so that a subsequent session for the same peer pair is never blocked.
+			defer seen.release(room)
 			actx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 			ac, err := d.h.AcceptICEViaSignal(actx, localAgent, callerAID, base)
 			cancel() // handshake established (or failed); no longer need startup timeout context.
