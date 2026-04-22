@@ -628,6 +628,13 @@ func (h *Host) EffectiveICESignalBase() string {
 	return h.effectiveICESignalBase()
 }
 
+// EffectiveICESignalURLs returns the full ordered list of ICE signaling base URLs.
+// Callee subscribers should open one /signal connection per URL.
+// Callers should try each URL in order until one succeeds.
+func (h *Host) EffectiveICESignalURLs() []string {
+	return h.effectiveICESignalURLs()
+}
+
 // SetDerivedICESignalURL sets the bootstrap-derived signal base when
 // Config.ICESignalURL is empty. Explicit config always wins and is not overwritten.
 func (h *Host) SetDerivedICESignalURL(s string) {
