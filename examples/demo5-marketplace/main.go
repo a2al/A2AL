@@ -379,7 +379,8 @@ func pickProvider(entries []providerEntry) (int, bool) {
 		fmt.Printf("        %s\n", shortAID(e.AID))
 	}
 	fmt.Println()
-	fmt.Printf("  Enter a number to select. If no input within 5 seconds, #1 will be tried automatically.\n")
+	fmt.Printf("  Enter a number to select, or press Enter. Auto-selecting #1 in 5 seconds.\n")
+	fmt.Printf("  Select [1–%d]: ", len(entries))
 
 	rd := bufio.NewReader(os.Stdin)
 	inputCh := make(chan string, 1)
@@ -388,35 +389,28 @@ func pickProvider(entries []providerEntry) (int, bool) {
 		inputCh <- strings.TrimSpace(line)
 	}()
 
-	for secs := 5; secs > 0; secs-- {
-		fmt.Printf("\r  Select [1–%d] (auto-starting in %ds...): ",
-			len(entries), secs)
-		t := time.NewTimer(time.Second)
-		select {
-		case raw := <-inputCh:
-			t.Stop()
-			fmt.Println()
-			n, err := strconv.Atoi(raw)
-			if err == nil && n >= 1 && n <= len(entries) {
-				fmt.Printf("  → Selected: [%d] %s\n", n, entries[n-1].Name)
-				return n - 1, true
-			}
-			// Invalid input — stop countdown, wait for a valid number.
-			fmt.Printf("  Invalid selection — enter a number from 1 to %d: ", len(entries))
-			for {
-				line, _ := rd.ReadString('\n')
-				line = strings.TrimSpace(line)
-				n2, err2 := strconv.Atoi(line)
-				if err2 == nil && n2 >= 1 && n2 <= len(entries) {
-					fmt.Printf("  → Selected: [%d] %s\n", n2, entries[n2-1].Name)
-					return n2 - 1, true
-				}
-				fmt.Printf("  Please enter 1–%d: ", len(entries))
-			}
-		case <-t.C:
+	select {
+	case raw := <-inputCh:
+		n, err := strconv.Atoi(raw)
+		if err == nil && n >= 1 && n <= len(entries) {
+			fmt.Printf("  → Selected: [%d] %s\n", n, entries[n-1].Name)
+			return n - 1, true
 		}
+		// Invalid input — stop countdown, wait for a valid number.
+		fmt.Printf("  Invalid selection — enter a number from 1 to %d: ", len(entries))
+		for {
+			line, _ := rd.ReadString('\n')
+			line = strings.TrimSpace(line)
+			n2, err2 := strconv.Atoi(line)
+			if err2 == nil && n2 >= 1 && n2 <= len(entries) {
+				fmt.Printf("  → Selected: [%d] %s\n", n2, entries[n2-1].Name)
+				return n2 - 1, true
+			}
+			fmt.Printf("  Please enter 1–%d: ", len(entries))
+		}
+	case <-time.After(5 * time.Second):
 	}
-	fmt.Printf("\r  No selection — auto-trying from #1: %s                    \n", entries[0].Name)
+	fmt.Printf("  No input — auto-selecting #1: %s\n", entries[0].Name)
 	return 0, false
 }
 
