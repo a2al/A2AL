@@ -656,8 +656,8 @@ func main() {
 	c := newClient(apiAddr, token)
 	if err := c.do("GET", "/health", nil, nil); err != nil {
 		fmt.Fprintf(os.Stderr, "error: cannot reach a2ald at %s: %v\n", apiAddr, err)
-		fmt.Fprintln(os.Stderr, "Start a2ald first, e.g.: a2ald --data-dir ./tmp/alice --fallback-host 127.0.0.1")
-		fmt.Fprintln(os.Stderr, "Download a2ald: https://github.com/a2al/a2al/releases")
+		fmt.Fprintln(os.Stderr, "Make sure a2ald is running. Download: https://github.com/a2al/a2al/releases")
+		fmt.Fprintln(os.Stderr, "See doc/examples.md or https://github.com/a2al/a2al for setup instructions.")
 		os.Exit(1)
 	}
 
