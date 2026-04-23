@@ -4,16 +4,28 @@ The `examples/` directory contains runnable demos that verify A2AL's core capabi
 
 ---
 
-## Running without a Go environment
+## Quick start — pre-built binaries (recommended)
 
-You don't need to install Go. Download the pre-built demo binaries from the [**Demo binaries (latest)**](https://github.com/a2al/a2al/releases/tag/demos-latest) release and `a2ald` from the [main Releases page](https://github.com/a2al/a2al/releases), then follow the instructions below — just replace every `go run .` with the binary name.
+No Go installation required. Download the two releases and you're ready:
 
-| Instead of | Use |
-|------------|-----|
-| `go run .` in `demo3-chat/` | `demo3-chat` |
-| `go run .` in `demo4-marketplace/` | `demo4-marketplace` |
-| `go run .` in `demo5-marketplace/` | `demo5-marketplace` |
-| `go run .` in `demo6-swarm/` | `demo6-swarm` |
+- **Demo binaries** (demo1 … demo6): [**Demo binaries (latest)**](https://github.com/a2al/a2al/releases/tag/demos-latest)
+- **`a2ald` daemon**: [Main Releases page](https://github.com/a2al/a2al/releases)
+
+Extract and place the binaries somewhere on your PATH, then follow the per-demo instructions below.
+
+### Windows — unsigned binary warning
+
+The demo and daemon binaries are currently **unsigned**. Windows SmartScreen will show a warning on first run — this is expected for open-source binaries that have not yet gone through the Microsoft code-signing process and does not indicate a security risk.
+
+**To run anyway:**
+
+1. Double-click (or run from PowerShell/Command Prompt) — a blue SmartScreen dialog appears.
+2. Click **"More info"**.
+3. Click **"Run anyway"**.
+
+If Windows Defender flags the file, choose **"Allow on device"** or add an exclusion for the binary's folder.
+
+> For developers who prefer to build from source, see the *Build from source* note at the end of each demo section.
 
 ---
 
@@ -25,7 +37,7 @@ You don't need to install Go. Download the pre-built demo binaries from the [**D
 | `demo5-marketplace` | QUIC tunnel, direct HTTP service invocation | Yes |
 | `demo4-marketplace` | Named service, encrypted notes, Sovereign Record | Yes |
 | `demo3-chat` | Encrypted chat via daemon REST API | Yes |
-| `demo2-chat` | QUIC, mutual TLS, NAT traversal; multi-candidate dial (try multiple paths) (Go library) | No |
+| `demo2-chat` | QUIC, mutual TLS, NAT traversal; multi-candidate dial (Go library) | No |
 | `demo1-node` | DHT node bootstrap, AID publishing, iterative resolution | No |
 
 Demos 3–6 use `a2ald` as the network layer and focus on application-level behaviour. Demos 1–2 embed a DHT/QUIC node directly in the process and require no daemon.
@@ -34,12 +46,12 @@ Demos 3–6 use `a2ald` as the network layer and focus on application-level beha
 
 ## Prerequisites
 
-- **Demos 1 and 2**: Go 1.22+ or a pre-built binary from [**Demo binaries (latest)**](https://github.com/a2al/a2al/releases/tag/demos-latest).
-- **Demos 3–6**: `a2ald` running on each participating machine, plus Go 1.22+ or a pre-built demo binary from [**Demo binaries (latest)**](https://github.com/a2al/a2al/releases/tag/demos-latest).
+- **Demos 1 and 2**: pre-built binary from [**Demo binaries (latest)**](https://github.com/a2al/a2al/releases/tag/demos-latest), or Go 1.22+ to build from source.
+- **Demos 3–6**: `a2ald` running on each participating machine, plus a pre-built demo binary or Go 1.22+.
 
 Start `a2ald` with no arguments on any internet-connected machine; it joins the public Tangled Network automatically.
 
-Testing without an internet connection (offline or isolated network) requires a few extra parameters for `a2ald`. The commands are longer but straightforward — refer to the comments at the top of each demo's source file for a full explanation of every parameter.
+Testing without an internet connection (offline or isolated network) requires a few extra parameters for `a2ald`. Refer to the comments at the top of each demo's source file for a full explanation.
 
 ---
 
@@ -47,29 +59,31 @@ Testing without an internet connection (offline or isolated network) requires a 
 
 **Verifies:** dynamic service discovery, parallel QUIC sessions, graceful handling of agents that go offline mid-session.
 
-Planner searches the Tangled Network for available specialist agents (market analysis, legal, logistics, localization), opens parallel QUIC tunnels to all found workers, collects their responses, and produces a consolidated report — without knowing in advance how many workers are online.
+Planner searches the Tangled Network for available specialist agents (compliance, logistics, tariffs, localization), opens parallel QUIC tunnels to all found workers, collects their responses, and produces a consolidated report — without knowing in advance how many workers are online.
 
 **Two machines (recommended):**
-```bash
+```
 # Machine A — worker
 a2ald
-go run . --role worker      # or: demo6-swarm --role worker
+demo6-swarm --role worker
 
 # Machine B — planner
 a2ald
-go run . --role planner     # or: demo6-swarm --role planner
+demo6-swarm --role planner
 ```
 
-Start Worker first. You can verify registered services in the Web UI (`http://localhost:2121`) under the **Discover** tab: search for `reason.evaluate`, `data.search`, `reason.analyze`, or `reason.recommend`.
+Start Worker first. Verify registered services in the Web UI (`http://localhost:2121`) → **Discover** tab: search `reason.evaluate`, `data.search`, `reason.analyze`, or `reason.recommend`.
 
 **Single machine** (four terminals):
-```bash
-Worker  a2ald:  a2ald --data-dir ./tmp/a --fallback-host 127.0.0.1
-Planner a2ald:  a2ald --data-dir ./tmp/b --listen :4122 --api-addr 127.0.0.1:2122 \
-                --fallback-host 127.0.0.1 --bootstrap 127.0.0.1:4121
-Worker  demo:   go run . --role worker
-Planner demo:   go run . --role planner --api 127.0.0.1:2122
 ```
+Worker  a2ald:   a2ald --data-dir ./tmp/a --fallback-host 127.0.0.1
+Planner a2ald:   a2ald --data-dir ./tmp/b --listen :4122 --api-addr 127.0.0.1:2122 \
+                 --fallback-host 127.0.0.1 --bootstrap 127.0.0.1:4121
+Worker  demo:    demo6-swarm --role worker
+Planner demo:    demo6-swarm --role planner --api 127.0.0.1:2122
+```
+
+> **Build from source:** replace `demo6-swarm` with `go run .` inside `examples/demo6-swarm/`.
 
 ---
 
@@ -80,26 +94,28 @@ Planner demo:   go run . --role planner --api 127.0.0.1:2122
 Seller exposes an HTTP question-answering service (`reason.qa`). Buyer discovers Seller, requests a QUIC tunnel from the daemon, and calls the HTTP endpoint directly through it.
 
 **Two machines (recommended):**
-```bash
+```
 # Machine A — seller
 a2ald
-go run . --role seller      # or: demo5-marketplace --role seller
+demo5-marketplace --role seller
 
 # Machine B — buyer
 a2ald
-go run . --role buyer       # or: demo5-marketplace --role buyer
+demo5-marketplace --role buyer
 ```
 
 Start Seller first. This demo requires two separate daemons even on a single machine (the QUIC tunnel is a cross-node operation).
 
 **Single machine** (four terminals):
-```bash
+```
 Seller a2ald:  a2ald --data-dir ./tmp/a --fallback-host 127.0.0.1
 Buyer  a2ald:  a2ald --data-dir ./tmp/b --listen :4122 --api-addr 127.0.0.1:2122 \
                --fallback-host 127.0.0.1 --bootstrap 127.0.0.1:4121
-Seller demo:   go run . --role seller
-Buyer  demo:   go run . --role buyer --api 127.0.0.1:2122
+Seller demo:   demo5-marketplace --role seller
+Buyer  demo:   demo5-marketplace --role buyer --api 127.0.0.1:2122
 ```
+
+> **Build from source:** replace `demo5-marketplace` with `go run .` inside `examples/demo5-marketplace/`.
 
 ---
 
@@ -110,33 +126,35 @@ Buyer  demo:   go run . --role buyer --api 127.0.0.1:2122
 Alice publishes a translation service as the named service `lang.translate`. Bob discovers it, sends a translation request via encrypted notes, and waits for the reply — without either party knowing the other's IP address.
 
 **Two machines (recommended):**
-```bash
+```
 # Machine A — alice
 a2ald
-go run . --role alice       # or: demo4-marketplace --role alice
+demo4-marketplace --role alice
 
 # Machine B — bob
 a2ald
-go run . --role bob         # or: demo4-marketplace --role bob
+demo4-marketplace --role bob
 ```
 
 Start Alice first; Bob discovers her automatically once both daemons have synced.
 
 **Single machine, shared daemon** (demo4 uses only DHT — no QUIC cross-node dial required):
-```bash
+```
 a2ald --fallback-host 127.0.0.1
-go run . --role alice   # terminal 2
-go run . --role bob     # terminal 3
+demo4-marketplace --role alice   # terminal 2
+demo4-marketplace --role bob     # terminal 3
 ```
 
 **Single machine, two daemons** (full P2P isolation):
-```bash
+```
 Alice a2ald:  a2ald --data-dir ./tmp/a --fallback-host 127.0.0.1
 Bob   a2ald:  a2ald --data-dir ./tmp/b --listen :4122 --api-addr 127.0.0.1:2122 \
               --fallback-host 127.0.0.1 --bootstrap 127.0.0.1:4121
-Alice demo:   go run . --role alice
-Bob   demo:   go run . --role bob --api 127.0.0.1:2122
+Alice demo:   demo4-marketplace --role alice
+Bob   demo:   demo4-marketplace --role bob --api 127.0.0.1:2122
 ```
+
+> **Build from source:** replace `demo4-marketplace` with `go run .` inside `examples/demo4-marketplace/`.
 
 ---
 
@@ -146,21 +164,23 @@ Bob   demo:   go run . --role bob --api 127.0.0.1:2122
 
 On each of two machines, open two terminals:
 
-```bash
-a2ald          # network layer
-go run .       # chat app  (or: demo3-chat)
+```
+a2ald        # network layer
+demo3-chat   # chat app
 ```
 
 Bob types Alice's AID → the daemon resolves and connects → bidirectional encrypted chat.
 
 **Single machine** (four terminals):
-```bash
+```
 Alice a2ald:  a2ald --data-dir ./tmp/a --fallback-host 127.0.0.1
-Alice chat:   go run .
+Alice chat:   demo3-chat
 Bob a2ald:    a2ald --data-dir ./tmp/b --listen :4122 --api-addr 127.0.0.1:2122 \
               --fallback-host 127.0.0.1 --bootstrap 127.0.0.1:4121
-Bob chat:     go run . --api 127.0.0.1:2122
+Bob chat:     demo3-chat --api 127.0.0.1:2122
 ```
+
+> **Build from source:** replace `demo3-chat` with `go run .` inside `examples/demo3-chat/`.
 
 ---
 
@@ -171,18 +191,20 @@ Bob chat:     go run . --api 127.0.0.1:2122
 Two nodes connect directly — no daemon involved. Bob types Alice's AID and a QUIC-encrypted session opens.
 
 **Two machines (recommended):**
-```bash
-go run .                             # Alice
-go run . -bootstrap <Alice-IP>:4121  # Bob
+```
+demo2-chat                             # Alice
+demo2-chat -bootstrap <Alice-IP>:4121  # Bob
 ```
 
 **Single machine:**
-```bash
-go run . -listen :4121                            # Alice
-go run . -listen :4123 -bootstrap 127.0.0.1:4121  # Bob
+```
+demo2-chat -listen :4121                            # Alice
+demo2-chat -listen :4123 -bootstrap 127.0.0.1:4121  # Bob
 ```
 
 Add `-debug :2634` to either side to inspect DHT and NAT state at `http://127.0.0.1:2634/debug/host`.
+
+> **Build from source:** replace `demo2-chat` with `go run .` inside `examples/demo2-chat/`.
 
 ---
 
@@ -192,12 +214,14 @@ Add `-debug :2634` to either side to inspect DHT and NAT state at `http://127.0.
 
 A minimal DHT node. After startup it publishes its own endpoint record and accepts AID lookups typed on stdin.
 
-```bash
-go run . -listen :4121 -debug :2634                          # Node A
-go run . -listen :4122 -bootstrap <A-IP>:4121 -debug :2635   # Node B
+```
+demo1-node -listen :4121 -debug :2634                          # Node A
+demo1-node -listen :4122 -bootstrap <A-IP>:4121 -debug :2635   # Node B
 ```
 
 Inspect live state at `http://127.0.0.1:2634/debug/routing`.
+
+> **Build from source:** replace `demo1-node` with `go run .` inside `examples/demo1-node/`.
 
 ---
 

@@ -7,20 +7,22 @@
 // registered specialists, opens parallel QUIC tunnels, and merges answers into one report.
 // Workers may go offline; Planner adapts to whatever is found.
 //
-// Start Planner after Worker prints that agents are online. Pre-built: demo6-swarm from the demos-latest release (replace go run . with demo6-swarm; same flags).
+// Start Planner after Worker prints that agents are online. Pre-built binary: demo6-swarm from the demos-latest release (see doc/examples.md).
 //
 // Recommended — two machines:
 //
-//	Worker machine:  a2ald  +  go run . --role worker
-//	Planner machine: a2ald  +  go run . --role planner
+//	Worker machine:  a2ald  +  demo6-swarm --role worker
+//	Planner machine: a2ald  +  demo6-swarm --role planner
 //
 // Single machine — four terminals:
 //
 //	Worker  a2ald:  a2ald --data-dir ./tmp/a --fallback-host 127.0.0.1
 //	Planner a2ald:  a2ald --data-dir ./tmp/b --listen :4122 --api-addr 127.0.0.1:2122 \
 //	                --fallback-host 127.0.0.1 --bootstrap 127.0.0.1:4121
-//	Worker  demo:   go run . --role worker
-//	Planner demo:   go run . --role planner --api 127.0.0.1:2122
+//	Worker  demo:   demo6-swarm --role worker
+//	Planner demo:   demo6-swarm --role planner --api 127.0.0.1:2122
+//
+// Build from source (Go 1.22+): replace "demo6-swarm" with "go run ." inside examples/demo6-swarm/.
 //
 // LAN/offline: set --fallback-host to this host's LAN IP; Planner adds --bootstrap <worker-ip>:4121.
 //
@@ -442,9 +444,10 @@ func runPlanner(c *client, apiPort string) {
 	// Discover agents in parallel; print each as it's found.
 	fmt.Println("  Searching Tangled...")
 	type discovery struct {
-		topic string
-		aid   string
-		name  string
+		topic   string
+		aid     string   // primary AID (Entries[0]) for display
+		name    string
+		allAIDs []string // all discovered AIDs, primary first
 	}
 	discoveryCh := make(chan discovery, len(experts))
 	for _, exp := range experts {
@@ -460,14 +463,18 @@ func runPlanner(c *client, apiPort string) {
 				if attempt > 0 {
 					time.Sleep(2 * time.Second)
 				}
-				if err := c.do("POST", "/discover",
-					map[string]any{"services": []string{exp.topic}}, &resp); err == nil &&
-					len(resp.Entries) > 0 {
-					discoveryCh <- discovery{exp.topic, resp.Entries[0].AID, resp.Entries[0].Name}
-					return
+			if err := c.do("POST", "/discover",
+				map[string]any{"services": []string{exp.topic}}, &resp); err == nil &&
+				len(resp.Entries) > 0 {
+				allAIDs := make([]string, 0, len(resp.Entries))
+				for _, e := range resp.Entries {
+					allAIDs = append(allAIDs, e.AID)
 				}
+				discoveryCh <- discovery{exp.topic, resp.Entries[0].AID, resp.Entries[0].Name, allAIDs}
+				return
 			}
-			discoveryCh <- discovery{exp.topic, "", ""}
+			}
+			discoveryCh <- discovery{exp.topic, "", "", nil}
 		}()
 	}
 
@@ -500,11 +507,26 @@ func runPlanner(c *client, apiPort string) {
 			var connResp struct {
 				Tunnel string `json:"tunnel"`
 			}
-			if err := c.do("POST", "/connect/"+d.aid,
-				map[string]any{"local_aid": id.AID}, &connResp); err != nil {
-				results <- expertResult{topic: d.topic, name: d.name, aid: d.aid,
-					err: fmt.Errorf("tunnel: %w", err)}
-				return
+			// Try each discovered candidate in order; fall back on tunnel failure.
+			var tunnelAddr string
+			for i, aid := range d.allAIDs {
+				if err := c.do("POST", "/connect/"+aid,
+					map[string]any{"local_aid": id.AID}, &connResp); err != nil {
+					if i+1 < len(d.allAIDs) {
+						fmt.Printf("  [%-18s] candidate %d/%d tunnel failed (%v); retrying…\n",
+							d.name, i+1, len(d.allAIDs), err)
+						continue
+					}
+					results <- expertResult{topic: d.topic, name: d.name, aid: aid,
+						err: fmt.Errorf("tunnel: %w", err)}
+					return
+				}
+				tunnelAddr = connResp.Tunnel
+				if i > 0 {
+					fmt.Printf("  [%-18s] fallback candidate %d/%d — tunnel OK\n",
+						d.name, i+1, len(d.allAIDs))
+				}
+				break
 			}
 
 			hc := &http.Client{Timeout: 15 * time.Second}
@@ -512,7 +534,7 @@ func runPlanner(c *client, apiPort string) {
 				"product": product,
 				"market":  market,
 			})
-			resp, err := hc.Post("http://"+connResp.Tunnel+"/consult",
+			resp, err := hc.Post("http://"+tunnelAddr+"/consult",
 				"application/json", bytes.NewReader(body))
 			if err != nil {
 				results <- expertResult{topic: d.topic, name: d.name, aid: d.aid,
@@ -623,8 +645,9 @@ func main() {
 
 	if role == "" {
 		fmt.Fprintln(os.Stderr, "Usage:")
-		fmt.Fprintln(os.Stderr, "  go run . --role worker   [--api 127.0.0.1:2121] [--token TOKEN]")
-		fmt.Fprintln(os.Stderr, "  go run . --role planner  [--api 127.0.0.1:2122] [--token TOKEN]")
+		fmt.Fprintln(os.Stderr, "  demo6-swarm --role worker   [--api 127.0.0.1:2121] [--token TOKEN]")
+		fmt.Fprintln(os.Stderr, "  demo6-swarm --role planner  [--api 127.0.0.1:2122] [--token TOKEN]")
+		fmt.Fprintln(os.Stderr, "  (build from source: go run . --role worker|planner ...)")
 		os.Exit(1)
 	}
 
@@ -632,7 +655,8 @@ func main() {
 	c := newClient(apiAddr, token)
 	if err := c.do("GET", "/health", nil, nil); err != nil {
 		fmt.Fprintf(os.Stderr, "error: cannot reach a2ald at %s: %v\n", apiAddr, err)
-		fmt.Fprintln(os.Stderr, "Start a2ald first, e.g.: a2ald --data-dir ./tmp/worker --fallback-host 127.0.0.1")
+		fmt.Fprintln(os.Stderr, "Make sure a2ald is running. Download: https://github.com/a2al/a2al/releases")
+		fmt.Fprintln(os.Stderr, "See doc/examples.md or https://github.com/a2al/a2al for setup instructions.")
 		os.Exit(1)
 	}
 

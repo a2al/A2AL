@@ -10,20 +10,22 @@
 //   demo4 — async DHT mailbox (like mail)
 //   demo5 — QUIC tunnel + synchronous HTTP (like a phone call)
 //
-// Start Buyer after Seller prints that it is online. Pre-built: demo5-marketplace from the demos-latest release (replace go run . with demo5-marketplace; same flags).
+// Start Buyer after Seller prints that it is online. Pre-built binary: demo5-marketplace from the demos-latest release (see doc/examples.md).
 //
 // Recommended — two machines, each with a2ald:
 //
-//	Machine A: a2ald  +  go run . --role seller
-//	Machine B: a2ald  +  go run . --role buyer
+//	Machine A: a2ald  +  demo5-marketplace --role seller
+//	Machine B: a2ald  +  demo5-marketplace --role buyer
 //
 // Single machine — QUIC needs two daemons (four terminals):
 //
 //	Seller a2ald:  a2ald --data-dir ./tmp/a --fallback-host 127.0.0.1
 //	Buyer  a2ald:  a2ald --data-dir ./tmp/b --listen :4122 --api-addr 127.0.0.1:2122 \
 //	               --fallback-host 127.0.0.1 --bootstrap 127.0.0.1:4121
-//	Seller demo:   go run . --role seller
-//	Buyer  demo:   go run . --role buyer --api 127.0.0.1:2122
+//	Seller demo:   demo5-marketplace --role seller
+//	Buyer  demo:   demo5-marketplace --role buyer --api 127.0.0.1:2122
+//
+// Build from source (Go 1.22+): replace "demo5-marketplace" with "go run ." inside examples/demo5-marketplace/.
 //
 // LAN/offline: set --fallback-host to this host's LAN IP; Buyer adds --bootstrap <peer-ip>:4121.
 //
@@ -59,6 +61,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/hex"
@@ -68,6 +71,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -349,6 +353,67 @@ var questions = []string{
 	"What is an AID?",
 }
 
+// providerEntry holds discovered provider info for display and selection.
+type providerEntry struct {
+	AID   string
+	Name  string
+	Brief string
+}
+
+// pickProvider shows a numbered list and gives the user 5 seconds to pick.
+// Returns (index, userSelected=true) for an explicit choice, or (0, false) for auto.
+// A single entry skips the prompt entirely.
+// Typing a non-numeric or out-of-range value stops the countdown and waits for a
+// valid number before proceeding.
+func pickProvider(entries []providerEntry) (int, bool) {
+	if len(entries) == 1 {
+		return 0, false
+	}
+	fmt.Printf("\n  Found %d providers:\n", len(entries))
+	for i, e := range entries {
+		brief := e.Brief
+		if len(brief) > 48 {
+			brief = brief[:46] + "…"
+		}
+		fmt.Printf("    [%d] %-22s  %s\n", i+1, e.Name, brief)
+		fmt.Printf("        %s\n", shortAID(e.AID))
+	}
+	fmt.Println()
+	fmt.Printf("  Enter a number to select, or press Enter. Auto-selecting #1 in 5 seconds.\n")
+	fmt.Printf("  Select [1–%d]: ", len(entries))
+
+	rd := bufio.NewReader(os.Stdin)
+	inputCh := make(chan string, 1)
+	go func() {
+		line, _ := rd.ReadString('\n')
+		inputCh <- strings.TrimSpace(line)
+	}()
+
+	select {
+	case raw := <-inputCh:
+		n, err := strconv.Atoi(raw)
+		if err == nil && n >= 1 && n <= len(entries) {
+			fmt.Printf("  → Selected: [%d] %s\n", n, entries[n-1].Name)
+			return n - 1, true
+		}
+		// Invalid input — stop countdown, wait for a valid number.
+		fmt.Printf("  Invalid selection — enter a number from 1 to %d: ", len(entries))
+		for {
+			line, _ := rd.ReadString('\n')
+			line = strings.TrimSpace(line)
+			n2, err2 := strconv.Atoi(line)
+			if err2 == nil && n2 >= 1 && n2 <= len(entries) {
+				fmt.Printf("  → Selected: [%d] %s\n", n2, entries[n2-1].Name)
+				return n2 - 1, true
+			}
+			fmt.Printf("  Please enter 1–%d: ", len(entries))
+		}
+	case <-time.After(5 * time.Second):
+	}
+	fmt.Printf("  No input — auto-selecting #1: %s\n", entries[0].Name)
+	return 0, false
+}
+
 func runBuyer(c *client, idPath string) {
 	fmt.Println("\n=== QA Buyer ===")
 
@@ -371,10 +436,9 @@ func runBuyer(c *client, idPath string) {
 	}
 	fmt.Println(" OK")
 
-	// Discover seller.
+	// Discover sellers — collect all entries, retry until at least one is found.
 	fmt.Print("  Discovering \"reason.qa\" on A2AL")
-	var sellerAID string
-	var sellerName, sellerBrief string
+	var allEntries []providerEntry
 	for attempt := 0; attempt < 20; attempt++ {
 		if attempt > 0 {
 			fmt.Print(".")
@@ -388,36 +452,79 @@ func runBuyer(c *client, idPath string) {
 			} `json:"entries"`
 		}
 		if err := c.do("POST", "/discover", map[string]any{"services": []string{"reason.qa"}}, &resp); err == nil && len(resp.Entries) > 0 {
-			sellerAID = resp.Entries[0].AID
-			sellerName = resp.Entries[0].Name
-			sellerBrief = resp.Entries[0].Brief
+			for _, e := range resp.Entries {
+				allEntries = append(allEntries, providerEntry{AID: e.AID, Name: e.Name, Brief: e.Brief})
+			}
 			break
 		}
 	}
 	fmt.Println()
 
-	if sellerAID == "" {
+	if len(allEntries) == 0 {
 		fatal("reason.qa not found.\nStart Seller first and wait until it prints that it is online, then run Buyer.")
 	}
 
-	fmt.Printf("\n  Found seller:\n")
-	fmt.Printf("    AID:   %s\n", sellerAID)
-	fmt.Printf("    name:  %s\n", sellerName)
-	fmt.Printf("    brief: %s\n", sellerBrief)
+	if len(allEntries) == 1 {
+		e := allEntries[0]
+		fmt.Printf("\n  Found 1 provider: %s\n  %s  (%s)\n", e.Name, e.Brief, shortAID(e.AID))
+	}
 
-	// Establish QUIC tunnel.
-	fmt.Printf("\n  Opening A2AL tunnel (local AID %s)...", shortAID(id.AID))
-	var connResp struct {
-		Tunnel string `json:"tunnel"`
+	chosen, userSelected := pickProvider(allEntries)
+
+	// Establish QUIC tunnel — behaviour differs by selection mode.
+	connectReq := map[string]any{"local_aid": id.AID}
+	var tunnelBase string
+
+	if userSelected {
+		e := allEntries[chosen]
+		fmt.Printf("\n  Step: establish QUIC tunnel → %s (%s)... ", e.Name, shortAID(e.AID))
+		var connResp struct {
+			Tunnel string `json:"tunnel"`
+		}
+		if err := c.do("POST", "/connect/"+e.AID, connectReq, &connResp); err != nil {
+			fmt.Printf("✗\n\nerror: Step \"establish QUIC tunnel\" failed: %v\n", err)
+			fmt.Fprintln(os.Stderr, "  Possible causes:")
+			fmt.Fprintln(os.Stderr, "    • Daemon not reachable — confirm your local a2ald is running and the")
+			fmt.Fprintln(os.Stderr, "      provider's a2ald is also online.")
+			fmt.Fprintln(os.Stderr, "    • Wrong provider — verify the AID matches the expected Seller:")
+			fmt.Fprintf(os.Stderr,  "      discovered AID: %s\n", e.AID)
+			os.Exit(1)
+		}
+		fmt.Printf("OK\n  tunnel: %s\n", connResp.Tunnel)
+		tunnelBase = "http://" + connResp.Tunnel
+	} else {
+		for i := chosen; i < len(allEntries); i++ {
+			e := allEntries[i]
+			if len(allEntries) > 1 {
+				fmt.Printf("\n  [%d/%d] Step: establish QUIC tunnel → %s (%s)... ",
+					i+1, len(allEntries), e.Name, shortAID(e.AID))
+			} else {
+				fmt.Printf("\n  Step: establish QUIC tunnel → %s (%s)... ", e.Name, shortAID(e.AID))
+			}
+			var connResp struct {
+				Tunnel string `json:"tunnel"`
+			}
+			if err := c.do("POST", "/connect/"+e.AID, connectReq, &connResp); err != nil {
+				fmt.Printf("✗  %v\n", err)
+				if i+1 < len(allEntries) {
+					fmt.Printf("  → trying next provider...\n")
+				}
+				continue
+			}
+			fmt.Printf("OK\n  tunnel: %s\n", connResp.Tunnel)
+			tunnelBase = "http://" + connResp.Tunnel
+			break
+		}
+		if tunnelBase == "" {
+			fmt.Fprintf(os.Stderr, "\nerror: All %d provider(s) failed at step \"establish QUIC tunnel\".\n", len(allEntries))
+			fmt.Fprintln(os.Stderr, "  Possible causes:")
+			fmt.Fprintln(os.Stderr, "    • Daemon not reachable — confirm your local a2ald is running and the")
+			fmt.Fprintln(os.Stderr, "      provider's a2ald is also online.")
+			fmt.Fprintln(os.Stderr, "    • Wrong providers — the discovered AIDs may not be the Seller you expect.")
+			fmt.Fprintln(os.Stderr, "      Compare the AIDs above with your Seller's printed AID.")
+			os.Exit(1)
+		}
 	}
-	connectReq := map[string]any{
-		"local_aid": id.AID,
-	}
-	if err := c.do("POST", "/connect/"+sellerAID, connectReq, &connResp); err != nil {
-		fatal("tunnel failed: %v\n  Keep Seller running and ensure both daemons can reach each other.", err)
-	}
-	tunnelBase := "http://" + connResp.Tunnel
-	fmt.Printf(" OK\n  tunnel: %s\n", connResp.Tunnel)
 
 	fmt.Printf("\n  ── calls ─────────────────────────────────\n\n")
 
@@ -519,8 +626,9 @@ func main() {
 
 	if role == "" {
 		fmt.Fprintln(os.Stderr, "Usage:")
-		fmt.Fprintln(os.Stderr, "  go run . --role seller  [--api 127.0.0.1:2121] [--id FILE] [--token TOKEN]")
-		fmt.Fprintln(os.Stderr, "  go run . --role buyer   [--api 127.0.0.1:2121] [--id FILE] [--token TOKEN]")
+		fmt.Fprintln(os.Stderr, "  demo5-marketplace --role seller  [--api 127.0.0.1:2121] [--id FILE] [--token TOKEN]")
+		fmt.Fprintln(os.Stderr, "  demo5-marketplace --role buyer   [--api 127.0.0.1:2121] [--id FILE] [--token TOKEN]")
+		fmt.Fprintln(os.Stderr, "  (build from source: go run . --role seller|buyer ...)")
 		os.Exit(1)
 	}
 	if idPath == "" {
@@ -531,7 +639,8 @@ func main() {
 	c := newClient(apiAddr, token)
 	if err := c.do("GET", "/health", nil, nil); err != nil {
 		fmt.Fprintf(os.Stderr, "error: cannot reach a2ald at %s: %v\n", apiAddr, err)
-		fmt.Fprintln(os.Stderr, "Start a2ald first, e.g.: a2ald --data-dir ./tmp/node --fallback-host 127.0.0.1")
+		fmt.Fprintln(os.Stderr, "Make sure a2ald is running. Download: https://github.com/a2al/a2al/releases")
+		fmt.Fprintln(os.Stderr, "See doc/examples.md or https://github.com/a2al/a2al for setup instructions.")
 		os.Exit(1)
 	}
 

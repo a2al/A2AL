@@ -9,26 +9,28 @@
 //   - Bob discovers Alice by named service, sends a request via encrypted notes, and waits for the reply.
 //
 // Both talk only to local a2ald; P2P is handled by the daemon. Start Bob after Alice prints that she is online.
-// Pre-built binary: demo4-marketplace from the demos-latest release (replace go run . with demo4-marketplace; same flags).
+// Pre-built binary: demo4-marketplace from the demos-latest release (see doc/examples.md).
 //
 // Recommended — two machines, each running a2ald:
 //
-//	Machine A: a2ald  +  go run . --role alice
-//	Machine B: a2ald  +  go run . --role bob
+//	Machine A: a2ald  +  demo4-marketplace --role alice
+//	Machine B: a2ald  +  demo4-marketplace --role bob
 //
 // Single machine — shared a2ald (demo4 only needs DHT encrypted notes / named service; both processes may share one daemon):
 //
 //	a2ald --fallback-host 127.0.0.1
-//	go run . --role alice   # terminal 2
-//	go run . --role bob     # terminal 3
+//	demo4-marketplace --role alice   # terminal 2
+//	demo4-marketplace --role bob     # terminal 3
 //
 // Single machine — two a2alds (four terminals; simulates cross-node P2P):
 //
 //	Alice a2ald:  a2ald --data-dir ./tmp/a --fallback-host 127.0.0.1
 //	Bob   a2ald:  a2ald --data-dir ./tmp/b --listen :4122 --api-addr 127.0.0.1:2122 \
 //	              --fallback-host 127.0.0.1 --bootstrap 127.0.0.1:4121
-//	Alice demo:   go run . --role alice
-//	Bob   demo:   go run . --role bob --api 127.0.0.1:2122
+//	Alice demo:   demo4-marketplace --role alice
+//	Bob   demo:   demo4-marketplace --role bob --api 127.0.0.1:2122
+//
+// Build from source (Go 1.22+): replace "demo4-marketplace" with "go run ." inside examples/demo4-marketplace/.
 //
 // LAN/offline: set --fallback-host to this host's LAN IP; Bob adds --bootstrap <peer-ip>:4121.
 //
@@ -64,6 +66,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
@@ -72,6 +75,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -334,6 +338,138 @@ func doTranslate(req string) string {
 
 // ─── Bob (consumer) ──────────────────────────────────────────────────────────
 
+// providerEntry holds discovered provider info for display and selection.
+type providerEntry struct {
+	AID   string
+	Name  string
+	Brief string
+	Tags  []string
+}
+
+// pickProvider shows a numbered list and gives the user 5 seconds to pick.
+// Returns (index, userSelected=true) for an explicit choice, or (0, false) for auto.
+// A single entry skips the prompt entirely.
+// Typing a non-numeric or out-of-range value stops the countdown and waits for a
+// valid number before proceeding.
+func pickProvider(entries []providerEntry) (int, bool) {
+	if len(entries) == 1 {
+		return 0, false
+	}
+	fmt.Printf("\n  Found %d providers:\n", len(entries))
+	for i, e := range entries {
+		brief := e.Brief
+		if len(brief) > 45 {
+			brief = brief[:43] + "…"
+		}
+		tagStr := ""
+		if len(e.Tags) > 0 {
+			tagStr = "  [" + strings.Join(e.Tags, ", ") + "]"
+		}
+		fmt.Printf("    [%d] %-22s  %s%s\n", i+1, e.Name, brief, tagStr)
+		fmt.Printf("        %s\n", shortAID(e.AID))
+	}
+	fmt.Println()
+	fmt.Printf("  Enter a number to select, or press Enter. Auto-selecting #1 in 5 seconds.\n")
+	fmt.Printf("  Select [1–%d]: ", len(entries))
+
+	rd := bufio.NewReader(os.Stdin)
+	inputCh := make(chan string, 1)
+	go func() {
+		line, _ := rd.ReadString('\n')
+		inputCh <- strings.TrimSpace(line)
+	}()
+
+	select {
+	case raw := <-inputCh:
+		n, err := strconv.Atoi(raw)
+		if err == nil && n >= 1 && n <= len(entries) {
+			fmt.Printf("  → Selected: [%d] %s\n", n, entries[n-1].Name)
+			return n - 1, true
+		}
+		// Invalid input — stop countdown, wait for a valid number.
+		fmt.Printf("  Invalid selection — enter a number from 1 to %d: ", len(entries))
+		for {
+			line, _ := rd.ReadString('\n')
+			line = strings.TrimSpace(line)
+			n2, err2 := strconv.Atoi(line)
+			if err2 == nil && n2 >= 1 && n2 <= len(entries) {
+				fmt.Printf("  → Selected: [%d] %s\n", n2, entries[n2-1].Name)
+				return n2 - 1, true
+			}
+			fmt.Printf("  Please enter 1–%d: ", len(entries))
+		}
+	case <-time.After(5 * time.Second):
+	}
+	fmt.Printf("  No input — auto-selecting #1: %s\n", entries[0].Name)
+	return 0, false
+}
+
+// tryBobWithAlice performs the full mailbox round-trip: send message + wait up to
+// 60s for a reply from aliceAID. Returns (reply, failedStep, err); failedStep is ""
+// on success.
+func tryBobWithAlice(c *client, bobAID, aliceAID string) (string, string, error) {
+	// Optional: read Alice's Sovereign Record for service info.
+	fmt.Printf("  Reading service record (rec_type=2)...")
+	var recResp struct {
+		Records []struct {
+			PayloadBase64 string `json:"payload_base64"`
+		} `json:"records"`
+	}
+	if err := c.do("GET", "/resolve/"+aliceAID+"/records?type=2", nil, &recResp); err != nil {
+		fmt.Printf(" skipped\n")
+	} else if len(recResp.Records) > 0 {
+		payload, _ := base64.StdEncoding.DecodeString(recResp.Records[0].PayloadBase64)
+		fmt.Printf(" %s\n", string(payload))
+	} else {
+		fmt.Println(" no records")
+	}
+
+	text := "translate: hello world"
+	fmt.Printf("  Step: send mailbox message (%q)... ", text)
+	sendReq := map[string]any{
+		"recipient":   aliceAID,
+		"msg_type":    1,
+		"body_base64": base64.StdEncoding.EncodeToString([]byte(text)),
+	}
+	if err := c.do("POST", "/agents/"+bobAID+"/mailbox/send", sendReq, nil); err != nil {
+		fmt.Printf("✗\n")
+		return "", "send mailbox message", err
+	}
+	fmt.Printf("OK\n")
+
+	fmt.Printf("  Step: wait for reply (up to 60s)")
+	deadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) {
+		time.Sleep(3 * time.Second)
+		fmt.Print(".")
+		var pollResp struct {
+			Messages []struct {
+				Sender     string `json:"sender"`
+				MsgType    uint8  `json:"msg_type"`
+				BodyBase64 string `json:"body_base64"`
+			} `json:"messages"`
+		}
+		if err := c.do("POST", "/agents/"+bobAID+"/mailbox/poll", struct{}{}, &pollResp); err != nil {
+			continue
+		}
+		for _, msg := range pollResp.Messages {
+			if msg.Sender == aliceAID {
+				body, _ := base64.StdEncoding.DecodeString(msg.BodyBase64)
+				fmt.Println(" OK")
+				return string(body), "", nil
+			}
+		}
+	}
+	fmt.Println()
+	return "", "wait for reply", fmt.Errorf("timed out after 60s")
+}
+
+func printBobSuccess(reply string) {
+	fmt.Printf("\n[Bob] translation result: %q\n", reply)
+	fmt.Println("\n✓ demo4 verification complete")
+	fmt.Println("  Flow: identity → Tangled publish → named service → discover → Sovereign Record → encrypted notes")
+}
+
 func runBob(c *client, idPath string) {
 	fmt.Println("\n=== Bob — translation client ===")
 
@@ -352,104 +488,97 @@ func runBob(c *client, idPath string) {
 		fatal("%v", err)
 	}
 
-	// Discover translator by named service.
-	fmt.Print(`  discover named service "lang.translate" (tag=es)`)
+	// Discover translator by named service — collect all entries.
+	fmt.Print(`  Discovering "lang.translate" (tag=es)`)
 	discoverReq := map[string]any{
 		"services": []string{"lang.translate"},
-		"filter": map[string]any{"tags": []string{"es"}},
+		"filter":   map[string]any{"tags": []string{"es"}},
 	}
-	var discoverResp struct {
-		Entries []struct {
-			AID   string   `json:"aid"`
-			Name  string   `json:"name"`
-			Brief string   `json:"brief"`
-			Tags  []string `json:"tags"`
-		} `json:"entries"`
-	}
-
-	var aliceAID string
+	var allEntries []providerEntry
 	for attempt := 0; attempt < 15; attempt++ {
 		if attempt > 0 {
 			fmt.Print(".")
 			time.Sleep(3 * time.Second)
 		}
-		if err := c.do("POST", "/discover", discoverReq, &discoverResp); err != nil {
-			continue
+		var resp struct {
+			Entries []struct {
+				AID   string   `json:"aid"`
+				Name  string   `json:"name"`
+				Brief string   `json:"brief"`
+				Tags  []string `json:"tags"`
+			} `json:"entries"`
 		}
-		if len(discoverResp.Entries) > 0 {
-			aliceAID = discoverResp.Entries[0].AID
+		if err := c.do("POST", "/discover", discoverReq, &resp); err == nil && len(resp.Entries) > 0 {
+			for _, e := range resp.Entries {
+				allEntries = append(allEntries, providerEntry{AID: e.AID, Name: e.Name, Brief: e.Brief, Tags: e.Tags})
+			}
 			break
 		}
 	}
 	fmt.Println()
 
-	if aliceAID == "" {
-		fatal("no translation service found (named service: lang.translate, tag: es).\nEnsure Alice is online and allow a few seconds for Tangled to sync.")
+	if len(allEntries) == 0 {
+		fatal("no translation service found (lang.translate, tag: es).\nEnsure Alice is online and allow a few seconds for Tangled to sync.")
 	}
 
-	fmt.Printf("\n  Found %d translation service(s):\n", len(discoverResp.Entries))
-	for _, e := range discoverResp.Entries {
-		fmt.Printf("    %-20s  %s  tags=%v\n", shortAID(e.AID), e.Brief, e.Tags)
+	if len(allEntries) == 1 {
+		e := allEntries[0]
+		tagStr := ""
+		if len(e.Tags) > 0 {
+			tagStr = "  [" + strings.Join(e.Tags, ", ") + "]"
+		}
+		fmt.Printf("\n  Found 1 provider: %s%s\n  %s  (%s)\n", e.Name, tagStr, e.Brief, shortAID(e.AID))
 	}
 
-	// Read Alice's Sovereign Record for extra service info.
-	fmt.Printf("\n  Reading Alice's Sovereign Record (rec_type=2)...")
-	var recResp struct {
-		Records []struct {
-			PayloadBase64 string `json:"payload_base64"`
-		} `json:"records"`
-	}
-	if err := c.do("GET", "/resolve/"+aliceAID+"/records?type=2", nil, &recResp); err != nil {
-		fmt.Printf(" skipped (%v)\n", err)
-	} else if len(recResp.Records) > 0 {
-		payload, _ := base64.StdEncoding.DecodeString(recResp.Records[0].PayloadBase64)
-		fmt.Printf("\n  Service info: %s\n", string(payload))
+	chosen, userSelected := pickProvider(allEntries)
+
+	if userSelected {
+		e := allEntries[chosen]
+		fmt.Printf("\n  Contacting: %s  (%s)\n", e.Name, shortAID(e.AID))
+		reply, step, err := tryBobWithAlice(c, id.AID, e.AID)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "\nerror: Step %q failed: %v\n", step, err)
+			fmt.Fprintln(os.Stderr, "  Possible causes:")
+			fmt.Fprintln(os.Stderr, "    • Daemon not reachable — confirm your local a2ald is running and the")
+			fmt.Fprintln(os.Stderr, "      provider's a2ald is also online.")
+			fmt.Fprintln(os.Stderr, "    • Wrong provider — verify the AID matches the expected Alice:")
+			fmt.Fprintf(os.Stderr,  "      discovered AID: %s\n", e.AID)
+			os.Exit(1)
+		}
+		printBobSuccess(reply)
 	} else {
-		fmt.Println(" no records")
-	}
-
-	// Send encrypted note (mailbox API).
-	text := "translate: hello world"
-	fmt.Printf("\n[Bob] sending translation request: %q\n", text)
-	sendReq := map[string]any{
-		"recipient":   aliceAID,
-		"msg_type":    1,
-		"body_base64": base64.StdEncoding.EncodeToString([]byte(text)),
-	}
-	if err := c.do("POST", "/agents/"+id.AID+"/mailbox/send", sendReq, nil); err != nil {
-		fatal("send failed: %v", err)
-	}
-	fmt.Println("[Bob] request sent; waiting for translation...")
-
-	// Poll for Alice's reply.
-	deadline := time.Now().Add(60 * time.Second)
-	for time.Now().Before(deadline) {
-		time.Sleep(3 * time.Second)
-		fmt.Print(".")
-
-		var pollResp struct {
-			Messages []struct {
-				Sender     string `json:"sender"`
-				MsgType    uint8  `json:"msg_type"`
-				BodyBase64 string `json:"body_base64"`
-			} `json:"messages"`
-		}
-		if err := c.do("POST", "/agents/"+id.AID+"/mailbox/poll", struct{}{}, &pollResp); err != nil {
-			continue
-		}
-		for _, msg := range pollResp.Messages {
-			if msg.Sender == aliceAID {
-				body, _ := base64.StdEncoding.DecodeString(msg.BodyBase64)
-				fmt.Printf("\n\n[Bob] translation result: %q\n", string(body))
-				fmt.Println("\n✓ demo4 verification complete")
-				fmt.Println("  Flow: identity → Tangled publish → named service → discover → Sovereign Record → encrypted notes")
-				return
+		var reply string
+		found := false
+		for i := chosen; i < len(allEntries); i++ {
+			e := allEntries[i]
+			if len(allEntries) > 1 {
+				fmt.Printf("\n  [%d/%d] Trying: %s  (%s)\n", i+1, len(allEntries), e.Name, shortAID(e.AID))
+			} else {
+				fmt.Printf("\n  Contacting: %s  (%s)\n", e.Name, shortAID(e.AID))
 			}
+			r, step, err := tryBobWithAlice(c, id.AID, e.AID)
+			if err != nil {
+				fmt.Printf("  ✗ Step %q failed: %v\n", step, err)
+				if i+1 < len(allEntries) {
+					fmt.Printf("  → trying next provider...\n")
+				}
+				continue
+			}
+			reply = r
+			found = true
+			break
 		}
+		if !found {
+			fmt.Fprintf(os.Stderr, "\nerror: All %d provider(s) failed.\n", len(allEntries))
+			fmt.Fprintln(os.Stderr, "  Possible causes:")
+			fmt.Fprintln(os.Stderr, "    • Daemon not reachable — confirm your local a2ald is running and the")
+			fmt.Fprintln(os.Stderr, "      provider's a2ald is also online.")
+			fmt.Fprintln(os.Stderr, "    • Wrong providers — the discovered AIDs may not be the Alice you expect.")
+			fmt.Fprintln(os.Stderr, "      Compare the AIDs above with your Alice's printed AID.")
+			os.Exit(1)
+		}
+		printBobSuccess(reply)
 	}
-	fmt.Println("\n[Bob] timed out (60s) waiting for Alice.")
-	fmt.Println("  Check that Alice is still running and both daemons can reach each other.")
-	os.Exit(1)
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -509,8 +638,9 @@ func main() {
 
 	if role == "" {
 		fmt.Fprintln(os.Stderr, "Usage:")
-		fmt.Fprintln(os.Stderr, "  go run . --role alice [--api 127.0.0.1:2121] [--id FILE] [--token TOKEN]")
-		fmt.Fprintln(os.Stderr, "  go run . --role bob   [--api 127.0.0.1:2121] [--id FILE] [--token TOKEN]")
+		fmt.Fprintln(os.Stderr, "  demo4-marketplace --role alice [--api 127.0.0.1:2121] [--id FILE] [--token TOKEN]")
+		fmt.Fprintln(os.Stderr, "  demo4-marketplace --role bob   [--api 127.0.0.1:2121] [--id FILE] [--token TOKEN]")
+		fmt.Fprintln(os.Stderr, "  (build from source: go run . --role alice|bob ...)")
 		os.Exit(1)
 	}
 	if idPath == "" {
@@ -521,7 +651,8 @@ func main() {
 	c := newClient(apiAddr, token)
 	if err := c.do("GET", "/health", nil, nil); err != nil {
 		fmt.Fprintf(os.Stderr, "error: cannot reach a2ald at %s: %v\n", apiAddr, err)
-		fmt.Fprintln(os.Stderr, "Start a2ald first, e.g.: a2ald --data-dir ./tmp/alice --fallback-host 127.0.0.1")
+		fmt.Fprintln(os.Stderr, "Make sure a2ald is running. Download: https://github.com/a2al/a2al/releases")
+		fmt.Fprintln(os.Stderr, "See doc/examples.md or https://github.com/a2al/a2al for setup instructions.")
 		os.Exit(1)
 	}
 

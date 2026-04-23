@@ -7,21 +7,23 @@
 // Transport, DHT, QUIC, and NAT traversal are handled by a2ald; this demo controls a2ald via
 // its REST API and exchanges messages over TCP.
 //
-// Prerequisite: start a2ald in another terminal. Bob enters Alice’s printed AID to chat.
-// Without Go, use the pre-built demo3-chat binary from the demos-latest release (replace go run . with demo3-chat; same flags).
+// Prerequisite: start a2ald in another terminal. Bob enters Alice's printed AID to chat.
+// Without Go, use the pre-built demo3-chat binary from the demos-latest release (see doc/examples.md).
 //
-// Recommended — two machines, two terminals each:
+// Recommended -- two machines, two terminals each:
 //
-//	Machine A: a2ald  +  go run .
-//	Machine B: a2ald  +  go run .
+//	Machine A: a2ald  +  demo3-chat
+//	Machine B: a2ald  +  demo3-chat
 //
-// Single machine — four terminals (two daemons as each other’s bootstrap; needs --fallback-host):
+// Single machine -- four terminals (two daemons as each other's bootstrap; needs --fallback-host):
 //
 //	Alice a2ald:  a2ald --data-dir ./tmp/a --fallback-host 127.0.0.1
-//	Alice chat:   go run .
+//	Alice chat:   demo3-chat
 //	Bob a2ald:    a2ald --data-dir ./tmp/b --listen :4122 --api-addr 127.0.0.1:2122 \
 //	              --fallback-host 127.0.0.1 --bootstrap 127.0.0.1:4121
-//	Bob chat:     go run . --api 127.0.0.1:2122
+//	Bob chat:     demo3-chat --api 127.0.0.1:2122
+//
+// Build from source (Go 1.22+): replace "demo3-chat" with "go run ." inside examples/demo3-chat/.
 //
 // LAN testing: set --fallback-host to this host's LAN IP; set --bootstrap to the peer's ip:4121.
 //
@@ -71,7 +73,7 @@ import (
 	"time"
 )
 
-// ─── REST client ─────────────────────────────────────────────────────────────
+// --- REST client ---------------------------------------------------------------
 
 type client struct {
 	base   string
@@ -121,7 +123,7 @@ func (c *client) do(method, path string, body, out any) error {
 	return nil
 }
 
-// ─── API types ───────────────────────────────────────────────────────────────
+// --- API types -----------------------------------------------------------------
 
 type identityGenResp struct {
 	OperationalPrivateKeyHex string `json:"operational_private_key_hex"`
@@ -144,11 +146,11 @@ type connectResp struct {
 	Tunnel string `json:"tunnel"`
 }
 
-// ─── Chat service (TCP server) ───────────────────────────────────────────────
+// --- Chat service (TCP server) -------------------------------------------------
 
 // chatServer listens on a random local TCP port. a2ald gateway forwards inbound
 // QUIC streams here. Each accepted connection begins with a 21-byte remote AID
-// header (spec §gateway), followed by UTF-8 chat messages (newline-delimited).
+// header (spec ?gateway), followed by UTF-8 chat messages (newline-delimited).
 type chatServer struct {
 	ln      net.Listener
 	myAID   string
@@ -224,7 +226,7 @@ func aidBytesToString(b []byte) string {
 	return string(buf)
 }
 
-// ─── Identity persistence ────────────────────────────────────────────────────
+// --- Identity persistence ------------------------------------------------------
 
 type savedIdentity struct {
 	OperationalPrivateKeyHex string `json:"operational_private_key_hex"`
@@ -253,7 +255,7 @@ func loadOrCreateIdentity(path string, c *client) (*savedIdentity, error) {
 	return id, nil
 }
 
-// ─── Main ────────────────────────────────────────────────────────────────────
+// --- Main ----------------------------------------------------------------------
 
 func main() {
 	apiAddr := "127.0.0.1:2121"
@@ -287,7 +289,8 @@ func main() {
 	// Check a2ald is alive.
 	if err := c.do("GET", "/health", nil, nil); err != nil {
 		fmt.Fprintf(os.Stderr, "error: cannot reach a2ald at %s: %v\n", apiAddr, err)
-		fmt.Fprintln(os.Stderr, "Start a2ald first, e.g.:  a2ald --data-dir /tmp/a2ald-data")
+		fmt.Fprintln(os.Stderr, "Make sure a2ald is running. Download: https://github.com/a2al/a2al/releases")
+		fmt.Fprintln(os.Stderr, "See doc/examples.md or https://github.com/a2al/a2al for setup instructions.")
 		os.Exit(1)
 	}
 
@@ -361,9 +364,9 @@ func main() {
 		if active != nil {
 			short := active.remoteAID
 			if len(short) > 16 {
-				short = short[:16] + "…"
+				short = short[:16] + "..."
 			}
-			fmt.Printf("[chat → %s] ", short)
+			fmt.Printf("[chat -> %s] ", short)
 		} else {
 			fmt.Print("> ")
 		}
@@ -377,7 +380,7 @@ func main() {
 			fmt.Printf("\n[inbound] %s wants to chat\n", cc.remoteAID)
 			active = cc
 			go readLoop(cc, func(msg string) {
-				fmt.Printf("\n[%s…] %s\n", cc.remoteAID[:min(16, len(cc.remoteAID))], msg)
+				fmt.Printf("\n[%s...] %s\n", cc.remoteAID[:min(16, len(cc.remoteAID))], msg)
 				prompt()
 			}, func() {
 				fmt.Println("\n[peer disconnected]")
@@ -386,7 +389,7 @@ func main() {
 				}
 				prompt()
 			})
-			fmt.Println("[chat mode — empty line to exit]")
+			fmt.Println("[chat mode -- empty line to exit]")
 			prompt()
 
 		case line, ok := <-stdinCh:
@@ -404,7 +407,7 @@ func main() {
 				}
 				_, err := fmt.Fprintf(active.conn, "%s\n", line)
 				if err != nil {
-					fmt.Println("(send error — chat ended)")
+					fmt.Println("(send error -- chat ended)")
 					active = nil
 				}
 				prompt()
@@ -428,7 +431,7 @@ func main() {
 			if err := connectToPeer(c, id.AID, line, func(cc *chatConn) {
 				active = cc
 				go readLoop(cc, func(msg string) {
-					fmt.Printf("\n[%s…] %s\n", cc.remoteAID[:min(16, len(cc.remoteAID))], msg)
+					fmt.Printf("\n[%s...] %s\n", cc.remoteAID[:min(16, len(cc.remoteAID))], msg)
 					prompt()
 				}, func() {
 					fmt.Println("\n[peer disconnected]")
@@ -437,7 +440,7 @@ func main() {
 					}
 					prompt()
 				})
-				fmt.Println("Connected! [chat mode — empty line to exit]")
+				fmt.Println("Connected! [chat mode -- empty line to exit]")
 				prompt()
 			}); err != nil {
 				fmt.Println("connect failed:", err)
@@ -450,7 +453,7 @@ func main() {
 // connectToPeer calls POST /connect/{aid}, connects the tunnel TCP, and calls
 // onConnected once the outbound chatConn is ready.
 func connectToPeer(c *client, localAID, peerAID string, onConnected func(*chatConn)) error {
-	fmt.Printf("Connecting to %s…\n", peerAID)
+	fmt.Printf("Connecting to %s...\n", peerAID)
 	var resp connectResp
 	type connectBody struct {
 		LocalAID string `json:"local_aid,omitempty"`
@@ -490,16 +493,17 @@ func readLoop(cc *chatConn, onMsg func(string), onClose func()) {
 
 func printBanner(aid string) {
 	fmt.Println()
-	fmt.Println("═══════════════════════════════════════════════════")
+	fmt.Println("======================================================")
 	fmt.Println("  demo3-chat  (powered by a2ald)")
 	fmt.Println("  My AID:", aid)
-	fmt.Println("═══════════════════════════════════════════════════")
+	fmt.Println("======================================================")
 	fmt.Println()
-	fmt.Println("Waiting for inbound connections…")
+	fmt.Println("Waiting for inbound connections...")
 	fmt.Println("Commands:")
-	fmt.Println("  <peer AID>   — connect to peer and start chatting")
-	fmt.Println("  aid          — print my AID again")
-	fmt.Println("  quit         — exit")
+	fmt.Println("  <peer AID>   -> connect to peer and start chatting")
+	fmt.Println("  aid          -- print my AID again")
+	fmt.Println("  quit         -- exit")
 	fmt.Println()
 }
+
 
