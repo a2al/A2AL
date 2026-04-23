@@ -6,19 +6,21 @@
 // Covers:
 //   Publish / Resolve / ConnectFromRecord / Accept / mutual TLS / agent-route / nat-sense / UPnP (optional)
 //
-// Without Go, use the pre-built demo2-chat binary from the demos-latest release (replace go run . with demo2-chat; same flags).
+// Without Go, use the pre-built demo2-chat binary from the demos-latest release (see doc/examples.md).
 //
 // Steps:
 //
 // Recommended — two machines (one terminal each):
 //
-//   Alice:  go run .
-//   Bob:    go run . -bootstrap <Alice-IP>:4121
+//   Alice:  demo2-chat
+//   Bob:    demo2-chat -bootstrap <Alice-IP>:4121
 //
 // Single machine — two terminals (different listen ports):
 //
-//   Terminal 1 (Alice):  go run . -listen :4121
-//   Terminal 2 (Bob):    go run . -listen :4123 -bootstrap 127.0.0.1:4121
+//   Terminal 1 (Alice):  demo2-chat -listen :4121
+//   Terminal 2 (Bob):    demo2-chat -listen :4123 -bootstrap 127.0.0.1:4121
+//
+// Build from source (Go 1.22+): replace "demo2-chat" with "go run ." inside examples/demo2-chat/.
 //
 // On Bob, enter Alice’s AID → resolve + QUIC connect → chat. Default QUIC shares the DHT UDP port;
 // use -quic if you need a separate QUIC listener.

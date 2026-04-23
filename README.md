@@ -119,16 +119,22 @@ A2AL is complementary to existing agent communication standards — it provides 
 
 Encrypted chat between two machines. On each machine, two terminals:
 
-```bash
-a2ald                          # terminal 1: network layer, joins the public Tangled Network
-go run ./examples/demo3-chat   # terminal 2: chat app (or run pre-built demo3-chat — see link below)
+```
+a2ald        # terminal 1: network layer, joins the public Tangled Network
+demo3-chat   # terminal 2: chat app — download pre-built binary below
 ```
 
 Bob types Alice's AID → direct encrypted QUIC tunnel → chat.
 
-Pre-built **demo** binaries (demo1-node … demo6-swarm): [**Demo binaries (latest)**](https://github.com/a2al/a2al/releases/tag/demos-latest). The `a2ald` daemon is on the [main Releases](https://github.com/a2al/a2al/releases) page.
+> **Go developers:** replace `demo3-chat` with `go run ./examples/demo3-chat`.
 
-More scenarios (marketplace, swarm) and single-machine variants: [`examples/`](examples/) — see [`doc/examples.md`](doc/examples.md) for the full guide.
+**Download:**
+- Pre-built **demo** binaries (demo1-node … demo6-swarm): [**Demo binaries (latest)**](https://github.com/a2al/a2al/releases/tag/demos-latest)
+- The `a2ald` daemon: [Main Releases page](https://github.com/a2al/a2al/releases)
+
+> **Windows users:** the binaries are currently unsigned. When Windows SmartScreen shows a warning, click **"More info" → "Run anyway"**. This is expected for open-source binaries without a paid code-signing certificate and does not indicate a security risk.
+
+More scenarios (marketplace, swarm) and single-machine variants: [`doc/examples.md`](doc/examples.md).
 
 ## Status
 
