@@ -379,6 +379,7 @@ func pickProvider(entries []providerEntry) (int, bool) {
 		fmt.Printf("        %s\n", shortAID(e.AID))
 	}
 	fmt.Println()
+	fmt.Printf("  Enter a number to select. If no input within 5 seconds, #1 will be tried automatically.\n")
 
 	rd := bufio.NewReader(os.Stdin)
 	inputCh := make(chan string, 1)
@@ -388,8 +389,8 @@ func pickProvider(entries []providerEntry) (int, bool) {
 	}()
 
 	for secs := 5; secs > 0; secs-- {
-		fmt.Printf("\r  Select [1–%d] or wait %ds to auto-try #1 (%s): ",
-			len(entries), secs, entries[0].Name)
+		fmt.Printf("\r  Select [1–%d] (auto-starting in %ds...): ",
+			len(entries), secs)
 		t := time.NewTimer(time.Second)
 		select {
 		case raw := <-inputCh:
