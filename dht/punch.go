@@ -119,4 +119,9 @@ func (n *Node) OnPunchComplete(nodeID a2al.NodeID, peerAddr net.Addr, success bo
 	n.addrToID.Store(peerAddr.String(), nodeID)
 
 	n.log.Debug("punch complete: success, admitted to routing table", "node", nodeID)
+
+	// Phase 5: exchange routing info with the newly-reachable peer.
+	// Runs in a goroutine so OnPunchComplete returns immediately to the
+	// host-layer scheduler.
+	go n.exchangeAfterPunch(nodeID, peerAddr)
 }
