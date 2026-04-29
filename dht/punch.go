@@ -89,7 +89,11 @@ func (n *Node) triggerPunch(nodeID a2al.NodeID, er *protocol.EndpointRecord, pri
 // OnPunchComplete is the callback invoked by the PunchTransport implementation
 // when an ICE attempt for nodeID finishes (success or failure).
 //
-// peerAddr is the peer's reachable net.Addr as determined by ICE (typically
+// peerLogicalAddr is the peer's a2al.Address (21-byte identity address
+// derived from their public key).  It is used to populate NodeInfo.Address so
+// that the punched node's info can be included in FIND_NODE responses.
+//
+// peerNetAddr is the peer's reachable net.Addr as determined by ICE (typically
 // the winning candidate pair's remote address). Must be non-nil on success;
 // ignored on failure.
 //
@@ -103,7 +107,7 @@ func (n *Node) triggerPunch(nodeID a2al.NodeID, er *protocol.EndpointRecord, pri
 // probe cycle will try again if conditions are met.
 //
 // This method is safe to call from any goroutine; it uses healthMu/tabMu/peerMu.
-func (n *Node) OnPunchComplete(nodeID a2al.NodeID, peerAddr net.Addr, success bool) {
+func (n *Node) OnPunchComplete(nodeID a2al.NodeID, peerLogicalAddr a2al.Address, peerNetAddr net.Addr, success bool) {
 	key := nodeIDKey(nodeID)
 	n.healthMu.Lock()
 	h := n.health[key]
@@ -112,16 +116,19 @@ func (n *Node) OnPunchComplete(nodeID a2al.NodeID, peerAddr net.Addr, success bo
 	}
 	n.healthMu.Unlock()
 
-	if !success || peerAddr == nil {
+	if !success || peerNetAddr == nil {
 		n.log.Debug("punch complete: failed", "node", nodeID)
 		return
 	}
 
 	// Build a NodeInfo so the routing layer can place the node in the correct bucket.
+	// Address is required by nodeInfoCheck so the entry can be included in
+	// FIND_NODE responses forwarded to other peers.
 	ni := protocol.NodeInfo{
-		NodeID: append([]byte(nil), nodeID[:]...),
+		NodeID:  append([]byte(nil), nodeID[:]...),
+		Address: append([]byte(nil), peerLogicalAddr[:]...),
 	}
-	if ua, ok := peerAddr.(*net.UDPAddr); ok {
+	if ua, ok := peerNetAddr.(*net.UDPAddr); ok {
 		if ip4 := ua.IP.To4(); ip4 != nil {
 			ni.IP = append([]byte(nil), ip4...)
 		} else {
@@ -140,14 +147,14 @@ func (n *Node) OnPunchComplete(nodeID a2al.NodeID, peerAddr net.Addr, success bo
 	// Phase 4 will consult PunchTransport.SendTo first; this registration
 	// ensures the UDP fallback also has a candidate address.
 	n.peerMu.Lock()
-	n.peers[key] = peerAddr
+	n.peers[key] = peerNetAddr
 	n.peerMu.Unlock()
-	n.addrToID.Store(peerAddr.String(), nodeID)
+	n.addrToID.Store(peerNetAddr.String(), nodeID)
 
 	n.log.Debug("punch complete: success, admitted to routing table", "node", nodeID)
 
 	// Phase 5: exchange routing info with the newly-reachable peer.
 	// Runs in a goroutine so OnPunchComplete returns immediately to the
 	// host-layer scheduler.
-	go n.exchangeAfterPunch(nodeID, peerAddr)
+	go n.exchangeAfterPunch(nodeID, peerNetAddr)
 }
