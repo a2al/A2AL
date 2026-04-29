@@ -42,6 +42,14 @@ type repNodeEntry struct {
 	badSince       time.Time     // non-zero: node is in 30-min grace window before eviction
 	nextProbeAt    time.Time
 	nextProbeDelay time.Duration // current exponential back-off interval
+
+	// Phase 0 reserved fields — declared here so Phase 7 can start populating
+	// them without touching unrelated code. All three are zero/false until
+	// Phase 7 (ReplicationSet dual-set) is implemented; existing logic must
+	// not read or write these fields before that phase.
+	isPunched   bool // node was reached via ICE hole-punch, not direct UDP
+	inXorSet    bool // member of the XOR-distance-closest N_rep set
+	inDirectSet bool // member of the directly-reachable N_rep set
 }
 
 // repSet tracks confirmed remote replicas for one (storeKey, publisher) pair.

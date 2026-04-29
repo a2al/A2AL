@@ -55,6 +55,12 @@ type bucketEntry struct {
 	info    protocol.NodeInfo
 	meta    EntryMeta
 	addedAt time.Time // when this entry was first created in the table
+
+	// isPunched marks entries that were admitted via ICE hole-punching rather
+	// than direct UDP reachability. Punched entries occupy spare slots only and
+	// are evicted first when a new directly-reachable node needs a bucket slot.
+	// Populated by Phase 3 (AddPunched); read-only zero value until then.
+	isPunched bool
 }
 
 // pendingEntry holds a hearsay node that is waiting to be verified before

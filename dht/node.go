@@ -76,6 +76,14 @@ type peerHealthEntry struct {
 	// cleared by recordSuccess.  Probes are allowed to halve the remaining
 	// duration via recordProbeFailure instead of growing it.
 	nextRetryAt time.Time
+
+	// isPunching indicates that an ICE hole-punch attempt is currently in
+	// flight for this peer. While true the peer is excluded from all query
+	// tracks (Good/Unknown/Bad) to avoid sending DHT messages to an address
+	// that is not yet reachable. Cleared when the punch attempt completes
+	// (success or failure). Populated by Phase 2 (punch scheduler); zero
+	// value (false) preserves existing behaviour until then.
+	isPunching bool
 }
 
 // Node is a single DHT participant (routing + local store + wire handler).
