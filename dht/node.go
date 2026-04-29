@@ -22,6 +22,47 @@ import (
 	"github.com/a2al/a2al/transport"
 )
 
+// PunchTransport is the optional ICE hole-punch integration layer.
+//
+// When non-nil (injected via Config.PunchTransport), the DHT can reach
+// NAT-bound peers that are not directly accessible over UDP. When nil
+// (default), all DHT behaviour is identical to the current direct-UDP-only
+// mode — no code paths change.
+//
+// The interface is intentionally narrow: DHT never sees QUIC connections,
+// streams, or ICE candidates. It only asks "can I send this byte slice to
+// that NodeID?" and "please start punching that NodeID in the background".
+//
+// Implementations live in the host layer (host/dht_punch_pool.go) and are
+// wired in by the daemon at startup, following the same pattern as
+// OnObservedAddr injection.
+type PunchTransport interface {
+	// SendTo attempts to deliver msg to nodeID via an existing punched QUIC
+	// connection. ok=false means no active punched connection is available
+	// for this peer; the caller must fall back to the UDP transport.
+	// Called on the hot RPC path — must not block.
+	SendTo(ctx context.Context, nodeID a2al.NodeID, msg []byte) (ok bool, err error)
+
+	// Punch enqueues an asynchronous ICE hole-punch attempt for nodeID.
+	// er supplies the signal URL and NAT classification from the peer's
+	// signed endpoint record. priority is one of the PunchPriority*
+	// constants. Non-blocking: returns immediately after enqueue.
+	Punch(nodeID a2al.NodeID, er *protocol.EndpointRecord, priority int)
+}
+
+// Punch priority levels for PunchTransport.Punch (§11 trigger table).
+const (
+	// PunchPriorityHigh is used by the replication maintainer (过程二) when
+	// a ReplicationSet member goes Bad — this directly affects record availability.
+	PunchPriorityHigh = 2
+	// PunchPriorityLow is used by the health probe (过程三) when persistent
+	// UDP failures indicate the peer is behind a restrictive NAT.
+	PunchPriorityLow = 1
+	// PunchPriorityLowest is used by the query engine when it encounters an
+	// unreachable node while iterating — speculative, best-effort.
+	PunchPriorityLowest = 0
+)
+
 // Config holds runtime dependencies for a DHT node (spec Step 7).
 type Config struct {
 	Transport transport.Transport
@@ -45,6 +86,11 @@ type Config struct {
 	// table across restarts (spec §7.3). Empty disables persistence (default in
 	// tests). The file is written with mode 0600.
 	SeenPeersPath string
+	// PunchTransport is an optional ICE hole-punch integration.
+	// When nil (default) the node operates in direct-UDP-only mode, which is
+	// fully backward-compatible. Set by the host layer at startup via the same
+	// injection pattern as OnObservedAddr.
+	PunchTransport PunchTransport
 }
 
 // PeerHealthState classifies a peer's reachability based on observed RPC outcomes.
@@ -153,6 +199,10 @@ type Node struct {
 	// routing table naturally through incoming traffic and do not need to
 	// search for peers themselves.
 	passiveRouting atomic.Bool
+
+	// punch is the optional ICE hole-punch integration, injected via Config.
+	// Nil when running in direct-UDP-only mode (default).
+	punch PunchTransport
 }
 
 type waitEntry struct {
@@ -204,6 +254,7 @@ func NewNode(cfg Config) (*Node, error) {
 		renewInFlight:  make(map[repKey]struct{}),
 		onObservedAddr: cfg.OnObservedAddr,
 		auth:           cfg.RecordAuth,
+		punch:          cfg.PunchTransport,
 	}
 	n.table = routing.NewTable(nid, nil)
 	if cfg.SeenPeersPath != "" {
@@ -262,6 +313,42 @@ func (n *Node) recvLoop() {
 			n.onNATProbeEcho(from, dec)
 		default:
 		}
+	}
+}
+
+// InjectReceived processes a pre-received DHT message from an external
+// transport (e.g. a punched QUIC stream managed by the host layer).
+//
+// It follows the same decode→dispatch path as recvLoop without reading from
+// the UDP transport. from should be the peer's reachable net.Addr so that
+// outbound responses can be addressed correctly; the host layer supplies the
+// ICE-negotiated address or the peer's reflexive candidate.
+//
+// Safe to call from any goroutine concurrently with the normal UDP receive loop.
+func (n *Node) InjectReceived(data []byte, from net.Addr) {
+	dec, err := protocol.VerifyAndDecode(data)
+	if err != nil {
+		return
+	}
+	n.statsRx.Add(1)
+	if n.tryDeliver(dec) {
+		return
+	}
+	switch dec.Header.MsgType {
+	case protocol.MsgPong, protocol.MsgFindValueResp, protocol.MsgFindNodeResp, protocol.MsgStoreResp:
+		return
+	case protocol.MsgPing:
+		n.onPing(from, dec)
+	case protocol.MsgFindNode:
+		n.onFindNode(from, dec)
+	case protocol.MsgFindValue:
+		n.onFindValue(from, dec)
+	case protocol.MsgStore:
+		n.onStore(from, dec)
+	case protocol.MsgNATProbeReq:
+		n.onNATProbeReq(from, dec)
+	case protocol.MsgNATProbeEcho:
+		n.onNATProbeEcho(from, dec)
 	}
 }
 
