@@ -213,6 +213,44 @@ func (t *Table) NearestNVerified(target a2al.NodeID, n int, cutoff time.Time) []
 	return out
 }
 
+// AddPunched inserts or refreshes a punched entry into the appropriate bucket.
+//
+// Punched entries are admitted only into spare slots (bucket len < K). A full
+// bucket silently rejects the entry — the next time a direct-contact node
+// arrives it will evict a punched entry (via Add), freeing a slot.
+//
+// Returns true if the entry was admitted or refreshed.
+func (t *Table) AddPunched(n protocol.NodeInfo, meta EntryMeta, addedAt time.Time) bool {
+	if len(n.NodeID) != len(t.self) {
+		return false
+	}
+	var peer a2al.NodeID
+	copy(peer[:], n.NodeID)
+	if peer == t.self {
+		return false
+	}
+	bi := BucketIndex(t.self, peer)
+	if bi < 0 {
+		return false
+	}
+	return t.b[bi].addOrTouchPunched(cloneNodeInfo(n), meta, addedAt)
+}
+
+// OldestPunchedInBucket returns the NodeInfo of the oldest (LRU-position)
+// punched entry in the bucket that would hold peer, together with its NodeID.
+// Returns (NodeInfo{}, false) when no punched entry exists in that bucket.
+//
+// Used by the dht layer's tabAdd to evict a punched node before triggering a
+// liveness ping on a direct-contact entry (punched nodes are evicted first).
+func (t *Table) OldestPunchedInBucket(peer a2al.NodeID) (protocol.NodeInfo, bool) {
+	bi := BucketIndex(t.self, peer)
+	if bi < 0 {
+		return protocol.NodeInfo{}, false
+	}
+	_, info, ok := t.b[bi].oldestPunchedInfo()
+	return info, ok
+}
+
 // BucketIndexOf returns BucketIndex(t.self, peer).
 func (t *Table) BucketIndexOf(peer a2al.NodeID) int {
 	return BucketIndex(t.self, peer)

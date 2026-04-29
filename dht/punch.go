@@ -17,8 +17,12 @@ package dht
 //   - No DHT semantic decisions (not deciding *why* to punch, only *whether*)
 
 import (
+	"net"
+	"time"
+
 	"github.com/a2al/a2al"
 	"github.com/a2al/a2al/protocol"
+	"github.com/a2al/a2al/routing"
 )
 
 // triggerPunch conditionally enqueues an ICE hole-punch attempt for nodeID.
@@ -59,16 +63,21 @@ func (n *Node) triggerPunch(nodeID a2al.NodeID, er *protocol.EndpointRecord, pri
 // OnPunchComplete is the callback invoked by the PunchTransport implementation
 // when an ICE attempt for nodeID finishes (success or failure).
 //
+// peerAddr is the peer's reachable net.Addr as determined by ICE (typically
+// the winning candidate pair's remote address). Must be non-nil on success;
+// ignored on failure.
+//
 // success=true: a punched QUIC connection is now available via
-// PunchTransport.SendTo. Phase 3 (AddPunched) will admit the node to the
-// routing table's punched zone when that phase is implemented.
+// PunchTransport.SendTo. This call admits the node to the routing table's
+// punched zone and registers its address in the peers map so that DHT
+// messages can be sent back to it.
 //
 // success=false: ICE failed (peer offline per noagent, or ICE timeout). The
 // node remains in its current health state (typically Bad); the next natural
 // probe cycle will try again if conditions are met.
 //
-// This method is safe to call from any goroutine; it uses healthMu.
-func (n *Node) OnPunchComplete(nodeID a2al.NodeID, success bool) {
+// This method is safe to call from any goroutine; it uses healthMu/tabMu/peerMu.
+func (n *Node) OnPunchComplete(nodeID a2al.NodeID, peerAddr net.Addr, success bool) {
 	key := nodeIDKey(nodeID)
 	n.healthMu.Lock()
 	h := n.health[key]
@@ -77,14 +86,37 @@ func (n *Node) OnPunchComplete(nodeID a2al.NodeID, success bool) {
 	}
 	n.healthMu.Unlock()
 
-	if success {
-		// Phase 3 will add routing-table admission here (AddPunched).
-		// Phase 4 will make SendTo available for this peer in the send path.
-		// For now: isPunching cleared is sufficient — the node will be found
-		// Good (its peerHealthEntry updated) by the next successful RPC.
-		n.log.Debug("punch complete: success, routing admission pending Phase 3",
-			"node", nodeID)
-	} else {
+	if !success || peerAddr == nil {
 		n.log.Debug("punch complete: failed", "node", nodeID)
+		return
 	}
+
+	// Build a NodeInfo so the routing layer can place the node in the correct bucket.
+	ni := protocol.NodeInfo{
+		NodeID: append([]byte(nil), nodeID[:]...),
+	}
+	if ua, ok := peerAddr.(*net.UDPAddr); ok {
+		if ip4 := ua.IP.To4(); ip4 != nil {
+			ni.IP = append([]byte(nil), ip4...)
+		} else {
+			ni.IP = append([]byte(nil), ua.IP.To16()...)
+		}
+		ni.Port = uint16(ua.Port)
+	}
+
+	// Admit to the routing table's punched zone (spare slots only).
+	now := time.Now()
+	n.tabMu.Lock()
+	n.table.AddPunched(ni, routing.EntryMeta{VerifiedAt: now}, now)
+	n.tabMu.Unlock()
+
+	// Register the peer address so DHT send functions can route to this peer.
+	// Phase 4 will consult PunchTransport.SendTo first; this registration
+	// ensures the UDP fallback also has a candidate address.
+	n.peerMu.Lock()
+	n.peers[key] = peerAddr
+	n.peerMu.Unlock()
+	n.addrToID.Store(peerAddr.String(), nodeID)
+
+	n.log.Debug("punch complete: success, admitted to routing table", "node", nodeID)
 }
