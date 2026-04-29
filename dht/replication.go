@@ -272,6 +272,8 @@ func (n *Node) renewBackground(rk repKey, rs *repSet) {
 	existing := make(map[string]struct{}, len(rs.nodes))
 	// Snapshot confirmedAt so we can detect which renewals failed below.
 	preRenewConfirmed := make(map[string]time.Time, len(rs.nodes))
+	// Phase 6: collect bad repSet members for punch trigger after unlock.
+	var badRepNodes []a2al.NodeID
 	{
 		now := time.Now()
 		for k, e := range rs.nodes {
@@ -288,12 +290,22 @@ func (n *Node) renewBackground(rk repKey, rs *repSet) {
 		// governs new candidate selection; repSet-level health governs eviction.
 		if !e.badSince.IsZero() {
 			e.nextProbeAt = now
+			badRepNodes = append(badRepNodes, e.nodeID) // Phase 6
 			continue
 		}
 			existingIDs = append(existingIDs, e.nodeID)
 		}
 	}
 	rs.mu.Unlock()
+
+	// Phase 6 (过程二, High priority): trigger ICE punch for each bad repSet
+	// member that has a signal URL.  These nodes are in the grace window and
+	// their record availability is directly at risk — punch is worth the cost.
+	for _, nid := range badRepNodes {
+		if er := n.lookupEndpointRecord(nid); er != nil {
+			n.triggerPunch(nid, er, PunchPriorityHigh)
+		}
+	}
 
 	// Renew existing replicas (they expire without a fresh STORE).
 	if len(existingIDs) > 0 {
@@ -821,6 +833,10 @@ func (n *Node) probeRepNode(ctx context.Context, rk repKey, rs *repSet, e *repNo
 		n.log.Debug("replication probe: node bad, grace window started", "nodeID", e.nodeID)
 		// Proactively look for a replacement while waiting.
 		n.enqueueReplication(rk, protocol.SignedRecord{})
+		// Phase 6 (过程三, Low priority): UDP has confirmed unreachable; try ICE.
+		if er := n.lookupEndpointRecord(e.nodeID); er != nil {
+			n.triggerPunch(e.nodeID, er, PunchPriorityLow)
+		}
 
 	default:
 		// Still accumulating failures; fast retry.

@@ -312,6 +312,12 @@ func (q *Query) runIterQuery(
 		if findValue {
 			recs, nodes, rpcErr := n.FindValueWithNodes(pctx, addr, target, recType)
 			if rpcErr != nil {
+				// Phase 6 (查询引擎, Lowest): bad-track RPC failure → speculative punch.
+				if track == trackBad {
+					if er := n.lookupEndpointRecord(id); er != nil {
+						n.triggerPunch(id, er, PunchPriorityLowest)
+					}
+				}
 				resultCh <- slotRes{track: track}
 				return
 			}
@@ -319,6 +325,12 @@ func (q *Query) runIterQuery(
 		} else {
 			nodes, rpcErr := n.FindNode(pctx, addr, target)
 			if rpcErr != nil {
+				// Phase 6 (查询引擎, Lowest): bad-track RPC failure → speculative punch.
+				if track == trackBad {
+					if er := n.lookupEndpointRecord(id); er != nil {
+						n.triggerPunch(id, er, PunchPriorityLowest)
+					}
+				}
 				resultCh <- slotRes{track: track}
 				return
 			}

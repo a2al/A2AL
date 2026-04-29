@@ -25,6 +25,32 @@ import (
 	"github.com/a2al/a2al/routing"
 )
 
+// lookupEndpointRecord returns the most recent endpoint record for nodeID that
+// contains a non-empty signal URL, fetched from the local store cache.
+//
+// Returns nil when:
+//   - No endpoint record for nodeID is cached locally.
+//   - The cached record has no signal URL (direct-only server nodes).
+//
+// Called by the punch trigger sites (Phase 6).  The lookup is intentionally
+// best-effort: the local store only contains records that were previously
+// fetched by Resolve or received via incoming DHT traffic.  Missing records
+// simply skip the punch trigger; routing correctness is unaffected.
+func (n *Node) lookupEndpointRecord(nodeID a2al.NodeID) *protocol.EndpointRecord {
+	recs := n.LocalStoreGet(nodeID, protocol.RecTypeEndpoint)
+	for _, sr := range recs {
+		er, err := protocol.ParseEndpointRecord(sr)
+		if err != nil {
+			continue
+		}
+		if er.Signal == "" {
+			continue
+		}
+		return &er
+	}
+	return nil
+}
+
 // triggerPunch conditionally enqueues an ICE hole-punch attempt for nodeID.
 //
 // It is a no-op when:
