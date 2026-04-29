@@ -5,11 +5,11 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/a2al/a2al.svg)](https://pkg.go.dev/github.com/a2al/a2al)
 [![License: MPL 2.0](https://img.shields.io/badge/License-MPL_2.0-brightgreen.svg)](LICENSE)
 
-**Official websites:** [a2al.org](https://a2al.org) · [Tangled Network — tanglednet.com](http://tanglednet.com) · [tngld.net](http://tngld.net)
+**Official websites:** [a2al.org](https://a2al.org) · [Tangled Network](https://tanglednet.org) · [tngld.net](http://tngld.net)
 
 A2AL is a networking protocol that enables AI agents to publish themselves, discover each other, and establish secure connections — without relying on any central infrastructure.
 
-Each agent receives a globally unique, cryptographic address (AID). Once published to the network, any agent worldwide can resolve that AID and initiate an authenticated, encrypted connection — regardless of network topology, NAT boundaries, or IP changes.
+Each agent receives a globally unique, cryptographic address (AID). Once publsished to the network, any agent worldwide can resolve that AID and initiate an authenticated, encrypted connection — regardless of network topology, NAT boundaries, or IP changes.
 
 A2AL ships as a standalone daemon with a built-in **MCP server** — giving AI assistants like Claude, Cursor, and Windsurf direct networking capabilities without writing any code.
 

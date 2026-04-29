@@ -165,7 +165,7 @@ func (t *FakePunchTransport) Punch(nodeID a2al.NodeID, _ *protocol.EndpointRecor
 
 	if !ok || remote.node == nil {
 		// Remote unknown: report failure so isPunching is cleared.
-		go selfNode.OnPunchComplete(nodeID, a2al.Address{}, nil, false)
+		go selfNode.OnPunchComplete(nodeID, a2al.Address{}, nil, false, false, PunchFailOther)
 		return
 	}
 
@@ -177,6 +177,17 @@ func (t *FakePunchTransport) Punch(nodeID a2al.NodeID, _ *protocol.EndpointRecor
 	selfNID := t.selfNID
 
 	// Simulate ICE success on both sides asynchronously.
-	go selfNode.OnPunchComplete(nodeID, remoteLogicalAddr, remoteFakeAddr, true)
-	go remoteNode.OnPunchComplete(selfNID, selfLogicalAddr, selfFakeAddr, true)
+	go selfNode.OnPunchComplete(nodeID, remoteLogicalAddr, remoteFakeAddr, true, false, PunchFailNone)
+	go remoteNode.OnPunchComplete(selfNID, selfLogicalAddr, selfFakeAddr, true, false, PunchFailNone)
+}
+
+// HasConn implements dht.PunchTransport.
+// FakePunchTransport does not maintain a pool; SendTo delivers directly via
+// InjectReceived so every registered peer is always "connected".
+// Returns true when the remote nodeID is registered in the network.
+func (t *FakePunchTransport) HasConn(nodeID a2al.NodeID) bool {
+	t.network.mu.Lock()
+	pe, ok := t.network.peers[nodeID]
+	t.network.mu.Unlock()
+	return ok && pe.node != nil
 }

@@ -52,6 +52,24 @@ func (s *iceSession) CloseSignaling() {
 	}
 }
 
+// isDirectCandidate reports whether the ICE-selected path is host or
+// server-reflexive on the remote side, meaning the remote peer is directly
+// reachable via plain UDP without NAT hole-punching.
+//
+// Used by Phase 8 (误分类纠正): if true the remote should be reclassified as
+// a direct node rather than a punched node in the routing table.
+func (s *iceSession) isDirectCandidate() bool {
+	if s.agent == nil {
+		return false
+	}
+	pair, err := s.agent.GetSelectedCandidatePair()
+	if err != nil || pair == nil {
+		return false
+	}
+	t := pair.Remote.Type()
+	return t == ice.CandidateTypeHost || t == ice.CandidateTypeServerReflexive
+}
+
 // Close tears down all resources: WebSocket, ICE connection, and agent.
 func (s *iceSession) Close() {
 	s.CloseSignaling()

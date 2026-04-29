@@ -246,6 +246,12 @@ func (q *Query) runIterQuery(
 		if id == n.nid {
 			return
 		}
+		// §12: exclude nodes with an in-flight punch attempt from all tracks.
+		// They are not yet reachable via any path; occupying a slot would block
+		// useful candidates and produce guaranteed failures.
+		if n.IsPunching(id) {
+			return
+		}
 		addr, ok := n.lookupPeer(id)
 		if !ok {
 			return

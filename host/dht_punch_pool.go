@@ -20,6 +20,7 @@ package host
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -29,6 +30,7 @@ import (
 	"github.com/quic-go/quic-go"
 
 	"github.com/a2al/a2al"
+	"github.com/a2al/a2al/dht"
 	"github.com/a2al/a2al/protocol"
 	"github.com/a2al/a2al/signaling"
 )
@@ -79,7 +81,7 @@ func (p *DHTpunchPool) bind(h *Host) { p.h = h }
 
 // node returns the DHT node via the host reference, or nil if not yet bound.
 func (p *DHTpunchPool) node() interface {
-	OnPunchComplete(a2al.NodeID, a2al.Address, net.Addr, bool)
+	OnPunchComplete(a2al.NodeID, a2al.Address, net.Addr, bool, bool, dht.PunchFailReason)
 	InjectReceived([]byte, net.Addr)
 } {
 	if p.h == nil {
@@ -122,7 +124,7 @@ func (p *DHTpunchPool) Punch(nodeID a2al.NodeID, er *protocol.EndpointRecord, pr
 	if p.h == nil {
 		p.log.Warn("dht punch: pool not bound to host, reporting failure")
 		if n := p.node(); n != nil {
-			n.OnPunchComplete(nodeID, a2al.Address{}, nil, false)
+			n.OnPunchComplete(nodeID, a2al.Address{}, nil, false, false, dht.PunchFailOther)
 		}
 		return
 	}
@@ -131,19 +133,23 @@ func (p *DHTpunchPool) Punch(nodeID a2al.NodeID, er *protocol.EndpointRecord, pr
 		ctx, cancel := context.WithTimeout(context.Background(), punchDialTimeout)
 		defer cancel()
 
-		qc, peerUDP, err := p.h.connectViaICEForDHT(ctx, er)
+		qc, peerUDP, isDirect, err := p.h.connectViaICEForDHT(ctx, er)
 		n := p.node()
 		if err != nil {
-			p.log.Debug("dht punch ice dial failed", "node", nodeID, "err", err)
+			reason := dht.PunchFailOther
+			if errors.Is(err, ErrNoAgent) {
+				reason = dht.PunchFailNoAgent
+			}
+			p.log.Debug("dht punch ice dial failed", "node", nodeID, "err", err, "reason", reason)
 			if n != nil {
-				n.OnPunchComplete(nodeID, a2al.Address{}, nil, false)
+				n.OnPunchComplete(nodeID, a2al.Address{}, nil, false, false, reason)
 			}
 			return
 		}
 
 		p.addConn(nodeID, qc)
 		if n != nil {
-			n.OnPunchComplete(nodeID, er.Address, peerUDP, true)
+			n.OnPunchComplete(nodeID, er.Address, peerUDP, true, isDirect, dht.PunchFailNone)
 		}
 	}()
 }
@@ -169,12 +175,12 @@ func (p *DHTpunchPool) HandleIncomingPunch(ctx context.Context, callerNodeID a2a
 		return
 	}
 
-	qc, peerUDP, teardown, err := p.h.acceptICEToQUIC(ctx, wsURL, nodeCert)
+	qc, peerUDP, isDirect, teardown, err := p.h.acceptICEToQUIC(ctx, wsURL, nodeCert, modeBQUICConfig())
 	n := p.node()
 	if err != nil {
 		p.log.Debug("dht punch accept: ice failed", "caller", callerNodeID, "err", err)
 		if n != nil {
-			n.OnPunchComplete(callerNodeID, callerLogicalAddr, nil, false)
+			n.OnPunchComplete(callerNodeID, callerLogicalAddr, nil, false, false, dht.PunchFailICETimeout)
 		}
 		return
 	}
@@ -186,7 +192,7 @@ func (p *DHTpunchPool) HandleIncomingPunch(ctx context.Context, callerNodeID a2a
 	}()
 
 	if n != nil {
-		n.OnPunchComplete(callerNodeID, callerLogicalAddr, peerUDP, true)
+		n.OnPunchComplete(callerNodeID, callerLogicalAddr, peerUDP, true, isDirect, dht.PunchFailNone)
 	}
 }
 
@@ -242,6 +248,15 @@ func (p *DHTpunchPool) runReadLoop(ctx context.Context, nodeID a2al.NodeID, qc q
 	}
 }
 
+// HasConn implements dht.PunchTransport.
+// Returns true if an active Mode B QUIC connection exists for nodeID.
+func (p *DHTpunchPool) HasConn(nodeID a2al.NodeID) bool {
+	p.mu.Lock()
+	_, ok := p.pool[nodeID]
+	p.mu.Unlock()
+	return ok
+}
+
 // ConnCount returns the number of active Mode B connections (for diagnostics).
 func (p *DHTpunchPool) ConnCount() int {
 	p.mu.Lock()
@@ -250,9 +265,9 @@ func (p *DHTpunchPool) ConnCount() int {
 }
 
 // Ensure DHTpunchPool satisfies the interface at compile time.
-// (The dht package defines PunchTransport; we verify here to catch drift.)
 var _ interface {
 	SendTo(context.Context, a2al.NodeID, []byte) (bool, error)
 	Punch(a2al.NodeID, *protocol.EndpointRecord, int)
+	HasConn(a2al.NodeID) bool
 } = (*DHTpunchPool)(nil)
 
