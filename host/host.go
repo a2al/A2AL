@@ -208,6 +208,8 @@ type Host struct {
 	beaconStats   func() map[string]any
 
 	natProbeMu sync.Mutex // guards RunNATProbe (only one probe at a time)
+
+	punchPool *DHTpunchPool
 }
 
 // New creates a Host with one initial agent identity from cfg.KeyStore.
@@ -251,14 +253,24 @@ func New(cfg Config) (*Host, error) {
 		return nil, err
 	}
 
+	// Create the punch pool before the DHT node so it can be injected into
+	// dht.Config. The pool's host reference is set via bind() after the Host
+	// struct is fully constructed below.
+	hlog := cfg.Logger
+	if hlog == nil {
+		hlog = slog.Default()
+	}
+	punchPool := newDHTpunchPool(hlog)
+
 	dhtCfg := dht.Config{
 		Keystore: cfg.KeyStore,
 		OnObservedAddr: func(reporter a2al.NodeID, wire []byte) {
 			sense.Record(reporter, wire)
 		},
-		RecordAuth:    recordAuthPolicy,
-		Logger:        cfg.Logger,
-		SeenPeersPath: cfg.SeenPeersPath,
+		RecordAuth:     recordAuthPolicy,
+		Logger:         cfg.Logger,
+		SeenPeersPath:  cfg.SeenPeersPath,
+		PunchTransport: punchPool,
 	}
 
 	var node *dht.Node
@@ -309,23 +321,21 @@ func New(cfg Config) (*Host, error) {
 		return nil, err
 	}
 
-	hlog := cfg.Logger
-	if hlog == nil {
-		hlog = slog.Default()
-	}
 	h := &Host{
-		cfg:    cfg,
-		log:    hlog,
-		addr:   myAddr,
-		priv:   priv,
-		mux:    mux,
-		node:   node,
-		sense:  sense,
-		quicTr: qt,
+		cfg:       cfg,
+		log:       hlog,
+		addr:      myAddr,
+		priv:      priv,
+		mux:       mux,
+		node:      node,
+		sense:     sense,
+		quicTr:    qt,
+		punchPool: punchPool,
 		agents: map[a2al.Address]*agentEntry{
 			myAddr: {addr: myAddr, priv: priv, cert: defaultCert},
 		},
 	}
+	punchPool.bind(h)
 
 	srvTLS := quicServerTLSWithSNI(defaultCert, h.certForSNI)
 	qListen, err := qt.Listen(srvTLS, defaultQUICConfig())
@@ -410,9 +420,10 @@ func (h *Host) RegisteredAgents() []a2al.Address {
 	return out
 }
 
-func (h *Host) Node() *dht.Node        { return h.node }
-func (h *Host) Sense() *natsense.Sense { return h.sense }
-func (h *Host) Address() a2al.Address  { return h.addr }
+func (h *Host) Node() *dht.Node              { return h.node }
+func (h *Host) Sense() *natsense.Sense        { return h.sense }
+func (h *Host) Address() a2al.Address         { return h.addr }
+func (h *Host) DHTpunchPool() *DHTpunchPool   { return h.punchPool }
 
 func (h *Host) DHTLocalAddr() *net.UDPAddr {
 	return h.node.LocalAddr().(*net.UDPAddr)

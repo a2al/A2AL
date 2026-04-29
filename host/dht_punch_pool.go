@@ -6,89 +6,253 @@ package host
 // DHTpunchPool is the host-layer implementation of dht.PunchTransport.
 //
 // It manages:
-//   - The punched-connection pool (nodeID → active QUIC connection)
-//   - The punch scheduler goroutine and priority queue
-//   - ICE negotiation via the Host's existing connectViaICESignal path
+//   - The punched-connection pool (nodeID → active Mode B QUIC connection)
+//   - ICE negotiation as caller (Punch) and as callee (HandleIncomingPunch)
+//   - Message injection into the DHT node via InjectReceived
 //
 // Architecture note (§15, dual-plane):
 //   - Connections owned here are Mode B (control-plane QUIC), completely
 //     separate from Mode A (data-plane AgentConn). They are never exposed
 //     to application code; their sole purpose is carrying DHT messages.
-//   - The host layer (this file) calls dht.Node.OnPunchComplete and
-//     dht.Node.InjectReceived; the dht layer calls PunchTransport.SendTo
-//     and PunchTransport.Punch via the injected interface. Dependency
-//     direction remains: host → dht. DHT never imports host.
-//
-// Phase 2 status — skeleton only:
-//   - SendTo: always returns ok=false (no connection pool yet).
-//   - Punch: accepts requests but does not perform ICE (logged only).
-//   - Wire up ICE dialing and the pool in Phase 4 alongside the
-//     routing-table integration (Phase 3).
+//   - The host layer calls dht.Node.OnPunchComplete and dht.Node.InjectReceived;
+//     the dht layer calls PunchTransport.SendTo and PunchTransport.Punch via
+//     the injected interface. Dependency direction: host → dht only.
 
 import (
 	"context"
+	"io"
 	"log/slog"
+	"net"
 	"sync"
+	"time"
+
+	"github.com/quic-go/quic-go"
 
 	"github.com/a2al/a2al"
-	"github.com/a2al/a2al/dht"
 	"github.com/a2al/a2al/protocol"
+	"github.com/a2al/a2al/signaling"
 )
 
-// DHTpunchPool implements dht.PunchTransport for the host layer.
-// Create via NewDHTpunchPool; inject the result into dht.Config.PunchTransport
-// before calling dht.NewNode.
-type DHTpunchPool struct {
-	node *dht.Node
-	log  *slog.Logger
+const (
+	// maxDHTPunchMsg caps a single DHT message read from a Mode B stream.
+	maxDHTPunchMsg = 64 << 10 // 64 KiB
+	// punchDialTimeout limits end-to-end ICE+QUIC dial time for a single attempt.
+	punchDialTimeout = 60 * time.Second
+)
 
-	mu   sync.Mutex
-	// pool maps nodeID key → active punched QUIC connection.
-	// Phase 2: always empty. Phase 4: populated after successful ICE.
-	// pool map[string]quic.Connection  // uncommented in Phase 4
+// modeBConn is a single Mode B (DHT control-plane) QUIC connection entry.
+type modeBConn struct {
+	qc     quic.Connection
+	cancel context.CancelFunc // cancels the runReadLoop goroutine
 }
 
-// NewDHTpunchPool creates a DHTpunchPool bound to node. The pool registers
-// itself as the punch result callback target via node.OnPunchComplete.
-func NewDHTpunchPool(node *dht.Node, log *slog.Logger) *DHTpunchPool {
+// DHTpunchPool implements dht.PunchTransport for the host layer.
+//
+// Lifecycle: create with newDHTpunchPool before dht.NewNode, inject into
+// dht.Config.PunchTransport, then call bind(host) after the Host is fully
+// initialised. This two-phase setup avoids the dht.Node / Host circular init.
+type DHTpunchPool struct {
+	log *slog.Logger
+
+	// h is set by bind() after the Host is fully constructed.
+	// All methods that need h check for nil and degrade gracefully.
+	h *Host
+
+	mu   sync.Mutex
+	pool map[a2al.NodeID]*modeBConn // nodeID → active connection
+}
+
+// newDHTpunchPool creates an unbound pool. Call bind(host) after host creation.
+func newDHTpunchPool(log *slog.Logger) *DHTpunchPool {
 	if log == nil {
 		log = slog.Default()
 	}
 	return &DHTpunchPool{
-		node: node,
 		log:  log,
+		pool: make(map[a2al.NodeID]*modeBConn),
 	}
 }
 
+// bind wires the pool to its owning Host. Called from host.New after the Host
+// struct is fully populated.
+func (p *DHTpunchPool) bind(h *Host) { p.h = h }
+
+// node returns the DHT node via the host reference, or nil if not yet bound.
+func (p *DHTpunchPool) node() interface {
+	OnPunchComplete(a2al.NodeID, a2al.Address, net.Addr, bool)
+	InjectReceived([]byte, net.Addr)
+} {
+	if p.h == nil {
+		return nil
+	}
+	return p.h.node
+}
+
 // SendTo implements dht.PunchTransport.
-//
-// Phase 2: always returns ok=false — the connection pool is empty. DHT will
-// fall back to UDP for every send, preserving existing behaviour exactly.
-// Phase 4: look up nodeID in the pool; if found, open a QUIC stream and write msg.
-func (p *DHTpunchPool) SendTo(_ context.Context, _ a2al.NodeID, _ []byte) (bool, error) {
-	// Phase 4: check pool, open stream, write.
-	return false, nil
+// Looks up the Mode B connection for nodeID; if found, opens a QUIC stream and
+// writes msg. Returns (false, nil) when no connection is available so the DHT
+// falls back to UDP transparently.
+func (p *DHTpunchPool) SendTo(ctx context.Context, nodeID a2al.NodeID, msg []byte) (bool, error) {
+	p.mu.Lock()
+	mb, ok := p.pool[nodeID]
+	p.mu.Unlock()
+	if !ok {
+		return false, nil
+	}
+
+	st, err := mb.qc.OpenStreamSync(ctx)
+	if err != nil {
+		p.removeConn(nodeID)
+		return false, nil
+	}
+	defer st.Close()
+
+	if _, err := st.Write(msg); err != nil {
+		p.removeConn(nodeID)
+		return false, nil
+	}
+	return true, nil
 }
 
 // Punch implements dht.PunchTransport.
-//
-// Phase 2: logs the request and returns immediately without performing ICE.
-// The node's isPunching flag (set by the DHT layer before calling Punch) will
-// be cleared by a call to node.OnPunchComplete(nodeID, nil, false) from the
-// scheduler. For Phase 2 we call it inline so DHT does not get stuck with
-// isPunching=true forever.
-//
-// Phase 4: enqueue into a priority queue; scheduler goroutine dequeues and
-// calls h.connectViaICESignal, then calls node.OnPunchComplete with the
-// ICE-negotiated peer address and result.
+// Spawns a goroutine that dials ICE → QUIC (Mode B) and calls OnPunchComplete.
 func (p *DHTpunchPool) Punch(nodeID a2al.NodeID, er *protocol.EndpointRecord, priority int) {
-	p.log.Debug("dht punch requested (Phase 2: no-op)",
-		"node", nodeID,
-		"signal", er.Signal,
-		"nat_type", er.NatType,
-		"priority", priority,
-	)
-	// Phase 2: immediately report failure so isPunching is cleared and DHT
-	// does not permanently exclude this node from query tracks.
-	p.node.OnPunchComplete(nodeID, a2al.Address{}, nil, false)
+	p.log.Debug("dht punch requested", "node", nodeID, "signal", er.Signal, "priority", priority)
+
+	if p.h == nil {
+		p.log.Warn("dht punch: pool not bound to host, reporting failure")
+		if n := p.node(); n != nil {
+			n.OnPunchComplete(nodeID, a2al.Address{}, nil, false)
+		}
+		return
+	}
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), punchDialTimeout)
+		defer cancel()
+
+		qc, peerUDP, err := p.h.connectViaICEForDHT(ctx, er)
+		n := p.node()
+		if err != nil {
+			p.log.Debug("dht punch ice dial failed", "node", nodeID, "err", err)
+			if n != nil {
+				n.OnPunchComplete(nodeID, a2al.Address{}, nil, false)
+			}
+			return
+		}
+
+		p.addConn(nodeID, qc)
+		if n != nil {
+			n.OnPunchComplete(nodeID, er.Address, peerUDP, true)
+		}
+	}()
 }
+
+// HandleIncomingPunch is called by the daemon ICE listener when a Mode B punch
+// incoming is received (fr.Target == nodeAddr). It runs ICE as controlled,
+// accepts a QUIC connection, and calls OnPunchComplete on the DHT node.
+func (p *DHTpunchPool) HandleIncomingPunch(ctx context.Context, callerNodeID a2al.NodeID, callerLogicalAddr a2al.Address, signalBase, room string) {
+	if p.h == nil {
+		p.log.Warn("dht punch accept: pool not bound to host")
+		return
+	}
+
+	wsURL, err := signaling.AppendRoomToICEURL(signalBase, room)
+	if err != nil {
+		p.log.Debug("dht punch accept: bad signal url", "base", signalBase, "err", err)
+		return
+	}
+
+	nodeCert, err := p.h.defaultAgentCert()
+	if err != nil {
+		p.log.Warn("dht punch accept: no node cert", "err", err)
+		return
+	}
+
+	qc, peerUDP, teardown, err := p.h.acceptICEToQUIC(ctx, wsURL, nodeCert)
+	n := p.node()
+	if err != nil {
+		p.log.Debug("dht punch accept: ice failed", "caller", callerNodeID, "err", err)
+		if n != nil {
+			n.OnPunchComplete(callerNodeID, callerLogicalAddr, nil, false)
+		}
+		return
+	}
+
+	p.addConn(callerNodeID, qc)
+	go func() {
+		<-qc.Context().Done()
+		teardown()
+	}()
+
+	if n != nil {
+		n.OnPunchComplete(callerNodeID, callerLogicalAddr, peerUDP, true)
+	}
+}
+
+// addConn registers a Mode B QUIC connection and starts the read loop.
+// If a previous connection for the same nodeID exists it is closed first.
+func (p *DHTpunchPool) addConn(nodeID a2al.NodeID, qc quic.Connection) {
+	ctx, cancel := context.WithCancel(context.Background())
+	mb := &modeBConn{qc: qc, cancel: cancel}
+
+	p.mu.Lock()
+	if old, ok := p.pool[nodeID]; ok {
+		old.cancel()
+	}
+	p.pool[nodeID] = mb
+	p.mu.Unlock()
+
+	go p.runReadLoop(ctx, nodeID, qc)
+}
+
+// removeConn removes a connection from the pool and cancels its read loop.
+func (p *DHTpunchPool) removeConn(nodeID a2al.NodeID) {
+	p.mu.Lock()
+	mb, ok := p.pool[nodeID]
+	if ok {
+		delete(p.pool, nodeID)
+	}
+	p.mu.Unlock()
+	if ok {
+		mb.cancel()
+	}
+}
+
+// runReadLoop accepts QUIC streams from a Mode B connection and injects each
+// message into the DHT node via InjectReceived. Exits when ctx is cancelled or
+// the QUIC connection closes.
+func (p *DHTpunchPool) runReadLoop(ctx context.Context, nodeID a2al.NodeID, qc quic.Connection) {
+	defer p.removeConn(nodeID)
+	for {
+		st, err := qc.AcceptStream(ctx)
+		if err != nil {
+			return
+		}
+		go func(s quic.Stream) {
+			defer s.Close()
+			data, err := io.ReadAll(io.LimitReader(s, maxDHTPunchMsg))
+			if err != nil || len(data) == 0 {
+				return
+			}
+			if n := p.node(); n != nil {
+				n.InjectReceived(data, qc.RemoteAddr())
+			}
+		}(st)
+	}
+}
+
+// ConnCount returns the number of active Mode B connections (for diagnostics).
+func (p *DHTpunchPool) ConnCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.pool)
+}
+
+// Ensure DHTpunchPool satisfies the interface at compile time.
+// (The dht package defines PunchTransport; we verify here to catch drift.)
+var _ interface {
+	SendTo(context.Context, a2al.NodeID, []byte) (bool, error)
+	Punch(a2al.NodeID, *protocol.EndpointRecord, int)
+} = (*DHTpunchPool)(nil)
+

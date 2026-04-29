@@ -266,8 +266,15 @@ func (d *Daemon) sleepICE(ctx context.Context, dura time.Duration) {
 }
 
 func (d *Daemon) sendICERegs(ctx context.Context, conn *websocket.Conn) error {
+	// Collect all identities to register: node identity first (enables DHT hole-punching
+	// callee), then each user agent (enables Mode A application connections).
+	aids := make([]string, 0, 1+len(d.reg.List()))
+	aids = append(aids, d.nodeAddr.String())
 	for _, e := range d.reg.List() {
-		b, err := signaling.EncodeFrame(signaling.Frame{T: "reg", AID: e.AID.String()})
+		aids = append(aids, e.AID.String())
+	}
+	for _, aid := range aids {
+		b, err := signaling.EncodeFrame(signaling.Frame{T: "reg", AID: aid})
 		if err != nil {
 			return err
 		}
@@ -317,6 +324,20 @@ func (d *Daemon) readICELoopFor(ctx context.Context, conn *websocket.Conn, base 
 			d.log.Debug("ice incoming dedup", "base", base, "room", room)
 			continue
 		}
+
+		if localAgent == d.nodeAddr {
+			// Mode B: caller is another DHT node punching this node's control plane.
+			// Hand off to DHTpunchPool without an agent-route handshake.
+			callerNodeID := a2al.NodeIDFromAddress(callerAID)
+			go func() {
+				defer seen.release(room)
+				actx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+				defer cancel()
+				d.h.DHTpunchPool().HandleIncomingPunch(actx, callerNodeID, callerAID, base, room)
+			}()
+			continue
+		}
+
 		go func() {
 			// Release the dedup entry when Accept finishes (success or failure)
 			// so that a subsequent session for the same peer pair is never blocked.
