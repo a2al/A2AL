@@ -454,21 +454,30 @@ func (n *Node) storeAndRecord(ctx context.Context, peers []protocol.NodeInfo, rk
 		n.log.Debug("replication StoreAt ok", "peer", addr)
 
 		k := infoKey(ni)
+		// Phase 7: check whether this peer is currently in the routing table
+		// as a punched entry so repSet membership can be classified correctly.
+		n.tabMu.RLock()
+		punched := n.table.IsPunched(id)
+		n.tabMu.RUnlock()
+
 		rs.mu.Lock()
 		if e, exists := rs.nodes[k]; exists {
 			// Renewal confirmed: update liveness state but leave probe schedule alone.
 			e.confirmedAt = time.Now()
 			e.failCount = 0
 			e.badSince = time.Time{}
+			e.isPunched = punched // refresh in case the node was promoted from punched
 		} else {
 			rs.nodes[k] = &repNodeEntry{
 				nodeID:         id,
 				confirmedAt:    time.Now(),
 				nextProbeAt:    time.Now().Add(probeInitDelay),
 				nextProbeDelay: probeInitDelay,
+				isPunched:      punched,
 			}
 		}
-		repSetEnforceHardCap(rs, rk.storeKey)
+		// Phase 7: rebalance dual-set membership after each insertion/update.
+		rebalanceRepSets(rs, rk.storeKey)
 		rs.mu.Unlock()
 
 		// Feed the confirmed-reachable peer back into the routing table.
@@ -489,7 +498,74 @@ func (n *Node) storeAndRecord(ctx context.Context, peers []protocol.NodeInfo, rk
 	}
 }
 
+// rebalanceRepSets recomputes XOR-set and direct-set membership for every
+// entry in rs and removes nodes that belong to neither set (Phase 7).
+//
+// Semantics (§8.2 dual-set):
+//
+//	XOR set   = top-nRep nodes by XOR distance (punched + direct)
+//	Direct set = top-nRep nodes by XOR distance among non-punched nodes only
+//	Effective repSet = XOR set ∪ Direct set (max size 2×nRep = repHardCap)
+//
+// A node removed from one set is kept alive if it still belongs to the other.
+// Only nodes in neither set are deleted from rs.nodes.
+//
+// Must be called with rs.mu held.
+func rebalanceRepSets(rs *repSet, key a2al.NodeID) {
+	if len(rs.nodes) == 0 {
+		return
+	}
+
+	// Sort all entries by XOR distance (ascending = closer first).
+	type entry struct {
+		k    string
+		e    *repNodeEntry
+		dist a2al.NodeID
+	}
+	all := make([]entry, 0, len(rs.nodes))
+	for k, e := range rs.nodes {
+		all = append(all, entry{k: k, e: e, dist: xorNodeID(e.nodeID, key)})
+	}
+	sort.Slice(all, func(i, j int) bool {
+		return !xorGT(all[i].dist, all[j].dist) && all[i].dist != all[j].dist
+	})
+
+	// Assign XOR-set membership: top-nRep regardless of isPunched.
+	xorCount := 0
+	for i := range all {
+		if xorCount < nRep {
+			all[i].e.inXorSet = true
+			xorCount++
+		} else {
+			all[i].e.inXorSet = false
+		}
+	}
+
+	// Assign direct-set membership: top-nRep among non-punched entries only.
+	directCount := 0
+	for i := range all {
+		if all[i].e.isPunched {
+			all[i].e.inDirectSet = false
+			continue
+		}
+		if directCount < nRep {
+			all[i].e.inDirectSet = true
+			directCount++
+		} else {
+			all[i].e.inDirectSet = false
+		}
+	}
+
+	// Remove entries that belong to neither set.
+	for _, item := range all {
+		if !item.e.inXorSet && !item.e.inDirectSet {
+			delete(rs.nodes, item.k)
+		}
+	}
+}
+
 // repSetEnforceHardCap removes the XOR-farthest node when |repSet| > repHardCap.
+// Kept as a safety net for legacy call sites; new code uses rebalanceRepSets.
 // Must be called with rs.mu held.
 func repSetEnforceHardCap(rs *repSet, key a2al.NodeID) {
 	if len(rs.nodes) <= repHardCap {
