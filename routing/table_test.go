@@ -482,6 +482,40 @@ func TestOldestPunchedInBucket(t *testing.T) {
 	}
 }
 
+// TestPunched_clearedByDirectContact verifies that a previously-punched entry
+// has its isPunched flag cleared when a direct-contact (VerifiedAt != zero)
+// update arrives for the same node.  After clearing, the node must not be
+// returned by OldestPunchedInBucket.
+func TestPunched_clearedByDirectContact(t *testing.T) {
+	var self a2al.NodeID
+	tb := NewTable(self, nil)
+
+	ni := nodeInfoMSBVariant(0x80, 7)
+	var id a2al.NodeID
+	copy(id[:], ni.NodeID)
+	now := time.Now()
+
+	// Admit via punched path.
+	if !tb.AddPunched(ni, EntryMeta{VerifiedAt: now}, now) {
+		t.Fatal("AddPunched should succeed for spare slot")
+	}
+	_, hasPunched := tb.OldestPunchedInBucket(id)
+	if !hasPunched {
+		t.Fatal("node should be flagged isPunched after AddPunched")
+	}
+
+	// Now the same node sends us a direct UDP message (direct-contact evidence).
+	ni.IP = []byte{10, 0, 0, 1}
+	ni.Port = 9000
+	tb.Add(ni, EntryMeta{VerifiedAt: now.Add(time.Second)}, now.Add(time.Second))
+
+	// isPunched must be cleared; OldestPunchedInBucket should now return false.
+	_, hasPunched = tb.OldestPunchedInBucket(id)
+	if hasPunched {
+		t.Error("isPunched should be cleared after direct-contact update")
+	}
+}
+
 func TestUpdateVerifiedAt(t *testing.T) {
 	var self a2al.NodeID
 	tb := NewTable(self, nil)

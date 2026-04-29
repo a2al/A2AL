@@ -145,6 +145,9 @@ func (b *bucket) addOrTouch(n protocol.NodeInfo, meta EntryMeta, addedAt time.Ti
 		if !meta.VerifiedAt.IsZero() && len(n.IP) > 0 && n.Port != 0 {
 			b.nodes[i].info.IP = append([]byte(nil), n.IP...)
 			b.nodes[i].info.Port = n.Port
+			// Direct-contact evidence: node has proven UDP reachability, so it
+			// is no longer a second-class punched citizen.
+			b.nodes[i].isPunched = false
 		}
 		b.touch(i)
 		return true
