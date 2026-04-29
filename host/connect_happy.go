@@ -22,6 +22,29 @@ import (
 // DefaultConnectStagger is the delay between starting each QUIC dial (Happy Eyeballs).
 const DefaultConnectStagger = 250 * time.Millisecond
 
+// shouldSkipDirect reports whether the direct QUIC/UDP dial should be skipped
+// for an endpoint record. Direct dialing is skipped when the peer's NAT type
+// makes a cold UDP connection essentially impossible and an ICE signal URL is
+// available to negotiate a punched path instead.
+//
+// Skipped NAT types (with signal required):
+//   - NATRestricted: address-restricted cone — inbound UDP blocked without prior outbound
+//   - NATPortRestricted: port-restricted cone — same, plus port must match
+//   - NATSymmetric: each outbound mapping uses a unique port, prediction impossible
+//
+// NATUnknown and NATFullCone are left for direct-dial first; ICE is attempted
+// only if the direct dial fails.
+func shouldSkipDirect(er *protocol.EndpointRecord) bool {
+	if er == nil || er.Signal == "" {
+		return false
+	}
+	switch er.NatType {
+	case protocol.NATRestricted, protocol.NATPortRestricted, protocol.NATSymmetric:
+		return true
+	}
+	return false
+}
+
 // QUICDialTargets returns ordered, deduplicated UDP addresses from quic:// / udp:// entries.
 func QUICDialTargets(er *protocol.EndpointRecord) ([]*net.UDPAddr, error) {
 	if er == nil {
@@ -79,7 +102,7 @@ func (h *Host) ConnectFromRecord(ctx context.Context, expectRemote a2al.Address,
 		natType = er.NatType
 		hasSignal = er.Signal != ""
 	}
-	skipDirect := er != nil && er.NatType == protocol.NATSymmetric && er.Signal != ""
+	skipDirect := shouldSkipDirect(er)
 	h.log.Debug("connect path decision",
 		"remote_aid", expectRemote.String(),
 		"nat_type", natType,
@@ -144,7 +167,7 @@ func (h *Host) ConnectFromRecordFor(ctx context.Context, localAgent, expectRemot
 		natType = er.NatType
 		hasSignal = er.Signal != ""
 	}
-	skipDirect := er != nil && er.NatType == protocol.NATSymmetric && er.Signal != ""
+	skipDirect := shouldSkipDirect(er)
 	h.log.Debug("connect path decision",
 		"local_aid", localAgent.String(),
 		"remote_aid", expectRemote.String(),
