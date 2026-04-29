@@ -875,7 +875,7 @@ func (n *Node) reply(from net.Addr, req *protocol.DecodedMessage, msgType uint8,
 		n.log.Warn("dht reply marshal failed", "msg_type", msgType, "to", from, "err", err)
 		return
 	}
-	if err := n.tr.Send(from, raw); err != nil {
+	if err := n.sendToOrFallback(n.ctx, from, raw); err != nil {
 		n.log.Warn("dht reply send failed", "msg_type", msgType, "to", from, "size", len(raw), "err", err)
 	} else {
 		n.statsTx.Add(1)
@@ -1118,7 +1118,7 @@ func (n *Node) sendAndWait(ctx context.Context, to net.Addr, hdr protocol.Header
 			n.unregisterWait(hdr.TxID)
 			return nil, err
 		}
-		if err := n.tr.Send(to, raw); err != nil {
+		if err := n.sendToOrFallback(ctx, to, raw); err != nil {
 			n.unregisterWait(hdr.TxID)
 			return nil, err
 		}
@@ -1149,6 +1149,30 @@ func (n *Node) sendAndWait(ctx context.Context, to net.Addr, hdr protocol.Header
 	}
 	n.log.Warn("dht rpc failed after retries", "to", to, "msg_type", hdr.MsgType, "attempts", rpcMaxAttempts)
 	return nil, context.DeadlineExceeded
+}
+
+// sendToOrFallback delivers raw to the peer at addr.
+//
+// When a punch pool is configured and a punched QUIC connection is already
+// active for the peer, the message is delivered via that connection (Mode B,
+// control-plane QUIC). If the pool reports no active connection (ok=false) or
+// no pool is configured, the call falls back to the UDP transport. This makes
+// the send path transparent: callers never need to know which transport was
+// used, and behaviour is identical to the current pure-UDP path when the pool
+// is empty (Phase 2/3 stub always returns ok=false).
+//
+// NAT-probe paths (onNATProbeReq, SendNATProbeReq) deliberately bypass this
+// helper and call n.tr.Send directly because their purpose is to measure raw
+// UDP reachability, which would be defeated by routing through a QUIC stream.
+func (n *Node) sendToOrFallback(ctx context.Context, to net.Addr, raw []byte) error {
+	if n.punch != nil {
+		if nid, ok := n.lookupPeerID(to); ok {
+			if sent, err := n.punch.SendTo(ctx, nid, raw); sent {
+				return err
+			}
+		}
+	}
+	return n.tr.Send(to, raw)
 }
 
 func (n *Node) notifyObserved(reporter a2al.NodeID, wire []byte) {
