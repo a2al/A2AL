@@ -355,6 +355,133 @@ func TestEstimatedNetworkSizeFiltered(t *testing.T) {
 	}
 }
 
+// ── Phase 3: punched-entry layered eviction tests ─────────────────────────────
+
+// TestAddPunched_spareSlot verifies that a punched node is admitted into a
+// spare slot and is visible to NearestN.
+func TestAddPunched_spareSlot(t *testing.T) {
+	var self a2al.NodeID
+	tb := NewTable(self, nil)
+
+	ni := nodeInfoMSBVariant(0x80, 42)
+	var id a2al.NodeID
+	copy(id[:], ni.NodeID)
+	now := time.Now()
+
+	admitted := tb.AddPunched(ni, EntryMeta{VerifiedAt: now}, now)
+	if !admitted {
+		t.Fatal("AddPunched should succeed for spare slot")
+	}
+	if !tb.Contains(id) {
+		t.Fatal("punched node should be in table after AddPunched")
+	}
+}
+
+// TestAddPunched_fullDirectBucket verifies that AddPunched rejects a node when
+// the bucket is already at K with direct (non-punched) entries.
+func TestAddPunched_fullDirectBucket(t *testing.T) {
+	var self a2al.NodeID
+	tb := NewTable(self, nil) // ping=nil → LRU eviction skipped in addOrTouch
+
+	// Fill the bucket for MSB=0x80 with K direct entries.
+	for i := 0; i < K; i++ {
+		ni := nodeInfoMSBVariant(0x80, byte(i))
+		tb.Add(ni, verifiedMeta(), time.Now())
+	}
+	probe := nodeInfoMSBVariant(0x80, 0)
+	var probeID a2al.NodeID
+	copy(probeID[:], probe.NodeID)
+	if tb.PeerBucketLen(probeID) < K {
+		t.Skip("bucket not full — variant not targeting the same bucket")
+	}
+
+	// A punched node targeting the same bucket should be rejected.
+	extra := nodeInfoMSBVariant(0x80, byte(K+1))
+	admitted := tb.AddPunched(extra, EntryMeta{VerifiedAt: time.Now()}, time.Now())
+	if admitted {
+		t.Fatal("AddPunched should be rejected when bucket is full with direct nodes")
+	}
+}
+
+// TestAdd_directEvictsPunchedFirst verifies that when a bucket holds both
+// direct and punched entries (bucket full), a new direct-contact node evicts
+// the oldest punched entry without triggering a liveness ping.
+func TestAdd_directEvictsPunchedFirst(t *testing.T) {
+	var self a2al.NodeID
+	pingCalled := false
+	tb := NewTable(self, func(ni protocol.NodeInfo) bool {
+		pingCalled = true
+		return true // LRU alive — would prevent eviction if reached
+	})
+
+	// Fill half the bucket with direct entries.
+	half := K / 2
+	for i := 0; i < half; i++ {
+		ni := nodeInfoMSBVariant(0x80, byte(i))
+		tb.Add(ni, verifiedMeta(), time.Now())
+	}
+	// Fill the rest with punched entries.
+	for i := half; i < K; i++ {
+		ni := nodeInfoMSBVariant(0x80, byte(i))
+		admitted := tb.AddPunched(ni, EntryMeta{VerifiedAt: time.Now()}, time.Now())
+		if !admitted {
+			t.Fatalf("AddPunched[%d] should succeed for spare slot", i)
+		}
+	}
+
+	// Now add a new direct-contact node. Bucket is full.
+	// Expectation: a punched node is evicted, ping is NOT called.
+	newDirect := nodeInfoMSBVariant(0x80, byte(K+1))
+	tb.Add(newDirect, verifiedMeta(), time.Now())
+
+	if pingCalled {
+		t.Error("ping should not be called when a punched entry can be evicted first")
+	}
+	var newID a2al.NodeID
+	copy(newID[:], newDirect.NodeID)
+	if !tb.Contains(newID) {
+		t.Error("new direct node should be in table after evicting a punched entry")
+	}
+}
+
+// TestOldestPunchedInBucket verifies that OldestPunchedInBucket returns the
+// correct entry and returns false when no punched entries exist.
+func TestOldestPunchedInBucket(t *testing.T) {
+	var self a2al.NodeID
+	tb := NewTable(self, nil)
+
+	directNI := nodeInfoMSBVariant(0x80, 1)
+	punchedNI := nodeInfoMSBVariant(0x80, 2)
+	var punchedID a2al.NodeID
+	copy(punchedID[:], punchedNI.NodeID)
+
+	// No punched entries yet.
+	var peer a2al.NodeID
+	copy(peer[:], directNI.NodeID)
+	_, hasPunched := tb.OldestPunchedInBucket(peer)
+	if hasPunched {
+		t.Fatal("should return false when no punched entries in bucket")
+	}
+
+	// Add a direct entry.
+	tb.Add(directNI, verifiedMeta(), time.Now())
+	_, hasPunched = tb.OldestPunchedInBucket(peer)
+	if hasPunched {
+		t.Fatal("direct entry should not be returned by OldestPunchedInBucket")
+	}
+
+	// Add a punched entry.
+	tb.AddPunched(punchedNI, EntryMeta{VerifiedAt: time.Now()}, time.Now())
+	info, hasPunched := tb.OldestPunchedInBucket(peer)
+	if !hasPunched {
+		t.Fatal("should return true when a punched entry exists")
+	}
+	if !bytes.Equal(info.NodeID, punchedNI.NodeID) {
+		t.Errorf("OldestPunchedInBucket returned wrong node: got %x, want %x",
+			info.NodeID, punchedNI.NodeID)
+	}
+}
+
 func TestUpdateVerifiedAt(t *testing.T) {
 	var self a2al.NodeID
 	tb := NewTable(self, nil)

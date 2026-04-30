@@ -443,6 +443,18 @@ func (n *Node) tabAdd(ni protocol.NodeInfo, meta routing.EntryMeta) {
 		n.tabMu.Unlock()
 		return
 	}
+	// Phase 3: before pinging the LRU direct node, check whether a punched
+	// entry exists in this bucket. Punched entries are second-class citizens
+	// and are evicted first — no liveness probe required.
+	punchedOldest, hasPunched := n.table.OldestPunchedInBucket(nid)
+	if hasPunched {
+		var punchedID a2al.NodeID
+		copy(punchedID[:], punchedOldest.NodeID)
+		n.table.Remove(punchedID)
+		n.table.Add(ni, meta, now)
+		n.tabMu.Unlock()
+		return
+	}
 	oldest, ok := n.table.OldestInBucket(nid)
 	n.tabMu.Unlock()
 	if !ok {
@@ -459,6 +471,24 @@ func (n *Node) tabAdd(ni protocol.NodeInfo, meta routing.EntryMeta) {
 	n.tabMu.Lock()
 	n.table.Remove(oldID)
 	n.table.Add(ni, meta, now)
+	n.tabMu.Unlock()
+}
+
+// tabAddPunched admits a peer that was reached via ICE hole-punching into the
+// routing table's punched zone (spare slots only, never evicts direct nodes).
+// Called by OnPunchComplete after the host layer confirms ICE success.
+func (n *Node) tabAddPunched(ni protocol.NodeInfo, meta routing.EntryMeta) {
+	if len(ni.NodeID) != len(a2al.NodeID{}) {
+		return
+	}
+	var nid a2al.NodeID
+	copy(nid[:], ni.NodeID)
+	if nid == n.nid {
+		return
+	}
+	now := time.Now()
+	n.tabMu.Lock()
+	n.table.AddPunched(ni, meta, now)
 	n.tabMu.Unlock()
 }
 

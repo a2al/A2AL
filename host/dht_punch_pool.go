@@ -74,12 +74,13 @@ func (p *DHTpunchPool) SendTo(_ context.Context, _ a2al.NodeID, _ []byte) (bool,
 //
 // Phase 2: logs the request and returns immediately without performing ICE.
 // The node's isPunching flag (set by the DHT layer before calling Punch) will
-// be cleared by a call to node.OnPunchComplete(nodeID, false) from the
+// be cleared by a call to node.OnPunchComplete(nodeID, nil, false) from the
 // scheduler. For Phase 2 we call it inline so DHT does not get stuck with
 // isPunching=true forever.
 //
 // Phase 4: enqueue into a priority queue; scheduler goroutine dequeues and
-// calls h.connectViaICESignal, then calls node.OnPunchComplete with result.
+// calls h.connectViaICESignal, then calls node.OnPunchComplete with the
+// ICE-negotiated peer address and result.
 func (p *DHTpunchPool) Punch(nodeID a2al.NodeID, er *protocol.EndpointRecord, priority int) {
 	p.log.Debug("dht punch requested (Phase 2: no-op)",
 		"node", nodeID,
@@ -89,5 +90,5 @@ func (p *DHTpunchPool) Punch(nodeID a2al.NodeID, er *protocol.EndpointRecord, pr
 	)
 	// Phase 2: immediately report failure so isPunching is cleared and DHT
 	// does not permanently exclude this node from query tracks.
-	p.node.OnPunchComplete(nodeID, false)
+	p.node.OnPunchComplete(nodeID, nil, false)
 }

@@ -82,6 +82,19 @@ type bucket struct {
 	futileCount      int  // consecutive FindNode attempts that yielded no improvement
 }
 
+// oldestPunchedInfo returns the NodeInfo of the oldest (LRU-position) punched
+// entry in the main bucket, together with its index. Returns (-1, _, false)
+// when no punched entries exist. Used by the direct-contact eviction path to
+// prefer evicting punched entries over pinging live direct-contact nodes.
+func (b *bucket) oldestPunchedInfo() (int, protocol.NodeInfo, bool) {
+	for i, e := range b.nodes {
+		if e.isPunched {
+			return i, e.info, true
+		}
+	}
+	return -1, protocol.NodeInfo{}, false
+}
+
 func (b *bucket) indexByID(id a2al.NodeID) int {
 	for i, e := range b.nodes {
 		if len(e.info.NodeID) == len(id) && bytes.Equal(e.info.NodeID, id[:]) {
@@ -150,7 +163,20 @@ func (b *bucket) addOrTouch(n protocol.NodeInfo, meta EntryMeta, addedAt time.Ti
 		return false
 	}
 
-	// Direct contact: give LRU node a chance to respond.
+	// Direct contact, bucket full.
+	//
+	// Phase 3: punched entries are second-class citizens. Evict the oldest
+	// punched entry (no ping needed) before falling back to the LRU-ping
+	// path for direct entries. This ensures direct nodes never have to wait
+	// for a liveness probe when a punched slot is available.
+	if punchIdx, _, hasPunched := b.oldestPunchedInfo(); hasPunched {
+		copy(b.nodes[punchIdx:], b.nodes[punchIdx+1:])
+		b.nodes = b.nodes[:len(b.nodes)-1]
+		b.nodes = append(b.nodes, bucketEntry{info: n, meta: meta, addedAt: addedAt})
+		return true
+	}
+
+	// No punched entries: give LRU direct node a chance to respond.
 	oldest := b.nodes[0]
 	if ping == nil || ping(oldest.info) {
 		// LRU is alive (or no ping func): keep it, drop the newcomer.
@@ -256,6 +282,40 @@ func (b *bucket) promotePending(id a2al.NodeID, meta EntryMeta, addedAt time.Tim
 	copy(b.pending[i:], b.pending[i+1:])
 	b.pending = b.pending[:len(b.pending)-1]
 	b.nodes = append(b.nodes, bucketEntry{info: pe.info, meta: meta, addedAt: addedAt})
+	return true
+}
+
+// addOrTouchPunched inserts or refreshes a punched entry.
+//
+// Admission rule: punched entries occupy spare slots only (len(nodes) < K).
+// When the bucket is at capacity, the entry is rejected and the caller should
+// not retry until a direct-contact admission opens a slot (by evicting an
+// existing punched entry via addOrTouch).
+//
+// If the entry already exists (was previously punched), it is moved to MRU
+// and its VerifiedAt is updated if the new value is strictly newer.
+func (b *bucket) addOrTouchPunched(n protocol.NodeInfo, meta EntryMeta, addedAt time.Time) bool {
+	var nid a2al.NodeID
+	if len(n.NodeID) != len(nid) {
+		return false
+	}
+	copy(nid[:], n.NodeID)
+
+	// Already in main bucket: touch, refresh VerifiedAt, ensure isPunched is set.
+	if i := b.indexByID(nid); i >= 0 {
+		if !meta.VerifiedAt.IsZero() && meta.VerifiedAt.After(b.nodes[i].meta.VerifiedAt) {
+			b.nodes[i].meta.VerifiedAt = meta.VerifiedAt
+		}
+		b.nodes[i].isPunched = true // re-assert in case it was cleared by a direct-contact touch
+		b.touch(i)
+		return true
+	}
+
+	// Only admit into a spare slot (bucket not yet at capacity).
+	if len(b.nodes) >= K {
+		return false
+	}
+	b.nodes = append(b.nodes, bucketEntry{info: n, meta: meta, addedAt: addedAt, isPunched: true})
 	return true
 }
 
