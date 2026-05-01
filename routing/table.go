@@ -309,6 +309,25 @@ func (t *Table) PeerBucketLen(peer a2al.NodeID) int {
 	return len(t.b[bi].nodes)
 }
 
+// IsPunched reports whether the given peer is currently in the main bucket and
+// has its isPunched flag set (i.e., was admitted via ICE hole-punching rather
+// than a direct UDP contact).
+//
+// Returns false when the peer is not in any main bucket or when it has been
+// promoted to a direct-contact entry (isPunched cleared by addOrTouch).
+// Used by the dht layer to classify repSet members into XOR-set vs direct-set.
+func (t *Table) IsPunched(peer a2al.NodeID) bool {
+	bi := BucketIndex(t.self, peer)
+	if bi < 0 {
+		return false
+	}
+	i := t.b[bi].indexByID(peer)
+	if i < 0 {
+		return false
+	}
+	return t.b[bi].nodes[i].isPunched
+}
+
 // OldestInBucket returns the LRU entry in the main bucket that would hold peer.
 func (t *Table) OldestInBucket(peer a2al.NodeID) (protocol.NodeInfo, bool) {
 	bi := BucketIndex(t.self, peer)
