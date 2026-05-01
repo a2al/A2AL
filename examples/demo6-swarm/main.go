@@ -62,14 +62,13 @@ package main
 
 import (
 	"bytes"
-	"context"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -178,35 +177,6 @@ func setupAgent(c *client, id *savedIdentity, serviceTCP string) error {
 		}
 	}
 	return c.do("POST", "/agents/"+id.AID+"/publish", struct{}{}, nil)
-}
-
-// ─── Gateway AID header ──────────────────────────────────────────────────────
-//
-// a2ald gateway prepends a 21-byte binary Remote AID to every inbound TCP
-// connection. aidListener reads it in Accept() so http.Serve gets clean HTTP.
-
-type remoteAIDKey struct{}
-
-type aidConn struct {
-	net.Conn
-	remoteAID string
-}
-
-type aidListener struct{ net.Listener }
-
-func (l *aidListener) Accept() (net.Conn, error) {
-	for {
-		conn, err := l.Listener.Accept()
-		if err != nil {
-			return nil, err
-		}
-		var hdr [21]byte
-		if _, err := io.ReadFull(conn, hdr[:]); err != nil {
-			conn.Close()
-			continue
-		}
-		return &aidConn{Conn: conn, remoteAID: hex.EncodeToString(hdr[:])}, nil
-	}
 }
 
 // ─── Expert definitions ───────────────────────────────────────────────────────
@@ -364,7 +334,17 @@ func runWorker(c *client, apiPort string) {
 				http.Error(w, "bad request", http.StatusBadRequest)
 				return
 			}
-			callerAID, _ := r.Context().Value(remoteAIDKey{}).(string)
+			// Query caller identity via daemon session API (out-of-band, stream untouched).
+			callerAID := ""
+			if host, portStr, err := net.SplitHostPort(r.RemoteAddr); err == nil && host == "127.0.0.1" {
+				port, _ := strconv.Atoi(portStr)
+				var si struct {
+					CallerAID string `json:"caller_aid"`
+				}
+				if err := c.do("GET", fmt.Sprintf("/sessions/%d", port), nil, &si); err == nil {
+					callerAID = si.CallerAID
+				}
+			}
 			result := expCopy.consult(req.Product, req.Market)
 			fmt.Printf("\n  [%s] consult from %s\n  → %s\n",
 				expCopy.name, shortAID(callerAID), result)
@@ -372,17 +352,9 @@ func runWorker(c *client, apiPort string) {
 			json.NewEncoder(w).Encode(map[string]string{"result": result})
 		})
 
-		srv := &http.Server{
-			Handler: mux,
-			ConnContext: func(ctx context.Context, conn net.Conn) context.Context {
-				if ac, ok := conn.(*aidConn); ok {
-					return context.WithValue(ctx, remoteAIDKey{}, ac.remoteAID)
-				}
-				return ctx
-			},
-		}
+		srv := &http.Server{Handler: mux}
 		go func() {
-			if err := srv.Serve(&aidListener{ln}); err != nil &&
+			if err := srv.Serve(ln); err != nil &&
 				!strings.Contains(err.Error(), "use of closed") {
 				fmt.Fprintf(os.Stderr, "[%s] HTTP error: %v\n", expCopy.name, err)
 			}

@@ -63,8 +63,6 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"context"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -196,38 +194,6 @@ func setupAgent(c *client, id *savedIdentity, serviceTCP string) error {
 	return nil
 }
 
-// ─── Gateway AID header ──────────────────────────────────────────────────────
-//
-// a2ald gateway prepends a 21-byte binary Remote AID to every inbound TCP
-// connection before bridging the QUIC stream. A plain http.Serve would try to
-// parse these bytes as an HTTP request and fail. aidListener reads the header
-// in Accept() and exposes the AID via ConnContext so HTTP handlers can retrieve
-// it from the request context.
-
-type remoteAIDKey struct{}
-
-type aidConn struct {
-	net.Conn
-	remoteAID string
-}
-
-type aidListener struct{ net.Listener }
-
-func (l *aidListener) Accept() (net.Conn, error) {
-	for {
-		conn, err := l.Listener.Accept()
-		if err != nil {
-			return nil, err
-		}
-		var hdr [21]byte
-		if _, err := io.ReadFull(conn, hdr[:]); err != nil {
-			conn.Close()
-			continue
-		}
-		return &aidConn{Conn: conn, remoteAID: hex.EncodeToString(hdr[:])}, nil
-	}
-}
-
 // ─── Seller ──────────────────────────────────────────────────────────────────
 
 // answers maps questions to canned answers for demo purposes.
@@ -238,7 +204,7 @@ var answers = map[string]string{
 	"who made a2al":     "A2AL is an open protocol for decentralized AI agent communication and service discovery.",
 }
 
-func startSellerHTTP() (net.Listener, string) {
+func startSellerHTTP(c *client) (net.Listener, string) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		fatal("HTTP listen: %v", err)
@@ -264,9 +230,19 @@ func startSellerHTTP() (net.Listener, string) {
 		if !ok {
 			answer = fmt.Sprintf("(no canned answer; echo) %s", req.Question)
 		}
-		// Remote AID is injected by aidListener via ConnContext — cryptographically
-		// verified by the daemon's mutual-TLS QUIC handshake.
-		callerAID, _ := r.Context().Value(remoteAIDKey{}).(string)
+		// Query the daemon for caller identity using the connection's remote port.
+		// The gateway records caller AID when it dials service_tcp; this is an
+		// out-of-band lookup that does not touch the byte stream.
+		callerAID := ""
+		if host, portStr, err := net.SplitHostPort(r.RemoteAddr); err == nil && host == "127.0.0.1" {
+			port, _ := strconv.Atoi(portStr)
+			var si struct {
+				CallerAID string `json:"caller_aid"`
+			}
+			if err := c.do("GET", fmt.Sprintf("/sessions/%d", port), nil, &si); err == nil {
+				callerAID = si.CallerAID
+			}
+		}
 		callerLabel := shortAID(callerAID)
 		if callerAID == "" {
 			callerLabel = "(unknown)"
@@ -279,17 +255,9 @@ func startSellerHTTP() (net.Listener, string) {
 		json.NewEncoder(w).Encode(map[string]string{"answer": answer})
 	})
 
-	srv := &http.Server{
-		Handler: mux,
-		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
-			if ac, ok := c.(*aidConn); ok {
-				return context.WithValue(ctx, remoteAIDKey{}, ac.remoteAID)
-			}
-			return ctx
-		},
-	}
+	srv := &http.Server{Handler: mux}
 	go func() {
-		if err := srv.Serve(&aidListener{ln}); err != nil && !strings.Contains(err.Error(), "use of closed") {
+		if err := srv.Serve(ln); err != nil && !strings.Contains(err.Error(), "use of closed") {
 			fmt.Fprintf(os.Stderr, "[Seller] HTTP error: %v\n", err)
 		}
 	}()
@@ -305,7 +273,7 @@ func runSeller(c *client, idPath string) {
 	}
 	fmt.Printf("  AID: %s\n", id.AID)
 
-	ln, svcAddr := startSellerHTTP()
+	ln, svcAddr := startSellerHTTP(c)
 	defer ln.Close()
 	fmt.Printf("  Local HTTP: %s\n", svcAddr)
 

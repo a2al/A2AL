@@ -76,8 +76,9 @@ type Daemon struct {
 
 	iceRegNotify chan struct{} // ICE /signal registration refresh (buffered)
 
-	demo *demoServer // built-in demo capability server (nil until New())
+	demo         *demoServer   // built-in demo capability server (nil until New())
 	gatewayConns atomic.Int64  // active gateway QUIC conns (direct + ICE)
+	sessions     sync.Map      // int (daemon-side TCP source port) → *sessionInfo
 
 	netMu                sync.Mutex
 	netStableFP          string

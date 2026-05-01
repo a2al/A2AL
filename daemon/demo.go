@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"sync"
@@ -63,35 +62,12 @@ func (ds *demoServer) startHTTP(nodeShortAID string) (int, error) {
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 	}
-	go srv.Serve(&demoAIDListener{Listener: ln}) //nolint:errcheck
+	go srv.Serve(ln) //nolint:errcheck
 
 	ds.ln = ln
 	ds.srv = srv
 	ds.port = port
 	return port, nil
-}
-
-// demoAIDListener strips the 21-byte remote AID prefix that the inbound QUIC
-// gateway prepends to every forwarded TCP connection (see daemon/gateway.go
-// bridgeInboundStream). Without this wrapper Go's http.Server would treat the
-// raw AID bytes as the start of the HTTP request and reply 400 Bad Request,
-// which is exactly what was observed when the Web UI tried to fetch
-// /.well-known/agent.json through a tunnel.
-type demoAIDListener struct{ net.Listener }
-
-func (l *demoAIDListener) Accept() (net.Conn, error) {
-	for {
-		c, err := l.Listener.Accept()
-		if err != nil {
-			return nil, err
-		}
-		var hdr [21]byte
-		if _, err := io.ReadFull(c, hdr[:]); err != nil {
-			_ = c.Close()
-			continue
-		}
-		return c, nil
-	}
 }
 
 // stopHTTP shuts down the HTTP server. Callers must hold ds.mu.

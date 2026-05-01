@@ -149,11 +149,12 @@ type connectResp struct {
 // --- Chat service (TCP server) -------------------------------------------------
 
 // chatServer listens on a random local TCP port. a2ald gateway forwards inbound
-// QUIC streams here. Each accepted connection begins with a 21-byte remote AID
-// header (spec ?gateway), followed by UTF-8 chat messages (newline-delimited).
+// QUIC streams here transparently; caller identity is retrieved via
+// GET /sessions/{port} on the daemon API instead of a binary in-stream header.
 type chatServer struct {
 	ln      net.Listener
 	myAID   string
+	c       *client // daemon API client for session queries
 	inbound chan *chatConn
 }
 
@@ -163,12 +164,12 @@ type chatConn struct {
 	rd        *bufio.Reader
 }
 
-func newChatServer(myAID string) (*chatServer, error) {
+func newChatServer(myAID string, c *client) (*chatServer, error) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return nil, err
 	}
-	s := &chatServer{ln: ln, myAID: myAID, inbound: make(chan *chatConn, 4)}
+	s := &chatServer{ln: ln, myAID: myAID, c: c, inbound: make(chan *chatConn, 4)}
 	go s.accept()
 	return s, nil
 }
@@ -194,13 +195,18 @@ func (s *chatServer) accept() {
 }
 
 func (s *chatServer) handle(conn net.Conn) {
-	// Read 21-byte remote AID header written by a2ald gateway.
-	var hdr [21]byte
-	if _, err := io.ReadFull(conn, hdr[:]); err != nil {
-		conn.Close()
-		return
+	// Query the daemon for the caller's AID using the connection's remote port.
+	// The daemon records caller identity when it dials service_tcp; this is a
+	// pure out-of-band lookup — the byte stream is untouched.
+	remoteAID := "(unknown)"
+	if ta, ok := conn.RemoteAddr().(*net.TCPAddr); ok {
+		var si struct {
+			CallerAID string `json:"caller_aid"`
+		}
+		if err := s.c.do("GET", fmt.Sprintf("/sessions/%d", ta.Port), nil, &si); err == nil && si.CallerAID != "" {
+			remoteAID = si.CallerAID
+		}
 	}
-	remoteAID := aidBytesToString(hdr[:])
 	s.inbound <- &chatConn{
 		remoteAID: remoteAID,
 		conn:      conn,
@@ -209,22 +215,6 @@ func (s *chatServer) handle(conn net.Conn) {
 }
 
 func (s *chatServer) close() { s.ln.Close() }
-
-// aidBytesToString encodes the 21-byte AID as a 42-char lowercase hex string.
-// This matches what ParseAddress accepts and is consistent enough for display
-// (Address.String() uses checksummed mixed case, but lowercase is also valid).
-func aidBytesToString(b []byte) string {
-	if len(b) < 21 {
-		return "unknown"
-	}
-	const hex = "0123456789abcdef"
-	buf := make([]byte, 42)
-	for i, c := range b[:21] {
-		buf[i*2] = hex[c>>4]
-		buf[i*2+1] = hex[c&0xf]
-	}
-	return string(buf)
-}
 
 // --- Identity persistence ------------------------------------------------------
 
@@ -302,7 +292,7 @@ func main() {
 	}
 
 	// Start local TCP chat server.
-	srv, err := newChatServer(id.AID)
+	srv, err := newChatServer(id.AID, c)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error: tcp listen:", err)
 		os.Exit(1)

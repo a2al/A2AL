@@ -54,6 +54,7 @@ func (d *Daemon) routes() http.Handler {
 	mux.HandleFunc("POST /demo/start", d.handleDemoStart)
 	mux.HandleFunc("POST /demo/stop", d.handleDemoStop)
 	mux.HandleFunc("GET /demo/status", d.handleDemoStatus)
+	mux.HandleFunc("GET /sessions/{port}", d.handleGetSession)
 	registerWebUIRoutes(mux)
 	return d.withMiddleware(mux)
 }
@@ -957,6 +958,26 @@ func (d *Daemon) handleDemoStop(w http.ResponseWriter, r *http.Request) {
 func (d *Daemon) handleDemoStatus(w http.ResponseWriter, _ *http.Request) {
 	running, aid, port := d.demo.Status()
 	writeJSON(w, map[string]any{"running": running, "aid": aid, "port": port})
+}
+
+// handleGetSession returns the caller metadata for an active gateway TCP bridge,
+// keyed by the daemon-side TCP source port that the backend sees as RemoteAddr.Port.
+//
+// Backends call this immediately after Accept() to retrieve the verified caller AID
+// without any modification to the byte stream.
+func (d *Daemon) handleGetSession(w http.ResponseWriter, r *http.Request) {
+	portStr := r.PathValue("port")
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port <= 0 || port > 65535 {
+		http.Error(w, `{"error":"invalid port"}`, http.StatusBadRequest)
+		return
+	}
+	v, ok := d.sessions.Load(port)
+	if !ok {
+		http.Error(w, `{"error":"session not found"}`, http.StatusNotFound)
+		return
+	}
+	writeJSON(w, v)
 }
 
 // mustParseAddress parses an AID string, panicking only in unreachable cases
