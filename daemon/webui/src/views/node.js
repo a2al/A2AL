@@ -9,6 +9,7 @@ const RESTART_FIELDS = new Set([
   'min_observed_peers',
   'api_addr',
   'key_dir',
+  'signal_listen_addr',
 ]);
 
 const CFG_DEFAULTS = {
@@ -24,6 +25,7 @@ const CFG_DEFAULTS = {
   log_format: 'text',
   log_level: 'info',
   auto_publish: true,
+  signal_listen_addr: '',
 };
 
 const CFG_EMPTY_NOTES = {
@@ -31,6 +33,7 @@ const CFG_EMPTY_NOTES = {
   fallback_host: 'disabled',
   key_dir: '<data-dir>/keys/',
   api_token: 'no authentication',
+  signal_listen_addr: 'same port as listen_addr',
 };
 
 const NAT = {

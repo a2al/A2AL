@@ -2,6 +2,18 @@ import { esc, shortAid, setLoading } from '../util.js';
 
 const QUICK = ['lang', 'gen', 'sense', 'data', 'reason', 'code', 'tool'];
 
+const NAT_TYPE_KEYS = {
+  0: 'node.nat.unknown',
+  1: 'node.nat.full_cone',
+  2: 'node.nat.restricted',
+  3: 'node.nat.port_restricted',
+  4: 'node.nat.symmetric',
+};
+function natLabel(t, n) {
+  if (n == null) return '—';
+  return t(NAT_TYPE_KEYS[n] ?? 'node.nat.unknown');
+}
+
 function utf8ToBase64(s) {
   const bytes = new TextEncoder().encode(s);
   let bin = '';
@@ -237,11 +249,11 @@ export async function renderDiscover(mount, ctx) {
       const r = resRes.value;
       resolveBox.className = 'disc-op-block';
       resolveBox.innerHTML = `
-        <div><strong>address</strong> <span class="mono">${esc(r.address || '')}</span></div>
-        <div><strong>endpoints</strong> ${fmtEndpoints(r.endpoints)}</div>
-        <div><strong>nat_type</strong> ${esc(String(r.nat_type ?? '—'))}</div>
-        <div><strong>seq</strong> ${esc(String(r.seq ?? '—'))} &nbsp; <strong>TTL</strong> ${esc(String(r.ttl ?? '—'))}</div>
-        <div><strong>timestamp</strong> ${esc(String(r.timestamp ?? '—'))}</div>`;
+        <div><strong>${esc(t('discover.resolve.address'))}</strong> <span class="mono">${esc(r.address || '')}</span></div>
+        <div><strong>${esc(t('discover.resolve.net_addr'))}</strong> ${fmtEndpoints(r.endpoints)}</div>
+        <div><strong>${esc(t('discover.resolve.net_type'))}</strong> ${esc(natLabel(t, r.nat_type))}</div>
+        <div><strong>${esc(t('discover.resolve.revision'))}</strong> ${esc(String(r.seq ?? '—'))} &nbsp; <strong>${esc(t('discover.resolve.ttl'))}</strong> ${esc(String(r.ttl ?? '—'))}</div>
+        <div><strong>${esc(t('discover.resolve.updated'))}</strong> ${esc(String(r.timestamp ?? '—'))}</div>`;
     } else {
       const e = resRes.reason;
       resolveBox.className = 'disc-op-block';

@@ -75,6 +75,8 @@ type Daemon struct {
 	heartbeatAt map[a2al.Address]time.Time
 
 	iceRegNotify chan struct{} // ICE /signal registration refresh (buffered)
+
+	demo *demoServer // built-in demo capability server (nil until New())
 	gatewayConns atomic.Int64  // active gateway QUIC conns (direct + ICE)
 
 	netMu                sync.Mutex
@@ -207,6 +209,7 @@ func New(cfg Config) (*Daemon, error) {
 		iceRegNotify:     make(chan struct{}, 1),
 		netChangeNotify:  make(chan struct{}, 1),
 		beacon:           newBeaconManager(h.Node(), &nodeCfg, log),
+		demo:             newDemoServer(),
 	}, nil
 }
 

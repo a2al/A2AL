@@ -706,19 +706,24 @@ func (d *Daemon) execAgentPatch(aidStr string, req patchAgentReq) error {
 	if err != nil {
 		return errBadAID
 	}
-	opPrivBytes, err := hex.DecodeString(req.OperationalPrivateKeyHex)
-	if err != nil || len(opPrivBytes) != ed25519.PrivateKeySize {
-		return errBadOpKeyHex
-	}
-	opPriv := ed25519.PrivateKey(opPrivBytes)
 	d.regMu.Lock()
 	defer d.regMu.Unlock()
 	e := d.reg.Get(aid)
 	if e == nil {
 		return errNotFound
 	}
-	if subtle.ConstantTimeCompare(e.OpPriv, opPriv) != 1 {
-		return errOpKeyMismatch
+	// If the caller supplies operational_private_key_hex, verify it matches the
+	// stored key. Omitting it is allowed for the local Web UI which does not
+	// persist private keys; the daemon is already localhost-only.
+	if req.OperationalPrivateKeyHex != "" {
+		opPrivBytes, err := hex.DecodeString(req.OperationalPrivateKeyHex)
+		if err != nil || len(opPrivBytes) != ed25519.PrivateKeySize {
+			return errBadOpKeyHex
+		}
+		opPriv := ed25519.PrivateKey(opPrivBytes)
+		if subtle.ConstantTimeCompare(e.OpPriv, opPriv) != 1 {
+			return errOpKeyMismatch
+		}
 	}
 	// service_tcp is optional; probe reachability before persisting so we can
 	// decide whether to trigger an immediate republish below.

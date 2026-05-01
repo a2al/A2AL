@@ -111,7 +111,25 @@ function renderShell() {
       <button type="button" class="btn btn-ghost btn-sm" id="hdrRefresh" title="${esc(t('common.refresh'))}">${esc(t('common.refresh'))}</button>
       <div class="header-meta" id="headerMeta"></div>
     </header>
-    <main class="main" id="mainPane"></main>`;
+    <main class="main" id="mainPane"></main>
+    <footer class="app-footer">
+      <div class="footer-inner">
+        <div class="footer-desc">
+          <strong>A2AL</strong> — ${esc(t('about.a2al_desc'))}
+        </div>
+        <div class="footer-desc footer-tangled">
+          <strong>Tangled Network</strong> — ${esc(t('about.tangled_desc'))}
+        </div>
+        <div class="footer-links">
+          <a href="https://a2al.org" target="_blank" rel="noopener">a2al.org</a>
+          <span class="footer-sep">·</span>
+          <a href="https://tanglednet.org" target="_blank" rel="noopener">tanglednet.org</a>
+          <span class="footer-sep">·</span>
+          <a href="https://github.com/a2al/a2al" target="_blank" rel="noopener">GitHub</a>
+        </div>
+        <div class="footer-copy">MPL 2.0 · ${esc(t('about.disclaimer'))}</div>
+      </div>
+    </footer>`;
 
   const nav = app.querySelector('#navTabs');
   for (const [id, key] of [
