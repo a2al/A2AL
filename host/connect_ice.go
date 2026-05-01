@@ -149,13 +149,21 @@ func (h *Host) tryICEViaHub(ctx context.Context, localCert tls.Certificate, loca
 // It returns the raw QUIC connection and the peer's UDP address without
 // performing any upper-layer handshake (agent-route or DHT).
 //
+// qcfg selects the QUIC configuration; pass defaultQUICConfig() for Mode A
+// (agent connections) or modeBQUICConfig() for Mode B (DHT control plane).
+//
+// isDirect is true when the selected ICE candidate pair is host/srflx on the
+// remote side, indicating the remote is directly reachable without NAT punching.
+// Used by Phase 8 reclassification in DHTpunchPool.
+//
 // The caller must invoke teardown when the connection is no longer needed.
-// Typically teardown is tied to qc.Context().Done() in a goroutine.
-func (h *Host) acceptICEToQUIC(ctx context.Context, wsURL string, cert tls.Certificate) (qc quic.Connection, peerUDP *net.UDPAddr, teardown func(), err error) {
+func (h *Host) acceptICEToQUIC(ctx context.Context, wsURL string, cert tls.Certificate, qcfg *quic.Config) (qc quic.Connection, peerUDP *net.UDPAddr, isDirect bool, teardown func(), err error) {
 	sess, err := runICESession(ctx, wsURL, h.mergeICEURLs(ctx), false, false)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, false, nil, err
 	}
+
+	isDirect = sess.isDirectCandidate()
 
 	pconn := &icePacketConn{c: sess.iceConn}
 	tr := &quic.Transport{Conn: pconn}
@@ -165,17 +173,17 @@ func (h *Host) acceptICEToQUIC(ctx context.Context, wsURL string, cert tls.Certi
 	}
 
 	srvTLS := quicServerTLSWithSNI(cert, h.certForSNI)
-	ln, err := tr.Listen(srvTLS, defaultQUICConfig())
+	ln, err := tr.Listen(srvTLS, qcfg)
 	if err != nil {
 		td()
-		return nil, nil, nil, err
+		return nil, nil, false, nil, err
 	}
 
 	qc, err = ln.Accept(ctx)
 	_ = ln.Close()
 	if err != nil {
 		td()
-		return nil, nil, nil, err
+		return nil, nil, false, nil, err
 	}
 
 	ra := qc.RemoteAddr()
@@ -183,9 +191,9 @@ func (h *Host) acceptICEToQUIC(ctx context.Context, wsURL string, cert tls.Certi
 	if !ok || udpRA == nil {
 		_ = qc.CloseWithError(1, "non-udp remote")
 		td()
-		return nil, nil, nil, fmt.Errorf("a2al/host: ice remote addr is %T", ra)
+		return nil, nil, false, nil, fmt.Errorf("a2al/host: ice remote addr is %T", ra)
 	}
-	return qc, udpRA, td, nil
+	return qc, udpRA, isDirect, td, nil
 }
 
 // AcceptICEViaSignal is the controlled (callee) side: WebSocket ICE signaling
@@ -210,7 +218,7 @@ func (h *Host) AcceptICEViaSignal(ctx context.Context, localAgent, expectRemote 
 		return nil, fmt.Errorf("a2al/host: ice signal url: %w", err)
 	}
 
-	qc, _, teardown, err := h.acceptICEToQUIC(ctx, wsURL, ag.cert)
+	qc, _, _, teardown, err := h.acceptICEToQUIC(ctx, wsURL, ag.cert, defaultQUICConfig())
 	if err != nil {
 		return nil, err
 	}
@@ -236,24 +244,38 @@ func (h *Host) AcceptICEViaSignal(ctx context.Context, localAgent, expectRemote 
 	return ac, nil
 }
 
+// modeBQUICConfig returns the QUIC configuration for Mode B (DHT control-plane)
+// connections. Key differences from the default (Mode A) config:
+//   - KeepAlivePeriod 20s: maintains NAT mappings (strategy §7: ≤25s required)
+//   - MaxIdleTimeout 5min: "仅路由途中偶遇 idle timeout 自然断开" (§7 table)
+func modeBQUICConfig() *quic.Config {
+	return &quic.Config{
+		HandshakeIdleTimeout: 10 * time.Second,
+		MaxIdleTimeout:       5 * time.Minute,
+		MaxIncomingStreams:   100,
+		MaxIncomingUniStreams: 10,
+		KeepAlivePeriod:     20 * time.Second,
+	}
+}
+
 // connectViaICEForDHT performs the controlling (caller) ICE path for Mode B
 // (DHT control-plane) connections. Unlike connectViaICESignal it does NOT run
 // the agent-route control stream — the returned QUIC connection carries raw DHT
 // messages only. The node identity certificate is used for mutual TLS.
 //
 // Resource lifetime: teardown is tied to qc.Context() by a background goroutine.
-func (h *Host) connectViaICEForDHT(ctx context.Context, er *protocol.EndpointRecord) (qc quic.Connection, peerUDP *net.UDPAddr, err error) {
+func (h *Host) connectViaICEForDHT(ctx context.Context, er *protocol.EndpointRecord) (qc quic.Connection, peerUDP *net.UDPAddr, isDirect bool, err error) {
 	signalURLs := er.Signals
 	if len(signalURLs) == 0 && er.Signal != "" {
 		signalURLs = []string{er.Signal}
 	}
 	if len(signalURLs) == 0 {
-		return nil, nil, errors.New("a2al/host: no signal url in record")
+		return nil, nil, false, errors.New("a2al/host: no signal url in record")
 	}
 
-	nodeCert, err := h.defaultAgentCert()
-	if err != nil {
-		return nil, nil, err
+	nodeCert, certErr := h.defaultAgentCert()
+	if certErr != nil {
+		return nil, nil, false, certErr
 	}
 
 	room := signaling.RoomID(h.addr.String(), er.Address.String())
@@ -261,30 +283,31 @@ func (h *Host) connectViaICEForDHT(ctx context.Context, er *protocol.EndpointRec
 
 	var lastErr error
 	for _, signalBase := range signalURLs {
-		qc, peerUDP, err = h.tryICEForDHT(ctx, nodeCert, er.Address, signalBase, room, iceURLs)
+		qc, peerUDP, isDirect, err = h.tryICEForDHT(ctx, nodeCert, er.Address, signalBase, room, iceURLs)
 		if err == nil {
-			return qc, peerUDP, nil
+			return qc, peerUDP, isDirect, nil
 		}
 		h.log.Debug("dht ice hub failed, trying next", "base", signalBase, "remote", er.Address, "err", err)
 		lastErr = err
 	}
-	return nil, nil, lastErr
+	return nil, nil, false, lastErr
 }
 
 // tryICEForDHT attempts a full ICE → QUIC handshake through one signal hub for
 // Mode B (DHT control-plane). No agent-route control stream is opened.
-func (h *Host) tryICEForDHT(ctx context.Context, cert tls.Certificate, expectRemote a2al.Address, signalBase, room string, iceURLs []*stun.URI) (quic.Connection, *net.UDPAddr, error) {
+// isDirect is true when the selected ICE candidate is host/srflx (Phase 8).
+func (h *Host) tryICEForDHT(ctx context.Context, cert tls.Certificate, expectRemote a2al.Address, signalBase, room string, iceURLs []*stun.URI) (quic.Connection, *net.UDPAddr, bool, error) {
 	wsURL, err := signaling.AppendRoomToICEURL(signalBase, room)
 	if err != nil {
-		return nil, nil, fmt.Errorf("a2al/host: ice signal url: %w", err)
+		return nil, nil, false, fmt.Errorf("a2al/host: ice signal url: %w", err)
 	}
 	wsURL, err = signaling.AppendQuery(wsURL, "target", expectRemote.String())
 	if err != nil {
-		return nil, nil, fmt.Errorf("a2al/host: ice signal url: %w", err)
+		return nil, nil, false, fmt.Errorf("a2al/host: ice signal url: %w", err)
 	}
 	wsURL, err = signaling.AppendQuery(wsURL, "caller", h.addr.String())
 	if err != nil {
-		return nil, nil, fmt.Errorf("a2al/host: ice signal url: %w", err)
+		return nil, nil, false, fmt.Errorf("a2al/host: ice signal url: %w", err)
 	}
 
 	var (
@@ -295,7 +318,7 @@ func (h *Host) tryICEForDHT(ctx context.Context, cert tls.Certificate, expectRem
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
-				return nil, nil, ctx.Err()
+				return nil, nil, false, ctx.Err()
 			case <-time.After(noAgentRetryDelay):
 			}
 		}
@@ -306,8 +329,11 @@ func (h *Host) tryICEForDHT(ctx context.Context, cert tls.Certificate, expectRem
 		h.log.Debug("dht ice retry on noagent", "remote", expectRemote, "hub", signalBase, "attempt", attempt+1)
 	}
 	if lerr != nil {
-		return nil, nil, lerr
+		return nil, nil, false, lerr
 	}
+
+	// Phase 8: check if the remote is actually directly reachable (host/srflx candidate).
+	isDirect := sess.isDirectCandidate()
 
 	pconn := &icePacketConn{c: sess.iceConn}
 	tr := &quic.Transport{Conn: pconn}
@@ -320,18 +346,18 @@ func (h *Host) tryICEForDHT(ctx context.Context, cert tls.Certificate, expectRem
 	udpRA, ok := ra.(*net.UDPAddr)
 	if !ok || udpRA == nil {
 		teardown()
-		return nil, nil, fmt.Errorf("a2al/host: ice remote addr is %T", ra)
+		return nil, nil, false, fmt.Errorf("a2al/host: ice remote addr is %T", ra)
 	}
 
 	cliTLS, err := quicClientTLSWithCert(cert, expectRemote)
 	if err != nil {
 		teardown()
-		return nil, nil, err
+		return nil, nil, false, err
 	}
-	qc, err := tr.Dial(ctx, udpRA, cliTLS, defaultQUICConfig())
+	qc, err := tr.Dial(ctx, udpRA, cliTLS, modeBQUICConfig())
 	if err != nil {
 		teardown()
-		return nil, nil, err
+		return nil, nil, false, err
 	}
 
 	// Mode B: no doDialerControlStream — connection carries raw DHT messages only.
@@ -339,5 +365,5 @@ func (h *Host) tryICEForDHT(ctx context.Context, cert tls.Certificate, expectRem
 		<-qc.Context().Done()
 		teardown()
 	}()
-	return qc, udpRA, nil
+	return qc, udpRA, isDirect, nil
 }

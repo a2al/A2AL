@@ -9,7 +9,7 @@
 
 A2AL is a networking protocol that enables AI agents to publish themselves, discover each other, and establish secure connections — without relying on any central infrastructure.
 
-Each agent receives a globally unique, cryptographic address (AID). Once published to the network, any agent worldwide can resolve that AID and initiate an authenticated, encrypted connection — regardless of network topology, NAT boundaries, or IP changes.
+Each agent receives a globally unique, cryptographic address (AID). Once publsished to the network, any agent worldwide can resolve that AID and initiate an authenticated, encrypted connection — regardless of network topology, NAT boundaries, or IP changes.
 
 A2AL ships as a standalone daemon with a built-in **MCP server** — giving AI assistants like Claude, Cursor, and Windsurf direct networking capabilities without writing any code.
 

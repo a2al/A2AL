@@ -36,6 +36,27 @@ import (
 // Implementations live in the host layer (host/dht_punch_pool.go) and are
 // wired in by the daemon at startup, following the same pattern as
 // OnObservedAddr injection.
+// PunchFailReason enumerates the reasons an ICE punch attempt can fail.
+// Used by OnPunchComplete to enable differentiated handling in the DHT layer.
+type PunchFailReason int
+
+const (
+	// PunchFailNone indicates success (used internally; callers check success bool).
+	PunchFailNone PunchFailReason = 0
+
+	// PunchFailNoAgent means the signaling hub reported the remote has no
+	// registered callee (hub returned "noagent"). The remote is likely offline
+	// or does not support ICE. The DHT can stop probing this peer.
+	PunchFailNoAgent PunchFailReason = 1
+
+	// PunchFailICETimeout means ICE negotiation started but connectivity checks
+	// timed out. The remote may be temporarily offline or behind a symmetric NAT.
+	PunchFailICETimeout PunchFailReason = 2
+
+	// PunchFailOther covers all other errors (TLS, network I/O, dial errors).
+	PunchFailOther PunchFailReason = 3
+)
+
 type PunchTransport interface {
 	// SendTo attempts to deliver msg to nodeID via an existing punched QUIC
 	// connection. ok=false means no active punched connection is available
@@ -48,6 +69,11 @@ type PunchTransport interface {
 	// signed endpoint record. priority is one of the PunchPriority*
 	// constants. Non-blocking: returns immediately after enqueue.
 	Punch(nodeID a2al.NodeID, er *protocol.EndpointRecord, priority int)
+
+	// HasConn reports whether an active Mode B QUIC connection already exists
+	// for nodeID. Used by triggerPunch to skip redundant punch attempts when
+	// the pool already has a healthy connection.
+	HasConn(nodeID a2al.NodeID) bool
 }
 
 // Punch priority levels for PunchTransport.Punch (§11 trigger table).
@@ -703,6 +729,16 @@ func (n *Node) PeerHealthOf(id a2al.NodeID) PeerHealthState {
 		return PeerHealthGood
 	}
 	return PeerHealthUnknown
+}
+
+// IsPunching reports whether an ICE hole-punch attempt is currently in flight
+// for the given peer. Used by the query engine's addCand to exclude punching
+// nodes from all track slots (§12 of strategy doc).
+func (n *Node) IsPunching(id a2al.NodeID) bool {
+	n.healthMu.RLock()
+	e := n.health[nodeIDKey(id)]
+	n.healthMu.RUnlock()
+	return e != nil && e.isPunching
 }
 
 // tabNearestHealthy returns up to k routing-table peers sorted first by

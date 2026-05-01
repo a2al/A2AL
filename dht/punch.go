@@ -51,11 +51,22 @@ func (n *Node) lookupEndpointRecord(nodeID a2al.NodeID) *protocol.EndpointRecord
 	return nil
 }
 
+// punchMinBackoff is the minimum backoff threshold a peer must have accumulated
+// before an ICE punch attempt is triggered (§14 抖动防护).
+//
+// A peer that just went bad (1-2 failures) has a small backoff (<30 s) — it is
+// likely a transient UDP blip and ICE would be wasted.  Only when the backoff
+// grows to punchMinBackoff (≥5 min) do we know the peer is persistently
+// unreachable and ICE is worth trying.
+const punchMinBackoff = 5 * time.Minute
+
 // triggerPunch conditionally enqueues an ICE hole-punch attempt for nodeID.
 //
-// It is a no-op when:
+// It is a no-op when any of the following hold:
 //   - PunchTransport is not configured (n.punch == nil)
+//   - An active Mode B connection already exists (HasConn)
 //   - A punch is already in flight for this peer (isPunching == true)
+//   - The peer's backoff is below punchMinBackoff (§14: anti-jitter gate)
 //
 // Otherwise it sets isPunching = true and calls PunchTransport.Punch, which
 // enqueues the attempt in the host-layer scheduler (non-blocking).
@@ -67,10 +78,26 @@ func (n *Node) triggerPunch(nodeID a2al.NodeID, er *protocol.EndpointRecord, pri
 	if n.punch == nil {
 		return
 	}
-	key := nodeIDKey(nodeID)
+	// Already have a live punched connection — no need to re-punch.
+	if n.punch.HasConn(nodeID) {
+		return
+	}
 
+	key := nodeIDKey(nodeID)
 	n.healthMu.Lock()
 	h := n.health[key]
+
+	// §14 anti-jitter gate: only punch when the peer has been bad long enough.
+	// Peers with a small backoff are likely suffering a transient UDP outage;
+	// ICE should not be wasted on them.  Zero nextRetryAt (never contacted or
+	// recently recovered) also passes through so that unknown peers can be tried.
+	if h != nil && !h.nextRetryAt.IsZero() {
+		if time.Until(h.nextRetryAt) < punchMinBackoff {
+			n.healthMu.Unlock()
+			return
+		}
+	}
+
 	if h != nil && h.isPunching {
 		n.healthMu.Unlock()
 		return // already in flight — deduplication gate
@@ -90,40 +117,53 @@ func (n *Node) triggerPunch(nodeID a2al.NodeID, er *protocol.EndpointRecord, pri
 // when an ICE attempt for nodeID finishes (success or failure).
 //
 // peerLogicalAddr is the peer's a2al.Address (21-byte identity address
-// derived from their public key).  It is used to populate NodeInfo.Address so
-// that the punched node's info can be included in FIND_NODE responses.
+// derived from their public key).  Used to populate NodeInfo.Address so that
+// the entry can be included in FIND_NODE responses.
 //
 // peerNetAddr is the peer's reachable net.Addr as determined by ICE (typically
-// the winning candidate pair's remote address). Must be non-nil on success;
-// ignored on failure.
+// the winning candidate pair's remote UDP address). Must be non-nil on success.
 //
-// success=true: a punched QUIC connection is now available via
-// PunchTransport.SendTo. This call admits the node to the routing table's
-// punched zone and registers its address in the peers map so that DHT
-// messages can be sent back to it.
+// success=true: a punched QUIC connection is now available via SendTo.
 //
-// success=false: ICE failed (peer offline per noagent, or ICE timeout). The
-// node remains in its current health state (typically Bad); the next natural
-// probe cycle will try again if conditions are met.
+// isDirect=true (Phase 8 误分类纠正): the ICE-selected path is host or
+// server-reflexive, meaning the remote is directly reachable via plain UDP.
+// In this case the node is admitted to the standard routing bucket (tabAdd)
+// rather than the punched zone; the Mode B QUIC connection remains in the pool
+// until it idle-times-out (5 min per modeBQUICConfig) — no special teardown.
 //
-// This method is safe to call from any goroutine; it uses healthMu/tabMu/peerMu.
-func (n *Node) OnPunchComplete(nodeID a2al.NodeID, peerLogicalAddr a2al.Address, peerNetAddr net.Addr, success bool) {
+// success=false: failReason identifies the cause.  PunchFailNoAgent indicates
+// the remote is definitively offline; the health system marks the peer Bad
+// permanently until the next probe cycle clears it, skipping further ICE.
+//
+// Safe to call from any goroutine; uses healthMu/tabMu/peerMu.
+func (n *Node) OnPunchComplete(nodeID a2al.NodeID, peerLogicalAddr a2al.Address, peerNetAddr net.Addr, success bool, isDirect bool, failReason PunchFailReason) {
 	key := nodeIDKey(nodeID)
 	n.healthMu.Lock()
 	h := n.health[key]
 	if h != nil {
 		h.isPunching = false
+		if !success && failReason == PunchFailNoAgent {
+			// Remote has no ICE callee registered — it is offline or does not
+			// support hole-punching. Advance failCount past the bad threshold so
+			// the health probe (过程三) will not waste RTTs on this peer until it
+			// reappears with a fresh endpoint record.
+			if h.failCount < badHealthThreshold {
+				h.failCount = badHealthThreshold
+			}
+			n.log.Debug("punch complete: noagent, peer marked bad", "node", nodeID)
+		}
 	}
 	n.healthMu.Unlock()
 
 	if !success || peerNetAddr == nil {
-		n.log.Debug("punch complete: failed", "node", nodeID)
+		if failReason != PunchFailNoAgent {
+			n.log.Debug("punch complete: failed", "node", nodeID, "reason", failReason)
+		}
 		return
 	}
 
-	// Build a NodeInfo so the routing layer can place the node in the correct bucket.
-	// Address is required by nodeInfoCheck so the entry can be included in
-	// FIND_NODE responses forwarded to other peers.
+	// Build NodeInfo for routing table admission. Address is required by
+	// nodeInfoCheck so the entry can appear in FIND_NODE responses.
 	ni := protocol.NodeInfo{
 		NodeID:  append([]byte(nil), nodeID[:]...),
 		Address: append([]byte(nil), peerLogicalAddr[:]...),
@@ -137,24 +177,30 @@ func (n *Node) OnPunchComplete(nodeID a2al.NodeID, peerLogicalAddr a2al.Address,
 		ni.Port = uint16(ua.Port)
 	}
 
-	// Admit to the routing table's punched zone (spare slots only).
 	now := time.Now()
-	n.tabMu.Lock()
-	n.table.AddPunched(ni, routing.EntryMeta{VerifiedAt: now}, now)
-	n.tabMu.Unlock()
+	meta := routing.EntryMeta{VerifiedAt: now}
+
+	if isDirect {
+		// Phase 8: remote is directly reachable — admit as standard direct node.
+		// tabAdd handles bucket eviction logic (including punched-zone priority).
+		n.tabAdd(ni, meta)
+		n.log.Debug("punch complete: reclassified as direct node", "node", nodeID)
+	} else {
+		// Normal punch: admit to the routing table's punched zone (spare slots only).
+		n.tabMu.Lock()
+		n.table.AddPunched(ni, meta, now)
+		n.tabMu.Unlock()
+		n.log.Debug("punch complete: admitted as punched node", "node", nodeID)
+	}
 
 	// Register the peer address so DHT send functions can route to this peer.
-	// Phase 4 will consult PunchTransport.SendTo first; this registration
+	// sendToOrFallback consults PunchTransport.SendTo first; this registration
 	// ensures the UDP fallback also has a candidate address.
 	n.peerMu.Lock()
 	n.peers[key] = peerNetAddr
 	n.peerMu.Unlock()
 	n.addrToID.Store(peerNetAddr.String(), nodeID)
 
-	n.log.Debug("punch complete: success, admitted to routing table", "node", nodeID)
-
 	// Phase 5: exchange routing info with the newly-reachable peer.
-	// Runs in a goroutine so OnPunchComplete returns immediately to the
-	// host-layer scheduler.
 	go n.exchangeAfterPunch(nodeID, peerNetAddr)
 }
