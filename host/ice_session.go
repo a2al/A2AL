@@ -201,10 +201,10 @@ func fetchTURNRESTCredentials(ctx context.Context, apiURL, auth string) (usernam
 	return body.Username, body.Password, nil
 }
 
-func newICEAgent(urls []*stun.URI, hostOnly bool) (*ice.Agent, error) {
+func newICEAgent(urls []*stun.URI, hostOnly bool, networkTypes []ice.NetworkType) (*ice.Agent, error) {
 	cfg := &ice.AgentConfig{
 		Urls:             urls,
-		NetworkTypes:     []ice.NetworkType{ice.NetworkTypeUDP4},
+		NetworkTypes:     networkTypes,
 		MulticastDNSMode: ice.MulticastDNSModeDisabled,
 	}
 	if hostOnly {
@@ -228,10 +228,13 @@ func newICEAgent(urls []*stun.URI, hostOnly bool) (*ice.Agent, error) {
 //     connectivity checks concurrently with gathering and returns when a pair is
 //     selected.
 //
+// networkTypes controls which address families are included in ICE candidate
+// gathering (e.g. {UDP4} or {UDP4, UDP6}). Callers pass h.cfg.ICENetworkTypes.
+//
 // On success the returned *iceSession owns the ICE connection, the underlying
 // agent, and the WebSocket. The caller must eventually close them (directly or
 // by tying their lifetime to a QUIC connection).
-func runICESession(ctx context.Context, wsURL string, urls []*stun.URI, controlling, hostOnly bool) (*iceSession, error) {
+func runICESession(ctx context.Context, wsURL string, urls []*stun.URI, controlling, hostOnly bool, networkTypes []ice.NetworkType) (*iceSession, error) {
 	sess := &iceSession{}
 	ok := false
 	defer func() {
@@ -250,7 +253,7 @@ func runICESession(ctx context.Context, wsURL string, urls []*stun.URI, controll
 	sess.ws = ws
 
 	// --- 2. ICE agent ---
-	agent, err := newICEAgent(urls, hostOnly)
+	agent, err := newICEAgent(urls, hostOnly, networkTypes)
 	if err != nil {
 		return nil, err
 	}

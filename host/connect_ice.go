@@ -90,7 +90,7 @@ func (h *Host) tryICEViaHub(ctx context.Context, localCert tls.Certificate, loca
 			case <-time.After(noAgentRetryDelay):
 			}
 		}
-		sess, err = runICESession(ctx, wsURL, iceURLs, true, false)
+		sess, err = runICESession(ctx, wsURL, iceURLs, true, false, h.cfg.ICENetworkTypes)
 		if !errors.Is(err, ErrNoAgent) {
 			break
 		}
@@ -158,7 +158,7 @@ func (h *Host) tryICEViaHub(ctx context.Context, localCert tls.Certificate, loca
 //
 // The caller must invoke teardown when the connection is no longer needed.
 func (h *Host) acceptICEToQUIC(ctx context.Context, wsURL string, cert tls.Certificate, qcfg *quic.Config) (qc quic.Connection, peerUDP *net.UDPAddr, isDirect bool, teardown func(), err error) {
-	sess, err := runICESession(ctx, wsURL, h.mergeICEURLs(ctx), false, false)
+	sess, err := runICESession(ctx, wsURL, h.mergeICEURLs(ctx), false, false, h.cfg.ICENetworkTypes)
 	if err != nil {
 		return nil, nil, false, nil, err
 	}
@@ -322,7 +322,7 @@ func (h *Host) tryICEForDHT(ctx context.Context, cert tls.Certificate, expectRem
 			case <-time.After(noAgentRetryDelay):
 			}
 		}
-		sess, lerr = runICESession(ctx, wsURL, iceURLs, true, false)
+		sess, lerr = runICESession(ctx, wsURL, iceURLs, true, false, h.cfg.ICENetworkTypes)
 		if !errors.Is(lerr, ErrNoAgent) {
 			break
 		}

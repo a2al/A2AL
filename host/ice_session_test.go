@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	ice "github.com/pion/ice/v3"
+
 	"github.com/a2al/a2al/signaling"
 )
 
@@ -34,12 +36,13 @@ func TestICESessionHostOnlyLoopback(t *testing.T) {
 	ctrlCh := make(chan res, 1)
 	othCh := make(chan res, 1)
 
+	v4Only := []ice.NetworkType{ice.NetworkTypeUDP4}
 	go func() {
-		s, e := runICESession(ctx, wsURL, nil, true, true)
+		s, e := runICESession(ctx, wsURL, nil, true, true, v4Only)
 		ctrlCh <- res{s, e}
 	}()
 	go func() {
-		s, e := runICESession(ctx, wsURL, nil, false, true)
+		s, e := runICESession(ctx, wsURL, nil, false, true, v4Only)
 		othCh <- res{s, e}
 	}()
 

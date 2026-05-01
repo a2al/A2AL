@@ -146,7 +146,9 @@ func resolveBootstrapAddrs(hostports []string, log *slog.Logger) []net.Addr {
 		if s == "" {
 			continue
 		}
-		a, err := net.ResolveUDPAddr("udp4", s)
+		// Use "udp" (not "udp4") so that literal IPv6 bootstrap addresses
+		// (e.g. "[2001:db8::1]:4121") are resolved correctly.
+		a, err := net.ResolveUDPAddr("udp", s)
 		if err != nil {
 			log.Debug("bootstrap resolve skip", "addr", s, "err", err)
 			continue

@@ -31,6 +31,8 @@ import (
 
 	"github.com/quic-go/quic-go"
 
+	ice "github.com/pion/ice/v3"
+
 	"github.com/a2al/a2al"
 	"github.com/a2al/a2al/crypto"
 	"github.com/a2al/a2al/dht"
@@ -89,8 +91,8 @@ type TURNServer struct {
 // IPv6 note: currently Host binds udp4 sockets only. The Transport interface,
 // protocol wire format (NodeInfo.IP 4/16 bytes, observed_addr 6/18 bytes), and
 // endpoint URL model ("quic://[v6]:port") are all IPv6-ready. Dual-stack
-// requires changing the socket setup in New() — either "udp" dual-stack or
-// separate v4+v6 listeners — and adding v6 candidate collection in candidates.go.
+// requires changing listenUDP4 in New() — either "udp" dual-stack or separate
+// v4+v6 listeners — and adding v6 candidate collection in candidates.go.
 // No interface or data-model changes are expected.
 type Config struct {
 	KeyStore crypto.KeyStore
@@ -131,6 +133,11 @@ type Config struct {
 	// SeenPeersPath is forwarded to the DHT node for seenPeers persistence (spec §7.3).
 	// Empty disables persistence.
 	SeenPeersPath string
+	// ICENetworkTypes lists the ICE network types used for candidate gathering.
+	// Defaults to {ice.NetworkTypeUDP4} (IPv4-only) when nil or empty.
+	// To enable IPv6 ICE, set to {ice.NetworkTypeUDP4, ice.NetworkTypeUDP6} after
+	// dual-stack socket support is implemented (Layer 1 of the IPv6 support plan).
+	ICENetworkTypes []ice.NetworkType
 }
 
 // agentRouteMagic is the legacy 4-byte prefix (a2r1). Still recognised on accept
@@ -248,9 +255,10 @@ func New(cfg Config) (*Host, error) {
 	}
 	sense := natsense.NewSense(min)
 
-	dhtUDP, err := net.ResolveUDPAddr("udp4", cfg.ListenAddr)
-	if err != nil {
-		return nil, err
+	// Apply ICE network types default: IPv4-only until dual-stack socket is ready.
+	// TODO(ipv6): change default to {UDP4, UDP6} in Layer 2 of the IPv6 support plan.
+	if len(cfg.ICENetworkTypes) == 0 {
+		cfg.ICENetworkTypes = []ice.NetworkType{ice.NetworkTypeUDP4}
 	}
 
 	// Create the punch pool before the DHT node so it can be injected into
@@ -278,7 +286,7 @@ func New(cfg Config) (*Host, error) {
 	var qt *quic.Transport
 
 	if cfg.QUICListenAddr == "" {
-		conn, err := net.ListenUDP("udp4", dhtUDP)
+		conn, err := listenUDP4(cfg.ListenAddr)
 		if err != nil {
 			return nil, err
 		}
@@ -292,15 +300,11 @@ func New(cfg Config) (*Host, error) {
 		}
 		qt = &quic.Transport{Conn: mux.QUICPacketConn()}
 	} else {
-		qUDP, err := net.ResolveUDPAddr("udp4", cfg.QUICListenAddr)
+		dConn, err := listenUDP4(cfg.ListenAddr)
 		if err != nil {
 			return nil, err
 		}
-		dConn, err := net.ListenUDP("udp4", dhtUDP)
-		if err != nil {
-			return nil, err
-		}
-		qConn, err := net.ListenUDP("udp4", qUDP)
+		qConn, err := listenUDP4(cfg.QUICListenAddr)
 		if err != nil {
 			_ = dConn.Close()
 			return nil, err
@@ -714,6 +718,12 @@ func (h *Host) ensureExternalIP(ctx context.Context) string {
 	return snap
 }
 
+// ensureUPnP attempts IGD port mapping via UPnP. Returns the mapped quic:// URL,
+// or empty when UPnP is disabled or unavailable.
+//
+// IPv6 note: UPnP IGD is an IPv4 NAT mechanism. Nodes with a global IPv6 address
+// are directly reachable and do not need port mapping — this function is skipped
+// implicitly because their public IP is collected via natsense/STUN instead.
 func (h *Host) ensureUPnP(ctx context.Context) string {
 	if h.cfg.DisableUPnP {
 		return ""
@@ -1096,16 +1106,41 @@ func FirstQUICAddr(er *protocol.EndpointRecord) (*net.UDPAddr, error) {
 // helpers
 // ---------------------------------------------------------------------------
 
-// outboundIP returns the preferred outbound IP without sending any packets.
-// It does this by connecting a UDP socket to a public address and reading
-// the local address the OS assigned.
-func outboundIP() net.IP {
+// outboundIPv4 returns the preferred IPv4 outbound address without sending any
+// packets, by connecting a UDP socket to a public IPv4 address and reading the
+// local address the OS assigned.
+func outboundIPv4() net.IP {
 	conn, err := net.Dial("udp4", "8.8.8.8:80")
 	if err != nil {
 		return nil
 	}
 	defer conn.Close()
 	return conn.LocalAddr().(*net.UDPAddr).IP
+}
+
+// outboundIPv6 returns the preferred IPv6 outbound address without sending any
+// packets. Currently returns nil; will be implemented in Layer 1 of the IPv6
+// support plan alongside dual-stack socket setup.
+//
+// TODO(ipv6): implement as net.Dial("udp6", "2001:4860:4860::8888:80") once
+// the DHT/QUIC socket supports IPv6.
+func outboundIPv6() net.IP {
+	return nil
+}
+
+// listenUDP4 resolves addr as IPv4 UDP and opens a socket.
+//
+// All DHT and QUIC sockets currently bind to IPv4 only.
+// TODO(ipv6): to enable dual-stack or IPv6-only, change "udp4" to "udp" (dual-stack
+// on Linux/macOS) or implement separate v4/v6 listeners here (required on Windows,
+// where net.ListenUDP("udp", ...) does not auto-bind IPv6). See Layer 1 in the IPv6
+// support design plan.
+func listenUDP4(addr string) (*net.UDPConn, error) {
+	a, err := net.ResolveUDPAddr("udp4", addr)
+	if err != nil {
+		return nil, err
+	}
+	return net.ListenUDP("udp4", a)
 }
 
 func peerAddrFromTLSState(state tls.ConnectionState) (a2al.Address, error) {
