@@ -144,6 +144,50 @@ func (h *Host) tryICEViaHub(ctx context.Context, localCert tls.Certificate, loca
 	return qc, nil
 }
 
+// acceptICEToQUIC runs the controlled (callee) side of ICE signaling, then
+// builds a QUIC listener and accepts exactly one incoming connection.
+// It returns the raw QUIC connection and the peer's UDP address without
+// performing any upper-layer handshake (agent-route or DHT).
+//
+// The caller must invoke teardown when the connection is no longer needed.
+// Typically teardown is tied to qc.Context().Done() in a goroutine.
+func (h *Host) acceptICEToQUIC(ctx context.Context, wsURL string, cert tls.Certificate) (qc quic.Connection, peerUDP *net.UDPAddr, teardown func(), err error) {
+	sess, err := runICESession(ctx, wsURL, h.mergeICEURLs(ctx), false, false)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	pconn := &icePacketConn{c: sess.iceConn}
+	tr := &quic.Transport{Conn: pconn}
+	td := func() {
+		_ = tr.Close()
+		sess.CloseSignaling()
+	}
+
+	srvTLS := quicServerTLSWithSNI(cert, h.certForSNI)
+	ln, err := tr.Listen(srvTLS, defaultQUICConfig())
+	if err != nil {
+		td()
+		return nil, nil, nil, err
+	}
+
+	qc, err = ln.Accept(ctx)
+	_ = ln.Close()
+	if err != nil {
+		td()
+		return nil, nil, nil, err
+	}
+
+	ra := qc.RemoteAddr()
+	udpRA, ok := ra.(*net.UDPAddr)
+	if !ok || udpRA == nil {
+		_ = qc.CloseWithError(1, "non-udp remote")
+		td()
+		return nil, nil, nil, fmt.Errorf("a2al/host: ice remote addr is %T", ra)
+	}
+	return qc, udpRA, td, nil
+}
+
 // AcceptICEViaSignal is the controlled (callee) side: WebSocket ICE signaling
 // on signalBase, then QUIC-over-ICE. expectRemote is the caller's agent address.
 //
@@ -166,31 +210,8 @@ func (h *Host) AcceptICEViaSignal(ctx context.Context, localAgent, expectRemote 
 		return nil, fmt.Errorf("a2al/host: ice signal url: %w", err)
 	}
 
-	urls := h.mergeICEURLs(ctx)
-	sess, err := runICESession(ctx, wsURL, urls, false, false)
+	qc, _, teardown, err := h.acceptICEToQUIC(ctx, wsURL, ag.cert)
 	if err != nil {
-		return nil, err
-	}
-
-	pconn := &icePacketConn{c: sess.iceConn}
-	tr := &quic.Transport{Conn: pconn}
-
-	teardown := func() {
-		_ = tr.Close()
-		sess.CloseSignaling()
-	}
-
-	srvTLS := quicServerTLSWithSNI(ag.cert, h.certForSNI)
-	ln, err := tr.Listen(srvTLS, defaultQUICConfig())
-	if err != nil {
-		teardown()
-		return nil, err
-	}
-
-	qc, err := ln.Accept(ctx)
-	_ = ln.Close() // stop accepting; the connection is already established
-	if err != nil {
-		teardown()
 		return nil, err
 	}
 
@@ -209,8 +230,114 @@ func (h *Host) AcceptICEViaSignal(ctx context.Context, localAgent, expectRemote 
 
 	go func() {
 		<-qc.Context().Done()
-		_ = tr.Close()
-		sess.CloseSignaling()
+		h.log.Debug("ice quic closed", "local_aid", localAgent.String(), "remote_aid", expectRemote.String(), "close_reason", qc.Context().Err())
+		teardown()
 	}()
 	return ac, nil
+}
+
+// connectViaICEForDHT performs the controlling (caller) ICE path for Mode B
+// (DHT control-plane) connections. Unlike connectViaICESignal it does NOT run
+// the agent-route control stream — the returned QUIC connection carries raw DHT
+// messages only. The node identity certificate is used for mutual TLS.
+//
+// Resource lifetime: teardown is tied to qc.Context() by a background goroutine.
+func (h *Host) connectViaICEForDHT(ctx context.Context, er *protocol.EndpointRecord) (qc quic.Connection, peerUDP *net.UDPAddr, err error) {
+	signalURLs := er.Signals
+	if len(signalURLs) == 0 && er.Signal != "" {
+		signalURLs = []string{er.Signal}
+	}
+	if len(signalURLs) == 0 {
+		return nil, nil, errors.New("a2al/host: no signal url in record")
+	}
+
+	nodeCert, err := h.defaultAgentCert()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	room := signaling.RoomID(h.addr.String(), er.Address.String())
+	iceURLs := h.mergeICEURLs(ctx)
+
+	var lastErr error
+	for _, signalBase := range signalURLs {
+		qc, peerUDP, err = h.tryICEForDHT(ctx, nodeCert, er.Address, signalBase, room, iceURLs)
+		if err == nil {
+			return qc, peerUDP, nil
+		}
+		h.log.Debug("dht ice hub failed, trying next", "base", signalBase, "remote", er.Address, "err", err)
+		lastErr = err
+	}
+	return nil, nil, lastErr
+}
+
+// tryICEForDHT attempts a full ICE → QUIC handshake through one signal hub for
+// Mode B (DHT control-plane). No agent-route control stream is opened.
+func (h *Host) tryICEForDHT(ctx context.Context, cert tls.Certificate, expectRemote a2al.Address, signalBase, room string, iceURLs []*stun.URI) (quic.Connection, *net.UDPAddr, error) {
+	wsURL, err := signaling.AppendRoomToICEURL(signalBase, room)
+	if err != nil {
+		return nil, nil, fmt.Errorf("a2al/host: ice signal url: %w", err)
+	}
+	wsURL, err = signaling.AppendQuery(wsURL, "target", expectRemote.String())
+	if err != nil {
+		return nil, nil, fmt.Errorf("a2al/host: ice signal url: %w", err)
+	}
+	wsURL, err = signaling.AppendQuery(wsURL, "caller", h.addr.String())
+	if err != nil {
+		return nil, nil, fmt.Errorf("a2al/host: ice signal url: %w", err)
+	}
+
+	var (
+		sess *iceSession
+		lerr error
+	)
+	for attempt := 0; attempt <= noAgentRetries; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, nil, ctx.Err()
+			case <-time.After(noAgentRetryDelay):
+			}
+		}
+		sess, lerr = runICESession(ctx, wsURL, iceURLs, true, false)
+		if !errors.Is(lerr, ErrNoAgent) {
+			break
+		}
+		h.log.Debug("dht ice retry on noagent", "remote", expectRemote, "hub", signalBase, "attempt", attempt+1)
+	}
+	if lerr != nil {
+		return nil, nil, lerr
+	}
+
+	pconn := &icePacketConn{c: sess.iceConn}
+	tr := &quic.Transport{Conn: pconn}
+	teardown := func() {
+		_ = tr.Close()
+		sess.CloseSignaling()
+	}
+
+	ra := sess.iceConn.RemoteAddr()
+	udpRA, ok := ra.(*net.UDPAddr)
+	if !ok || udpRA == nil {
+		teardown()
+		return nil, nil, fmt.Errorf("a2al/host: ice remote addr is %T", ra)
+	}
+
+	cliTLS, err := quicClientTLSWithCert(cert, expectRemote)
+	if err != nil {
+		teardown()
+		return nil, nil, err
+	}
+	qc, err := tr.Dial(ctx, udpRA, cliTLS, defaultQUICConfig())
+	if err != nil {
+		teardown()
+		return nil, nil, err
+	}
+
+	// Mode B: no doDialerControlStream — connection carries raw DHT messages only.
+	go func() {
+		<-qc.Context().Done()
+		teardown()
+	}()
+	return qc, udpRA, nil
 }
