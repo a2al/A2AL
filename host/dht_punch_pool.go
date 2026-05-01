@@ -90,5 +90,5 @@ func (p *DHTpunchPool) Punch(nodeID a2al.NodeID, er *protocol.EndpointRecord, pr
 	)
 	// Phase 2: immediately report failure so isPunching is cleared and DHT
 	// does not permanently exclude this node from query tracks.
-	p.node.OnPunchComplete(nodeID, nil, false)
+	p.node.OnPunchComplete(nodeID, a2al.Address{}, nil, false)
 }
