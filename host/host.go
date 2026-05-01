@@ -25,7 +25,6 @@ import (
 	"net"
 	"net/http"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -205,8 +204,9 @@ type Host struct {
 	extipSnap string    // "ip:port" (STUN) or "ip" (HTTP); empty = not yet resolved
 	extipExp  time.Time // cache expiry
 
-	iceMu            sync.RWMutex
-	derivedICESignal string // from bootstrap when cfg.ICESignalURL is empty
+	iceMu              sync.RWMutex
+	derivedICESignals  []string // candidate signal hub URLs from bootstrap
+	activeSignalURLs   []string // currently connected hubs, maintained by ice_listener
 
 	signalStatsMu sync.RWMutex
 	signalStats   func() map[string]any
@@ -596,10 +596,10 @@ func (h *Host) BuildEndpointPayload(ctx context.Context) (protocol.EndpointPaylo
 		return protocol.EndpointPayload{}, err
 	}
 
-	// Signal URLs: multi-center list, Signal = Signals[0] for backward compat.
+	// Signal URLs: publish only live connections (or explicit config).
 	// turns[] is intentionally not published: callee-pays TURN relay addresses are
 	// exchanged via trickle ICE during sessions, not stored in the DHT.
-	signals := h.effectiveICESignalURLs()
+	signals := h.publishSignalURLs()
 	var signal string
 	if len(signals) > 0 {
 		signal = signals[0]
@@ -612,8 +612,9 @@ func (h *Host) BuildEndpointPayload(ctx context.Context) (protocol.EndpointPaylo
 	}, nil
 }
 
-// effectiveICESignalURLs returns the ordered list of signal hub URLs to publish.
-// Priority: ICESignalURLs config > ICESignalURL config > bootstrap-derived value.
+// effectiveICESignalURLs returns the ordered candidate list for ice_listener to
+// attempt connections to. Priority: ICESignalURLs config > ICESignalURL config >
+// bootstrap-derived candidates. This list drives WHICH hubs to try, not what to publish.
 func (h *Host) effectiveICESignalURLs() []string {
 	h.iceMu.RLock()
 	defer h.iceMu.RUnlock()
@@ -623,8 +624,25 @@ func (h *Host) effectiveICESignalURLs() []string {
 	if h.cfg.ICESignalURL != "" {
 		return []string{h.cfg.ICESignalURL}
 	}
-	if h.derivedICESignal != "" {
-		return []string{h.derivedICESignal}
+	return h.derivedICESignals
+}
+
+// publishSignalURLs returns the signal hub URLs to include in endpoint records.
+// For explicitly configured URLs the operator vouches for them; for bootstrap-derived
+// URLs only hubs with live connections are published, avoiding stale DHT entries.
+func (h *Host) publishSignalURLs() []string {
+	h.iceMu.RLock()
+	defer h.iceMu.RUnlock()
+	if len(h.cfg.ICESignalURLs) > 0 {
+		return h.cfg.ICESignalURLs
+	}
+	if h.cfg.ICESignalURL != "" {
+		return []string{h.cfg.ICESignalURL}
+	}
+	if len(h.activeSignalURLs) > 0 {
+		out := make([]string, len(h.activeSignalURLs))
+		copy(out, h.activeSignalURLs)
+		return out
 	}
 	return nil
 }
@@ -650,15 +668,24 @@ func (h *Host) EffectiveICESignalURLs() []string {
 	return h.effectiveICESignalURLs()
 }
 
-// SetDerivedICESignalURL sets the bootstrap-derived signal base when
-// Config.ICESignalURL is empty. Explicit config always wins and is not overwritten.
-func (h *Host) SetDerivedICESignalURL(s string) {
+// SetDerivedICESignalURLs sets bootstrap-derived signal hub candidates.
+// Explicit config (ICESignalURLs / ICESignalURL) always wins and is not overwritten.
+func (h *Host) SetDerivedICESignalURLs(urls []string) {
 	h.iceMu.Lock()
 	defer h.iceMu.Unlock()
-	if h.cfg.ICESignalURL != "" {
+	if len(h.cfg.ICESignalURLs) > 0 || h.cfg.ICESignalURL != "" {
 		return
 	}
-	h.derivedICESignal = strings.TrimSpace(s)
+	h.derivedICESignals = urls
+}
+
+// SetActiveSignalURLs records the set of signal hub URLs with live connections.
+// Called by ice_listener when the active set changes; BuildEndpointPayload uses
+// this list (instead of all candidates) to avoid publishing stale hub addresses.
+func (h *Host) SetActiveSignalURLs(urls []string) {
+	h.iceMu.Lock()
+	h.activeSignalURLs = urls
+	h.iceMu.Unlock()
 }
 
 // SetSignalStatsProvider merges hub stats into GET /debug/stats under "signal".

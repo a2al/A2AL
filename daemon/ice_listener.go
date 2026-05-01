@@ -15,6 +15,106 @@ import (
 	"github.com/a2al/a2al/signaling"
 )
 
+const (
+	// signalSlots is the target number of simultaneously connected signal hubs.
+	signalSlots = 2
+	// signalNeverRetries is the number of consecutive dial failures allowed for
+	// a hub that has never connected before it is put into cooldown.
+	signalNeverRetries = 3
+	// signalNeverDelay is the pause between attempts for a never-connected hub.
+	signalNeverDelay = 5 * time.Second
+	// signalQuickRetries is the number of reconnect attempts allowed after a
+	// previously live hub disconnects unexpectedly.
+	signalQuickRetries = 3
+	// signalQuickDelay is the pause between quick reconnect attempts.
+	signalQuickDelay = 2 * time.Second
+	// signalCooldown is how long a hub stays out of rotation after exhausting
+	// its never-connected retries.
+	signalCooldown = 5 * time.Minute
+)
+
+// signalSlotState is the shared pool managed by runICEListener. It tracks
+// which candidate URLs are claimed (being attempted by a slot), active
+// (connected), or in cooldown (temporarily excluded).
+type signalSlotState struct {
+	d    *Daemon
+	mu   sync.Mutex
+	act  map[string]struct{}   // currently connected hubs
+	clm  map[string]struct{}   // hubs being attempted (not yet connected)
+	cool map[string]time.Time  // hubs excluded until this time
+}
+
+func newSignalSlotState(d *Daemon) *signalSlotState {
+	return &signalSlotState{
+		d:    d,
+		act:  make(map[string]struct{}),
+		clm:  make(map[string]struct{}),
+		cool: make(map[string]time.Time),
+	}
+}
+
+// pick selects and claims the first available candidate not already active,
+// claimed, or in cooldown. Returns "" if no candidate is available right now.
+func (s *signalSlotState) pick(candidates []string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	for _, u := range candidates {
+		if _, ok := s.act[u]; ok {
+			continue
+		}
+		if _, ok := s.clm[u]; ok {
+			continue
+		}
+		if t, ok := s.cool[u]; ok && now.Before(t) {
+			continue
+		}
+		s.clm[u] = struct{}{}
+		return u
+	}
+	return ""
+}
+
+// markConnected transitions url from claimed → active and notifies the host.
+func (s *signalSlotState) markConnected(url string) {
+	s.mu.Lock()
+	delete(s.clm, url)
+	s.act[url] = struct{}{}
+	delete(s.cool, url)
+	s.mu.Unlock()
+	s.flush()
+}
+
+// markCooldown puts a never-connected url into cooldown and releases its claim.
+func (s *signalSlotState) markCooldown(url string) {
+	s.mu.Lock()
+	delete(s.clm, url)
+	s.cool[url] = time.Now().Add(signalCooldown)
+	s.mu.Unlock()
+}
+
+// release removes url from both claimed and active sets and notifies the host.
+// Safe to call more than once (idempotent map deletes).
+func (s *signalSlotState) release(url string) {
+	s.mu.Lock()
+	delete(s.clm, url)
+	delete(s.act, url)
+	s.mu.Unlock()
+	s.flush()
+}
+
+// flush snapshots the active set and pushes it to the host for DHT publishing.
+func (s *signalSlotState) flush() {
+	s.mu.Lock()
+	urls := make([]string, 0, len(s.act))
+	for u := range s.act {
+		urls = append(urls, u)
+	}
+	s.mu.Unlock()
+	slices.Sort(urls)
+	s.d.h.SetActiveSignalURLs(urls)
+}
+
 // iceKeepaliveInterval is how often the daemon re-sends reg frames on an idle
 // /signal connection. Re-sending reg frames (application-layer data frames)
 // resets the server-side 60 s read deadline and traverses any intermediate
@@ -55,207 +155,183 @@ func (d *incomingDedup) release(room string) {
 	d.mu.Unlock()
 }
 
-// runICEListener manages per-hub /signal subscriptions. It monitors the
-// effective signal URL list; when the list changes all active subscribers
-// are cancelled and a new set is started. The shared incomingDedup prevents
-// duplicate AcceptICEViaSignal calls when multiple hubs deliver the same
-// incoming notification.
-//
-// d.iceRegNotify is broadcast to all active subscriber notify channels so
-// that every hub re-sends reg frames immediately when agent registration changes.
+// runICEListener manages signalSlots concurrent hub connections. Each slot
+// independently picks from the candidate list, attempts to connect, and reports
+// its live state through signalSlotState. d.iceRegNotify is broadcast to all
+// active slots so every hub re-sends reg frames on agent registration changes.
 func (d *Daemon) runICEListener(ctx context.Context) {
-	var (
-		notifyMu  sync.Mutex
-		notifyChs []chan struct{} // one per active subscriber goroutine
-	)
+	seen := newIncomingDedup()
+	state := newSignalSlotState(d)
 
-	// broadcast forwards iceRegNotify to all active subscriber goroutines.
+	// Per-slot notify channels; broadcast goroutine fans out from d.iceRegNotify.
+	notifyChs := make([]chan struct{}, signalSlots)
+	for i := range notifyChs {
+		notifyChs[i] = make(chan struct{}, 1)
+	}
 	go func() {
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-d.iceRegNotify:
-				notifyMu.Lock()
 				for _, ch := range notifyChs {
 					select {
 					case ch <- struct{}{}:
 					default:
 					}
 				}
-				notifyMu.Unlock()
 			}
 		}
 	}()
 
-	seen := newIncomingDedup()
-
-	var (
-		lastURLs     []string
-		workerCancel context.CancelFunc
-		workerDone   <-chan struct{}
-	)
-
-	stopWorkers := func() {
-		if workerCancel != nil {
-			workerCancel()
-			<-workerDone
-			workerCancel = nil
-			workerDone = nil
-		}
-		notifyMu.Lock()
-		notifyChs = nil
-		notifyMu.Unlock()
+	var wg sync.WaitGroup
+	for i := 0; i < signalSlots; i++ {
+		wg.Add(1)
+		notify := notifyChs[i]
+		go func() {
+			defer wg.Done()
+			d.runSignalSlot(ctx, state, seen, notify)
+		}()
 	}
-
-	for ctx.Err() == nil {
-		hasAgents := len(d.reg.List()) > 0
-		urls := d.h.EffectiveICESignalURLs()
-
-		if !hasAgents || len(urls) == 0 {
-			stopWorkers()
-			lastURLs = nil
-			d.sleepICE(ctx, time.Second)
-			continue
-		}
-
-		urlsChanged := !slices.Equal(urls, lastURLs)
-
-		if urlsChanged {
-			stopWorkers()
-			lastURLs = slices.Clone(urls)
-
-			workerCtx, cancel := context.WithCancel(ctx)
-			workerCancel = cancel
-			done := make(chan struct{})
-			workerDone = done
-
-			chs := make([]chan struct{}, len(urls))
-			for i := range chs {
-				chs[i] = make(chan struct{}, 1)
-			}
-			notifyMu.Lock()
-			notifyChs = chs
-			notifyMu.Unlock()
-
-			var wg sync.WaitGroup
-			for i, base := range urls {
-				wg.Add(1)
-				go func(base string, notify <-chan struct{}) {
-					defer wg.Done()
-					d.runSingleICESubscriber(workerCtx, base, seen, notify)
-				}(base, chs[i])
-			}
-			go func() { wg.Wait(); close(done) }()
-		}
-
-		// Poll for URL / agent-list changes once per second.
-		select {
-		case <-ctx.Done():
-			stopWorkers()
-			return
-		case <-time.After(time.Second):
-		}
-	}
-	stopWorkers()
+	wg.Wait()
 }
 
-// runSingleICESubscriber maintains a persistent /signal WebSocket to one hub.
-// It reconnects with exponential backoff on any connection failure.
-// Incoming notifications are deduplicated via seen before spawning AcceptICEViaSignal.
-func (d *Daemon) runSingleICESubscriber(ctx context.Context, base string, seen *incomingDedup, notify <-chan struct{}) {
-	backoff := 2 * time.Second
+// runSignalSlot is one connection slot in the signal pool. It repeatedly picks
+// an available hub candidate and calls runSignalURL until the context is done.
+func (d *Daemon) runSignalSlot(ctx context.Context, state *signalSlotState, seen *incomingDedup, notify <-chan struct{}) {
 	for ctx.Err() == nil {
-		subURL, err := signaling.SubscribeURL(base)
-		if err != nil {
-			d.log.Debug("ice listener subscribe url", "base", base, "err", err)
-			d.sleepICE(ctx, backoff)
-			backoff = nextICEBackoff(backoff)
+		url := state.pick(d.h.EffectiveICESignalURLs())
+		if url == "" {
+			d.sleepICE(ctx, 5*time.Second)
 			continue
 		}
-		conn, _, err := websocket.Dial(ctx, subURL, &websocket.DialOptions{
-			Subprotocols: []string{signaling.SubprotocolICE},
-		})
+		d.runSignalURL(ctx, url, state, seen, notify)
+	}
+}
+
+// runSignalURL manages the full lifecycle of one hub URL for a slot: initial
+// connection attempts, keepalive, and reconnect after disconnection.
+// If the hub never connects within signalNeverRetries attempts it is cooled down;
+// if it loses an established connection the slot tries signalQuickRetries times
+// before releasing the URL and returning (slot picks a new one).
+func (d *Daemon) runSignalURL(ctx context.Context, url string, state *signalSlotState, seen *incomingDedup, notify <-chan struct{}) {
+	// release covers all exit paths; markCooldown also clears the claim so the
+	// extra delete on already-absent map keys is harmless (idempotent).
+	defer state.release(url)
+
+	wasConnected := false
+	fails := 0
+
+	for ctx.Err() == nil {
+		conn, err := d.connectHub(ctx, url)
 		if err != nil {
-			d.log.Debug("ice listener dial", "base", base, "err", err)
-			d.sleepICE(ctx, backoff)
-			backoff = nextICEBackoff(backoff)
+			fails++
+			if !wasConnected {
+				if fails >= signalNeverRetries {
+					d.log.Debug("ice hub unreachable, cooling down", "base", url)
+					state.markCooldown(url)
+					return
+				}
+				d.sleepICE(ctx, signalNeverDelay)
+			} else {
+				if fails >= signalQuickRetries {
+					d.log.Debug("ice hub reconnect failed, releasing", "base", url)
+					return
+				}
+				d.sleepICE(ctx, signalQuickDelay)
+			}
 			continue
 		}
-		backoff = 2 * time.Second
-		if err := d.sendICERegs(ctx, conn); err != nil {
+
+		if !wasConnected {
+			state.markConnected(url)
+			wasConnected = true
+		}
+		fails = 0
+
+		d.runHubSession(ctx, conn, url, seen, notify)
+		// Disconnected; loop to reconnect.
+	}
+}
+
+// connectHub dials a signal hub and sends initial reg frames.
+// Both steps are treated atomically: a failed sendICERegs closes the connection.
+func (d *Daemon) connectHub(ctx context.Context, base string) (*websocket.Conn, error) {
+	subURL, err := signaling.SubscribeURL(base)
+	if err != nil {
+		return nil, err
+	}
+	conn, _, err := websocket.Dial(ctx, subURL, &websocket.DialOptions{
+		Subprotocols: []string{signaling.SubprotocolICE},
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := d.sendICERegs(ctx, conn); err != nil {
+		_ = conn.CloseNow()
+		return nil, err
+	}
+	return conn, nil
+}
+
+// runHubSession runs the keepalive loop for an established hub connection.
+// It returns when the connection is lost or ctx is cancelled.
+func (d *Daemon) runHubSession(ctx context.Context, conn *websocket.Conn, base string, seen *incomingDedup, notify <-chan struct{}) {
+	readErr := make(chan error, 1)
+	go func() { readErr <- d.readICELoopFor(ctx, conn, base, seen) }()
+
+	keepalive := time.NewTicker(iceKeepaliveInterval)
+	defer keepalive.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
 			_ = conn.CloseNow()
-			d.sleepICE(ctx, backoff)
-			continue
-		}
-		readErr := make(chan error, 1)
-		go func() {
-			readErr <- d.readICELoopFor(ctx, conn, base, seen)
-		}()
-		keepalive := time.NewTicker(iceKeepaliveInterval)
-	outer:
-		for {
-			select {
-			case <-ctx.Done():
-				keepalive.Stop()
+			<-readErr
+			return
+		case <-keepalive.C:
+			// Re-send reg frames to reset the server-side read deadline and keep
+			// intermediate proxies alive, then Ping to confirm end-to-end liveness.
+			if err := d.sendICERegs(ctx, conn); err != nil {
+				_ = conn.CloseNow()
+				if ctx.Err() != nil {
+					<-readErr
+					return
+				}
+				d.log.Debug("ice keepalive", "base", base, "err", err)
+				<-readErr
+				return
+			}
+			pctx, pcancel := context.WithTimeout(ctx, 10*time.Second)
+			pingErr := conn.Ping(pctx)
+			pcancel()
+			if pingErr != nil {
+				_ = conn.CloseNow()
+				if ctx.Err() != nil {
+					<-readErr
+					return
+				}
+				d.log.Debug("ice ping", "base", base, "err", pingErr)
+				<-readErr
+				return
+			}
+		case <-notify:
+			if err := d.sendICERegs(ctx, conn); err != nil {
 				_ = conn.CloseNow()
 				<-readErr
 				return
-			case <-keepalive.C:
-				// Re-send reg frames to reset the server-side read deadline and
-				// keep intermediate proxies alive, then Ping to confirm the server
-				// is reachable (pong is processed by the concurrent Read goroutine).
-				if err := d.sendICERegs(ctx, conn); err != nil {
-					keepalive.Stop()
-					_ = conn.CloseNow()
-					if ctx.Err() != nil {
-						<-readErr
-						return
-					}
-					d.log.Debug("ice listener keepalive", "base", base, "err", err)
-					break outer
-				}
-				pctx, pcancel := context.WithTimeout(ctx, 10*time.Second)
-				pingErr := conn.Ping(pctx)
-				pcancel()
-				if pingErr != nil {
-					keepalive.Stop()
-					_ = conn.CloseNow()
-					if ctx.Err() != nil {
-						<-readErr
-						return
-					}
-					d.log.Debug("ice listener ping", "base", base, "err", pingErr)
-					break outer
-				}
-			case <-notify:
-				if err := d.sendICERegs(ctx, conn); err != nil {
-					keepalive.Stop()
-					_ = conn.CloseNow()
-					break outer
-				}
-			case err := <-readErr:
-				keepalive.Stop()
-				_ = conn.CloseNow()
-				if ctx.Err() != nil {
-					return
-				}
-				if err != nil {
-					d.log.Debug("ice listener read", "base", base, "err", err)
-				}
-				break outer
 			}
+		case err := <-readErr:
+			_ = conn.CloseNow()
+			if ctx.Err() != nil {
+				return
+			}
+			if err != nil {
+				d.log.Debug("ice read", "base", base, "err", err)
+			}
+			return
 		}
-		d.sleepICE(ctx, backoff)
-		backoff = nextICEBackoff(backoff)
 	}
-}
-
-func nextICEBackoff(b time.Duration) time.Duration {
-	if b < 60*time.Second {
-		return b * 2
-	}
-	return b
 }
 
 func (d *Daemon) sleepICE(ctx context.Context, dura time.Duration) {
