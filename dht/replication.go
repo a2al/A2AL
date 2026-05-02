@@ -445,10 +445,14 @@ func (n *Node) storeAndRecord(ctx context.Context, peers []protocol.NodeInfo, rk
 		}
 
 		pctx, cancel := context.WithTimeout(ctx, queryPeerTimeout)
-		_, err := n.StoreAt(pctx, addr, rk.storeKey, rec)
+		stored, err := n.StoreAt(pctx, addr, rk.storeKey, rec)
 		cancel()
 		if err != nil {
 			n.log.Debug("replication StoreAt failed", "peer", addr, "err", err)
+			continue
+		}
+		if !stored {
+			n.log.Debug("replication StoreAt rejected", "peer", addr)
 			continue
 		}
 		n.log.Debug("replication StoreAt ok", "peer", addr)
