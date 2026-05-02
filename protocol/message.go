@@ -89,9 +89,22 @@ type BodyStore struct {
 	Key    []byte       `cbor:"2,keyasint,omitempty"` // 32-byte DHT key; omit = NodeID(Address)
 }
 
+// StoreReason is the machine-readable cause carried in BodyStoreResp.Reason.
+// Zero (StoreReasonOK) is the default and means no error information is present,
+// which is also what older nodes send.  New reasons must be assigned new non-zero
+// values; existing values must never be reused for a different meaning.
+type StoreReason uint8
+
+const (
+	StoreReasonOK          StoreReason = 0 // stored or already-had (see Stored/AlreadyHad)
+	StoreReasonPolicy      StoreReason = 1 // node-side policy rejected (ACL, whitelist, etc.) — stable refusal
+	StoreReasonRecordInvalid StoreReason = 2 // record-level rejection (bad sig, key mismatch, delegation error)
+)
+
 type BodyStoreResp struct {
-	Stored    bool `cbor:"1,keyasint"`
-	AlreadyHad bool `cbor:"2,keyasint,omitempty"` // true when the node already held an equal-or-newer record
+	Stored     bool        `cbor:"1,keyasint"`
+	AlreadyHad bool        `cbor:"2,keyasint,omitempty"` // true when the node already held an equal-or-newer record
+	Reason     StoreReason `cbor:"3,keyasint,omitempty"` // non-zero only on rejection; 0 from old nodes means unknown
 }
 
 // BodyNATProbeReq asks the receiver to send a NATProbeEcho directly to ClaimedAddr.

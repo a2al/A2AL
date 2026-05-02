@@ -31,6 +31,14 @@ type RecordAuthFunc func(key a2al.NodeID, rec protocol.SignedRecord, now time.Ti
 // ErrStaleRecord means an equal or older record already exists for the same slot.
 var ErrStaleRecord = errors.New("dht: stale record")
 
+// ErrStorePolicy signals a node-side policy rejection that is independent of
+// record validity.  Auth functions (RecordAuthFunc) should wrap this sentinel
+// when the refusal is due to ACL, whitelist, or other node-level rules so that
+// callers can distinguish a stable policy refusal from a record-level error.
+//
+//	return fmt.Errorf("address blacklisted: %w", dht.ErrStorePolicy)
+var ErrStorePolicy = errors.New("dht: policy rejected")
+
 // Store is an in-memory record map keyed by DHT NodeID (Phase 4 multi-category).
 type Store struct {
 	mu          sync.Mutex
