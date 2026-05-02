@@ -241,7 +241,8 @@ func startSellerHTTP(c *client) (net.Listener, string) {
 			var si struct {
 				CallerAID string `json:"caller_aid"`
 			}
-			if err := c.do("GET", fmt.Sprintf("/sessions/%d", port), nil, &si); err == nil {
+			sc := &client{base: c.base, token: c.token, http: &http.Client{Timeout: 1 * time.Second}}
+			if err := sc.do("GET", fmt.Sprintf("/sessions/%d", port), nil, &si); err == nil {
 				callerAID = si.CallerAID
 			}
 		}
