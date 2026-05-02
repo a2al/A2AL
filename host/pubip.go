@@ -34,6 +34,10 @@ const stunMagicCookie = uint32(0x2112A442)
 
 // probeSTUN tries all STUN servers in parallel and returns the first successful
 // external (ip, port) pair. Returns nil ip if all fail.
+//
+// Currently queries IPv4 STUN only. TODO(ipv6): add a parallel probeSTUNv6 that
+// calls stunQuery with network="udp6" and a v6 STUN server list once dual-stack
+// socket support is in place (see IPv6 support plan).
 func probeSTUN(ctx context.Context) (net.IP, uint16) {
 	type result struct {
 		ip   net.IP
@@ -43,7 +47,7 @@ func probeSTUN(ctx context.Context) (net.IP, uint16) {
 	for _, srv := range stunServers {
 		srv := srv
 		go func() {
-			ip, port, err := stunQuery(ctx, srv)
+			ip, port, err := stunQuery(ctx, "udp4", srv)
 			if err != nil {
 				ch <- result{}
 				return
@@ -60,14 +64,18 @@ func probeSTUN(ctx context.Context) (net.IP, uint16) {
 	return nil, 0
 }
 
-// stunQuery sends a single RFC 5389 Binding Request to serverAddr and parses
-// the XOR-MAPPED-ADDRESS (or MAPPED-ADDRESS) attribute from the response.
-func stunQuery(ctx context.Context, serverAddr string) (net.IP, uint16, error) {
-	raddr, err := net.ResolveUDPAddr("udp4", serverAddr)
+// stunQuery sends a single RFC 5389 Binding Request to serverAddr using the
+// given network ("udp4" or "udp6") and parses the XOR-MAPPED-ADDRESS (or
+// MAPPED-ADDRESS) attribute from the response.
+//
+// Passing "udp6" and a v6-capable STUN server will return the IPv6 mapped
+// address once dual-stack socket support is enabled.
+func stunQuery(ctx context.Context, network, serverAddr string) (net.IP, uint16, error) {
+	raddr, err := net.ResolveUDPAddr(network, serverAddr)
 	if err != nil {
 		return nil, 0, err
 	}
-	conn, err := net.ListenUDP("udp4", nil)
+	conn, err := net.ListenUDP(network, nil)
 	if err != nil {
 		return nil, 0, err
 	}

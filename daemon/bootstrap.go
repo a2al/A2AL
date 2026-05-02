@@ -20,16 +20,16 @@ import (
 
 const dnsBootstrapName = "_a2al-bootstrap.a2al.org"
 
-// runBootstrapChain joins the DHT, then derives an ICE signal base URL from a
-// trusted source (config or DNS TXT only). peers.cache is used for fast DHT
+// runBootstrapChain joins the DHT, then derives ICE signal hub candidates from
+// trusted sources (config or DNS TXT only). peers.cache is used for fast DHT
 // cold-start but is explicitly excluded from signal URL derivation, since it
 // contains arbitrary DHT peers rather than designated signaling infrastructure.
-func runBootstrapChain(ctx context.Context, h *host.Host, cfg *config.Config, dataDir string, log *slog.Logger, bm *beaconManager) string {
+func runBootstrapChain(ctx context.Context, h *host.Host, cfg *config.Config, dataDir string, log *slog.Logger, bm *beaconManager) []string {
 	if !bootstrapDHT(ctx, h, cfg, dataDir, log, bm) {
 		log.Info("no bootstrap peers reachable, starting as standalone node")
-		return ""
+		return nil
 	}
-	return deriveSignalURL(cfg, log)
+	return deriveSignalURLs(cfg, log)
 }
 
 // bootstrapDHT joins the DHT using persisted peers, then optional config seeds,
@@ -96,25 +96,43 @@ func bootstrapDHT(ctx context.Context, h *host.Host, cfg *config.Config, dataDir
 	return ok
 }
 
-// deriveSignalURL returns a signal base URL from trusted infrastructure sources
-// only: config.Bootstrap or DNS TXT records. peers.cache is intentionally
-// excluded because it contains arbitrary DHT peers, not signaling hubs.
-func deriveSignalURL(cfg *config.Config, log *slog.Logger) string {
-	if hp := firstBootstrapHostPort(cfg.Bootstrap); hp != "" {
-		if u, err := signaling.DeriveSignalBaseFromHostPort(hp); err == nil {
-			log.Debug("signal url derived", "source", "config", "url", u)
-			return u
-		}
-	}
-	if txt := lookupBootstrapTXT(dnsBootstrapName); len(txt) > 0 {
-		if hp := firstBootstrapHostPort(txt); hp != "" {
-			if u, err := signaling.DeriveSignalBaseFromHostPort(hp); err == nil {
-				log.Debug("signal url derived", "source", "dns", "url", u)
-				return u
+// maxSignalCandidates caps the number of bootstrap-derived signal hub candidates.
+// This bounds the subscriber goroutines and the Signals[] list in DHT records.
+const maxSignalCandidates = 4
+
+// deriveSignalURLs returns signal hub base URLs from trusted infrastructure sources
+// only (config.Bootstrap or DNS TXT records). peers.cache is intentionally excluded
+// because it contains arbitrary DHT peers, not signaling hubs. Returns up to
+// maxSignalCandidates unique URLs, preserving bootstrap list order.
+func deriveSignalURLs(cfg *config.Config, log *slog.Logger) []string {
+	var out []string
+	seen := make(map[string]struct{})
+
+	addHostPorts := func(lines []string, source string) {
+		for _, line := range lines {
+			if hp := strings.TrimSpace(line); hp != "" {
+				if u, err := signaling.DeriveSignalBaseFromHostPort(hp); err == nil {
+					if _, dup := seen[u]; !dup {
+						seen[u] = struct{}{}
+						log.Debug("signal url derived", "source", source, "url", u)
+						out = append(out, u)
+						if len(out) >= maxSignalCandidates {
+							return
+						}
+					}
+				}
 			}
 		}
 	}
-	return ""
+
+	if len(cfg.Bootstrap) > 0 {
+		addHostPorts(cfg.Bootstrap, "config")
+	} else {
+		if txt := lookupBootstrapTXT(dnsBootstrapName); len(txt) > 0 {
+			addHostPorts(txt, "dns")
+		}
+	}
+	return out
 }
 
 func firstBootstrapHostPort(lines []string) string {
@@ -146,7 +164,9 @@ func resolveBootstrapAddrs(hostports []string, log *slog.Logger) []net.Addr {
 		if s == "" {
 			continue
 		}
-		a, err := net.ResolveUDPAddr("udp4", s)
+		// Use "udp" (not "udp4") so that literal IPv6 bootstrap addresses
+		// (e.g. "[2001:db8::1]:4121") are resolved correctly.
+		a, err := net.ResolveUDPAddr("udp", s)
 		if err != nil {
 			log.Debug("bootstrap resolve skip", "addr", s, "err", err)
 			continue
@@ -224,8 +244,8 @@ func (d *Daemon) maybeRebootstrap(ctx context.Context) {
 	d.rebootstrapMu.Unlock()
 
 	if bootstrapDHT(ctx, d.h, d.cfg, d.dataDir, d.log, d.beacon) {
-		if u := deriveSignalURL(d.cfg, d.log); u != "" {
-			d.h.SetDerivedICESignalURL(u)
+		if urls := deriveSignalURLs(d.cfg, d.log); len(urls) > 0 {
+			d.h.SetDerivedICESignalURLs(urls)
 		}
 		d.log.Info("bootstrap recovery succeeded")
 		// Trigger a cascade so observe/probe/publish run with the newly joined

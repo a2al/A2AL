@@ -13,6 +13,9 @@ import (
 
 // isPlausibleWANIP reports whether ip is suitable to publish in an endpoint record
 // (not loopback, link-local, private, CGNAT, unspecified, or multicast).
+// Works for both IPv4 and IPv6; the CGNAT exclusion (RFC 6598, 100.64/10) applies
+// to IPv4 only. For IPv6, GUA (2000::/3) addresses pass; ULA (fc00::/7) and
+// link-local (fe80::/10) are rejected by IsPrivate/IsLinkLocalUnicast respectively.
 func isPlausibleWANIP(ip net.IP) bool {
 	if ip == nil || ip.IsUnspecified() || ip.IsLoopback() || ip.IsMulticast() || ip.IsLinkLocalUnicast() {
 		return false
@@ -105,14 +108,22 @@ func (h *Host) orderedQUICEndpointStrings(extipSnapshot, upnpSnapshot string) ([
 		if ip4 := ua.IP.To4(); ip4 != nil && isPlausibleWANIP(ip4) {
 			appendCandidateUnique(seen, &out, "quic://"+net.JoinHostPort(ip4.String(), portStr))
 		}
+		// TODO(ipv6): add global unicast v6 candidate here when dual-stack socket is enabled.
+		// else if isPlausibleWANIP(ua.IP) {
+		//     appendCandidateUnique(seen, &out, "quic://"+net.JoinHostPort(ua.IP.String(), portStr))
+		// }
 	}
 
 	// ④ outbound probe (valid only when machine has a direct WAN IP)
-	if ip := outboundIP(); ip != nil {
+	if ip := outboundIPv4(); ip != nil {
 		if ip4 := ip.To4(); ip4 != nil && isPlausibleWANIP(ip4) {
 			appendCandidateUnique(seen, &out, "quic://"+net.JoinHostPort(ip4.String(), portStr))
 		}
 	}
+	// TODO(ipv6): call outboundIPv6() here and add as candidate once dual-stack socket is enabled.
+	// if ip6 := outboundIPv6(); ip6 != nil && isPlausibleWANIP(ip6) {
+	//     appendCandidateUnique(seen, &out, "quic://"+net.JoinHostPort(ip6.String(), portStr))
+	// }
 
 	// ⑤ explicit FallbackHost override
 	if fh := strings.TrimSpace(h.cfg.FallbackHost); fh != "" {

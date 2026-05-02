@@ -74,6 +74,11 @@ func endpointPayloadFingerprint(ep protocol.EndpointPayload) string {
 	}
 	b.WriteString(ep.Signal)
 	b.WriteByte('|')
+	for _, u := range ep.Signals {
+		b.WriteString(u)
+		b.WriteByte(',')
+	}
+	b.WriteByte('|')
 	for _, t := range ep.Turns {
 		b.WriteString(t)
 		b.WriteByte(',')

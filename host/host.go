@@ -25,11 +25,12 @@ import (
 	"net"
 	"net/http"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/quic-go/quic-go"
+
+	ice "github.com/pion/ice/v3"
 
 	"github.com/a2al/a2al"
 	"github.com/a2al/a2al/crypto"
@@ -89,8 +90,8 @@ type TURNServer struct {
 // IPv6 note: currently Host binds udp4 sockets only. The Transport interface,
 // protocol wire format (NodeInfo.IP 4/16 bytes, observed_addr 6/18 bytes), and
 // endpoint URL model ("quic://[v6]:port") are all IPv6-ready. Dual-stack
-// requires changing the socket setup in New() — either "udp" dual-stack or
-// separate v4+v6 listeners — and adding v6 candidate collection in candidates.go.
+// requires changing listenUDP4 in New() — either "udp" dual-stack or separate
+// v4+v6 listeners — and adding v6 candidate collection in candidates.go.
 // No interface or data-model changes are expected.
 type Config struct {
 	KeyStore crypto.KeyStore
@@ -131,6 +132,11 @@ type Config struct {
 	// SeenPeersPath is forwarded to the DHT node for seenPeers persistence (spec §7.3).
 	// Empty disables persistence.
 	SeenPeersPath string
+	// ICENetworkTypes lists the ICE network types used for candidate gathering.
+	// Defaults to {ice.NetworkTypeUDP4} (IPv4-only) when nil or empty.
+	// To enable IPv6 ICE, set to {ice.NetworkTypeUDP4, ice.NetworkTypeUDP6} after
+	// dual-stack socket support is implemented (see IPv6 support plan).
+	ICENetworkTypes []ice.NetworkType
 }
 
 // agentRouteMagic is the legacy 4-byte prefix (a2r1). Still recognised on accept
@@ -198,8 +204,9 @@ type Host struct {
 	extipSnap string    // "ip:port" (STUN) or "ip" (HTTP); empty = not yet resolved
 	extipExp  time.Time // cache expiry
 
-	iceMu            sync.RWMutex
-	derivedICESignal string // from bootstrap when cfg.ICESignalURL is empty
+	iceMu              sync.RWMutex
+	derivedICESignals  []string // candidate signal hub URLs from bootstrap
+	activeSignalURLs   []string // currently connected hubs, maintained by ice_listener
 
 	signalStatsMu sync.RWMutex
 	signalStats   func() map[string]any
@@ -248,9 +255,10 @@ func New(cfg Config) (*Host, error) {
 	}
 	sense := natsense.NewSense(min)
 
-	dhtUDP, err := net.ResolveUDPAddr("udp4", cfg.ListenAddr)
-	if err != nil {
-		return nil, err
+	// Apply ICE network types default: IPv4-only until dual-stack socket is ready.
+	// TODO(ipv6): change default to {UDP4, UDP6} once dual-stack socket support is ready.
+	if len(cfg.ICENetworkTypes) == 0 {
+		cfg.ICENetworkTypes = []ice.NetworkType{ice.NetworkTypeUDP4}
 	}
 
 	// Create the punch pool before the DHT node so it can be injected into
@@ -278,7 +286,7 @@ func New(cfg Config) (*Host, error) {
 	var qt *quic.Transport
 
 	if cfg.QUICListenAddr == "" {
-		conn, err := net.ListenUDP("udp4", dhtUDP)
+		conn, err := listenUDP4(cfg.ListenAddr)
 		if err != nil {
 			return nil, err
 		}
@@ -292,15 +300,11 @@ func New(cfg Config) (*Host, error) {
 		}
 		qt = &quic.Transport{Conn: mux.QUICPacketConn()}
 	} else {
-		qUDP, err := net.ResolveUDPAddr("udp4", cfg.QUICListenAddr)
+		dConn, err := listenUDP4(cfg.ListenAddr)
 		if err != nil {
 			return nil, err
 		}
-		dConn, err := net.ListenUDP("udp4", dhtUDP)
-		if err != nil {
-			return nil, err
-		}
-		qConn, err := net.ListenUDP("udp4", qUDP)
+		qConn, err := listenUDP4(cfg.QUICListenAddr)
 		if err != nil {
 			_ = dConn.Close()
 			return nil, err
@@ -592,10 +596,10 @@ func (h *Host) BuildEndpointPayload(ctx context.Context) (protocol.EndpointPaylo
 		return protocol.EndpointPayload{}, err
 	}
 
-	// Signal URLs: multi-center list, Signal = Signals[0] for backward compat.
+	// Signal URLs: publish only live connections (or explicit config).
 	// turns[] is intentionally not published: callee-pays TURN relay addresses are
 	// exchanged via trickle ICE during sessions, not stored in the DHT.
-	signals := h.effectiveICESignalURLs()
+	signals := h.publishSignalURLs()
 	var signal string
 	if len(signals) > 0 {
 		signal = signals[0]
@@ -608,8 +612,9 @@ func (h *Host) BuildEndpointPayload(ctx context.Context) (protocol.EndpointPaylo
 	}, nil
 }
 
-// effectiveICESignalURLs returns the ordered list of signal hub URLs to publish.
-// Priority: ICESignalURLs config > ICESignalURL config > bootstrap-derived value.
+// effectiveICESignalURLs returns the ordered candidate list for ice_listener to
+// attempt connections to. Priority: ICESignalURLs config > ICESignalURL config >
+// bootstrap-derived candidates. This list drives WHICH hubs to try, not what to publish.
 func (h *Host) effectiveICESignalURLs() []string {
 	h.iceMu.RLock()
 	defer h.iceMu.RUnlock()
@@ -619,8 +624,25 @@ func (h *Host) effectiveICESignalURLs() []string {
 	if h.cfg.ICESignalURL != "" {
 		return []string{h.cfg.ICESignalURL}
 	}
-	if h.derivedICESignal != "" {
-		return []string{h.derivedICESignal}
+	return h.derivedICESignals
+}
+
+// publishSignalURLs returns the signal hub URLs to include in endpoint records.
+// For explicitly configured URLs the operator vouches for them; for bootstrap-derived
+// URLs only hubs with live connections are published, avoiding stale DHT entries.
+func (h *Host) publishSignalURLs() []string {
+	h.iceMu.RLock()
+	defer h.iceMu.RUnlock()
+	if len(h.cfg.ICESignalURLs) > 0 {
+		return h.cfg.ICESignalURLs
+	}
+	if h.cfg.ICESignalURL != "" {
+		return []string{h.cfg.ICESignalURL}
+	}
+	if len(h.activeSignalURLs) > 0 {
+		out := make([]string, len(h.activeSignalURLs))
+		copy(out, h.activeSignalURLs)
+		return out
 	}
 	return nil
 }
@@ -646,15 +668,24 @@ func (h *Host) EffectiveICESignalURLs() []string {
 	return h.effectiveICESignalURLs()
 }
 
-// SetDerivedICESignalURL sets the bootstrap-derived signal base when
-// Config.ICESignalURL is empty. Explicit config always wins and is not overwritten.
-func (h *Host) SetDerivedICESignalURL(s string) {
+// SetDerivedICESignalURLs sets bootstrap-derived signal hub candidates.
+// Explicit config (ICESignalURLs / ICESignalURL) always wins and is not overwritten.
+func (h *Host) SetDerivedICESignalURLs(urls []string) {
 	h.iceMu.Lock()
 	defer h.iceMu.Unlock()
-	if h.cfg.ICESignalURL != "" {
+	if len(h.cfg.ICESignalURLs) > 0 || h.cfg.ICESignalURL != "" {
 		return
 	}
-	h.derivedICESignal = strings.TrimSpace(s)
+	h.derivedICESignals = urls
+}
+
+// SetActiveSignalURLs records the set of signal hub URLs with live connections.
+// Called by ice_listener when the active set changes; BuildEndpointPayload uses
+// this list (instead of all candidates) to avoid publishing stale hub addresses.
+func (h *Host) SetActiveSignalURLs(urls []string) {
+	h.iceMu.Lock()
+	h.activeSignalURLs = urls
+	h.iceMu.Unlock()
 }
 
 // SetSignalStatsProvider merges hub stats into GET /debug/stats under "signal".
@@ -714,6 +745,12 @@ func (h *Host) ensureExternalIP(ctx context.Context) string {
 	return snap
 }
 
+// ensureUPnP attempts IGD port mapping via UPnP. Returns the mapped quic:// URL,
+// or empty when UPnP is disabled or unavailable.
+//
+// IPv6 note: UPnP IGD is an IPv4 NAT mechanism. Nodes with a global IPv6 address
+// are directly reachable and do not need port mapping — this function is skipped
+// implicitly because their public IP is collected via natsense/STUN instead.
 func (h *Host) ensureUPnP(ctx context.Context) string {
 	if h.cfg.DisableUPnP {
 		return ""
@@ -1096,16 +1133,39 @@ func FirstQUICAddr(er *protocol.EndpointRecord) (*net.UDPAddr, error) {
 // helpers
 // ---------------------------------------------------------------------------
 
-// outboundIP returns the preferred outbound IP without sending any packets.
-// It does this by connecting a UDP socket to a public address and reading
-// the local address the OS assigned.
-func outboundIP() net.IP {
+// outboundIPv4 returns the preferred IPv4 outbound address without sending any
+// packets, by connecting a UDP socket to a public IPv4 address and reading the
+// local address the OS assigned.
+func outboundIPv4() net.IP {
 	conn, err := net.Dial("udp4", "8.8.8.8:80")
 	if err != nil {
 		return nil
 	}
 	defer conn.Close()
 	return conn.LocalAddr().(*net.UDPAddr).IP
+}
+
+// outboundIPv6 returns the preferred IPv6 outbound address without sending any
+// packets. Currently returns nil; will be implemented alongside dual-stack socket setup.
+//
+// TODO(ipv6): implement as net.Dial("udp6", "2001:4860:4860::8888:80") once
+// the DHT/QUIC socket supports IPv6.
+func outboundIPv6() net.IP {
+	return nil
+}
+
+// listenUDP4 resolves addr as IPv4 UDP and opens a socket.
+//
+// All DHT and QUIC sockets currently bind to IPv4 only.
+// TODO(ipv6): to enable dual-stack or IPv6-only, change "udp4" to "udp" (dual-stack
+// on Linux/macOS) or implement separate v4/v6 listeners here (required on Windows,
+// where net.ListenUDP("udp", ...) does not auto-bind IPv6).
+func listenUDP4(addr string) (*net.UDPConn, error) {
+	a, err := net.ResolveUDPAddr("udp4", addr)
+	if err != nil {
+		return nil, err
+	}
+	return net.ListenUDP("udp4", a)
 }
 
 func peerAddrFromTLSState(state tls.ConnectionState) (a2al.Address, error) {

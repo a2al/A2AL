@@ -3,6 +3,11 @@
 
 // Package natmap provides optional NAT helpers (Phase 2b: UPnP IGD port mapping).
 // TURN and other relays are out of scope until Phase 3+.
+//
+// IPv6 note: UPnP IGD is an IPv4 NAT mechanism. Nodes with a globally routable IPv6
+// address are directly reachable without any port mapping and do not use this package.
+// UPnP mapping is only attempted when the node's public address is obtained via STUN
+// or natsense and the socket is behind an IPv4 NAT.
 package natmap
 
 import (

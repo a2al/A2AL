@@ -277,14 +277,16 @@ func (d *Daemon) Run(ctx context.Context, mcpStdio bool) error {
 	// (resolve, discover, publish) will return errors or empty results until
 	// bootstrap completes, which is correct behaviour.
 	go func() {
-		if derived := runBootstrapChain(netCtx, d.h, d.cfg, d.dataDir, d.log, d.beacon); derived != "" {
-			d.h.SetDerivedICESignalURL(derived)
+		if urls := runBootstrapChain(netCtx, d.h, d.cfg, d.dataDir, d.log, d.beacon); len(urls) > 0 {
+			d.h.SetDerivedICESignalURLs(urls)
 		}
 		d.h.RunNATProbe(netCtx) // active NAT classification after bootstrap
+		// Start signal pool before initial publish so hubs can connect during
+		// the endpoint probe window (~1–2 s), reducing startup double-publishes.
+		go d.runICEListener(netCtx)
 		d.initialAutoPublish(netCtx)
 		d.beacon.start(netCtx, func() []a2al.NodeID { return d.allAgentKeys() })
 		d.h.SetBeaconStatsProvider(d.beacon.Stats)
-		go d.runICEListener(netCtx)
 		d.autoPublishMainLoop(netCtx)
 	}()
 	go d.runNetworkMonitor(netCtx)
