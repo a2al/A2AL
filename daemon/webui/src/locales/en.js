@@ -28,6 +28,7 @@ export default {
 
   'agent.last_refresh': 'Last refreshed {ago}',
   'agent.next_refresh': 'Next refresh in {eta}',
+  'agent.dht_replicas': 'Replicas {n}/{target}',
 
   'agent.modal.create.title': 'Generate New Identity',
   'agent.modal.masterkey.warning':

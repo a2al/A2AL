@@ -28,6 +28,7 @@ export default {
 
   'agent.last_refresh': '最終更新: {ago}',
   'agent.next_refresh': '次回更新: {eta}',
+  'agent.dht_replicas': 'レプリカ {n}/{target}',
 
   'agent.modal.create.title': '新しいIDを生成',
   'agent.modal.masterkey.warning':

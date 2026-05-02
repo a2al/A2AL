@@ -28,6 +28,7 @@ export default {
 
   'agent.last_refresh': '上次刷新 {ago}',
   'agent.next_refresh': '下次刷新 {eta}',
+  'agent.dht_replicas': '副本 {n}/{target}',
 
   'agent.modal.create.title': '生成新身份',
   'agent.modal.masterkey.warning':
