@@ -461,6 +461,8 @@ func (d *Daemon) execAgentsList() []map[string]any {
 			m["last_publish_at"] = nil
 			m["next_republish_estimate"] = nil
 		}
+		storeKey := a2al.NodeIDFromAddress(e.AID)
+		m["dht_local_replicas"] = d.h.Node().RepSetSize(storeKey, storeKey)
 		out = append(out, m)
 	}
 	return out
