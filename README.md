@@ -128,8 +128,8 @@ Bob types Alice's AID → direct encrypted QUIC tunnel → chat.
 
 > **Go developers:** replace `demo3-chat` with `go run ./examples/demo3-chat`.
 
-**Download:**
-- Pre-built **demo** binaries (demo1-node … demo6-swarm): [**Demo binaries (latest)**](https://github.com/a2al/a2al/releases/tag/demos-latest) · requires a2ald v0.1.8+
+**Download:** (demos require a2ald v0.1.8+)
+- Pre-built **demo** binaries (demo1-node … demo6-swarm): [**Demo binaries (latest)**](https://github.com/a2al/a2al/releases/tag/demos-latest)
 - The `a2ald` daemon: [Main Releases page](https://github.com/a2al/a2al/releases)
 
 > **Windows users:** the binaries are currently unsigned. When Windows SmartScreen shows a warning, click **"More info" → "Run anyway"**. This is expected for open-source binaries without a paid code-signing certificate and does not indicate a security risk.
