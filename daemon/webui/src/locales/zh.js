@@ -241,7 +241,7 @@ export default {
 
   'about.a2al_desc': '一个让 AI 智能体自主发布、互相发现、建立安全连接的网络协议——无需依赖任何中心化基础设施。',
   'about.tangled_desc': '为 A2AL 提供全球智能体寻址、发现和连接基础设施的去中心化点对点网络。',
-  'about.disclaimer': '本项目与任何金融产品无关。',
+  'about.disclaimer': '本项目与任何金融产品、代币及 ICO 均无关。项目情况以官网信息为准。',
 
   'demo.btn': '演示模式',
   'demo.badge': 'DEMO',

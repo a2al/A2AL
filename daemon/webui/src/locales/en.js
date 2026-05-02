@@ -241,7 +241,7 @@ export default {
 
   'about.a2al_desc': 'A networking protocol that enables AI agents to publish themselves, discover each other, and establish secure connections — without relying on any central infrastructure.',
   'about.tangled_desc': 'The decentralized peer-to-peer network that provides global agent identity, discovery, and connectivity infrastructure for A2AL.',
-  'about.disclaimer': 'Not affiliated with any financial product.',
+  'about.disclaimer': 'Not affiliated with any financial product, token, or ICO. For official project information, visit a2al.org.',
 
   'demo.btn': 'Demo Mode',
   'demo.badge': 'DEMO',

@@ -8,6 +8,7 @@ import { renderDiscover } from './views/discover.js';
 import { renderNode } from './views/node.js';
 
 let tab = 'agents';
+let _ver = ''; // cached version string, populated by refreshHeader()
 
 /** Open a modal. onMount receives (modalEl, { close }). */
 function openModal({ title, body, footer, wide, onMount }) {
@@ -69,7 +70,7 @@ async function refreshHeader() {
   const stLabel = document.getElementById('stLabel');
   if (!dot || !meta || !stLabel) return;
   try {
-    const [host, stats] = await Promise.all([api('/debug/host'), api('/debug/stats')]);
+    const [host, stats, status] = await Promise.all([api('/debug/host'), api('/debug/stats'), api('/status')]);
     dot.className = 'status-dot ok';
     stLabel.textContent = t('status.online');
     meta.innerHTML = '';
@@ -83,6 +84,13 @@ async function refreshHeader() {
     add('Tangled', host.dht_addr || '—');
     add('QUIC', host.quic_addr || '—');
     add(t('node.peers'), String(stats.total_peers ?? 0));
+    // Update footer version — build display string once, reuse on language switch.
+    if (status?.version) {
+      const commit = status.commit && status.commit !== 'unknown' ? ` (${status.commit.slice(0, 7)})` : '';
+      _ver = status.version + commit;
+      const el = document.getElementById('footerVer');
+      if (el) el.textContent = _ver;
+    }
   } catch (e) {
     dot.className = 'status-dot err';
     stLabel.textContent = t('status.offline');
@@ -127,7 +135,7 @@ function renderShell() {
           <span class="footer-sep">·</span>
           <a href="https://github.com/a2al/a2al" target="_blank" rel="noopener">GitHub</a>
         </div>
-        <div class="footer-copy">MPL 2.0 · ${esc(t('about.disclaimer'))}</div>
+        <div class="footer-copy">a2ald <span id="footerVer" class="mono">${esc(_ver)}</span> · MPL 2.0 · ${esc(t('about.disclaimer'))}</div>
       </div>
     </footer>`;
 

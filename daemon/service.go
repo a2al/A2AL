@@ -21,6 +21,7 @@ import (
 	"github.com/a2al/a2al/dht"
 	"github.com/a2al/a2al/identity"
 	"github.com/a2al/a2al/internal/registry"
+	"github.com/a2al/a2al/internal/version"
 	"github.com/a2al/a2al/protocol"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
 )
@@ -669,6 +670,8 @@ func (d *Daemon) execStatus() map[string]any {
 		"node_published":       nseq > 0,
 		"republish_interval_s": int(republishPeriod.Seconds()),
 		"endpoint_ttl_s":       int(endpointRecordTTL),
+		"version":              version.Version,
+		"commit":               version.Commit,
 	}
 	if !nlp.IsZero() {
 		out["node_last_publish_at"] = nlp.UTC().Format(time.RFC3339)
