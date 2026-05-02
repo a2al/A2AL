@@ -42,11 +42,26 @@ func (ds *demoServer) startHTTP(nodeShortAID string) (int, error) {
 
 	mux := http.NewServeMux()
 
+	// addCORS writes the headers required for browser fetch() with mode:'cors'.
+	// The tunnel proxy runs on a different port than the Web UI, so every
+	// response must carry Access-Control-Allow-Origin or the browser rejects it.
+	addCORS := func(w http.ResponseWriter) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	}
+
+	mux.HandleFunc("OPTIONS /", func(w http.ResponseWriter, _ *http.Request) {
+		addCORS(w)
+		w.WriteHeader(http.StatusNoContent)
+	})
 	mux.HandleFunc("GET /.well-known/agent.json", func(w http.ResponseWriter, _ *http.Request) {
+		addCORS(w)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(demoAgentCardJSON))
 	})
 	mux.HandleFunc("POST /echo", func(w http.ResponseWriter, r *http.Request) {
+		addCORS(w)
 		var body any
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		w.Header().Set("Content-Type", "application/json")
