@@ -90,7 +90,8 @@ type BodyStore struct {
 }
 
 type BodyStoreResp struct {
-	Stored bool `cbor:"1,keyasint"`
+	Stored    bool `cbor:"1,keyasint"`
+	AlreadyHad bool `cbor:"2,keyasint,omitempty"` // true when the node already held an equal-or-newer record
 }
 
 // BodyNATProbeReq asks the receiver to send a NATProbeEcho directly to ClaimedAddr.
