@@ -41,6 +41,14 @@ function agentStatus(ag) {
   return { key: 'agent.status.published', cls: 'b-green' };
 }
 
+// Left-border accent is driven by service_tcp connectivity, independent of DHT publish state.
+function tcpAccentCls(ag) {
+  if (!ag.service_tcp)           return 'b-gray';
+  if (ag.service_tcp_ok === false) return 'b-red';
+  if (ag.service_tcp_ok === true)  return 'b-green';
+  return 'b-gray'; // configured but not yet probed
+}
+
 function fmtTtl(sec) {
   if (!sec) return '—';
   if (sec < 60) return `${sec}s`;
@@ -172,7 +180,7 @@ export async function renderAgents(mount, ctx) {
     const isDemoActive = demoStatus.running && demoStatus.aid === ag.aid;
     const card = document.createElement('div');
     card.className = 'card ag2-card';
-    card.dataset.status = st.cls;
+    card.dataset.status = tcpAccentCls(ag);
 
     // ── § Basic info ──
     const infoDiv = document.createElement('div');
@@ -989,6 +997,10 @@ export async function renderAgents(mount, ctx) {
       return `<button type="button" data-cat="${c}" class="btn btn-secondary btn-sm${on ? ' cat-on' : ''}">${esc(c)}</button>`;
     }).join('');
     const customOn = !CATS.includes(preCat);
+    const initialAgent = agentList.find((a) => a.aid === editAid) || agentList[0];
+    const preUrl = initialAgent?.service_tcp
+      ? 'http://' + initialAgent.service_tcp + '/.well-known/agent.json'
+      : '';
     openModal({
       title: t('service.modal.title'),
       wide: true,
@@ -997,7 +1009,7 @@ export async function renderAgents(mount, ctx) {
         <div class="field">
           <label>${esc(t('service.modal.import.label'))}</label>
           <div style="display:flex;gap:.35rem;flex-wrap:wrap">
-            <input type="url" id="svUrl" style="flex:1;min-width:12rem" placeholder="${esc(t('service.modal.import.placeholder'))}" />
+            <input type="url" id="svUrl" style="flex:1;min-width:12rem" placeholder="${esc(t('service.modal.import.placeholder'))}" value="${esc(preUrl)}" />
             <button type="button" class="btn btn-secondary" id="svFetch">${esc(t('service.modal.import.fetch'))}</button>
           </div>
         </div>
@@ -1098,6 +1110,7 @@ export async function renderAgents(mount, ctx) {
             if (m.url) root.querySelector('#svMetaUrl').value = m.url;
             root.querySelector('#svMcp').checked = m.protocols.includes('mcp');
             root.querySelector('#svA2a').checked = m.protocols.includes('a2a');
+            root.querySelector('#svHttp').checked = m.protocols.includes('http');
             toast('ok', 'ok');
           } catch (e) {
             toast(t('common.error', { msg: e.message }), 'err');

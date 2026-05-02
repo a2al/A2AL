@@ -430,6 +430,7 @@ pre.resp {
 .ag2-card[data-status="b-green"]  { border-left-color: var(--success); }
 .ag2-card[data-status="b-yellow"] { border-left-color: var(--warn); }
 .ag2-card[data-status="b-gray"]   { border-left-color: #94a3b8; }
+.ag2-card[data-status="b-red"]    { border-left-color: var(--error); }
 
 /* ── Info section (top part of card) ─────────────────────────────────────── */
 .ag2-info {

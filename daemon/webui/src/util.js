@@ -128,10 +128,11 @@ export function mapCardJson(j) {
     '';
   const u = j.url || j.serverUrl || j.server_url || j.mcpEndpoint || j.endpoint;
   if (typeof u === 'string') out.url = u;
-  if (j.protocols && Array.isArray(j.protocols)) out.protocols = j.protocols.map(String);
-  else if (j.mcpServers || j.tools || j.capabilities?.mcp) out.protocols.push('mcp');
-  if (j.capabilities || j.skills || j.tools) {
-    if (!out.protocols.includes('a2a')) out.protocols.push('a2a');
+  if (j.protocols && Array.isArray(j.protocols)) {
+    out.protocols = j.protocols.map(String);
+  } else {
+    if (j.mcpServers || j.tools || j.capabilities?.mcp) out.protocols.push('mcp');
+    if (j.skills) out.protocols.push('a2a');
   }
   return out;
 }

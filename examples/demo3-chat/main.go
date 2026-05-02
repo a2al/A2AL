@@ -197,23 +197,49 @@ func (s *chatServer) accept() {
 }
 
 func (s *chatServer) handle(conn net.Conn) {
-	// Query the daemon for the caller's AID using the connection's remote port.
-	// The daemon records caller identity when it dials service_tcp; this is a
-	// pure out-of-band lookup — the byte stream is untouched.
+	rd := bufio.NewReader(conn)
+
+	// Query caller AID from the daemon session registry (1 s — always local).
 	remoteAID := "(unknown)"
 	if ta, ok := conn.RemoteAddr().(*net.TCPAddr); ok {
+		fastClient := &client{base: s.c.base, token: s.c.token, http: &http.Client{Timeout: 1 * time.Second}}
 		var si struct {
 			CallerAID string `json:"caller_aid"`
 		}
-		if err := s.c.do("GET", fmt.Sprintf("/sessions/%d", ta.Port), nil, &si); err == nil && si.CallerAID != "" {
+		if err := fastClient.do("GET", fmt.Sprintf("/sessions/%d", ta.Port), nil, &si); err == nil && si.CallerAID != "" {
 			remoteAID = si.CallerAID
 		}
 	}
-	s.inbound <- &chatConn{
-		remoteAID: remoteAID,
-		conn:      conn,
-		rd:        bufio.NewReader(conn),
+
+	// Read the first line to determine intent.
+	// connectToPeer sends "CHAT\n" immediately; probes and Web UI send HTTP
+	// headers or nothing. 3 s is enough for any programmatic sender.
+	// This goroutine is independent — the timeout never blocks other connections.
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	firstLine, err := rd.ReadString('\n')
+	_ = conn.SetReadDeadline(time.Time{})
+	firstLine = strings.TrimRight(firstLine, "\r\n")
+
+	if err != nil || firstLine != "CHAT" {
+		// Not a chat request — show a brief non-scrolling summary on the
+		// current prompt line, then close. \r overwrites without scrolling.
+		summary := firstLine
+		if len(summary) > 40 {
+			summary = summary[:40] + "…"
+		}
+		if summary == "" {
+			summary = "(silent)"
+		}
+		short := remoteAID
+		if len(short) > 20 {
+			short = short[:8] + "…" + short[len(short)-6:]
+		}
+		fmt.Printf("\r[inbound] %s  %s\r", short, summary)
+		_ = conn.Close()
+		return
 	}
+
+	s.inbound <- &chatConn{remoteAID: remoteAID, conn: conn, rd: rd}
 }
 
 func (s *chatServer) close() { s.ln.Close() }
@@ -460,6 +486,11 @@ func connectToPeer(c *client, localAID, peerAID string, onConnected func(*chatCo
 	conn, err := net.DialTimeout("tcp", resp.Tunnel, 10*time.Second)
 	if err != nil {
 		return fmt.Errorf("dial tunnel %s: %w", resp.Tunnel, err)
+	}
+	// Announce intent: receiving side uses this to distinguish chat from probes.
+	if _, err := fmt.Fprintf(conn, "CHAT\n"); err != nil {
+		_ = conn.Close()
+		return fmt.Errorf("chat handshake: %w", err)
 	}
 	cc := &chatConn{
 		remoteAID: peerAID,

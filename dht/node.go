@@ -1005,8 +1005,18 @@ func (n *Node) onStore(from net.Addr, dec *protocol.DecodedMessage) {
 		copy(key[:], body.Key)
 	}
 	err := n.store.Put(key, body.Record, time.Now())
-	ok := err == nil
-	n.reply(from, dec, protocol.MsgStoreResp, &protocol.BodyStoreResp{Stored: ok})
+	alreadyHad := errors.Is(err, ErrStaleRecord)
+	ok := err == nil || alreadyHad
+	var reason protocol.StoreReason
+	if !ok {
+		if errors.Is(err, ErrStorePolicy) {
+			reason = protocol.StoreReasonPolicy
+		} else {
+			reason = protocol.StoreReasonRecordInvalid
+		}
+		n.log.Debug("store rejected", "from", from, "key", hex.EncodeToString(key[:4]), "reason", reason, "err", err)
+	}
+	n.reply(from, dec, protocol.MsgStoreResp, &protocol.BodyStoreResp{Stored: ok, AlreadyHad: alreadyHad, Reason: reason})
 }
 
 // natProbeEchoMax is the maximum number of NAT probe echoes sent per source IP
@@ -1290,7 +1300,16 @@ func (n *Node) StoreAt(ctx context.Context, peer net.Addr, storeKey a2al.NodeID,
 	}
 	peerNID := a2al.NodeIDFromAddress(dec.SenderAddr)
 	n.recordSuccess(peerNID, time.Since(t0))
-	return dec.Body.(*protocol.BodyStoreResp).Stored, nil
+	resp := dec.Body.(*protocol.BodyStoreResp)
+	switch {
+	case resp.AlreadyHad:
+		n.log.Debug("dht store: peer already had record", "peer", peer, "key", hex.EncodeToString(storeKey[:4]))
+	case !resp.Stored && resp.Reason == protocol.StoreReasonPolicy:
+		n.log.Debug("dht store: peer policy rejected", "peer", peer, "key", hex.EncodeToString(storeKey[:4]))
+	case !resp.Stored && resp.Reason == protocol.StoreReasonRecordInvalid:
+		n.log.Debug("dht store: record invalid", "peer", peer, "key", hex.EncodeToString(storeKey[:4]))
+	}
+	return resp.Stored, nil
 }
 
 // FindNode asks peer for closest nodes to target NodeID.
