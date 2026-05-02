@@ -29,7 +29,7 @@ export default {
   'agent.last_refresh': '最終公開: {ago}',
   'agent.next_refresh': '次回公開: {eta}',
   'agent.sort.label': '並び替え：',
-  'agent.sort.registered': '登録日時',
+  'agent.sort.aid': 'アドレス',
   'agent.sort.alias': 'エイリアス',
   'agent.dht_replicas': 'レプリカ {n}/{target}',
 

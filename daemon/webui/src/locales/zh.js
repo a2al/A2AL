@@ -29,7 +29,7 @@ export default {
   'agent.last_refresh': '上次更新 {ago}',
   'agent.next_refresh': '下次更新 {eta}',
   'agent.sort.label': '排序：',
-  'agent.sort.registered': '注册时间',
+  'agent.sort.aid': '地址',
   'agent.sort.alias': '别名',
   'agent.dht_replicas': '副本 {n}/{target}',
 

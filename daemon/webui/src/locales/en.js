@@ -29,7 +29,7 @@ export default {
   'agent.last_refresh': 'Last published {ago}',
   'agent.next_refresh': 'Next publish in {eta}',
   'agent.sort.label': 'Sort:',
-  'agent.sort.registered': 'Registration time',
+  'agent.sort.aid': 'Address',
   'agent.sort.alias': 'Alias',
   'agent.dht_replicas': 'Replicas {n}/{target}',
 

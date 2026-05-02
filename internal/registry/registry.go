@@ -10,7 +10,6 @@ import (
 	"encoding/json"
 	"os"
 	"sync"
-	"time"
 
 	"github.com/a2al/a2al"
 )
@@ -35,8 +34,7 @@ type Entry struct {
 	DelegationCBOR []byte
 	Seq            uint64
 	// Services lists published service payloads for auto-renewal (user-facing name for DHT topics).
-	Services     []ServiceRecord
-	RegisteredAt time.Time // when the agent was first registered; used for stable list ordering
+	Services []ServiceRecord
 }
 
 type diskAgent struct {
@@ -46,7 +44,6 @@ type diskAgent struct {
 	DelegationProofHex string          `json:"delegation_proof_hex"`
 	Seq                uint64          `json:"seq"`
 	Services           []ServiceRecord `json:"services,omitempty"`
-	RegisteredAt       time.Time       `json:"registered_at,omitempty"`
 	// Topics is a legacy field (pre-v1.1); loaded for migration, never written.
 	Topics []string `json:"topics,omitempty"`
 }
@@ -84,8 +81,7 @@ func Load(path string) (*Registry, error) {
 	if err := json.Unmarshal(b, &df); err != nil {
 		return nil, err
 	}
-	loadBase := time.Now()
-	for i, da := range df.Agents {
+	for _, da := range df.Agents {
 		aid, err := a2al.ParseAddress(da.AID)
 		if err != nil {
 			continue
@@ -105,12 +101,6 @@ func Load(path string) (*Registry, error) {
 				svcs = append(svcs, ServiceRecord{Topic: t})
 			}
 		}
-		regAt := da.RegisteredAt
-		if regAt.IsZero() {
-			// Legacy entry without a timestamp: assign synthetic timestamps
-			// based on file order so the list has a deterministic ordering.
-			regAt = loadBase.Add(time.Duration(i) * time.Millisecond)
-		}
 		r.byAID[aid] = &Entry{
 			AID:            aid,
 			ServiceTCP:     da.ServiceTCP,
@@ -118,7 +108,6 @@ func Load(path string) (*Registry, error) {
 			DelegationCBOR: proof,
 			Seq:            da.Seq,
 			Services:       svcs,
-			RegisteredAt:   regAt,
 		}
 	}
 	return r, nil
@@ -176,7 +165,6 @@ func (r *Registry) Save() error {
 			DelegationProofHex: hex.EncodeToString(e.DelegationCBOR),
 			Seq:                e.Seq,
 			Services:           append([]ServiceRecord(nil), e.Services...),
-			RegisteredAt:       e.RegisteredAt,
 		})
 	}
 	b, err := json.MarshalIndent(df, "", "  ")

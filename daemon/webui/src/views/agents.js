@@ -106,14 +106,14 @@ export async function renderAgents(mount, ctx) {
     return;
   }
 
-  // Sort bar
-  let sortBy = localStorage.getItem('agentSortBy') || 'registered';
+  // Sort bar — two stable client-side options, no daemon changes needed.
+  let sortBy = localStorage.getItem('agentSortBy') || 'aid';
   const sortBar = document.createElement('div');
   sortBar.className = 'ag-sortbar';
   const renderSortBar = () => {
     sortBar.innerHTML = `
       <span class="muted" style="font-size:.85rem">${esc(t('agent.sort.label'))}</span>
-      <button type="button" class="btn btn-ghost btn-sm${sortBy === 'registered' ? ' active' : ''}" data-sort="registered">${esc(t('agent.sort.registered'))}</button>
+      <button type="button" class="btn btn-ghost btn-sm${sortBy === 'aid' ? ' active' : ''}" data-sort="aid">${esc(t('agent.sort.aid'))}</button>
       <button type="button" class="btn btn-ghost btn-sm${sortBy === 'alias' ? ' active' : ''}" data-sort="alias">${esc(t('agent.sort.alias'))}</button>`;
     sortBar.querySelectorAll('[data-sort]').forEach(btn => {
       btn.onclick = () => {
@@ -138,8 +138,10 @@ export async function renderAgents(mount, ctx) {
         const lb = (aliasOf(b.aid) || b.aid).toLowerCase();
         return la < lb ? -1 : la > lb ? 1 : 0;
       });
+    } else {
+      // 'aid': stable alphabetical sort by AID string
+      copy.sort((a, b) => (a.aid < b.aid ? -1 : a.aid > b.aid ? 1 : 0));
     }
-    // 'registered' keeps server order (already sorted by registered_at)
     return copy;
   };
 
