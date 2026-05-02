@@ -1,3 +1,4 @@
+doc-local
 doc-local/
 daemon/webui/node_modules/
 *.exe
