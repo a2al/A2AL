@@ -18,6 +18,7 @@ export default {
   'agent.action.create': 'Generate New Identity',
   'agent.action.import': 'Import Existing Identity',
   'agent.action.eth': 'Ethereum Identity',
+  'agent.action.publish': 'Publish',
   'agent.action.republish': 'Update & Publish',
   'agent.action.export': 'Export',
   'agent.action.delete': 'Delete',

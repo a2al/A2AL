@@ -224,7 +224,7 @@ export async function renderAgents(mount, ctx) {
           ${ag.dht_local_replicas != null ? `&nbsp;·&nbsp;${esc(t('agent.dht_replicas', { n: ag.dht_local_replicas, target: 8 }))}` : ''}
         </span>
         <div class="ag2-actions">
-          ${!ag.published_to_dht ? `<button type="button" class="btn btn-primary btn-sm" data-pub-now>${esc(t('agent.action.republish'))}</button>` : ''}
+          ${!ag.published_to_dht ? `<button type="button" class="btn btn-primary btn-sm" data-pub-now>${esc(t('agent.action.publish'))}</button>` : ''}
           <button type="button" class="btn btn-secondary btn-sm" data-pub>${esc(t('agent.action.republish'))}</button>
           <button type="button" class="btn btn-danger btn-sm" data-del>${esc(t('agent.action.delete'))}</button>
         </div>

@@ -18,6 +18,7 @@ export default {
   'agent.action.create': '生成新身份',
   'agent.action.import': '导入已有身份',
   'agent.action.eth': 'Ethereum 身份',
+  'agent.action.publish': '发布',
   'agent.action.republish': '更新发布',
   'agent.action.export': '导出',
   'agent.action.delete': '删除',

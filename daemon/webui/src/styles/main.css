@@ -415,8 +415,8 @@ pre.resp {
   margin-left: auto;
 }
 .ag-sortbar .btn.active {
-  background: var(--accent);
-  color: #fff;
+  background: transparent;
+  color: var(--accent);
   border-color: var(--accent);
 }
 

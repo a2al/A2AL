@@ -18,6 +18,7 @@ export default {
   'agent.action.create': '新しいIDを生成',
   'agent.action.import': '既存のIDをインポート',
   'agent.action.eth': 'Ethereumアイデンティティ',
+  'agent.action.publish': '公開',
   'agent.action.republish': '更新して公開',
   'agent.action.export': 'エクスポート',
   'agent.action.delete': '削除',
