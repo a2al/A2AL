@@ -18,7 +18,8 @@ export default {
   'agent.action.create': '新しいIDを生成',
   'agent.action.import': '既存のIDをインポート',
   'agent.action.eth': 'Ethereumアイデンティティ',
-  'agent.action.refresh': '更新',
+  'agent.action.publish': '公開',
+  'agent.action.republish': '更新して公開',
   'agent.action.export': 'エクスポート',
   'agent.action.delete': '削除',
 
@@ -26,8 +27,11 @@ export default {
   'agent.status.unpublished': 'Unpublished',
   'agent.status.refresh_failed': 'Refresh failed',
 
-  'agent.last_refresh': '最終更新: {ago}',
-  'agent.next_refresh': '次回更新: {eta}',
+  'agent.last_refresh': '最終公開: {ago}',
+  'agent.next_refresh': '次回公開: {eta}',
+  'agent.sort.label': '並び替え：',
+  'agent.sort.aid': 'アドレス',
+  'agent.sort.alias': 'エイリアス',
   'agent.dht_replicas': 'レプリカ {n}/{target}',
 
   'agent.modal.create.title': '新しいIDを生成',
@@ -241,7 +245,7 @@ export default {
 
   'about.a2al_desc': 'AIエージェントが自律的に公開・発見・接続できるネットワークプロトコル——中央インフラに依存しない。',
   'about.tangled_desc': 'A2ALにグローバルなエージェントアドレス解決・発見・接続インフラを提供する分散型P2Pネットワーク。',
-  'about.disclaimer': '本プロジェクトは金融商品とは一切関係ありません。',
+  'about.disclaimer': '本プロジェクトは金融商品・トークン・ICOとは一切無関係です。プロジェクトの詳細は公式サイトをご確認ください。',
 
   'demo.btn': 'デモモード',
   'demo.badge': 'DEMO',

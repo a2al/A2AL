@@ -18,7 +18,8 @@ export default {
   'agent.action.create': '生成新身份',
   'agent.action.import': '导入已有身份',
   'agent.action.eth': 'Ethereum 身份',
-  'agent.action.refresh': '刷新',
+  'agent.action.publish': '发布',
+  'agent.action.republish': '更新发布',
   'agent.action.export': '导出',
   'agent.action.delete': '删除',
 
@@ -26,8 +27,11 @@ export default {
   'agent.status.unpublished': 'Unpublished',
   'agent.status.refresh_failed': 'Refresh failed',
 
-  'agent.last_refresh': '上次刷新 {ago}',
-  'agent.next_refresh': '下次刷新 {eta}',
+  'agent.last_refresh': '上次更新 {ago}',
+  'agent.next_refresh': '下次更新 {eta}',
+  'agent.sort.label': '排序：',
+  'agent.sort.aid': '地址',
+  'agent.sort.alias': '别名',
   'agent.dht_replicas': '副本 {n}/{target}',
 
   'agent.modal.create.title': '生成新身份',
@@ -241,7 +245,7 @@ export default {
 
   'about.a2al_desc': '一个让 AI 智能体自主发布、互相发现、建立安全连接的网络协议——无需依赖任何中心化基础设施。',
   'about.tangled_desc': '为 A2AL 提供全球智能体寻址、发现和连接基础设施的去中心化点对点网络。',
-  'about.disclaimer': '本项目与任何金融产品无关。',
+  'about.disclaimer': '本项目与任何金融产品、代币及 ICO 均无关。项目情况以官网信息为准。',
 
   'demo.btn': '演示模式',
   'demo.badge': 'DEMO',

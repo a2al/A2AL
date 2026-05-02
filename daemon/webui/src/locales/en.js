@@ -18,7 +18,8 @@ export default {
   'agent.action.create': 'Generate New Identity',
   'agent.action.import': 'Import Existing Identity',
   'agent.action.eth': 'Ethereum Identity',
-  'agent.action.refresh': 'Refresh',
+  'agent.action.publish': 'Publish',
+  'agent.action.republish': 'Update & Publish',
   'agent.action.export': 'Export',
   'agent.action.delete': 'Delete',
 
@@ -26,8 +27,11 @@ export default {
   'agent.status.unpublished': 'Unpublished',
   'agent.status.refresh_failed': 'Refresh failed',
 
-  'agent.last_refresh': 'Last refreshed {ago}',
-  'agent.next_refresh': 'Next refresh in {eta}',
+  'agent.last_refresh': 'Last published {ago}',
+  'agent.next_refresh': 'Next publish in {eta}',
+  'agent.sort.label': 'Sort:',
+  'agent.sort.aid': 'Address',
+  'agent.sort.alias': 'Alias',
   'agent.dht_replicas': 'Replicas {n}/{target}',
 
   'agent.modal.create.title': 'Generate New Identity',
@@ -241,7 +245,7 @@ export default {
 
   'about.a2al_desc': 'A networking protocol that enables AI agents to publish themselves, discover each other, and establish secure connections — without relying on any central infrastructure.',
   'about.tangled_desc': 'The decentralized peer-to-peer network that provides global agent identity, discovery, and connectivity infrastructure for A2AL.',
-  'about.disclaimer': 'Not affiliated with any financial product.',
+  'about.disclaimer': 'Not affiliated with any financial product, token, or ICO. For official project information, visit a2al.org.',
 
   'demo.btn': 'Demo Mode',
   'demo.badge': 'DEMO',

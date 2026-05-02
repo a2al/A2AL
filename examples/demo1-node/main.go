@@ -19,6 +19,8 @@
 //   http://127.0.0.1:2634/debug/routing
 //   http://127.0.0.1:2634/debug/store
 //   http://127.0.0.1:2634/debug/stats
+//
+// Requires: a2ald v0.1.8 or later — https://github.com/a2al/a2al/releases
 package main
 
 import (
@@ -39,6 +41,7 @@ import (
 )
 
 func main() {
+	fmt.Fprintln(os.Stderr, "Requires a2ald v0.1.8 or later — https://github.com/a2al/a2al/releases")
 	listen := flag.String("listen", ":4121", "UDP listen address")
 	bootstrapAddr := flag.String("bootstrap", "", "seed node UDP address (e.g. 127.0.0.1:4121)")
 	debugAddr := flag.String("debug", "", "debug HTTP address (e.g. 127.0.0.1:2634)")

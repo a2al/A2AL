@@ -81,7 +81,8 @@ export async function renderAgents(mount, ctx) {
   topBar.innerHTML = `
     <button type="button" class="btn btn-secondary btn-sm" id="tb-create">+ ${esc(t('agent.action.create'))}</button>
     <button type="button" class="btn btn-ghost btn-sm" id="tb-import">${esc(t('agent.action.import'))}</button>
-    <button type="button" class="btn btn-ghost btn-sm" id="tb-eth">${esc(t('agent.action.eth'))}</button>`;
+    <button type="button" class="btn btn-ghost btn-sm" id="tb-eth">${esc(t('agent.action.eth'))}</button>
+    <div class="ag-sortbar" id="tb-sortbar"></div>`;
   topBar.querySelector('#tb-create').onclick = () => openCreateModal();
   topBar.querySelector('#tb-import').onclick = () => openImportModal();
   topBar.querySelector('#tb-eth').onclick = () => openEthModal();
@@ -106,9 +107,61 @@ export async function renderAgents(mount, ctx) {
     return;
   }
 
-  for (let idx = 0; idx < agents.length; idx++) {
-    mount.appendChild(buildAgentCard(agents[idx], idx === 0, agents, idx, demoStatus));
-  }
+  // Sort controls — rendered inside the topbar (right side via CSS margin-left:auto).
+  // Clicking the active button toggles asc/desc; clicking another button switches
+  // field and resets to ascending.
+  let sortBy  = localStorage.getItem('agentSortBy')  || 'aid';
+  let sortDir = localStorage.getItem('agentSortDir') || 'asc';
+  const sortBar = topBar.querySelector('#tb-sortbar');
+  const renderSortBar = () => {
+    const arrow = sortDir === 'asc' ? ' ↑' : ' ↓';
+    sortBar.innerHTML = `
+      <span class="muted" style="font-size:.85rem">${esc(t('agent.sort.label'))}</span>
+      <button type="button" class="btn btn-ghost btn-sm${sortBy === 'aid' ? ' active' : ''}" data-sort="aid">${esc(t('agent.sort.aid'))}${sortBy === 'aid' ? arrow : ''}</button>
+      <button type="button" class="btn btn-ghost btn-sm${sortBy === 'alias' ? ' active' : ''}" data-sort="alias">${esc(t('agent.sort.alias'))}${sortBy === 'alias' ? arrow : ''}</button>`;
+    sortBar.querySelectorAll('[data-sort]').forEach(btn => {
+      btn.onclick = () => {
+        if (btn.dataset.sort === sortBy) {
+          sortDir = sortDir === 'asc' ? 'desc' : 'asc';
+        } else {
+          sortBy  = btn.dataset.sort;
+          sortDir = 'asc';
+        }
+        localStorage.setItem('agentSortBy',  sortBy);
+        localStorage.setItem('agentSortDir', sortDir);
+        renderList();
+        renderSortBar();
+      };
+    });
+  };
+  renderSortBar();
+
+  const listContainer = document.createElement('div');
+  mount.appendChild(listContainer);
+
+  const sortedAgents = () => {
+    const copy = [...agents];
+    const dir  = sortDir === 'asc' ? 1 : -1;
+    if (sortBy === 'alias') {
+      copy.sort((a, b) => {
+        const la = (aliasOf(a.aid) || a.aid).toLowerCase();
+        const lb = (aliasOf(b.aid) || b.aid).toLowerCase();
+        return (la < lb ? -1 : la > lb ? 1 : 0) * dir;
+      });
+    } else {
+      copy.sort((a, b) => (a.aid < b.aid ? -1 : a.aid > b.aid ? 1 : 0) * dir);
+    }
+    return copy;
+  };
+
+  const renderList = () => {
+    listContainer.innerHTML = '';
+    const sorted = sortedAgents();
+    for (let idx = 0; idx < sorted.length; idx++) {
+      listContainer.appendChild(buildAgentCard(sorted[idx], idx === 0, sorted, idx, demoStatus));
+    }
+  };
+  renderList();
 
   // ── Agent card builder ──────────────────────────────────────────────────
   function buildAgentCard(ag, svcExpanded, allAgents, idx, demoStatus) {
@@ -171,8 +224,8 @@ export async function renderAgents(mount, ctx) {
           ${ag.dht_local_replicas != null ? `&nbsp;·&nbsp;${esc(t('agent.dht_replicas', { n: ag.dht_local_replicas, target: 8 }))}` : ''}
         </span>
         <div class="ag2-actions">
-          ${!ag.published_to_dht ? `<button type="button" class="btn btn-primary btn-sm" data-pub-now>${esc(t('agent.action.refresh'))}</button>` : ''}
-          <button type="button" class="btn btn-secondary btn-sm" data-pub>${esc(t('agent.action.refresh'))}</button>
+          ${!ag.published_to_dht ? `<button type="button" class="btn btn-primary btn-sm" data-pub-now>${esc(t('agent.action.publish'))}</button>` : ''}
+          <button type="button" class="btn btn-secondary btn-sm" data-pub>${esc(t('agent.action.republish'))}</button>
           <button type="button" class="btn btn-danger btn-sm" data-del>${esc(t('agent.action.delete'))}</button>
         </div>
       </div>`;

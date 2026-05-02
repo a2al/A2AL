@@ -128,7 +128,7 @@ Bob types Alice's AID → direct encrypted QUIC tunnel → chat.
 
 > **Go developers:** replace `demo3-chat` with `go run ./examples/demo3-chat`.
 
-**Download:**
+**Download:** (demos require a2ald v0.1.8+)
 - Pre-built **demo** binaries (demo1-node … demo6-swarm): [**Demo binaries (latest)**](https://github.com/a2al/a2al/releases/tag/demos-latest)
 - The `a2ald` daemon: [Main Releases page](https://github.com/a2al/a2al/releases)
 
