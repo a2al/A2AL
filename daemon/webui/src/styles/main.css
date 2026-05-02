@@ -412,7 +412,7 @@ pre.resp {
   display: flex;
   align-items: center;
   gap: .35rem;
-  margin-bottom: .75rem;
+  margin-left: auto;
 }
 .ag-sortbar .btn.active {
   background: var(--accent);

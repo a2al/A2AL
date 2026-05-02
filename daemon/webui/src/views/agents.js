@@ -81,7 +81,8 @@ export async function renderAgents(mount, ctx) {
   topBar.innerHTML = `
     <button type="button" class="btn btn-secondary btn-sm" id="tb-create">+ ${esc(t('agent.action.create'))}</button>
     <button type="button" class="btn btn-ghost btn-sm" id="tb-import">${esc(t('agent.action.import'))}</button>
-    <button type="button" class="btn btn-ghost btn-sm" id="tb-eth">${esc(t('agent.action.eth'))}</button>`;
+    <button type="button" class="btn btn-ghost btn-sm" id="tb-eth">${esc(t('agent.action.eth'))}</button>
+    <div class="ag-sortbar" id="tb-sortbar"></div>`;
   topBar.querySelector('#tb-create').onclick = () => openCreateModal();
   topBar.querySelector('#tb-import').onclick = () => openImportModal();
   topBar.querySelector('#tb-eth').onclick = () => openEthModal();
@@ -106,10 +107,9 @@ export async function renderAgents(mount, ctx) {
     return;
   }
 
-  // Sort bar — two stable client-side options, no daemon changes needed.
+  // Sort controls — rendered inside the topbar (right side via CSS margin-left:auto).
   let sortBy = localStorage.getItem('agentSortBy') || 'aid';
-  const sortBar = document.createElement('div');
-  sortBar.className = 'ag-sortbar';
+  const sortBar = topBar.querySelector('#tb-sortbar');
   const renderSortBar = () => {
     sortBar.innerHTML = `
       <span class="muted" style="font-size:.85rem">${esc(t('agent.sort.label'))}</span>
@@ -125,7 +125,6 @@ export async function renderAgents(mount, ctx) {
     });
   };
   renderSortBar();
-  mount.appendChild(sortBar);
 
   const listContainer = document.createElement('div');
   mount.appendChild(listContainer);
