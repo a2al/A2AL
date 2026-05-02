@@ -63,6 +63,8 @@
 //   --api   HOST:PORT    REST address of local a2ald (default 127.0.0.1:2121)
 //   --token TOKEN        a2ald api_token (if the daemon enables authentication)
 //   --id    FILE         identity file path (default identity-<role>-<port>.json)
+//
+// Requires: a2ald v0.1.8 or later — https://github.com/a2al/a2al/releases
 package main
 
 import (
@@ -598,6 +600,7 @@ func fatal(format string, args ...any) {
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 func main() {
+	fmt.Fprintln(os.Stderr, "Requires a2ald v0.1.8 or later — https://github.com/a2al/a2al/releases")
 	role := ""
 	apiAddr := "127.0.0.1:2121"
 	token := ""

@@ -58,6 +58,8 @@
 // Web UI verification — in the Discover tab, search for these service names to see each agent:
 //
 //	reason.evaluate  /  data.search  /  reason.analyze  /  reason.recommend
+//
+// Requires: a2ald v0.1.8 or later — https://github.com/a2al/a2al/releases
 package main
 
 import (
@@ -582,6 +584,7 @@ func fatal(format string, args ...any) {
 }
 
 func main() {
+	fmt.Fprintln(os.Stderr, "Requires a2ald v0.1.8 or later — https://github.com/a2al/a2al/releases")
 	role := ""
 	apiAddr := "127.0.0.1:2121"
 	token := ""

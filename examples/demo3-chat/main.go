@@ -56,6 +56,8 @@
 // demo parameters
 //   --api HOST:PORT   REST address of the a2ald this demo talks to (default 127.0.0.1:2121)
 //   --token TOKEN     a2ald api_token (required if the daemon enables authentication)
+//
+// Requires: a2ald v0.1.8 or later — https://github.com/a2al/a2al/releases
 package main
 
 import (
@@ -248,6 +250,7 @@ func loadOrCreateIdentity(path string, c *client) (*savedIdentity, error) {
 // --- Main ----------------------------------------------------------------------
 
 func main() {
+	fmt.Fprintln(os.Stderr, "Requires a2ald v0.1.8 or later — https://github.com/a2al/a2al/releases")
 	apiAddr := "127.0.0.1:2121"
 	token := ""
 	idPath := ""
