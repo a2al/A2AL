@@ -108,17 +108,27 @@ export async function renderAgents(mount, ctx) {
   }
 
   // Sort controls — rendered inside the topbar (right side via CSS margin-left:auto).
-  let sortBy = localStorage.getItem('agentSortBy') || 'aid';
+  // Clicking the active button toggles asc/desc; clicking another button switches
+  // field and resets to ascending.
+  let sortBy  = localStorage.getItem('agentSortBy')  || 'aid';
+  let sortDir = localStorage.getItem('agentSortDir') || 'asc';
   const sortBar = topBar.querySelector('#tb-sortbar');
   const renderSortBar = () => {
+    const arrow = sortDir === 'asc' ? ' ↑' : ' ↓';
     sortBar.innerHTML = `
       <span class="muted" style="font-size:.85rem">${esc(t('agent.sort.label'))}</span>
-      <button type="button" class="btn btn-ghost btn-sm${sortBy === 'aid' ? ' active' : ''}" data-sort="aid">${esc(t('agent.sort.aid'))}</button>
-      <button type="button" class="btn btn-ghost btn-sm${sortBy === 'alias' ? ' active' : ''}" data-sort="alias">${esc(t('agent.sort.alias'))}</button>`;
+      <button type="button" class="btn btn-ghost btn-sm${sortBy === 'aid' ? ' active' : ''}" data-sort="aid">${esc(t('agent.sort.aid'))}${sortBy === 'aid' ? arrow : ''}</button>
+      <button type="button" class="btn btn-ghost btn-sm${sortBy === 'alias' ? ' active' : ''}" data-sort="alias">${esc(t('agent.sort.alias'))}${sortBy === 'alias' ? arrow : ''}</button>`;
     sortBar.querySelectorAll('[data-sort]').forEach(btn => {
       btn.onclick = () => {
-        sortBy = btn.dataset.sort;
-        localStorage.setItem('agentSortBy', sortBy);
+        if (btn.dataset.sort === sortBy) {
+          sortDir = sortDir === 'asc' ? 'desc' : 'asc';
+        } else {
+          sortBy  = btn.dataset.sort;
+          sortDir = 'asc';
+        }
+        localStorage.setItem('agentSortBy',  sortBy);
+        localStorage.setItem('agentSortDir', sortDir);
         renderList();
         renderSortBar();
       };
@@ -131,15 +141,15 @@ export async function renderAgents(mount, ctx) {
 
   const sortedAgents = () => {
     const copy = [...agents];
+    const dir  = sortDir === 'asc' ? 1 : -1;
     if (sortBy === 'alias') {
       copy.sort((a, b) => {
         const la = (aliasOf(a.aid) || a.aid).toLowerCase();
         const lb = (aliasOf(b.aid) || b.aid).toLowerCase();
-        return la < lb ? -1 : la > lb ? 1 : 0;
+        return (la < lb ? -1 : la > lb ? 1 : 0) * dir;
       });
     } else {
-      // 'aid': stable alphabetical sort by AID string
-      copy.sort((a, b) => (a.aid < b.aid ? -1 : a.aid > b.aid ? 1 : 0));
+      copy.sort((a, b) => (a.aid < b.aid ? -1 : a.aid > b.aid ? 1 : 0) * dir);
     }
     return copy;
   };
