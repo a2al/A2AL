@@ -961,10 +961,11 @@ func (n *Node) onFindValue(from net.Addr, dec *protocol.DecodedMessage) {
 		ObservedAddr: ObservedAddr(from),
 		Records:      records,
 	}
-	// Only include the legacy Record field when it matches the requested type,
-	// to avoid wasting packet space with unrelated record types (e.g. endpoint
-	// records cluttering a mailbox query).
-	if best != nil && (body.RecType == 0 || best.RecType == body.RecType) {
+	// Populate the legacy Record field only when Records is empty: receivers
+	// that understand the Records array prefer it over Record, so including
+	// both fields for the same content doubles the packet size for no benefit.
+	// Setting Record solely for older nodes that only read the legacy field.
+	if best != nil && len(records) == 0 && (body.RecType == 0 || best.RecType == body.RecType) {
 		r := *best
 		resp.Record = &r
 	}
@@ -981,6 +982,14 @@ func (n *Node) onFindValue(from net.Addr, dec *protocol.DecodedMessage) {
 		// requester. GetAll returns records in insertion order (oldest first).
 		if len(resp.Records) > 1 {
 			resp.Records = resp.Records[1:]
+			continue
+		}
+		// Last resort: clear the legacy Record field. Its content is already
+		// carried in Records[0] when both were set; if Records is empty and
+		// a single record still exceeds the limit, drop it rather than send
+		// a packet that would be silently discarded by the UDP transport.
+		if resp.Record != nil {
+			resp.Record = nil
 			continue
 		}
 		break

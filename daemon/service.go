@@ -519,6 +519,11 @@ func (d *Daemon) execAgentGet(ctx context.Context, aidStr string) (map[string]an
 			out["published_record_seq"] = er.Seq
 		}
 	}
+	// Local repSet size: how many confirmed remote replicas this node is
+	// currently tracking for the agent's AID record.  Pure in-memory read,
+	// no RPC.  Useful for debugging DHT propagation health.
+	storeKey := a2al.NodeIDFromAddress(aid)
+	out["dht_local_replicas"] = d.h.Node().RepSetSize(storeKey, storeKey)
 	return out, nil
 }
 

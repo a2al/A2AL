@@ -119,6 +119,7 @@ export async function renderAgents(mount, ctx) {
     const isDemoActive = demoStatus.running && demoStatus.aid === ag.aid;
     const card = document.createElement('div');
     card.className = 'card ag2-card';
+    card.dataset.status = st.cls;
 
     // ── § Basic info ──
     const infoDiv = document.createElement('div');
@@ -167,6 +168,7 @@ export async function renderAgents(mount, ctx) {
           ${esc(t('agent.last_refresh', { ago: ag.last_publish_at ? relTime(ag.last_publish_at) : '—' }))}
           &nbsp;·&nbsp;
           ${esc(t('agent.next_refresh', { eta: ag.next_republish_estimate ? relTime(ag.next_republish_estimate) : '—' }))}
+          ${ag.dht_local_replicas != null ? `&nbsp;·&nbsp;${esc(t('agent.dht_replicas', { n: ag.dht_local_replicas, target: 8 }))}` : ''}
         </span>
         <div class="ag2-actions">
           ${!ag.published_to_dht ? `<button type="button" class="btn btn-primary btn-sm" data-pub-now>${esc(t('agent.action.refresh'))}</button>` : ''}

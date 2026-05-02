@@ -172,7 +172,7 @@ func (b *beaconManager) StoreAll(ctx context.Context, keys []a2al.NodeID) {
 				r := rec
 				k := key
 				go func() {
-					sctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+					sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 					defer cancel()
 					if _, err := b.node.StoreAt(sctx, a, k, r); err != nil {
 						b.log.Debug("aux-dht store", "addr", a, "err", err)

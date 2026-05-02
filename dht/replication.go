@@ -6,6 +6,7 @@ package dht
 import (
 	"context"
 	crand "crypto/rand"
+	"fmt"
 	"net"
 	"sort"
 	"sync"
@@ -99,6 +100,24 @@ func (n *Node) getOrCreateRepSet(rk repKey) *repSet {
 		n.repSets[rk] = rs
 	}
 	return rs
+}
+
+// RepSetSize returns the number of confirmed remote replicas for a record
+// identified by (storeKey, publisher).  Returns 0 if no repSet exists yet.
+// The value is a point-in-time snapshot; it can change as renewBackground and
+// probeRepNode run in the background.
+func (n *Node) RepSetSize(storeKey, publisher a2al.NodeID) int {
+	rk := repKey{storeKey: storeKey, publisher: publisher}
+	n.repMu.RLock()
+	rs := n.repSets[rk]
+	n.repMu.RUnlock()
+	if rs == nil {
+		return 0
+	}
+	rs.mu.Lock()
+	sz := len(rs.nodes)
+	rs.mu.Unlock()
+	return sz
 }
 
 // RemoveRepSetsForPublisher removes all repSets whose publisher matches the
@@ -395,11 +414,16 @@ func (n *Node) renewBackground(rk repKey, rs *repSet) {
 	// processReplTask uses tabNearestHealthy which may surface candidates not
 	// returned by FindNode (e.g. recently-discovered Good peers).
 	rs.mu.Lock()
-	stillNeed := nRep - len(rs.nodes)
+	finalSize := len(rs.nodes)
 	rs.mu.Unlock()
-	if stillNeed > 0 {
+	if nRep-finalSize > 0 {
 		n.enqueueReplication(rk, protocol.SignedRecord{})
 	}
+	n.log.Debug("replication status",
+		"key", fmt.Sprintf("%x", rk.storeKey[:4]),
+		"replicas", finalSize,
+		"target", nRep,
+	)
 }
 
 // storeAndRecord sends STORE to peers one by one with storeStagger delay
@@ -445,10 +469,35 @@ func (n *Node) storeAndRecord(ctx context.Context, peers []protocol.NodeInfo, rk
 		}
 
 		pctx, cancel := context.WithTimeout(ctx, queryPeerTimeout)
-		_, err := n.StoreAt(pctx, addr, rk.storeKey, rec)
+		stored, err := n.StoreAt(pctx, addr, rk.storeKey, rec)
 		cancel()
 		if err != nil {
 			n.log.Debug("replication StoreAt failed", "peer", addr, "err", err)
+			continue
+		}
+		if !stored {
+			// The peer is reachable but its recordAuthPolicy rejected this
+			// record (e.g. unsupported delegation type, policy mismatch).
+			// This is a record-scoped signal: do not penalise the peer's
+			// global health score.
+			//
+			// If the peer was already a confirmed replica (renewal path),
+			// remove it from the repSet — it is no longer holding the record
+			// and will not accept a re-store.  The stillNeed check at the end
+			// of renewBackground will detect the resulting gap and queue a
+			// processReplTask to find a replacement.
+			k := infoKey(ni)
+			rs.mu.Lock()
+			_, wasReplica := rs.nodes[k]
+			if wasReplica {
+				delete(rs.nodes, k)
+			}
+			rs.mu.Unlock()
+			if wasReplica {
+				n.log.Debug("replication StoreAt rejected: removed from repSet", "peer", addr)
+			} else {
+				n.log.Debug("replication StoreAt rejected", "peer", addr)
+			}
 			continue
 		}
 		n.log.Debug("replication StoreAt ok", "peer", addr)
