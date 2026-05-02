@@ -18,7 +18,7 @@ export default {
   'agent.action.create': '生成新身份',
   'agent.action.import': '导入已有身份',
   'agent.action.eth': 'Ethereum 身份',
-  'agent.action.refresh': '刷新',
+  'agent.action.republish': '更新发布',
   'agent.action.export': '导出',
   'agent.action.delete': '删除',
 
@@ -26,8 +26,11 @@ export default {
   'agent.status.unpublished': 'Unpublished',
   'agent.status.refresh_failed': 'Refresh failed',
 
-  'agent.last_refresh': '上次刷新 {ago}',
-  'agent.next_refresh': '下次刷新 {eta}',
+  'agent.last_refresh': '上次更新 {ago}',
+  'agent.next_refresh': '下次更新 {eta}',
+  'agent.sort.label': '排序：',
+  'agent.sort.registered': '注册时间',
+  'agent.sort.alias': '别名',
   'agent.dht_replicas': '副本 {n}/{target}',
 
   'agent.modal.create.title': '生成新身份',

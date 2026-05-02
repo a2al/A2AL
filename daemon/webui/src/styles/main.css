@@ -408,6 +408,17 @@ pre.resp {
   flex-wrap: wrap;
   margin-bottom: 1.25rem;
 }
+.ag-sortbar {
+  display: flex;
+  align-items: center;
+  gap: .35rem;
+  margin-bottom: .75rem;
+}
+.ag-sortbar .btn.active {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
 
 /* ── Card wrapper ─────────────────────────────────────────────────────────── */
 .ag2-card {

@@ -18,7 +18,7 @@ export default {
   'agent.action.create': 'Generate New Identity',
   'agent.action.import': 'Import Existing Identity',
   'agent.action.eth': 'Ethereum Identity',
-  'agent.action.refresh': 'Refresh',
+  'agent.action.republish': 'Update & Publish',
   'agent.action.export': 'Export',
   'agent.action.delete': 'Delete',
 
@@ -26,8 +26,11 @@ export default {
   'agent.status.unpublished': 'Unpublished',
   'agent.status.refresh_failed': 'Refresh failed',
 
-  'agent.last_refresh': 'Last refreshed {ago}',
-  'agent.next_refresh': 'Next refresh in {eta}',
+  'agent.last_refresh': 'Last published {ago}',
+  'agent.next_refresh': 'Next publish in {eta}',
+  'agent.sort.label': 'Sort:',
+  'agent.sort.registered': 'Registration time',
+  'agent.sort.alias': 'Alias',
   'agent.dht_replicas': 'Replicas {n}/{target}',
 
   'agent.modal.create.title': 'Generate New Identity',

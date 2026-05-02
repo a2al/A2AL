@@ -106,9 +106,51 @@ export async function renderAgents(mount, ctx) {
     return;
   }
 
-  for (let idx = 0; idx < agents.length; idx++) {
-    mount.appendChild(buildAgentCard(agents[idx], idx === 0, agents, idx, demoStatus));
-  }
+  // Sort bar
+  let sortBy = localStorage.getItem('agentSortBy') || 'registered';
+  const sortBar = document.createElement('div');
+  sortBar.className = 'ag-sortbar';
+  const renderSortBar = () => {
+    sortBar.innerHTML = `
+      <span class="muted" style="font-size:.85rem">${esc(t('agent.sort.label'))}</span>
+      <button type="button" class="btn btn-ghost btn-sm${sortBy === 'registered' ? ' active' : ''}" data-sort="registered">${esc(t('agent.sort.registered'))}</button>
+      <button type="button" class="btn btn-ghost btn-sm${sortBy === 'alias' ? ' active' : ''}" data-sort="alias">${esc(t('agent.sort.alias'))}</button>`;
+    sortBar.querySelectorAll('[data-sort]').forEach(btn => {
+      btn.onclick = () => {
+        sortBy = btn.dataset.sort;
+        localStorage.setItem('agentSortBy', sortBy);
+        renderList();
+        renderSortBar();
+      };
+    });
+  };
+  renderSortBar();
+  mount.appendChild(sortBar);
+
+  const listContainer = document.createElement('div');
+  mount.appendChild(listContainer);
+
+  const sortedAgents = () => {
+    const copy = [...agents];
+    if (sortBy === 'alias') {
+      copy.sort((a, b) => {
+        const la = (aliasOf(a.aid) || a.aid).toLowerCase();
+        const lb = (aliasOf(b.aid) || b.aid).toLowerCase();
+        return la < lb ? -1 : la > lb ? 1 : 0;
+      });
+    }
+    // 'registered' keeps server order (already sorted by registered_at)
+    return copy;
+  };
+
+  const renderList = () => {
+    listContainer.innerHTML = '';
+    const sorted = sortedAgents();
+    for (let idx = 0; idx < sorted.length; idx++) {
+      listContainer.appendChild(buildAgentCard(sorted[idx], idx === 0, sorted, idx, demoStatus));
+    }
+  };
+  renderList();
 
   // ── Agent card builder ──────────────────────────────────────────────────
   function buildAgentCard(ag, svcExpanded, allAgents, idx, demoStatus) {
@@ -171,8 +213,8 @@ export async function renderAgents(mount, ctx) {
           ${ag.dht_local_replicas != null ? `&nbsp;·&nbsp;${esc(t('agent.dht_replicas', { n: ag.dht_local_replicas, target: 8 }))}` : ''}
         </span>
         <div class="ag2-actions">
-          ${!ag.published_to_dht ? `<button type="button" class="btn btn-primary btn-sm" data-pub-now>${esc(t('agent.action.refresh'))}</button>` : ''}
-          <button type="button" class="btn btn-secondary btn-sm" data-pub>${esc(t('agent.action.refresh'))}</button>
+          ${!ag.published_to_dht ? `<button type="button" class="btn btn-primary btn-sm" data-pub-now>${esc(t('agent.action.republish'))}</button>` : ''}
+          <button type="button" class="btn btn-secondary btn-sm" data-pub>${esc(t('agent.action.republish'))}</button>
           <button type="button" class="btn btn-danger btn-sm" data-del>${esc(t('agent.action.delete'))}</button>
         </div>
       </div>`;

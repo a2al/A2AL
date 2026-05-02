@@ -135,6 +135,7 @@ func (d *Daemon) persistDelegatedAgent(aid a2al.Address, opPriv ed25519.PrivateK
 		OpPriv:         opPriv,
 		DelegationCBOR: proofRaw,
 		Seq:            0, // first DHT publish uses seq 1 via POST /publish or auto-republish
+		RegisteredAt:   time.Now(),
 	}
 	if err := d.reg.Put(ent); err != nil {
 		d.h.UnregisterAgent(aid)
@@ -435,6 +436,11 @@ func (d *Daemon) execAgentsList() []map[string]any {
 	}
 	d.publishMetaMu.Unlock()
 
+	// Sort by registration time (oldest first) for a stable, predictable order.
+	slices.SortFunc(list, func(a, b *registry.Entry) int {
+		return a.RegisteredAt.Compare(b.RegisteredAt)
+	})
+
 	out := make([]map[string]any, 0, len(list))
 	for _, e := range list {
 		var tcpOK any // nil = not configured; bool = probe result
@@ -448,6 +454,7 @@ func (d *Daemon) execAgentsList() []map[string]any {
 			"service_tcp_ok":   tcpOK,
 			"published_to_dht": e.Seq > 0,
 			"services":         e.Services,
+			"registered_at":    e.RegisteredAt.UTC().Format(time.RFC3339),
 		}
 		if hbT, ok := hbSnap[e.AID]; ok {
 			m["heartbeat_seconds_ago"] = time.Since(hbT).Seconds()

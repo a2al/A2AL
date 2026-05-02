@@ -18,7 +18,7 @@ export default {
   'agent.action.create': '新しいIDを生成',
   'agent.action.import': '既存のIDをインポート',
   'agent.action.eth': 'Ethereumアイデンティティ',
-  'agent.action.refresh': '更新',
+  'agent.action.republish': '更新して公開',
   'agent.action.export': 'エクスポート',
   'agent.action.delete': '削除',
 
@@ -26,8 +26,11 @@ export default {
   'agent.status.unpublished': 'Unpublished',
   'agent.status.refresh_failed': 'Refresh failed',
 
-  'agent.last_refresh': '最終更新: {ago}',
-  'agent.next_refresh': '次回更新: {eta}',
+  'agent.last_refresh': '最終公開: {ago}',
+  'agent.next_refresh': '次回公開: {eta}',
+  'agent.sort.label': '並び替え：',
+  'agent.sort.registered': '登録日時',
+  'agent.sort.alias': 'エイリアス',
   'agent.dht_replicas': 'レプリカ {n}/{target}',
 
   'agent.modal.create.title': '新しいIDを生成',
