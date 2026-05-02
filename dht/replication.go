@@ -452,7 +452,28 @@ func (n *Node) storeAndRecord(ctx context.Context, peers []protocol.NodeInfo, rk
 			continue
 		}
 		if !stored {
-			n.log.Debug("replication StoreAt rejected", "peer", addr)
+			// The peer is reachable but its recordAuthPolicy rejected this
+			// record (e.g. unsupported delegation type, policy mismatch).
+			// This is a record-scoped signal: do not penalise the peer's
+			// global health score.
+			//
+			// If the peer was already a confirmed replica (renewal path),
+			// remove it from the repSet — it is no longer holding the record
+			// and will not accept a re-store.  The stillNeed check at the end
+			// of renewBackground will detect the resulting gap and queue a
+			// processReplTask to find a replacement.
+			k := infoKey(ni)
+			rs.mu.Lock()
+			_, wasReplica := rs.nodes[k]
+			if wasReplica {
+				delete(rs.nodes, k)
+			}
+			rs.mu.Unlock()
+			if wasReplica {
+				n.log.Debug("replication StoreAt rejected: removed from repSet", "peer", addr)
+			} else {
+				n.log.Debug("replication StoreAt rejected", "peer", addr)
+			}
 			continue
 		}
 		n.log.Debug("replication StoreAt ok", "peer", addr)
