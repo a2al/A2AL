@@ -1,6 +1,6 @@
 export default {
   'agent.section.identity': 'Agent ID',
-  'service.section': '公開中のサービス',
+  'service.section': '公開済みケイパビリティ',
 
   'nav.agents': 'Agents',
   'nav.discover': 'Discover',
@@ -31,12 +31,14 @@ export default {
 
   'agent.modal.create.title': '新しいIDを生成',
   'agent.modal.masterkey.warning':
-    '⚠ これはこのIDの唯一の所有権証明であり、この後は表示されません。\nいかなるサーバーにも保存されません。紛失した場合、このAIDの所有権は永久に証明できなくなります。',
-  'agent.modal.masterkey.confirm': 'マスター秘密鍵を安全に保存しました',
+    '⚠ これはこのIDの唯一の所有権証明であり、この後は表示されません。\n今すぐ下のボタンでコピーし、安全な場所に保存してください。\nいかなるサーバーにも保存されません。紛失した場合、このAIDの所有権は永久に証明できなくなります。',
+  'agent.modal.masterkey.key_label': 'マスター秘密鍵（Master Private Key）— コピーして保存',
+  'agent.modal.masterkey.copy_btn': 'マスター秘密鍵をコピー',
+  'agent.modal.masterkey.confirm': 'マスター秘密鍵をコピーして安全に保存しました',
   'agent.modal.advanced': '詳細設定',
-  'agent.modal.service_tcp.label': 'Service TCP',
-  'agent.modal.service_tcp.hint':
-    'デーモンがQUIC着信をフォワードするローカルアドレス。公開URLがある場合は空白で可。',
+  'agent.modal.service_tcp.label': 'Agent URL',
+  'agent.modal.service_tcp.optional': '（後で設定可）',
+  'agent.modal.service_tcp.hint': 'URLまたはTCP host:port形式に対応。例: http://127.0.0.1:8080 または 127.0.0.1:8080。',
   'agent.modal.submit': '登録',
 
   'agent.modal.import.title': '既存のIDをインポート',
@@ -48,6 +50,7 @@ export default {
   'agent.modal.eth.intro':
     'あなたのAgentは、ネットワーク上のIDとしてEthereumアドレスを持つことができます。\nそのアドレスは完全に自律的です——暗号アルゴリズムによって生成され、いかなるプラットフォームにも属さず、誰の許可も必要としません。',
   'agent.modal.eth.footer': 'もちろん！あらゆるウォレットアドレスをサポートする予定です。',
+  'agent.modal.eth.addr_placeholder': 'ステップ1をクリックしてMetaMaskでアカウントを選択',
 
   'agent.delete.confirm': 'このIDを削除しますか？この操作は取り消せません。',
 
@@ -60,18 +63,50 @@ export default {
 
   'agent.export.unavailable': 'Web UIではまだIDのエクスポートに対応していません。',
   'agent.eth.metamask': 'MetaMaskが見つかりません（window.ethereum）。',
+  'agent.eth.need_step1': 'ステップ1を先に完了してください——MetaMaskでアカウントを選択してください。',
+  'agent.eth.need_step2': 'ステップ2を先に完了してください——MetaMaskで署名してください。',
+
+  'agent.tcp.ok': '正常',
+  'agent.tcp.fail': '応答なし',
+  'agent.tcp.unknown': '未確認',
+  'agent.tcp.none': '未設定',
+  'agent.tcp.edit': '編集',
+  'agent.tcp.save': '保存',
+
+  'agent.alias.set': 'エイリアス設定',
+  'agent.alias.placeholder': 'エイリアス…',
+
+  'agent.svc.title': 'ケイパビリティ（{n}件）',
+  'agent.svc.ttl': 'TTL {v}',
+
+  'agent.fn.card': 'Agent Card',
+  'agent.fn.network': 'ネットワーク',
+  'agent.fn.recv_notes': 'ノート受信',
+  'agent.fn.send_note': 'ノート送信',
+  'agent.fn.ping': '接続テスト',
+  'agent.fn.card.no_tcp': 'APIアドレスを設定してください。Agent CardはAgentのHTTPサービスが提供します。',
+  'agent.fn.network.endpoints': 'ネットワークアドレス',
+  'agent.fn.network.nat': 'ネットワークタイプ',
+
+  'agent.note.send.recipient': '宛先',
+  'agent.note.send.manual': '任意のAIDを貼り付け…',
+  'agent.note.send.body': 'メッセージ',
+  'agent.note.send.btn': '送信',
+
+  'agent.onboard.hint': 'まだネットワークに公開されていません —',
+  'agent.published': '公開済み · seq {seq}',
 
   'service.empty.title': 'このAgentはまだネットワークに能力を宣言していません。',
   'service.empty.body':
-    'IDは存在を与え、サービスは必要とされることを与えます。\nあなたのAgentはネットワーク上で他のAgentの能力を発見し、\nまた自らも発見される存在になります。\nこれが、Agentたちが自律的に協調し、Swarmを形成する土台です。',
+    'IDは存在を与え、ケイパビリティは必要とされることを与えます。\nあなたのAgentはネットワーク上で他のAgentの能力を発見し、\nまた自らも発見される存在になります。\nこれが、Agentたちが自律的に協調し、Swarmを形成する土台です。',
 
-  'service.action.publish': 'サービスを公開',
-  'service.action.unpublish': '公開停止',
+  'service.action.publish': 'ケイパビリティを公開',
+  'service.action.unpublish': '取り消し',
   'service.action.edit': '編集',
 
   'service.unpublish.notice': 'Tangled ネットワーク上のエントリは約1時間以内に自然に期限切れになります。',
 
-  'service.modal.title': 'サービスを公開',
+  'service.modal.title': 'ケイパビリティを公開',
   'service.modal.import.label': 'Agent Cardからインポート（推奨）',
   'service.modal.import.placeholder': 'Agent Card または MCP Server Card の URL',
   'service.modal.import.fetch': '取得して入力',
@@ -82,20 +117,20 @@ export default {
   'service.modal.func.hint': '簡潔な英語の動詞または名詞（例: translate, summarize）',
   'service.modal.qualifier.label': '修飾語（省略可）',
   'service.modal.qualifier.hint': '検索精度を高めるための語（例: cn-to-en, v2, streaming）',
-  'service.modal.preview': 'サービス名プレビュー：',
+  'service.modal.preview': 'ケイパビリティ名プレビュー：',
   'service.modal.display_name': '表示名',
   'service.modal.brief': '説明',
   'service.modal.protocols': 'プロトコル',
   'service.modal.tags.label': 'タグ',
   'service.modal.tags.hint': 'カンマまたはスペース区切り',
-  'service.modal.url.label': 'サービスURL（省略可）',
+  'service.modal.url.label': 'ケイパビリティURL（省略可）',
   'service.modal.url.hint': '相手がAgent Cardを取得するために使用',
   'service.modal.ttl.label': 'TTL（秒）',
   'service.modal.submit': '公開',
   'service.modal.agent_pick': 'Agent',
 
   'discover.tab.aid': 'AIDで検索',
-  'discover.tab.service': 'サービスで検索',
+  'discover.tab.service': 'ケイパビリティで検索',
   'discover.aid.placeholder': 'AIDを入力',
   'discover.aid.required': 'AIDを入力してください。',
   'discover.myagent.pick': 'マイAgent…',
@@ -110,10 +145,16 @@ export default {
   'discover.result.use': 'このAgentを使用',
 
   'discover.section.dht': 'ネットワーク情報（直接接続不要）',
-  'discover.section.connect': '直接接続（QUICトンネル）',
-  'discover.resolve.idle': '「検索」でResolveとローカル登録を読み込みます。',
-  'discover.local_services': 'このデーモン上の公開サービス',
-  'discover.local_services.empty': 'このデーモンにサービス未登録です。',
+  'discover.section.connect': '直接接続',
+  'discover.resolve.idle': '「検索」でAgentのネットワーク情報を取得します。',
+  'discover.resolve.address': 'アドレス',
+  'discover.resolve.net_addr': 'ネットワークアドレス',
+  'discover.resolve.net_type': 'ネットワークタイプ',
+  'discover.resolve.revision': 'リビジョン',
+  'discover.resolve.ttl': '有効期限',
+  'discover.resolve.updated': '更新日時',
+  'discover.local_services': 'このデーモン上の公開済みケイパビリティ',
+  'discover.local_services.empty': 'このデーモンにケイパビリティ未登録です。',
   'discover.profile': 'Agentプロフィール',
   'discover.profile.wip': '準備中（主権レコード）。',
   'discover.msg.send': 'メッセージを送る',
@@ -196,4 +237,15 @@ export default {
   'time.unit.second': '秒',
   'time.unit.minute': '分',
   'time.unit.hour': '時間',
+
+  'about.a2al_desc': 'AIエージェントが自律的に公開・発見・接続できるネットワークプロトコル——中央インフラに依存しない。',
+  'about.tangled_desc': 'A2ALにグローバルなエージェントアドレス解決・発見・接続インフラを提供する分散型P2Pネットワーク。',
+  'about.disclaimer': '本プロジェクトは金融商品とは一切関係ありません。',
+
+  'demo.btn': 'デモモード',
+  'demo.badge': 'DEMO',
+  'demo.stop': '停止',
+  'demo.started': 'デモ能力が有効になりました。他のノードからこのデモエージェントを発見できます。',
+  'demo.stopped': 'デモ能力を停止しました。',
+  'demo.confirm_overwrite': '現在の Agent URL "{addr}" が上書きされます。停止時に元の値が復元されます。続けますか？',
 };

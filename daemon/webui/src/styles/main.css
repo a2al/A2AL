@@ -612,3 +612,253 @@ pre.resp {
     padding: 1rem 0.65rem;
   }
 }
+
+/* ===== Agent v2 card layout ===== */
+
+.ag-topbar {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  margin-bottom: 1.25rem;
+}
+
+.ag2-card {
+  margin-bottom: 1.25rem;
+  padding: 0;
+}
+
+/* Basic info section */
+.ag2-info {
+  padding: 1.1rem 1.5rem 1rem;
+}
+
+.ag2-info-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 1rem;
+  margin-bottom: 0.6rem;
+}
+
+.ag2-aid-col {
+  flex: 1;
+  min-width: 0;
+}
+
+.ag2-badges {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0.35rem;
+  flex-shrink: 0;
+}
+
+.ag2-aid-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.4rem;
+  font-size: 1.05rem;
+}
+
+.ag2-alias {
+  font-weight: 600;
+  color: var(--text);
+}
+
+.ag2-tcp-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+  font-size: 0.88rem;
+}
+
+.ag2-tcp-addr {
+  font-size: 0.84rem;
+  color: var(--muted);
+}
+
+.tcp-dot { font-size: 0.75rem; }
+.tcp-ok   { color: var(--success); }
+.tcp-fail { color: var(--error); }
+.tcp-unk  { color: var(--muted); }
+.tcp-none { color: var(--muted); }
+
+.ag2-info-bottom {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  border-top: 1px solid var(--border);
+  padding-top: 0.6rem;
+  margin-top: 0.65rem;
+}
+
+.ag2-meta {
+  font-size: 0.82rem;
+  flex: 1;
+  min-width: 0;
+}
+
+.ag2-actions {
+  display: flex;
+  gap: 0.4rem;
+  flex-shrink: 0;
+}
+
+.ag2-alias-input,
+.ag2-tcp-input {
+  font-size: 0.9rem;
+}
+
+/* Services section */
+.ag2-svc-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.55rem 1.5rem;
+  border-top: 1px solid var(--border);
+  background: var(--surface-2);
+}
+
+.ag2-svc-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 0.9rem;
+  font-weight: 500;
+  color: var(--text);
+  padding: 0;
+  flex: 1;
+  text-align: left;
+}
+.ag2-svc-toggle:hover { color: var(--accent); }
+.ag2-toggle-arrow { font-size: 0.72rem; color: var(--muted); }
+
+.ag2-svc-body {
+  padding: 0.75rem 1.5rem;
+  border-top: 1px solid var(--border);
+}
+
+.ag2-svc-empty-title {
+  font-weight: 600;
+  font-size: 0.95rem;
+  margin-bottom: 0.25rem;
+}
+
+.ag2-svc-row {
+  padding: 0.55rem 0;
+  border-bottom: 1px solid var(--border);
+}
+.ag2-svc-row:last-child { border-bottom: none; }
+
+.ag2-svc-top {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+
+.ag2-svc-ttl {
+  font-size: 0.8rem;
+  margin-left: 0.25rem;
+}
+
+.ag2-svc-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 0.25rem;
+}
+
+.ag2-svc-detail {
+  margin-top: 0.2rem;
+  font-size: 0.88rem;
+}
+
+/* Function area */
+.ag2-fn-bar {
+  display: flex;
+  gap: 0.35rem;
+  flex-wrap: wrap;
+  padding: 0.6rem 1.5rem;
+  border-top: 1px solid var(--border);
+  background: var(--surface-2);
+}
+
+.ag2-fn-btn.active {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+
+.ag2-fn-panel {
+  padding: 0.85rem 1.5rem;
+  border-top: 1px solid var(--border);
+  font-size: 0.92rem;
+}
+
+.ag2-note-row {
+  padding: 0.5rem 0;
+  border-bottom: 1px solid var(--border);
+}
+.ag2-note-row:last-child { border-bottom: none; }
+
+/* Extra-small button */
+.btn-xs {
+  padding: 0.1rem 0.45rem;
+  min-height: 26px;
+  font-size: 0.78rem;
+}
+
+/* ── Footer ─────────────────────────────────────────────────────────── */
+.app-footer {
+  margin-top: 3rem;
+  border-top: 1px solid var(--border);
+  background: var(--surface-2);
+}
+
+.footer-inner {
+  max-width: 860px;
+  margin: 0 auto;
+  padding: 1.25rem 1.5rem 1.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.footer-desc {
+  font-size: 0.82rem;
+  color: var(--text-muted, #888);
+  line-height: 1.5;
+}
+
+.footer-links {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  flex-wrap: wrap;
+  font-size: 0.82rem;
+  margin-top: 0.4rem;
+}
+
+.footer-links a {
+  color: var(--accent);
+  text-decoration: none;
+}
+.footer-links a:hover { text-decoration: underline; }
+
+.footer-sep {
+  color: var(--text-muted, #aaa);
+}
+
+.footer-copy {
+  font-size: 0.76rem;
+  color: var(--text-muted, #aaa);
+  margin-top: 0.15rem;
+}

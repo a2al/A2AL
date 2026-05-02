@@ -5,6 +5,8 @@ package daemon
 
 import (
 	"context"
+	"crypto/ed25519"
+	"encoding/base64"
 	"io"
 	"net"
 	"sync"
@@ -14,6 +16,15 @@ import (
 	"github.com/a2al/a2al/host"
 	"github.com/quic-go/quic-go"
 )
+
+// sessionInfo is the per-connection metadata stored while a gateway TCP bridge
+// is active. It is exposed via GET /sessions/{port}.
+type sessionInfo struct {
+	CallerAID    string    `json:"caller_aid"`
+	CallerPubkey string    `json:"caller_pubkey"` // base64url-encoded Ed25519 public key
+	LocalAID     string    `json:"local_aid"`
+	ConnectedAt  time.Time `json:"connected_at"`
+}
 
 const (
 	maxGatewayConns    = 1024
@@ -101,14 +112,24 @@ func (d *Daemon) bridgeInboundStream(ac *host.AgentConn, str quic.Stream, servic
 		_ = str.Close()
 		return
 	}
-	var hdr [21]byte
-	copy(hdr[:], ac.Remote[:])
-	if _, err := tcp.Write(hdr[:]); err != nil {
-		d.log.Warn("gateway: write aid header failed", "local_aid", ac.Local.String(), "remote_aid", ac.Remote.String(), "target", serviceTCP, "err", err)
-		_ = str.Close()
-		_ = tcp.Close()
-		return
+
+	// Register session so backends can query caller identity via GET /sessions/{port}.
+	// The source port of the daemon's outbound TCP connection is the unique key —
+	// the backend sees it as conn.RemoteAddr().Port after Accept().
+	srcPort := tcp.LocalAddr().(*net.TCPAddr).Port
+	si := &sessionInfo{
+		CallerAID:   ac.Remote.String(),
+		LocalAID:    ac.Local.String(),
+		ConnectedAt: time.Now(),
 	}
+	if certs := ac.ConnectionState().TLS.PeerCertificates; len(certs) > 0 {
+		if pub, ok := certs[0].PublicKey.(ed25519.PublicKey); ok {
+			si.CallerPubkey = base64.RawURLEncoding.EncodeToString(pub)
+		}
+	}
+	d.sessions.Store(srcPort, si)
+	defer d.sessions.Delete(srcPort)
+
 	bridgeTCPQUICStream(str, tcp)
 }
 

@@ -1,6 +1,6 @@
 export default {
   'agent.section.identity': 'Agent 身份',
-  'service.section': '已发布的服务',
+  'service.section': '已发布的能力',
 
   'nav.agents': 'Agents',
   'nav.discover': 'Discover',
@@ -31,11 +31,14 @@ export default {
 
   'agent.modal.create.title': '生成新身份',
   'agent.modal.masterkey.warning':
-    '⚠ 这是这个身份的唯一主权凭证，此刻之后不再显示。\n它不存储于任何服务器。一旦丢失，该 AID 的所有权将永久无法证明，身份本身也无法恢复。',
-  'agent.modal.masterkey.confirm': '我已安全保存主私钥',
+    '⚠ 这是这个身份的唯一主权凭证，此刻之后不再显示。\n请立即点击下方按钮复制，并保存到安全位置。\n它不存储于任何服务器。一旦丢失，该 AID 的所有权将永久无法证明，身份本身也无法恢复。',
+  'agent.modal.masterkey.key_label': '主私钥（Master Private Key）— 请复制并保存',
+  'agent.modal.masterkey.copy_btn': '复制主私钥',
+  'agent.modal.masterkey.confirm': '我已复制并妥善保存主私钥',
   'agent.modal.advanced': '高级设置',
-  'agent.modal.service_tcp.label': 'Service TCP',
-  'agent.modal.service_tcp.hint': 'Daemon 将入站 QUIC 连接转发至此地址。若 Agent 有公开 URL，可留空。',
+  'agent.modal.service_tcp.label': 'Agent URL',
+  'agent.modal.service_tcp.optional': '（暂无可留空，稍后配置）',
+  'agent.modal.service_tcp.hint': '支持 URL 或 TCP 协议的 host:port 格式，如 http://127.0.0.1:8080 或 127.0.0.1:8080。',
   'agent.modal.submit': '注册',
 
   'agent.modal.import.title': '导入已有身份',
@@ -47,6 +50,7 @@ export default {
   'agent.modal.eth.intro':
     '你的 Agent 可以拥有一个以太坊地址作为它在网络中的身份。\n这个地址完全自主——由加密算法生成，不归属于任何平台，不需要任何人的许可。',
   'agent.modal.eth.footer': '当然！我们将支持任何钱包地址。',
+  'agent.modal.eth.addr_placeholder': '点击步骤 1 在 MetaMask 中选择账户',
 
   'agent.delete.confirm': '确认删除此身份？此操作不可撤销。',
 
@@ -59,42 +63,74 @@ export default {
 
   'agent.export.unavailable': 'Web UI 暂不支持导出身份，请使用 CLI。',
   'agent.eth.metamask': '未检测到 MetaMask（window.ethereum）。',
+  'agent.eth.need_step1': '请先完成步骤 1——在 MetaMask 中选择账户并生成授权消息。',
+  'agent.eth.need_step2': '请先完成步骤 2——在 MetaMask 中签名。',
+
+  'agent.tcp.ok': '正常',
+  'agent.tcp.fail': '无响应',
+  'agent.tcp.unknown': '待测',
+  'agent.tcp.none': '未配置',
+  'agent.tcp.edit': '修改',
+  'agent.tcp.save': '保存',
+
+  'agent.alias.set': '设置别名',
+  'agent.alias.placeholder': '别名…',
+
+  'agent.svc.title': '能力（{n} 条）',
+  'agent.svc.ttl': 'TTL {v}',
+
+  'agent.fn.card': 'Agent Card',
+  'agent.fn.network': '网络详情',
+  'agent.fn.recv_notes': '查收便条',
+  'agent.fn.send_note': '发便条',
+  'agent.fn.ping': '连通测试',
+  'agent.fn.card.no_tcp': '请先配置 API 地址——Agent Card 由你的 Agent HTTP 服务提供。',
+  'agent.fn.network.endpoints': '网络地址',
+  'agent.fn.network.nat': '网络类型',
+
+  'agent.note.send.recipient': '收件人',
+  'agent.note.send.manual': '粘贴任意 AID…',
+  'agent.note.send.body': '消息内容',
+  'agent.note.send.btn': '发送',
+
+  'agent.onboard.hint': '尚未发布到网络 —',
+  'agent.published': '已发布 · seq {seq}',
 
   'service.empty.title': 'Agent 尚未向网络宣告它的能力。',
   'service.empty.body':
-    '身份让它存在，服务让它被需要。\n你的每一个 Agent 都可以在网络上发现其他 Agent 的能力，\n也可以让别人的 Agent 发现它。\n这是它们自主协作、组成 Swarm 的基础。',
+    '身份让它存在，能力让它被需要。\n你的每一个 Agent 都可以在网络上发现其他 Agent 的能力，\n也可以让别人的 Agent 发现它。\n这是它们自主协作、组成 Swarm 的基础。',
 
-  'service.action.publish': '发布服务',
-  'service.action.unpublish': '下架',
+  'service.action.publish': '发布能力',
+  'service.action.unpublish': '撤销',
   'service.action.edit': '编辑',
 
   'service.unpublish.notice': 'Tangled 网络上的条目将在约 1 小时内自然失效。',
 
-  'service.modal.title': '发布服务',
+  'service.modal.title': '发布能力',
   'service.modal.import.label': '从 Agent Card 导入（推荐）',
   'service.modal.import.placeholder': 'Agent Card 或 MCP Server Card URL',
   'service.modal.import.fetch': '抓取并填充',
   'service.modal.import.or': '或手动填写',
-  'service.modal.category.label': '服务类别',
+  'service.modal.category.label': '能力类别',
   'service.modal.category.custom': '自定义…',
   'service.modal.func.label': '功能名',
   'service.modal.func.hint': '简洁英文动词或名词，如 translate、summarize',
   'service.modal.qualifier.label': '限定词（可选）',
   'service.modal.qualifier.hint': '帮助更精准匹配，如 cn-to-en、v2、streaming',
-  'service.modal.preview': '服务名预览：',
+  'service.modal.preview': '能力名预览：',
   'service.modal.display_name': '显示名称',
   'service.modal.brief': '简介',
   'service.modal.protocols': '协议',
   'service.modal.tags.label': '标签',
   'service.modal.tags.hint': '逗号或空格分隔',
-  'service.modal.url.label': '服务 URL（可选）',
+  'service.modal.url.label': '能力 URL（可选）',
   'service.modal.url.hint': '供对端获取你的 Agent Card',
   'service.modal.ttl.label': 'TTL（秒）',
   'service.modal.submit': '发布',
   'service.modal.agent_pick': 'Agent',
 
   'discover.tab.aid': '通过 AID 查询',
-  'discover.tab.service': '按服务搜索',
+  'discover.tab.service': '按能力搜索',
   'discover.aid.placeholder': '输入 AID',
   'discover.aid.required': '请输入 AID。',
   'discover.myagent.pick': '我的 Agent…',
@@ -109,10 +145,16 @@ export default {
   'discover.result.use': '使用此 Agent',
 
   'discover.section.dht': '网络信息（无需直连）',
-  'discover.section.connect': '直连交互（QUIC tunnel）',
-  'discover.resolve.idle': '点击查询以加载 Resolve 与本机登记。',
-  'discover.local_services': '本机已发布服务',
-  'discover.local_services.empty': '本 daemon 上该 Agent 未登记服务。',
+  'discover.section.connect': '直连交互',
+  'discover.resolve.idle': '点击查询以获取 Agent 网络信息。',
+  'discover.resolve.address': '接入地址',
+  'discover.resolve.net_addr': '网络地址',
+  'discover.resolve.net_type': '网络类型',
+  'discover.resolve.revision': '版本序号',
+  'discover.resolve.ttl': '有效期',
+  'discover.resolve.updated': '更新时间',
+  'discover.local_services': '本机已发布能力',
+  'discover.local_services.empty': '本 daemon 上该 Agent 未登记任何能力。',
   'discover.profile': 'Agent 档案',
   'discover.profile.wip': '完善中（主权记录）。',
   'discover.msg.send': '发消息',
@@ -195,4 +237,15 @@ export default {
   'time.unit.second': '秒',
   'time.unit.minute': '分钟',
   'time.unit.hour': '小时',
+
+  'about.a2al_desc': '一个让 AI 智能体自主发布、互相发现、建立安全连接的网络协议——无需依赖任何中心化基础设施。',
+  'about.tangled_desc': '为 A2AL 提供全球智能体寻址、发现和连接基础设施的去中心化点对点网络。',
+  'about.disclaimer': '本项目与任何金融产品无关。',
+
+  'demo.btn': '演示模式',
+  'demo.badge': 'DEMO',
+  'demo.stop': '停用',
+  'demo.started': '演示能力已激活，其他节点现在可以发现并连接此演示智能体。',
+  'demo.stopped': '演示能力已停用。',
+  'demo.confirm_overwrite': '当前 Agent URL "{addr}" 将被覆盖，停用时将自动恢复原值。继续？',
 };

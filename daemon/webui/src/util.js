@@ -3,6 +3,70 @@ export function shortAid(aid) {
   return aid.slice(0, 7) + '…' + aid.slice(-4);
 }
 
+/** Returns the locally stored alias for this AID, or '' if none set. */
+export function aliasOf(aid) {
+  if (!aid) return '';
+  return localStorage.getItem('a2al_alias_' + aid) || '';
+}
+
+/** Persist an alias for an AID to localStorage. */
+export function setAliasOf(aid, alias) {
+  if (!aid) return;
+  if (alias) localStorage.setItem('a2al_alias_' + aid, alias);
+  else localStorage.removeItem('a2al_alias_' + aid);
+}
+
+/** Generate a locale-aware default alias (e.g. "Agent 42", "AI智能体 42"). */
+export function generateDefaultAlias() {
+  const n = Math.floor(Math.random() * 90) + 10; // 10–99
+  const lang = localStorage.getItem('a2al_lang') || 'en';
+  if (lang === 'zh') return `AI智能体 ${n}`;
+  if (lang === 'ja') return `AIエージェント ${n}`;
+  return `Agent ${n}`;
+}
+
+/** For dropdown labels: "Alias (shortAid)" when alias set, else shortAid. */
+export function labelAid(aid) {
+  const a = aliasOf(aid);
+  return a ? `${a} (${shortAid(aid)})` : shortAid(aid);
+}
+
+/** Normalize a user-entered Agent URL or host:port into the host:port format
+ *  required by service_tcp. Accepts:
+ *    http://127.0.0.1:8080  → 127.0.0.1:8080
+ *    https://host           → host:443
+ *    http://host            → host:80
+ *    127.0.0.1:8080         → 127.0.0.1:8080  (pass-through)
+ */
+export function normalizeServiceTCP(input) {
+  const s = (input || '').trim();
+  if (!s) return '';
+  if (s.startsWith('http://') || s.startsWith('https://')) {
+    try {
+      const u = new URL(s);
+      const port = u.port || (u.protocol === 'https:' ? '443' : '80');
+      return `${u.hostname}:${port}`;
+    } catch (_) {}
+  }
+  return s;
+}
+export function parseCardData(j) {
+  if (!j || typeof j !== 'object') return null;
+  const name = j.name || j.title || j.serverInfo?.name || '';
+  const version = j.version || j.apiVersion || j.serverInfo?.version || '';
+  let tools = [];
+  if (Array.isArray(j.tools)) {
+    tools = j.tools.map((x) => (typeof x === 'string' ? x : x.name || '')).filter(Boolean);
+  } else if (j.tools && typeof j.tools === 'object') {
+    tools = Object.keys(j.tools);
+  }
+  let caps = '';
+  if (j.capabilities && typeof j.capabilities === 'object') {
+    caps = Object.entries(j.capabilities).map(([k, v]) => `${k}: ${v}`).join(', ');
+  }
+  return { name, version, caps, tools };
+}
+
 export function esc(s) {
   return String(s)
     .replace(/&/g, '&amp;')

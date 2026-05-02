@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"strconv"
@@ -50,6 +51,10 @@ func (d *Daemon) routes() http.Handler {
 	mux.HandleFunc("POST /connect/{aid}", d.handleConnect)
 	mux.Handle("/debug/", d.h.DebugHTTPHandler())
 	mux.Handle("/mcp/", d.mcpHTTPHandler())
+	mux.HandleFunc("POST /demo/start", d.handleDemoStart)
+	mux.HandleFunc("POST /demo/stop", d.handleDemoStop)
+	mux.HandleFunc("GET /demo/status", d.handleDemoStatus)
+	mux.HandleFunc("GET /sessions/{port}", d.handleGetSession)
 	registerWebUIRoutes(mux)
 	return d.withMiddleware(mux)
 }
@@ -823,4 +828,161 @@ func (d *Daemon) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]string{"tunnel": tun})
+}
+
+// ── Demo mode handlers ─────────────────────────────────────────────────────
+
+type demoStartReq struct {
+	AID string `json:"aid"`
+}
+
+func (d *Daemon) handleDemoStart(w http.ResponseWriter, r *http.Request) {
+	var req demoStartReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return
+	}
+	if _, err := a2al.ParseAddress(req.AID); err != nil {
+		http.Error(w, `{"error":"bad aid"}`, http.StatusBadRequest)
+		return
+	}
+
+	d.demo.mu.Lock()
+	defer d.demo.mu.Unlock()
+
+	// Refuse if demo is already running for a different agent.
+	if d.demo.running() && d.demo.activeAID != "" && d.demo.activeAID != req.AID {
+		http.Error(w, `{"error":"demo already running for another agent"}`, http.StatusConflict)
+		return
+	}
+
+	// Save current service_tcp for later restoration.
+	d.regMu.RLock()
+	e := d.reg.Get(mustParseAddress(req.AID))
+	d.regMu.RUnlock()
+	if e == nil {
+		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+		return
+	}
+	prevTCP := e.ServiceTCP
+
+	// Start the internal HTTP server.
+	shortAID := demoShortAID(d.nodeAddr.String())
+	port, err := d.demo.startHTTP(shortAID)
+	if err != nil {
+		http.Error(w, `{"error":"failed to start demo server"}`, http.StatusInternalServerError)
+		return
+	}
+	tcpAddr := fmt.Sprintf("127.0.0.1:%d", port)
+
+	// Update service_tcp to point at the demo server.
+	if err := d.execAgentPatch(req.AID, patchAgentReq{ServiceTCP: tcpAddr}); err != nil {
+		d.demo.stopHTTP()
+		http.Error(w, `{"error":"failed to set service_tcp"}`, http.StatusInternalServerError)
+		return
+	}
+
+	// Register the demo.echo capability.
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	_ = d.execTopicRegister(ctx, req.AID, topicRegisterReq{
+		Services:  []string{"demo.echo"},
+		Name:      "Demo Echo",
+		Brief:     "A2AL demo capability — echoes back any request. Powered by Tangled Network.",
+		Protocols: []string{"http"},
+		TTL:       3600,
+	})
+
+	d.demo.activeAID = req.AID
+	d.demo.prevTCP = prevTCP
+	writeJSON(w, map[string]any{"port": port, "service_tcp": tcpAddr})
+}
+
+func (d *Daemon) handleDemoStop(w http.ResponseWriter, r *http.Request) {
+	var req demoStartReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return
+	}
+
+	d.demo.mu.Lock()
+	defer d.demo.mu.Unlock()
+
+	aidStr := req.AID
+	if aidStr == "" {
+		aidStr = d.demo.activeAID
+	}
+
+	// If neither the HTTP server is running nor an AID was provided, nothing to do.
+	if aidStr == "" && !d.demo.running() {
+		writeJSON(w, map[string]string{"status": "not running"})
+		return
+	}
+
+	if aidStr != "" {
+		// Remove the demo.echo capability.
+		_ = d.execTopicUnregister(aidStr, "demo.echo")
+
+		// Determine which service_tcp to restore.
+		// prevTCP is set when this daemon session started the demo.
+		// After a daemon restart prevTCP is empty; in that case we inspect the
+		// current value: if it is a loopback address it was set by a previous demo
+		// session and is now dead, so clear it.  Otherwise leave it alone.
+		restoreTCP := d.demo.prevTCP
+		shouldPatch := true
+		if restoreTCP == "" {
+			if aid, err := a2al.ParseAddress(aidStr); err == nil {
+				d.regMu.RLock()
+				e := d.reg.Get(aid)
+				d.regMu.RUnlock()
+				if e != nil && strings.HasPrefix(e.ServiceTCP, "127.0.0.1:") {
+					restoreTCP = "" // clear the stale demo address
+				} else {
+					shouldPatch = false // real address or already empty — don't touch
+				}
+			} else {
+				shouldPatch = false
+			}
+		}
+		if shouldPatch {
+			_ = d.execAgentPatch(aidStr, patchAgentReq{ServiceTCP: restoreTCP})
+		}
+	}
+
+	d.demo.stopHTTP()
+	d.demo.activeAID = ""
+	d.demo.prevTCP = ""
+	writeJSON(w, map[string]string{"status": "stopped"})
+}
+
+func (d *Daemon) handleDemoStatus(w http.ResponseWriter, _ *http.Request) {
+	running, aid, port := d.demo.Status()
+	writeJSON(w, map[string]any{"running": running, "aid": aid, "port": port})
+}
+
+// handleGetSession returns the caller metadata for an active gateway TCP bridge,
+// keyed by the daemon-side TCP source port that the backend sees as RemoteAddr.Port.
+//
+// Backends call this immediately after Accept() to retrieve the verified caller AID
+// without any modification to the byte stream.
+func (d *Daemon) handleGetSession(w http.ResponseWriter, r *http.Request) {
+	portStr := r.PathValue("port")
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port <= 0 || port > 65535 {
+		http.Error(w, `{"error":"invalid port"}`, http.StatusBadRequest)
+		return
+	}
+	v, ok := d.sessions.Load(port)
+	if !ok {
+		http.Error(w, `{"error":"session not found"}`, http.StatusNotFound)
+		return
+	}
+	writeJSON(w, v)
+}
+
+// mustParseAddress parses an AID string, panicking only in unreachable cases
+// (callers already validated the AID before calling this).
+func mustParseAddress(s string) a2al.Address {
+	addr, _ := a2al.ParseAddress(s)
+	return addr
 }
