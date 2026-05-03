@@ -11,6 +11,7 @@ import {
   mapCardJson,
   parseCardData,
   normalizeServiceTCP,
+  base64ToUtf8,
 } from '../util.js';
 
 const CATS = ['lang', 'gen', 'sense', 'data', 'reason', 'code', 'tool'];
@@ -482,18 +483,19 @@ export async function renderAgents(mount, ctx) {
   async function renderFnPanel(fn, ag, panel, allAgents) {
     switch (fn) {
       case 'card': {
-        if (!ag.service_tcp) {
-          panel.innerHTML = `<p class="muted">${esc(t('agent.fn.card.no_tcp'))}</p>`;
-          return;
-        }
         panel.innerHTML = `<p class="muted">${esc(t('discover.card.fetching'))}</p>`;
         try {
           let got = null;
           for (const path of ['/.well-known/agent.json', '/.well-known/mcp.json']) {
             try {
-              const cr = await api(`/connect/${encodeURIComponent(ag.aid)}`, { method: 'POST', body: '{}' });
-              const res = await fetch('http://' + cr.tunnel + path, { mode: 'cors' });
-              if (res.ok) { got = { json: await res.json(), path }; break; }
+              const r = await api(`/fetch/${encodeURIComponent(ag.aid)}`, {
+                method: 'POST',
+                body: JSON.stringify({ path }),
+              });
+              if (r.status >= 200 && r.status < 300) {
+                got = { json: JSON.parse(base64ToUtf8(r.body)), path };
+                break;
+              }
             } catch (_) {}
           }
           if (!got) { panel.innerHTML = `<p class="muted">${esc(t('discover.card_failed'))}</p>`; return; }
@@ -624,7 +626,7 @@ export async function renderAgents(mount, ctx) {
       case 'ping': {
         panel.innerHTML = `
           <div style="display:flex;gap:.75rem;align-items:center;flex-wrap:wrap">
-            <button type="button" class="btn btn-secondary btn-sm" id="fn-ping-btn">${esc(t('discover.ping'))}</button>
+            <button type="button" class="btn btn-secondary btn-sm" id="fn-ping-btn">${esc(t('agent.fn.ping'))}</button>
             <span id="fn-ping-out" class="muted" style="font-size:.9rem"></span>
           </div>`;
         const doPing = async () => {

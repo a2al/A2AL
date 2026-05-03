@@ -1,4 +1,4 @@
-import { esc, shortAid, setLoading } from '../util.js';
+import { esc, shortAid, setLoading, base64ToUtf8 } from '../util.js';
 
 const QUICK = ['lang', 'gen', 'sense', 'data', 'reason', 'code', 'tool'];
 
@@ -23,6 +23,7 @@ function utf8ToBase64(s) {
   return btoa(bin);
 }
 
+
 function parseCard(j) {
   if (!j || typeof j !== 'object') return null;
   const name = j.name || j.title || j.serverInfo?.name || '';
@@ -43,17 +44,16 @@ function parseCard(j) {
   return { name, version, caps, tools, url, raw: j };
 }
 
-async function fetchAgentCardThroughTunnel(api, aid) {
+async function fetchAgentCard(api, aid) {
   const paths = ['/.well-known/agent.json', '/.well-known/mcp.json'];
   for (const path of paths) {
     try {
-      const cr = await api(`/connect/${encodeURIComponent(aid)}`, {
+      const r = await api(`/fetch/${encodeURIComponent(aid)}`, {
         method: 'POST',
-        body: '{}',
+        body: JSON.stringify({ path }),
       });
-      const res = await fetch('http://' + cr.tunnel + path, { mode: 'cors' });
-      if (res.ok) {
-        const j = await res.json();
+      if (r.status >= 200 && r.status < 300) {
+        const j = JSON.parse(base64ToUtf8(r.body));
         return { json: j, path };
       }
     } catch (_) {}
@@ -132,8 +132,12 @@ export async function renderDiscover(mount, ctx) {
             <button type="button" class="btn btn-secondary btn-sm" id="dPing">${esc(t('discover.ping'))}</button>
             <button type="button" class="btn btn-secondary btn-sm" id="dCard">${esc(t('discover.card'))}</button>
             <button type="button" class="btn btn-secondary btn-sm" id="dShowReq">${esc(t('discover.req.title'))}</button>
+            <button type="button" class="btn btn-secondary btn-sm" id="dOneshot">${esc(t('discover.oneshot.btn'))}</button>
+            <button type="button" class="btn btn-secondary btn-sm" id="dTunnel">${esc(t('discover.tunnel.btn'))}</button>
           </div>
           <div id="dPingOut" class="disc-op-block muted"></div>
+          <div id="dOneshotOut" class="disc-op-block hidden"></div>
+          <div id="dTunnelOut" class="disc-op-block hidden"></div>
           <div id="dCardOut" class="disc-op-block hidden"></div>
           <div id="dReq" class="hidden disc-op-block"></div>
         </div>
@@ -160,6 +164,8 @@ export async function renderDiscover(mount, ctx) {
   const cat = wrap.querySelector('#dqCat');
 
   let currentAid = '';
+  let currentTunnelId = null;
+  let oneshotTimer = null;
 
   for (const c of QUICK) {
     const b = document.createElement('button');
@@ -235,6 +241,17 @@ export async function renderDiscover(mount, ctx) {
     localSvcBox.classList.add('hidden');
     localSvcBox.innerHTML = '';
     wrap.querySelector('#dPingOut').textContent = '';
+    // Reset one-shot tunnel countdown.
+    if (oneshotTimer) { clearInterval(oneshotTimer); oneshotTimer = null; }
+    wrap.querySelector('#dOneshotOut').classList.add('hidden');
+    wrap.querySelector('#dOneshotOut').innerHTML = '';
+    // Close any open multiplexed tunnel when switching to a new target.
+    if (currentTunnelId) {
+      api(`/tunnel/${encodeURIComponent(currentTunnelId)}`, { method: 'DELETE' }).catch(() => {});
+      currentTunnelId = null;
+    }
+    wrap.querySelector('#dTunnelOut').classList.add('hidden');
+    wrap.querySelector('#dTunnelOut').innerHTML = '';
     wrap.querySelector('#dCardOut').classList.add('hidden');
     wrap.querySelector('#dCardOut').innerHTML = '';
     wrap.querySelector('#dReq').classList.add('hidden');
@@ -371,6 +388,48 @@ export async function renderDiscover(mount, ctx) {
     };
   }
 
+  /** One-shot tunnel */
+  wrap.querySelector('#dOneshot').onclick = async (ev) => {
+    if (!currentAid) return;
+    const out = wrap.querySelector('#dOneshotOut');
+    const btn = ev.currentTarget;
+    setLoading(btn, true);
+    out.classList.remove('hidden');
+    out.innerHTML = `<p class="muted">${esc(t('common.loading'))}</p>`;
+    if (oneshotTimer) { clearInterval(oneshotTimer); oneshotTimer = null; }
+    try {
+      const cr = await api(`/connect/${encodeURIComponent(currentAid)}`, {
+        method: 'POST',
+        body: '{}',
+      });
+      let remaining = 30;
+      out.innerHTML = `
+        <p style="color:var(--success);margin:0 0 .2rem">${esc(t('discover.oneshot.ok'))}</p>
+        <p class="muted" style="margin:0 0 .45rem;font-size:.85rem">${esc(t('discover.oneshot.hint'))}</p>
+        <div style="display:flex;align-items:center;gap:.5rem;flex-wrap:wrap;margin-bottom:.3rem">
+          <code class="mono" style="font-size:.9rem">${esc(cr.tunnel)}</code>
+          <button type="button" class="btn btn-ghost btn-sm" id="dOneshotCp">\u29c9</button>
+        </div>
+        <p class="muted" style="font-size:.82rem;margin:0" id="dOneshotCountdown">${esc(t('discover.oneshot.countdown', { n: remaining }))}</p>`;
+      out.querySelector('#dOneshotCp').onclick = () => copyText(cr.tunnel);
+      oneshotTimer = setInterval(() => {
+        remaining--;
+        const cd = out.querySelector('#dOneshotCountdown');
+        if (remaining <= 0) {
+          clearInterval(oneshotTimer);
+          oneshotTimer = null;
+          out.innerHTML = `<p class="muted">${esc(t('discover.oneshot.expired'))}</p>`;
+          return;
+        }
+        if (cd) cd.textContent = t('discover.oneshot.countdown', { n: remaining });
+      }, 1000);
+    } catch (e) {
+      out.innerHTML = `<p style="color:var(--error)">${esc(t('common.error', { msg: e.message }))}</p>`;
+    } finally {
+      setLoading(btn, false);
+    }
+  };
+
   /** Ping */
   wrap.querySelector('#dPing').onclick = async (ev) => {
     if (!currentAid) return;
@@ -395,6 +454,54 @@ export async function renderDiscover(mount, ctx) {
     }
   };
 
+  /** Tunnel */
+  wrap.querySelector('#dTunnel').onclick = async (ev) => {
+    if (!currentAid) return;
+    const out = wrap.querySelector('#dTunnelOut');
+    const btn = ev.currentTarget;
+    setLoading(btn, true);
+    out.classList.remove('hidden');
+    out.innerHTML = `<p class="muted">${esc(t('common.loading'))}</p>`;
+    // Close any previously opened tunnel for this target before creating a new one.
+    if (currentTunnelId) {
+      api(`/tunnel/${encodeURIComponent(currentTunnelId)}`, { method: 'DELETE' }).catch(() => {});
+      currentTunnelId = null;
+    }
+    try {
+      const tr = await api(`/tunnel/${encodeURIComponent(currentAid)}`, {
+        method: 'POST',
+        body: '{}',
+      });
+      currentTunnelId = tr.id;
+      const tunnelUrl = 'http://' + tr.listen;
+      out.innerHTML = `
+        <p style="color:var(--success);margin:0 0 .4rem">${esc(t('discover.tunnel.ok'))}</p>
+        <div style="display:flex;align-items:center;gap:.5rem;flex-wrap:wrap;margin-bottom:.4rem">
+          <code class="mono" style="font-size:.9rem">${esc(tr.listen)}</code>
+          <button type="button" class="btn btn-ghost btn-sm" id="dTunnelCp">\u29c9</button>
+          <button type="button" class="btn btn-ghost btn-sm" id="dTunnelClose">${esc(t('discover.tunnel.close'))}</button>
+        </div>
+        <div style="display:flex;gap:.5rem;flex-wrap:wrap;align-items:center">
+          <button type="button" class="btn btn-secondary btn-sm" id="dTunnelOpen">${esc(t('discover.tunnel.open'))}</button>
+          <span class="muted" style="font-size:.82rem">${esc(t('discover.tunnel.open_hint'))}</span>
+        </div>`;
+      out.querySelector('#dTunnelCp').onclick = () => copyText(tr.listen);
+      out.querySelector('#dTunnelOpen').onclick = () => window.open(tunnelUrl, '_blank', 'noopener');
+      out.querySelector('#dTunnelClose').onclick = async () => {
+        if (!currentTunnelId) return;
+        try {
+          await api(`/tunnel/${encodeURIComponent(currentTunnelId)}`, { method: 'DELETE' });
+        } catch (_) {}
+        currentTunnelId = null;
+        out.innerHTML = `<p class="muted">${esc(t('discover.tunnel.closed'))}</p>`;
+      };
+    } catch (e) {
+      out.innerHTML = `<p style="color:var(--error)">${esc(t('common.error', { msg: e.message }))}</p>`;
+    } finally {
+      setLoading(btn, false);
+    }
+  };
+
   /** Agent card */
   wrap.querySelector('#dCard').onclick = async (ev) => {
     if (!currentAid) return;
@@ -404,7 +511,7 @@ export async function renderDiscover(mount, ctx) {
     out.classList.remove('hidden');
     out.innerHTML = `<p class="muted">${esc(t('discover.card.fetching'))}</p>`;
     try {
-      const got = await fetchAgentCardThroughTunnel(api, currentAid);
+      const got = await fetchAgentCard(api, currentAid);
       if (!got) {
         out.innerHTML = `<p class="muted">${esc(t('discover.card_failed'))}</p>`;
         return;
@@ -432,13 +539,14 @@ export async function renderDiscover(mount, ctx) {
     req.dataset.mounted = '1';
     const opts = `<option value="">${esc(t('discover.req.node_identity'))}</option>${agents.map((a) => `<option value="${esc(a.aid)}">${esc(shortAid(a.aid))}</option>`).join('')}`;
     req.innerHTML = `
-      <h4 style="font-size:.95rem;margin:0 0 .5rem">${esc(t('discover.req.title'))}</h4>
+      <h4 style="font-size:.95rem;margin:0 0 .25rem">${esc(t('discover.req.title'))}</h4>
+      <p class="muted" style="font-size:.82rem;margin:0 0 .5rem">🔒 ${esc(t('discover.req.encrypted'))}</p>
       <div class="field">
         <label>${esc(t('discover.req.identity'))}</label>
         <select id="rqAid">${opts}</select>
       </div>
       <div class="field" style="display:flex;gap:.5rem;flex-wrap:wrap;align-items:center">
-        <select id="rqM"><option>GET</option><option>POST</option></select>
+        <select id="rqM"><option>GET</option><option>POST</option><option>PUT</option><option>DELETE</option><option>PATCH</option></select>
         <input type="text" id="rqP" style="flex:1;min-width:8rem" placeholder="/" value="/" />
         <button type="button" class="btn btn-primary" id="rqGo">${esc(t('discover.req.send'))}</button>
       </div>
@@ -452,7 +560,8 @@ export async function renderDiscover(mount, ctx) {
     const m = req.querySelector('#rqM');
     const bw = req.querySelector('#rqBodyW');
     m.onchange = () => {
-      if (m.value === 'POST') bw.classList.remove('hidden');
+      const needsBody = ['POST', 'PUT', 'PATCH'].includes(m.value);
+      if (needsBody) bw.classList.remove('hidden');
       else bw.classList.add('hidden');
     };
     req.querySelector('#rqGo').onclick = async (ev) => {
@@ -464,29 +573,28 @@ export async function renderDiscover(mount, ctx) {
       const localAid = req.querySelector('#rqAid').value;
       const t0 = performance.now();
       try {
-        const connectBody = localAid ? { local_aid: localAid } : {};
-        const cr = await api(`/connect/${encodeURIComponent(currentAid)}`, {
-          method: 'POST',
-          body: JSON.stringify(connectBody),
-        });
-        const base = 'http://' + cr.tunnel;
-        const url = base + (path.startsWith('/') ? path : '/' + path);
-        const opt = { method };
-        if (method === 'POST') {
-          opt.headers = { 'Content-Type': 'application/json' };
-          opt.body = req.querySelector('#rqB').value || '{}';
+        const fetchBody = { method, path };
+        if (localAid) fetchBody.local_aid = localAid;
+        const needsBody = ['POST', 'PUT', 'PATCH'].includes(method);
+        if (needsBody) {
+          const rawBody = req.querySelector('#rqB').value || '{}';
+          fetchBody.body_base64 = utf8ToBase64(rawBody);
+          fetchBody.headers = { 'Content-Type': ['application/json'] };
         }
-        const res = await fetch(url, opt);
-        const txt = await res.text();
-        let disp = txt;
-        try {
-          disp = JSON.stringify(JSON.parse(txt), null, 2);
-        } catch (_) {}
-        req.querySelector('#rqOut').textContent = disp;
-        req.querySelector('#rqMeta').textContent = t('discover.req.status', {
-          code: res.status,
-          ms: Math.round(performance.now() - t0),
+        const r = await api(`/fetch/${encodeURIComponent(currentAid)}`, {
+          method: 'POST',
+          body: JSON.stringify(fetchBody),
         });
+        const text = base64ToUtf8(r.body);
+        let disp = text;
+        try {
+          disp = JSON.stringify(JSON.parse(text), null, 2);
+        } catch (_) {}
+        req.querySelector('#rqOut').textContent = disp || '(empty)';
+        const statusColor = r.status < 300 ? 'var(--success)' : r.status < 500 ? 'var(--warn, #c07800)' : 'var(--error)';
+        const truncNote = r.truncated ? `  ⚠ ${esc(t('discover.req.truncated'))}` : '';
+        req.querySelector('#rqMeta').innerHTML =
+          `<span style="color:${statusColor};font-weight:600">${r.status}</span>  •  ${Math.round(performance.now() - t0)} ms${truncNote}`;
       } catch (e) {
         req.querySelector('#rqOut').textContent = e.message;
         req.querySelector('#rqMeta').textContent = '';
