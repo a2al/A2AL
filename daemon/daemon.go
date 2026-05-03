@@ -18,12 +18,15 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/quic-go/quic-go"
+
 	"github.com/a2al/a2al"
 	"github.com/a2al/a2al/config"
 	"github.com/a2al/a2al/host"
 	"github.com/a2al/a2al/internal/nodeks"
 	"github.com/a2al/a2al/internal/peerscache"
 	"github.com/a2al/a2al/internal/registry"
+	"github.com/a2al/a2al/protocol"
 	"github.com/a2al/a2al/signaling"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -76,9 +79,13 @@ type Daemon struct {
 
 	iceRegNotify chan struct{} // ICE /signal registration refresh (buffered)
 
-	demo         *demoServer   // built-in demo capability server (nil until New())
+	demo         *demoServer    // built-in demo capability server (nil until New())
 	gatewayConns atomic.Int64  // active gateway QUIC conns (direct + ICE)
 	sessions     sync.Map      // int (daemon-side TCP source port) → *sessionInfo
+
+	// connPool caches outbound Mode A data-plane QUIC connections for execFetch.
+	// Connections are established on demand and evicted passively (no keepalive).
+	connPool *modeAConnPool
 
 	netMu                sync.Mutex
 	netStableFP          string
@@ -196,14 +203,15 @@ func New(cfg Config) (*Daemon, error) {
 		return nil, err
 	}
 
-	return &Daemon{
+	nodeAddr := ks.Address()
+	d := &Daemon{
 		dataDir:          cfg.DataDir,
 		cfgPath:          cfgPath,
 		cfg:              &nodeCfg,
 		log:              log,
 		h:                h,
 		reg:              reg,
-		nodeAddr:         ks.Address(),
+		nodeAddr:         nodeAddr,
 		agentLastPublish: make(map[a2al.Address]time.Time),
 		heartbeatAt:      make(map[a2al.Address]time.Time),
 		mailboxSeen:      make(map[string]map[string]time.Time),
@@ -211,7 +219,16 @@ func New(cfg Config) (*Daemon, error) {
 		netChangeNotify:  make(chan struct{}, 1),
 		beacon:           newBeaconManager(h.Node(), &nodeCfg, log),
 		demo:             newDemoServer(),
-	}, nil
+	}
+	// connPool dial function: use node identity by default, agent cert when
+	// a registered local AID is specified (mirrors execConnect's pickLocalAgent).
+	d.connPool = newModeAConnPool(func(ctx context.Context, local, remote a2al.Address, er *protocol.EndpointRecord) (quic.Connection, error) {
+		if local == nodeAddr {
+			return h.ConnectFromRecord(ctx, remote, er)
+		}
+		return h.ConnectFromRecordFor(ctx, local, remote, er)
+	}, log)
+	return d, nil
 }
 
 // toHostTURNServers converts config.TURNServerConfig slice to host.TURNServer slice,
@@ -256,6 +273,7 @@ func (d *Daemon) Run(ctx context.Context, mcpStdio bool) error {
 		if closeSignalHub != nil {
 			closeSignalHub()
 		}
+		d.connPool.Close()
 		savePeersCache(filepath.Join(d.dataDir, "peers.cache"), d.h, d.log)
 		_ = d.h.Close()
 	}()

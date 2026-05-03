@@ -49,6 +49,7 @@ func (d *Daemon) routes() http.Handler {
 	mux.HandleFunc("GET /resolve/{aid}/records", d.handleResolveRecords)
 	mux.HandleFunc("POST /resolve/{aid}", d.handleResolve)
 	mux.HandleFunc("POST /connect/{aid}", d.handleConnect)
+	mux.HandleFunc("POST /fetch/{aid}", d.handleFetch)
 	mux.Handle("/debug/", d.h.DebugHTTPHandler())
 	mux.Handle("/mcp/", d.mcpHTTPHandler())
 	mux.HandleFunc("POST /demo/start", d.handleDemoStart)

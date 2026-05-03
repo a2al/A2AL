@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/a2al/a2al"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -118,6 +119,10 @@ func buildMCPServer(d *Daemon) *mcp.Server {
 		Name:        "a2al_discover",
 		Description: "Search the Tangled Network for agents offering specific capabilities. Returns matching agents with their names, protocols, and AIDs. Optionally filter by protocol (e.g. 'mcp', 'a2a') or tags.",
 	}, d.mcpDiscover)
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "a2al_fetch",
+		Description: "Make an HTTP request to a remote agent's service through the Tangled Network. The request travels end-to-end encrypted via QUIC; no ports are exposed. Returns HTTP status, headers, and body. Use for querying a remote agent's REST API, health check, or any HTTP endpoint it serves.",
+	}, d.mcpFetch)
 
 	return s
 }
@@ -453,4 +458,42 @@ func structToMap(v any) (map[string]any, error) {
 		return nil, err
 	}
 	return m, nil
+}
+
+// ── a2al_fetch ────────────────────────────────────────────────────────────────
+
+// mcpFetchArgs extends fetchReq with a required remote_aid field.
+// All other fetch parameters are promoted from the embedded fetchReq.
+type mcpFetchArgs struct {
+	RemoteAID string `json:"remote_aid"`
+	fetchReq
+}
+
+func (d *Daemon) mcpFetch(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[mcpFetchArgs]) (*mcp.CallToolResultFor[map[string]any], error) {
+	remoteAID, err := a2al.ParseAddress(params.Arguments.RemoteAID)
+	if err != nil {
+		return nil, errors.New("bad remote_aid")
+	}
+	localAID, err := resolveLocalAID(params.Arguments.LocalAID, d.nodeAddr)
+	if err != nil {
+		return nil, errors.New("bad local_aid")
+	}
+	fctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	result, err := d.execFetch(fctx, localAID, remoteAID, params.Arguments.fetchReq)
+	if err != nil {
+		switch {
+		case errors.Is(err, errResolve):
+			return nil, errors.New("resolve failed: remote agent not found on the network")
+		case errors.Is(err, errConnectQUIC):
+			return nil, errors.New("connect failed: could not establish QUIC connection to remote agent")
+		default:
+			return nil, err
+		}
+	}
+	m, err := structToMap(result)
+	if err != nil {
+		return nil, err
+	}
+	return &mcp.CallToolResultFor[map[string]any]{StructuredContent: m}, nil
 }
