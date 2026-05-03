@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -724,10 +725,9 @@ func cmdInfo(c *Client, g globalOpts, args []string) {
 		fmt.Printf("Seq:        %.0f\n", seq)
 	}
 
-	// Attempt to fetch agent card via tunnel. Output L1 info above first so
-	// the user sees something immediately; the fetch may take a few seconds.
-	fmt.Fprintln(os.Stderr, "\nFetching agent card... (Ctrl+C to skip)")
-	card, src, err := tryFetchCardViaTunnel(c, aid)
+	// Fetch agent card via daemon's encrypted fetch API.
+	fmt.Fprintln(os.Stderr, "\nFetching agent card...")
+	card, src, err := tryFetchCard(c, aid)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "(no agent card: %v)\n", err)
 		return
@@ -750,38 +750,36 @@ func cmdInfo(c *Client, g globalOpts, args []string) {
 	}
 }
 
-// tryFetchCardViaTunnel establishes a QUIC tunnel to remoteAID and fetches
-// /.well-known/agent.json (A2A) or /.well-known/mcp.json (MCP).
+// tryFetchCard fetches /.well-known/agent.json (A2A) or /.well-known/mcp.json
+// (MCP) from a remote agent via the daemon's POST /fetch/{aid} endpoint.
 // Returns (nil, "", err) when no card is available.
-func tryFetchCardViaTunnel(c *Client, remoteAID string) (*topicDraft, string, error) {
-	var tun map[string]string
-	if _, _, err := c.DoRequest(http.MethodPost, "/connect/"+remoteAID, map[string]any{}, &tun); err != nil {
-		return nil, "", fmt.Errorf("connect: %w", err)
+func tryFetchCard(c *Client, remoteAID string) (*topicDraft, string, error) {
+	type fetchResp struct {
+		Status int    `json:"status"`
+		Body   string `json:"body"` // base64-encoded
 	}
-	addr := tun["tunnel"]
-	if addr == "" {
-		return nil, "", fmt.Errorf("no tunnel address returned")
+	type pathSrc struct {
+		path string
+		src  string
 	}
-	hc := &http.Client{Timeout: 15 * time.Second}
-	try := func(path string) ([]byte, error) {
-		resp, err := hc.Get("http://" + addr + path)
+	for _, ps := range []pathSrc{
+		{"/.well-known/agent.json", "A2A Agent Card"},
+		{"/.well-known/mcp.json", "MCP Server Card"},
+	} {
+		var resp fetchResp
+		if _, _, err := c.DoRequest(http.MethodPost, "/fetch/"+remoteAID,
+			map[string]any{"path": ps.path}, &resp); err != nil {
+			continue
+		}
+		if resp.Status < 200 || resp.Status >= 300 {
+			continue
+		}
+		b, err := base64.StdEncoding.DecodeString(resp.Body)
 		if err != nil {
-			return nil, err
+			continue
 		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("http %d", resp.StatusCode)
-		}
-		return io.ReadAll(resp.Body)
-	}
-	if b, err := try("/.well-known/agent.json"); err == nil {
 		if d, _, err := parseAgentCardJSON(b); err == nil {
-			return d, "A2A Agent Card", nil
-		}
-	}
-	if b, err := try("/.well-known/mcp.json"); err == nil {
-		if d, _, err := parseAgentCardJSON(b); err == nil {
-			return d, "MCP Server Card", nil
+			return d, ps.src, nil
 		}
 	}
 	return nil, "", fmt.Errorf("agent card not available")
@@ -798,7 +796,7 @@ func cmdGet(c *Client, g globalOpts, args []string) {
 	}
 	localAID, rest := extractLocalAID(args[2:])
 	headers := parseHeaders(rest)
-	doHTTPThroughTunnel(c, g, http.MethodGet, remote, path, nil, headers, localAID)
+	doHTTPFetch(c, g, http.MethodGet, remote, path, nil, headers, localAID)
 }
 
 func cmdPost(c *Client, g globalOpts, args []string) {
@@ -835,7 +833,7 @@ func cmdPost(c *Client, g globalOpts, args []string) {
 	}
 	localAID, hdrArgs2 := extractLocalAID(hdrArgs)
 	headers := parseHeaders(hdrArgs2)
-	doHTTPThroughTunnel(c, g, http.MethodPost, remote, path, body, headers, localAID)
+	doHTTPFetch(c, g, http.MethodPost, remote, path, body, headers, localAID)
 }
 
 func parseHeaders(args []string) http.Header {
@@ -881,57 +879,75 @@ func resolveLocalIdentityLabel(c *Client, localAID string) string {
 	return "node (default)"
 }
 
-func doHTTPThroughTunnel(c *Client, g globalOpts, method, remoteAID, path string, body io.Reader, extra http.Header, localAID string) {
-	connectBody := map[string]any{}
-	if localAID != "" {
-		connectBody["local_aid"] = localAID
-	}
+// doHTTPFetch sends an HTTP request to a remote agent via the daemon's
+// POST /fetch/{aid} endpoint. The daemon handles QUIC negotiation and NAT
+// traversal; the CLI never touches the transport layer directly.
+func doHTTPFetch(c *Client, g globalOpts, method, remoteAID, path string, body io.Reader, extra http.Header, localAID string) {
 	if !g.Quiet && !g.JSON {
 		label := resolveLocalIdentityLabel(c, localAID)
 		fmt.Fprintf(os.Stderr, "Connecting as %s → %s\n", label, shortAID(remoteAID))
 	}
-	var tun map[string]string
-	if _, _, err := c.DoRequest(http.MethodPost, "/connect/"+remoteAID, connectBody, &tun); err != nil {
-		fatal(err)
+
+	req := map[string]any{
+		"method": method,
+		"path":   path,
 	}
-	addr := tun["tunnel"]
-	if addr == "" {
-		fatal(fmt.Errorf("no tunnel in response"))
+	if localAID != "" {
+		req["local_aid"] = localAID
 	}
-	url := "http://" + addr + path
-	req, err := http.NewRequest(method, url, body)
-	if err != nil {
-		fatal(err)
+	if len(extra) > 0 {
+		hdrs := make(map[string][]string)
+		for k, vs := range extra {
+			hdrs[k] = vs
+		}
+		req["headers"] = hdrs
 	}
-	for k, vv := range extra {
-		for _, v := range vv {
-			req.Header.Add(k, v)
+	if body != nil {
+		b, err := io.ReadAll(body)
+		if err != nil {
+			fatal(err)
+		}
+		if len(b) > 0 {
+			if method == http.MethodPost && extra.Get("Content-Type") == "" {
+				if req["headers"] == nil {
+					req["headers"] = map[string][]string{}
+				}
+				req["headers"].(map[string][]string)["Content-Type"] = []string{"application/json"}
+			}
+			req["body_base64"] = base64.StdEncoding.EncodeToString(b)
 		}
 	}
-	if method == http.MethodPost && req.Header.Get("Content-Type") == "" {
-		req.Header.Set("Content-Type", "application/json")
+
+	var resp struct {
+		Status    int                 `json:"status"`
+		Headers   map[string][]string `json:"headers"`
+		Body      string              `json:"body"` // base64-encoded
+		Truncated bool                `json:"truncated"`
 	}
-	resp, err := c.HTTP.Do(req)
-	if err != nil {
+	if _, _, err := c.DoRequest(http.MethodPost, "/fetch/"+remoteAID, req, &resp); err != nil {
 		fatal(err)
 	}
-	defer resp.Body.Close()
-	b, err := io.ReadAll(resp.Body)
-	if err != nil {
-		fatal(err)
-	}
+
+	bodyBytes, _ := base64.StdEncoding.DecodeString(resp.Body)
 	if g.JSON {
-		printJSON(true, map[string]any{"status": resp.StatusCode, "body": string(b)})
+		printJSON(true, map[string]any{
+			"status":  resp.Status,
+			"headers": resp.Headers,
+			"body":    string(bodyBytes),
+		})
 		return
 	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		fmt.Fprintf(os.Stderr, "a2al: HTTP %s\n", resp.Status)
+	if resp.Status < 200 || resp.Status >= 300 {
+		fmt.Fprintf(os.Stderr, "a2al: HTTP %d\n", resp.Status)
 	}
-	os.Stdout.Write(b)
-	if len(b) > 0 && b[len(b)-1] != '\n' {
+	os.Stdout.Write(bodyBytes)
+	if len(bodyBytes) > 0 && bodyBytes[len(bodyBytes)-1] != '\n' {
 		fmt.Println()
 	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+	if resp.Truncated {
+		fmt.Fprintln(os.Stderr, "a2al: warning: response body truncated (> 4 MiB)")
+	}
+	if resp.Status < 200 || resp.Status >= 300 {
 		os.Exit(1)
 	}
 }

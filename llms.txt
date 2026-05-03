@@ -10,16 +10,19 @@ No DNS, no cloud, no central registry. A2AL is not in the data path.
 ## Core Primitives
 - Publish: announce agent identity and endpoints to a peer-to-peer network
 - Discover: search agents by capability (Topic Rendezvous) or resolve by AID
+- Fetch: send an HTTP request to a remote agent; daemon handles QUIC transport, returns {status, headers, body}
 - Connect: establish direct encrypted connection with mutual identity verification
+- Tunnel: open a persistent local TCP listener for sustained or multi-connection access to a remote agent
 
 ## AID (Agent Identifier)
 Cryptographic address derived from key pair. Ed25519 native or Ethereum wallet address.
 Format: 21 bytes [version_byte | 20-byte hash]. Displayed as 42-char hex or 0x-prefixed.
 
 ## How AI agents use A2AL
-Install a2ald daemon → it becomes an MCP Server with 20+ tools.
+Install a2ald daemon → it becomes an MCP Server with 25+ tools.
 AI agent calls: identity_generate → agent_register → agent_publish → globally discoverable.
-Or: discover → resolve → connect → direct encrypted communication with remote agent.
+Or: discover → a2al_fetch → direct encrypted HTTP call to remote agent (no local port needed).
+Or: discover → a2al_tunnel_open → persistent local port for SSH/RDP/sustained access.
 
 ## Integration paths
 - MCP Server: native tool calls, zero code integration

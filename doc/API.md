@@ -200,7 +200,12 @@ Binds to `config.Config.APIAddr` (default `127.0.0.1:2121`). If `api_token` is s
 | `POST` | `/discover` | `{"services":["..."],"filter":{"protocols":[],"tags":[]}}` → `{"entries":[{"service","aid","name",...},...]}`. |
 | `GET` | `/resolve/{aid}/records?type={rec_type}` | List verified `SignedRecord`s for remote AID; omit `type` or `type=0` for all RecTypes. Response `records[]` with `payload_base64`, `pubkey_base64`, `signature_base64`, etc. |
 | `POST` | `/resolve/{aid}` | Resolve remote AID to endpoint record JSON. |
-| `POST` | `/connect/{aid}` | Outbound tunnel: returns `{"tunnel":"127.0.0.1:<port>"}`; optional JSON `{"local_aid":"..."}` if multiple local agents. |
+| `POST` | `/connect/{aid}` | One-shot tunnel: returns `{"tunnel":"127.0.0.1:<port>"}`. Tunnel closes when TCP connection closes. Optional `{"local_aid":"..."}`. |
+| `POST` | `/fetch/{aid}` | Send HTTP request to remote agent over QUIC; daemon handles transport internally. Request: `{"method","path","headers","body_base64","local_aid"}`. Response: `{"status","headers","body"(base64),"truncated"}`. |
+| `POST` | `/tunnel/{aid}` | Open persistent multiplexed tunnel (multiple concurrent TCP connections over one QUIC stream pool). Returns `{"id","listen","remote_aid"}`. Optional `{"local_aid","idle_timeout_sec"}`. |
+| `DELETE` | `/tunnel/{id}` | Close persistent tunnel by ID. Returns `{"ok":true}`. |
+| `GET` | `/tunnel` | List active persistent tunnels: `{"tunnels":[{"id","listen","remote_aid","active_conns"},...]}`. |
+| `GET` | `/tunnel/{id}` | Status of a single persistent tunnel. |
 | `GET` | `/debug/...` | Same as `Host.DebugHTTPHandler()` (includes `/debug/host`). |
 | (MCP) | `/mcp/` | Streamable HTTP handler from `modelcontextprotocol/go-sdk` (see below). |
 
@@ -209,7 +214,7 @@ Binds to `config.Config.APIAddr` (default `127.0.0.1:2121`). If `api_token` is s
 - **Streamable HTTP**: mounted at `/mcp/` on the API server.  
 - **Stdio**: run `a2ald -mcp-stdio` (no HTTP API in that mode).
 
-All tools: `a2al_identity_generate`, `a2al_agents_generate_ethereum`, `a2al_ethereum_delegation_message`, `a2al_ethereum_register`, `a2al_ethereum_proof`, `a2al_agents_list`, `a2al_agent_register`, `a2al_agent_get`, `a2al_agent_patch`, `a2al_agent_publish`, `a2al_agent_heartbeat`, `a2al_agent_delete`, `a2al_agent_publish_record`, `a2al_status`, `a2al_resolve_records`, `a2al_resolve`, `a2al_connect`, `a2al_mailbox_send`, `a2al_mailbox_poll`, `a2al_service_register`, `a2al_service_unregister`, `a2al_discover`.
+All tools: `a2al_identity_generate`, `a2al_agents_generate_ethereum`, `a2al_ethereum_delegation_message`, `a2al_ethereum_register`, `a2al_ethereum_proof`, `a2al_agents_list`, `a2al_agent_register`, `a2al_agent_get`, `a2al_agent_patch`, `a2al_agent_publish`, `a2al_agent_heartbeat`, `a2al_agent_delete`, `a2al_agent_publish_record`, `a2al_status`, `a2al_resolve_records`, `a2al_resolve`, `a2al_connect`, `a2al_fetch`, `a2al_tunnel_open`, `a2al_tunnel_close`, `a2al_tunnel_list`, `a2al_mailbox_send`, `a2al_mailbox_poll`, `a2al_service_register`, `a2al_service_unregister`, `a2al_discover`.
 
 ---
 

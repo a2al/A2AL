@@ -264,9 +264,9 @@ Fetch raw `SignedRecord`s for a remote AID. Omit `type` or set `type=0` for all 
 
 #### `POST /connect/{aid}`
 
-Establish a direct encrypted tunnel to a remote agent. Returns a local TCP address your application connects to.
+Open a **one-shot** encrypted tunnel to a remote agent. Returns a local TCP address your application connects to. The tunnel is released when the TCP connection closes.
 
-**Request (optional — only needed when multiple local agents are registered):**
+**Request (optional):**
 
 ```json
 {"local_aid": "a2alXYZ..."}
@@ -278,7 +278,94 @@ Establish a direct encrypted tunnel to a remote agent. Returns a local TCP addre
 {"tunnel": "127.0.0.1:54321"}
 ```
 
-Connect your application to `127.0.0.1:54321`. Traffic is forwarded over the QUIC tunnel to the remote agent. The tunnel closes when your TCP connection closes.
+> For multiple concurrent connections to the same remote agent, use the persistent tunnel API below.
+
+#### `POST /fetch/{aid}`
+
+Send an HTTP request to a remote agent over an encrypted QUIC connection. The daemon handles NAT traversal and connection reuse internally — no local TCP port is required.
+
+**Request:**
+
+```json
+{
+  "method": "GET",
+  "path": "/.well-known/agent.json",
+  "headers": {"Accept": ["application/json"]},
+  "body_base64": "",
+  "local_aid": "a2alXYZ..."
+}
+```
+
+`method` defaults to `GET`. `headers`, `body_base64`, and `local_aid` are optional.
+
+**Response:**
+
+```json
+{
+  "status": 200,
+  "headers": {"Content-Type": ["application/json"]},
+  "body": "<base64-encoded response body>",
+  "truncated": false
+}
+```
+
+`body` is base64-encoded. `truncated` is `true` when the response body exceeded the 4 MiB limit and was cut off.
+
+#### `POST /tunnel/{aid}`
+
+Open a **persistent multiplexed** encrypted tunnel. A single tunnel accepts any number of concurrent TCP connections, each mapped to a new QUIC stream over the same pooled QUIC connection.
+
+**Request (all fields optional):**
+
+```json
+{
+  "local_aid": "a2alXYZ...",
+  "idle_timeout_sec": 90
+}
+```
+
+**Response:**
+
+```json
+{
+  "id": "tun_abc123",
+  "listen": "127.0.0.1:58320",
+  "remote_aid": "a2alRemote..."
+}
+```
+
+Connect any number of TCP clients to `listen`. The tunnel persists until explicitly closed or the QUIC connection idles out (`idle_timeout_sec`, default 90 s).
+
+#### `DELETE /tunnel/{id}`
+
+Close a persistent tunnel by ID. All in-flight connections are terminated immediately.
+
+**Response:** `{"ok": true}`
+
+#### `GET /tunnel`
+
+List all active persistent tunnels.
+
+**Response:**
+
+```json
+{
+  "tunnels": [
+    {
+      "id": "tun_abc123",
+      "listen": "127.0.0.1:58320",
+      "remote_aid": "a2alRemote...",
+      "active_conns": 2
+    }
+  ]
+}
+```
+
+#### `GET /tunnel/{id}`
+
+Get the status of a single persistent tunnel.
+
+**Response:** same shape as one element of the `tunnels` array above.
 
 ---
 
@@ -421,7 +508,11 @@ See [MCP Setup](mcp-setup.md) for platform-specific config snippets.
 | `a2al_status` | Daemon status: node AID, auto-publish state, last/next publish times. |
 | `a2al_resolve` | Look up a remote agent's current endpoints by AID. |
 | `a2al_resolve_records` | Fetch all signed records published by a remote agent. |
-| `a2al_connect` | Open a direct encrypted tunnel to a remote agent. Returns `127.0.0.1:<port>`. |
+| `a2al_connect` | Open a one-shot encrypted tunnel to a remote agent. Returns `127.0.0.1:<port>`. |
+| `a2al_fetch` | Send an HTTP request to a remote agent over an encrypted QUIC connection. Returns `{status, headers, body}`. No local TCP port required. |
+| `a2al_tunnel_open` | Open a persistent multiplexed encrypted tunnel. Returns `{id, listen}`. |
+| `a2al_tunnel_close` | Close a persistent tunnel by ID. |
+| `a2al_tunnel_list` | List all active persistent tunnels. |
 | `a2al_mailbox_send` | Send an encrypted note to any agent (offline delivery supported). |
 | `a2al_mailbox_poll` | Retrieve pending incoming notes for a local agent. |
 | `a2al_service_register` | Publish capability tags for an agent (e.g. `lang.translate`, `code.review`). |

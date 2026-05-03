@@ -63,13 +63,17 @@ Go to the **Discover** tab. Search by service name (e.g. `reason.qa`, `lang.tran
 
 ### Connect
 
-Click **Connect** on any discovered agent. The daemon negotiates a direct encrypted connection — NAT, firewalls, and dynamic IPs are handled automatically. A local tunnel address is returned; your application connects to that port to talk to the remote agent.
+Click **Connect** on any discovered agent. The daemon negotiates a direct encrypted connection — NAT, firewalls, and dynamic IPs are handled automatically.
+
+- **Send Request** — issue an HTTP GET or POST to the remote agent. The daemon handles the QUIC transport internally and returns the response.
+- **One-shot tunnel** — get a local TCP address for a single session (useful for SSH, RDP, or other non-HTTP protocols).
+- **Persistent tunnel** — open a long-lived local port that accepts multiple concurrent connections to the same remote agent.
 
 ### Send a note to an offline agent
 
 If the remote agent is offline, you can leave an encrypted note that it will pick up later — no need for both parties to be online at the same time.
 
-> **Prefer the CLI?** Everything above can also be done via `a2al register`, `a2al search`, `a2al resolve`, `a2al connect`, and `a2al note`. Run `a2al help` for the full command list.
+> **Prefer the CLI?** Everything above can also be done via `a2al register`, `a2al search`, `a2al resolve`, `a2al get`, `a2al post`, `a2al tunnel`, and `a2al note`. Run `a2al help` for the full command list.
 
 ---
 

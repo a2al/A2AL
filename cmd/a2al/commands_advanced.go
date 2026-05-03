@@ -393,6 +393,137 @@ func cmdConnect(c *Client, g globalOpts, args []string) {
 	fmt.Println(addr)
 }
 
+// cmdTunnel manages persistent multiplexed encrypted tunnels.
+//
+//	a2al tunnel                          — list active tunnels
+//	a2al tunnel open <aid> [flags]       — open a persistent tunnel
+//	a2al tunnel close <id>               — close a tunnel by ID
+//	a2al tunnel status <id>              — show tunnel status
+func cmdTunnel(c *Client, g globalOpts, args []string) {
+	if len(args) == 0 {
+		listTunnels(c, g)
+		return
+	}
+	switch args[0] {
+	case "open":
+		if len(args) < 2 {
+			fatalf("usage: a2al tunnel open <remote-aid> [--local-aid …] [--idle-timeout N]")
+		}
+		tunnelOpen(c, g, args[1:])
+	case "close":
+		if len(args) != 2 {
+			fatalf("usage: a2al tunnel close <id>")
+		}
+		tunnelClose(c, g, args[1])
+	case "status":
+		if len(args) != 2 {
+			fatalf("usage: a2al tunnel status <id>")
+		}
+		tunnelStatus(c, g, args[1])
+	default:
+		fatalf("unknown tunnel subcommand: %s\n\nUsage:\n  a2al tunnel\n  a2al tunnel open <aid> [--local-aid …] [--idle-timeout N]\n  a2al tunnel close <id>\n  a2al tunnel status <id>", args[0])
+	}
+}
+
+func listTunnels(c *Client, g globalOpts) {
+	var out struct {
+		Tunnels []map[string]any `json:"tunnels"`
+	}
+	if _, _, err := c.DoRequest(http.MethodGet, "/tunnel", nil, &out); err != nil {
+		fatal(err)
+	}
+	if g.JSON {
+		printJSON(true, out)
+		return
+	}
+	if g.Quiet {
+		for _, t := range out.Tunnels {
+			fmt.Println(t["id"])
+		}
+		return
+	}
+	if len(out.Tunnels) == 0 {
+		fmt.Println("No active tunnels.")
+		return
+	}
+	for _, t := range out.Tunnels {
+		id, _ := t["id"].(string)
+		listen, _ := t["listen"].(string)
+		remote, _ := t["remote_aid"].(string)
+		conns, _ := t["active_conns"].(float64)
+		fmt.Printf("%-20s  %-22s  →  %-22s  connections: %.0f\n",
+			id, listen, shortAID(remote), conns)
+	}
+}
+
+func tunnelOpen(c *Client, g globalOpts, args []string) {
+	remote := args[0]
+	la := flagString(args[1:], "--local-aid")
+	idleStr := flagString(args[1:], "--idle-timeout")
+
+	body := map[string]any{}
+	if la != "" {
+		body["local_aid"] = la
+	}
+	if idleStr != "" {
+		var n int
+		if _, err := fmt.Sscanf(idleStr, "%d", &n); err != nil {
+			fatalf("invalid --idle-timeout: %v", err)
+		}
+		body["idle_timeout_sec"] = n
+	}
+
+	if !g.Quiet && !g.JSON {
+		label := resolveLocalIdentityLabel(c, la)
+		fmt.Fprintf(os.Stderr, "Opening tunnel as %s → %s\n", label, shortAID(remote))
+	}
+	var tun map[string]any
+	if _, _, err := c.DoRequest(http.MethodPost, "/tunnel/"+url.PathEscape(remote), body, &tun); err != nil {
+		fatal(err)
+	}
+	if g.JSON {
+		printJSON(true, tun)
+		return
+	}
+	listen, _ := tun["listen"].(string)
+	id, _ := tun["id"].(string)
+	if g.Quiet {
+		fmt.Println(listen)
+		return
+	}
+	fmt.Printf("Tunnel:  %s\n", listen)
+	fmt.Printf("ID:      %s\n", id)
+	fmt.Println("Supports multiple concurrent connections. Use `a2al tunnel close <id>` to close.")
+}
+
+func tunnelClose(c *Client, g globalOpts, id string) {
+	if _, _, err := c.DoRequest(http.MethodDelete, "/tunnel/"+url.PathEscape(id), nil, new(map[string]any)); err != nil {
+		fatal(err)
+	}
+	if g.JSON {
+		printJSON(true, map[string]any{"ok": true})
+	} else if !g.Quiet {
+		fmt.Println("closed", id)
+	}
+}
+
+func tunnelStatus(c *Client, g globalOpts, id string) {
+	var t map[string]any
+	if _, _, err := c.DoRequest(http.MethodGet, "/tunnel/"+url.PathEscape(id), nil, &t); err != nil {
+		fatal(err)
+	}
+	if g.JSON || g.Quiet {
+		printJSON(true, t)
+		return
+	}
+	listen, _ := t["listen"].(string)
+	remote, _ := t["remote_aid"].(string)
+	conns, _ := t["active_conns"].(float64)
+	fmt.Printf("Listen:       %s\n", listen)
+	fmt.Printf("Remote:       %s\n", remote)
+	fmt.Printf("Connections:  %.0f\n", conns)
+}
+
 func cmdNote(c *Client, g globalOpts, args []string) {
 	if len(args) < 1 {
 		fatalf("usage: a2al note send|poll …")
@@ -510,9 +641,25 @@ Global flags:
   --json          JSON output
   --quiet         Minimal output
 
-Commands:
-  status, register, publish, unpublish, search, info, get, post
-  agents, identity, resolve, connect, note, config, help
+Commands (everyday use):
+  status          Show daemon and registered agents
+  register        Register a new agent identity
+  publish         Publish a service to the Tangled Network
+  unpublish       Remove a service from the Tangled Network
+  search          Search for agents by service name
+  info            Fetch agent info and card from a remote AID
+  get             HTTP GET to a remote agent (encrypted, NAT-traversing)
+  post            HTTP POST to a remote agent (encrypted, NAT-traversing)
+
+Commands (advanced):
+  agents          Manage local agents
+  identity        Generate raw identity material
+  resolve         Look up a remote AID's current endpoints
+  connect         Open a one-shot encrypted tunnel to a remote agent
+  tunnel          Manage persistent multiplexed encrypted tunnels
+  note            Send / poll encrypted offline messages
+  config          Get or set daemon configuration
+  help            Show this help
 
 Examples:
   a2al status
@@ -522,5 +669,9 @@ Examples:
   a2al search lang.translate
   a2al info <aid>
   a2al get <aid> /.well-known/agent.json
+  a2al post <aid> /tasks -d '{"text":"hello"}'
+  a2al tunnel open <aid>
+  a2al tunnel
+  a2al tunnel close <id>
 `)
 }

@@ -126,9 +126,15 @@ You can narrow results by tag: `a2al search reason.analyze --filter-tag finance`
 
 Once you have an AID, `a2ald` negotiates a direct QUIC connection with the remote agent. Both sides verify each other's identity cryptographically before the connection is established — no trusted third party involved.
 
-The result is a **local tunnel**: `a2ald` returns `127.0.0.1:<port>` and your application connects to that port. From your application's perspective, it's a plain TCP socket — encryption, NAT traversal, and identity verification happen transparently underneath.
+There are three ways to use a connection, depending on your use case:
 
-This means zero code changes to your existing application. If it can talk over TCP, it can talk to any agent on the Tangled Network.
+**Fetch (recommended for HTTP calls)** — `a2ald` sends the HTTP request internally and returns the response. No local port is allocated. This is what `a2al get` and `a2al post` use under the hood (`POST /fetch/{aid}`).
+
+**One-shot tunnel** — `a2ald` returns `127.0.0.1:<port>` and your application connects to that port for a single TCP session. From your application's perspective, it's a plain TCP socket. The tunnel is released when the TCP connection closes (`POST /connect/{aid}`).
+
+**Persistent tunnel** — a long-lived local TCP listener that accepts any number of concurrent connections, each forwarded over the same QUIC connection. Suitable for sustained access or when multiple clients need to reach the same remote agent simultaneously (`POST /tunnel/{aid}`, managed via `a2al tunnel`).
+
+All three modes handle encryption, NAT traversal, and identity verification transparently.
 
 ---
 
@@ -146,8 +152,7 @@ Your AI coding assistant (running in Cursor, Claude, or any MCP-compatible tool)
 
 1. Calls `a2al_discover` with service `code.review`
 2. Gets back a list of available agents — name, description, AID
-3. Picks one, calls `a2al_connect` to open a tunnel
-4. Sends code over the tunnel, receives a review
+3. Picks one, calls `a2al_fetch` to send code and receive a review in one call
 
 The assistant never knew the reviewer's IP, port, or network location. The entire flow — discovery, identity verification, NAT traversal — was handled by A2AL. This is the core value proposition for AI agents: *capability-based discovery replaces hardcoded dependencies.*
 
@@ -157,7 +162,8 @@ If your AI uses an MCP-compatible tool (Claude Desktop, Cursor, Windsurf, Cline)
 
 - *"Register an agent and publish it to the network"* → the AI calls `a2al_identity_generate`, `a2al_agent_register`, `a2al_agent_publish`
 - *"Find me a translation agent that supports legal documents"* → calls `a2al_discover` with `lang.translate` and a tag filter
-- *"Connect to agent `0x3a7f...`"* → calls `a2al_connect`, gets a tunnel address
+- *"Fetch the status page from agent `0x3a7f...`"* → calls `a2al_fetch`, gets the HTTP response directly
+- *"Open a tunnel to agent `0x3a7f...` for SSH access"* → calls `a2al_tunnel_open`, gets a local port
 
 Your agent is live, discoverable, and connected — without writing a single line of networking code.
 
@@ -177,8 +183,8 @@ A Planner agent evaluates a business expansion strategy. Rather than routing thr
 
 1. Searches for available specialists: `reason.analyze`, `data.search`, `reason.evaluate`, `reason.recommend`
 2. Discovers multiple available agents — with varying expertise, descriptions, and tags
-3. Opens parallel QUIC tunnels to all of them
-4. Sends each a relevant sub-question; collects responses concurrently
+3. Calls `a2al_fetch` in parallel to each of them with a relevant sub-question
+4. Collects responses concurrently — no local ports required
 5. Synthesizes a final recommendation
 
 The composition of the swarm is determined at runtime by what's discoverable — not by what's pre-wired. Agents can join or leave the network freely; the Planner handles partial availability gracefully. This is the Tangled Network as a live capability marketplace.
@@ -241,8 +247,10 @@ Once joined, `a2ald` builds its own routing table and no longer depends on the b
 | **Publish** | Write a signed endpoint record for an AID to the Tangled Network. |
 | **Resolve** | Look up the current endpoints for a given AID. |
 | **Discover** | Search for agents by service capability name. |
-| **Connect** | Negotiate a direct encrypted QUIC connection to a remote agent. Returns a local tunnel address. |
-| **Tunnel** | A local TCP address (`127.0.0.1:<port>`) returned by `connect`; your application writes to this port to reach the remote agent. |
+| **Connect** | Negotiate a direct encrypted QUIC connection to a remote agent. |
+| **Fetch** | Send an HTTP request to a remote agent through the daemon; the daemon handles the QUIC connection internally and returns the HTTP response. No local TCP port required. |
+| **One-shot tunnel** | A local TCP address (`127.0.0.1:<port>`) for a single TCP session to a remote agent. Released when the TCP connection closes. |
+| **Persistent tunnel** | A long-lived local TCP listener that accepts multiple concurrent connections to the same remote agent over a shared QUIC connection. |
 | **Service** | A declared capability published alongside an endpoint record (e.g. `lang.translate`, `code.review`). |
 | **Note** | An encrypted asynchronous message stored on the DHT for an offline recipient to retrieve later. |
 | **Master key** | The private key that derives the AID. Keep offline. Proof of permanent identity ownership. |

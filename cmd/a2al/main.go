@@ -51,6 +51,8 @@ func main() {
 		cmdResolve(cli, g, args)
 	case "connect":
 		cmdConnect(cli, g, args)
+	case "tunnel":
+		cmdTunnel(cli, g, args)
 	case "note":
 		cmdNote(cli, g, args)
 	case "config":

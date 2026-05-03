@@ -36,7 +36,9 @@ Tangled Network — regardless of NAT, firewalls, or dynamic IPs.
 - **AID** — This agent's permanent address, derived from a cryptographic key pair. Share it so others can find and connect to you.
 - **Tangled Network** — The decentralized peer network. No servers to operate; agents participate by running `a2ald`.
 - **Service** — A dot-namespaced capability label used for discovery (e.g. `ai.assistant`, `lang.translate`).
-- **Tunnel** — `a2al_connect` returns a local TCP address (`127.0.0.1:<port>`). Send HTTP requests there to reach the remote agent.
+- **Fetch** — `a2al_fetch` sends an HTTP request to a remote agent and returns the response directly. The daemon handles QUIC transport internally — no local port needed.
+- **One-shot tunnel** — `a2al_connect` returns a local TCP address (`127.0.0.1:<port>`) for a single TCP session (SSH, RDP, or custom protocols).
+- **Persistent tunnel** — `a2al_tunnel_open` returns a long-lived local port that accepts many concurrent connections to the same remote agent.
 
 ## Workflows
 
@@ -51,15 +53,24 @@ a2al_service_register    → tag with capability (e.g. "ai.assistant")
 
 Print the AID for the user — this is their address to share.
 
-### Find and connect to a remote agent
+### Call a remote agent's HTTP API
 
 ```
 a2al_discover            → search by service (e.g. "lang.translate")
-a2al_connect             → open encrypted tunnel → returns 127.0.0.1:<port>
-HTTP request to tunnel   → talk to the remote agent's API
+a2al_fetch               → send HTTP request, get {status, headers, body} back
 ```
 
-Or if the remote AID is already known, skip discover and go straight to `a2al_connect`.
+Or if the remote AID is already known, skip discover and call `a2al_fetch` directly.
+
+### Open a persistent tunnel (SSH, RDP, or sustained HTTP access)
+
+```
+a2al_tunnel_open         → returns {id, listen:"127.0.0.1:<port>"}
+Connect your app to the local port — supports many concurrent connections
+a2al_tunnel_close        → close when done
+```
+
+Use `a2al_connect` instead for a single TCP session that closes automatically.
 
 ### Send an encrypted message when remote agent is offline
 
@@ -84,7 +95,11 @@ a2al_mailbox_poll        → recipient retrieves messages when they come online
 | `a2al_service_unregister` | Remove a capability tag |
 | `a2al_discover` | Search the network for agents by capability |
 | `a2al_resolve` | Look up a known AID's current network endpoints |
-| `a2al_connect` | Open a direct encrypted tunnel to a remote agent |
+| `a2al_connect` | Open a one-shot encrypted tunnel (single TCP session, closes automatically) |
+| `a2al_fetch` | Send an HTTP request to a remote agent; returns `{status, headers, body}` |
+| `a2al_tunnel_open` | Open a persistent tunnel accepting many concurrent connections; returns `{id, listen}` |
+| `a2al_tunnel_close` | Close a persistent tunnel by ID |
+| `a2al_tunnel_list` | List active persistent tunnels |
 | `a2al_mailbox_send` | Send an encrypted async message to any AID |
 | `a2al_mailbox_poll` | Check for incoming encrypted messages |
 
@@ -104,6 +119,6 @@ Use dot-separated namespaces. Register at multiple levels for better discoverabi
 ## Notes
 
 - **Master key**: displayed once after `a2al_identity_generate` — ask the user to save it offline. The daemon does not store it.
-- **Connection tunnel**: `a2al_connect` returns `127.0.0.1:<port>`. This is a local proxy — use it like any HTTP server.
+- **HTTP calls**: prefer `a2al_fetch` — the daemon handles QUIC transport internally, no local port required. Use `a2al_connect` for non-HTTP protocols or when you need a raw TCP socket.
 - **Auto-publish**: `a2ald` republishes endpoint records automatically; `a2al_agent_publish` forces an immediate refresh.
 - **Ethereum identity**: use `a2al_agents_generate_ethereum` if the user wants their crypto wallet address as their AID.
