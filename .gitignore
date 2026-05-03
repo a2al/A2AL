@@ -17,3 +17,6 @@ python/src/a2al/bin/a2ald.exe
 # python build artifacts
 python/dist/
 python/src/a2al.egg-info/
+
+# local goreleaser / release output
+dist/

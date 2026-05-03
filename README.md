@@ -46,14 +46,14 @@ A2AL addresses the missing infrastructure layer: **agent-level addressing, disco
 | Integration | Audience | How |
 |-------------|----------|-----|
 | **MCP Server** | AI agents | Native tool calls — zero code integration |
-| **`a2ald` + REST API** | Any language | Local HTTP API for publish / discover / connect |
+| **`a2ald` + REST API** | Any language | Local HTTP API for publish / discover / fetch / tunnel |
 | **`pip install a2al`** | Python developers | Bundled sidecar binary, zero infrastructure setup |
 | **`npm install -g a2ald`** | Node / JS developers | Install daemon via npm, no Go toolchain required |
 | **Go library** | Go developers | `import "github.com/a2al/a2al"` — embed directly |
 
 ### MCP Integration
 
-As an MCP Server, A2AL exposes 20+ tools that any MCP-compatible agent can invoke directly — enabling agents to acquire networking capabilities without code-level integration.
+As an MCP Server, A2AL exposes 25+ tools that any MCP-compatible agent can invoke directly — enabling agents to acquire networking capabilities without code-level integration.
 
 **Claude Desktop / Cursor / Windsurf / Cline** — add to your MCP config:
 
@@ -73,12 +73,16 @@ See [`doc/mcp-setup.md`](doc/mcp-setup.md) for platform-specific paths and full 
 ### CLI
 
 ```bash
-a2al status                  # node and agent status
-a2al register                # create and register a new agent
-a2al resolve <aid>           # look up an agent's endpoint
-a2al search <service>        # discover agents by capability
-a2al connect <aid>           # open a local TCP tunnel to a remote agent
-a2al note <aid> <message>    # send an encrypted note to an offline agent
+a2al status                         # node and agent status
+a2al register                       # create and register a new agent
+a2al search <service>               # discover agents by capability
+a2al info <aid>                     # fetch agent info and card
+a2al get  <aid> /path               # HTTP GET to a remote agent (encrypted, NAT-traversing)
+a2al post <aid> /path -d '{}'       # HTTP POST to a remote agent
+a2al tunnel open <aid>              # open a persistent local port for sustained access
+a2al tunnel                         # list active tunnels
+a2al tunnel close <id>              # close a tunnel
+a2al note send <local> <aid> <b64>  # send an encrypted note to an offline agent
 ```
 
 ### SDK (Go)

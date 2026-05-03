@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any, Mapping, Optional
@@ -185,3 +186,52 @@ class Client:
         if local_aid:
             body["local_aid"] = local_aid
         return self._request("POST", f"/connect/{aid}", body)
+
+    def fetch(
+        self,
+        aid: str,
+        *,
+        method: str = "GET",
+        path: str = "/",
+        headers: Optional[Mapping[str, Any]] = None,
+        body_base64: str = "",
+        local_aid: str = "",
+    ) -> Any:
+        """POST /fetch/{aid} — HTTP request to a remote agent over QUIC."""
+        body: dict[str, Any] = {"method": method, "path": path}
+        if headers is not None:
+            body["headers"] = dict(headers)
+        if body_base64:
+            body["body_base64"] = body_base64
+        if local_aid:
+            body["local_aid"] = local_aid
+        return self._request("POST", f"/fetch/{aid}", body)
+
+    def tunnel_open(
+        self,
+        aid: str,
+        *,
+        local_aid: str = "",
+        idle_timeout_sec: Optional[int] = None,
+    ) -> Any:
+        """POST /tunnel/{aid} — open a persistent multiplexed tunnel."""
+        body: dict[str, Any] = {}
+        if local_aid:
+            body["local_aid"] = local_aid
+        if idle_timeout_sec is not None:
+            body["idle_timeout_sec"] = idle_timeout_sec
+        return self._request("POST", f"/tunnel/{aid}", body)
+
+    def tunnel_close(self, tunnel_id: str) -> Any:
+        """DELETE /tunnel/{id} — close a persistent tunnel."""
+        tid = urllib.parse.quote(tunnel_id, safe="")
+        return self._request("DELETE", f"/tunnel/{tid}", None)
+
+    def tunnel_list(self) -> Any:
+        """GET /tunnel — list active persistent tunnels."""
+        return self._request("GET", "/tunnel", None)
+
+    def tunnel_status(self, tunnel_id: str) -> Any:
+        """GET /tunnel/{id} — status of one tunnel."""
+        tid = urllib.parse.quote(tunnel_id, safe="")
+        return self._request("GET", f"/tunnel/{tid}", None)

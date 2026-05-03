@@ -26,15 +26,25 @@ After install, the `a2ald` binary is available where npm links local binaries (e
 npx a2ald --help
 ```
 
-## Documentation
+## What a2ald provides
 
-- Repository & full docs: [github.com/a2al/a2al](https://github.com/a2al/a2al)
-- User-facing guides live under the repo `doc/` directory.
+Once running, the daemon exposes a local REST API on `http://127.0.0.1:2121`. Key endpoints:
+
+| Endpoint | Description |
+|----------|-------------|
+| `POST /fetch/{aid}` | Send an HTTP request to a remote agent over encrypted QUIC; daemon handles transport internally |
+| `POST /connect/{aid}` | One-shot tunnel: returns a local TCP address for a single session |
+| `POST /tunnel/{aid}` | Persistent multiplexed tunnel: multiple concurrent TCP connections over one QUIC pool |
+| `POST /resolve/{aid}` | Look up a remote agent's current endpoints |
+
+A built-in MCP server exposes all capabilities as tools for AI agents. Full API reference: [doc/api-reference.md](https://github.com/a2al/a2al/blob/main/doc/api-reference.md)
+
+For CLI usage outside Node, see the `a2al` tool in the same repository (`a2al get`, `a2al post`, `a2al tunnel` commands).
 
 ## Official websites
 
-- **A2AL** — [a2al.org](https://a2al.org) — project site and documentation hub
-- **Tangled Network** — [tanglednet.com](https://tanglednet.com) · short link [tngld.net](https://tngld.net)
+- [a2al.org](https://a2al.org) - project site and documentation
+- [tanglednet.org](https://tanglednet.org) / [tngld.net](https://tngld.net) - Tangled Network
 
 ## License
 

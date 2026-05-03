@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "a2al"
 version = "0.1.0"
-description = "Python client for a2al: spawn a2ald and call its REST API"
+description = "Python client for a2al: spawn a2ald and call its REST API (health, agents, resolve, fetch, tunnel, …)"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MPL-2.0" }
@@ -18,6 +18,9 @@ keywords = [
   "a2a",
   "ai-agents",
   "p2p",
+  "quic",
+  "http-proxy",
+  "tunnel",
   "mcp",
   "mcp-server"
 ]
@@ -38,7 +41,7 @@ classifiers = [
 Homepage = "https://a2al.org"
 Repository = "https://github.com/a2al/a2al"
 "Bug Tracker" = "https://github.com/a2al/a2al/issues"
-"Tangled Network" = "https://tanglednet.com"
+"Tangled Network" = "https://tanglednet.org"
 "tngld.net" = "https://tngld.net"
 
 [tool.setuptools.packages.find]

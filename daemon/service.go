@@ -811,9 +811,7 @@ func (d *Daemon) execConnect(ctx context.Context, remoteAidStr string, body conn
 		"endpoints", len(er.Endpoints),
 		"has_signal", er.Signal != "",
 	)
-	// Acquire a pooled QUIC connection. The connection is NOT closed when the
-	// tunnel ends — it returns to the pool for reuse by subsequent calls.
-	qc, err := d.connPool.acquire(ctx, local, remote, er)
+	qc, err := d.h.ConnectFromRecordFor(ctx, local, remote, er)
 	if err != nil {
 		d.log.Warn("connect quic", "remote", remote.String(), "err", err)
 		return "", errConnectQUIC
@@ -821,9 +819,11 @@ func (d *Daemon) execConnect(ctx context.Context, remoteAidStr string, body conn
 	d.log.Debug("connect quic ok", "local_aid", local.String(), "remote_aid", remote.String())
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
+		_ = qc.CloseWithError(0, "listen failed")
 		return "", errListen
 	}
 	go func() {
+		defer qc.CloseWithError(0, "tunnel done")
 		defer ln.Close()
 		_ = ln.(*net.TCPListener).SetDeadline(time.Now().Add(30 * time.Second))
 		d.log.Debug("tunnel local listen", "local_aid", local.String(), "remote_aid", remote.String(), "listen", ln.Addr().String(), "accept_timeout", "30s")
