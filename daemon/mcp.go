@@ -123,6 +123,18 @@ func buildMCPServer(d *Daemon) *mcp.Server {
 		Name:        "a2al_fetch",
 		Description: "Make an HTTP request to a remote agent's service through the Tangled Network. The request travels end-to-end encrypted via QUIC; no ports are exposed. Returns HTTP status, headers, and body. Use for querying a remote agent's REST API, health check, or any HTTP endpoint it serves.",
 	}, d.mcpFetch)
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "a2al_tunnel_open",
+		Description: "Open a persistent multiplexed tunnel to a remote agent's service. Returns a local TCP address (e.g. 127.0.0.1:PORT) and a tunnel_id. Unlike a2al_connect, the tunnel accepts unlimited concurrent TCP connections, each mapped to its own QUIC stream. Ideal for SSH forwarding, database clients, and any tool that opens multiple connections. Close with a2al_tunnel_close when done.",
+	}, d.mcpTunnelOpen)
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "a2al_tunnel_close",
+		Description: "Close a multiplexed tunnel previously opened with a2al_tunnel_open. Stops accepting new TCP connections immediately; in-flight streams continue until they finish naturally. The underlying QUIC connection is retained in the pool for future use.",
+	}, d.mcpTunnelClose)
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "a2al_tunnel_list",
+		Description: "List all currently open multiplexed tunnels, including their local listen address, remote agent, active connection count, and idle time.",
+	}, d.mcpTunnelList)
 
 	return s
 }
@@ -496,4 +508,62 @@ func (d *Daemon) mcpFetch(ctx context.Context, _ *mcp.ServerSession, params *mcp
 		return nil, err
 	}
 	return &mcp.CallToolResultFor[map[string]any]{StructuredContent: m}, nil
+}
+
+// ── a2al_tunnel_open / _close / _list ────────────────────────────────────────
+
+type mcpTunnelOpenArgs struct {
+	RemoteAID      string `json:"remote_aid"`
+	LocalAID       string `json:"local_aid,omitempty"`
+	IdleTimeoutSec int    `json:"idle_timeout_sec,omitempty"`
+}
+
+func (d *Daemon) mcpTunnelOpen(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[mcpTunnelOpenArgs]) (*mcp.CallToolResultFor[map[string]any], error) {
+	tctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	entry, err := d.execTunnelOpen(tctx, params.Arguments.RemoteAID, tunnelOpenReq{
+		LocalAID:       params.Arguments.LocalAID,
+		IdleTimeoutSec: params.Arguments.IdleTimeoutSec,
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, errBadAID):
+			return nil, errors.New("bad remote_aid")
+		case errors.Is(err, errResolve):
+			return nil, errors.New("resolve failed: remote agent not found on the network")
+		case errors.Is(err, errConnectQUIC):
+			return nil, errors.New("connect failed: could not establish QUIC connection to remote agent")
+		default:
+			return nil, err
+		}
+	}
+	m, err := structToMap(entry.status())
+	if err != nil {
+		return nil, err
+	}
+	return &mcp.CallToolResultFor[map[string]any]{StructuredContent: m}, nil
+}
+
+type mcpTunnelCloseArgs struct {
+	TunnelID string `json:"tunnel_id"`
+}
+
+func (d *Daemon) mcpTunnelClose(_ context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[mcpTunnelCloseArgs]) (*mcp.CallToolResultFor[map[string]any], error) {
+	if !d.closeTunnel(params.Arguments.TunnelID) {
+		return nil, errors.New("tunnel not found")
+	}
+	return &mcp.CallToolResultFor[map[string]any]{StructuredContent: map[string]any{"closed": true}}, nil
+}
+
+func (d *Daemon) mcpTunnelList(_ context.Context, _ *mcp.ServerSession, _ *mcp.CallToolParamsFor[struct{}]) (*mcp.CallToolResultFor[map[string]any], error) {
+	list := d.tunnels.list()
+	items := make([]any, len(list))
+	for i, s := range list {
+		m, err := structToMap(s)
+		if err != nil {
+			return nil, err
+		}
+		items[i] = m
+	}
+	return &mcp.CallToolResultFor[map[string]any]{StructuredContent: map[string]any{"tunnels": items}}, nil
 }

@@ -791,7 +791,7 @@ func (d *Daemon) execConnect(ctx context.Context, remoteAidStr string, body conn
 	if err != nil {
 		return "", errBadAID
 	}
-	local, err := d.pickLocalAgent(body)
+	local, err := d.pickLocalAgent(body.LocalAID)
 	if err != nil {
 		return "", err
 	}

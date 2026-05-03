@@ -50,6 +50,10 @@ func (d *Daemon) routes() http.Handler {
 	mux.HandleFunc("POST /resolve/{aid}", d.handleResolve)
 	mux.HandleFunc("POST /connect/{aid}", d.handleConnect)
 	mux.HandleFunc("POST /fetch/{aid}", d.handleFetch)
+	mux.HandleFunc("POST /tunnel/{aid}", d.handleTunnelOpen)
+	mux.HandleFunc("DELETE /tunnel/{id}", d.handleTunnelClose)
+	mux.HandleFunc("GET /tunnel", d.handleTunnelList)
+	mux.HandleFunc("GET /tunnel/{id}", d.handleTunnelGet)
 	mux.Handle("/debug/", d.h.DebugHTTPHandler())
 	mux.Handle("/mcp/", d.mcpHTTPHandler())
 	mux.HandleFunc("POST /demo/start", d.handleDemoStart)
@@ -799,9 +803,9 @@ type connectReq struct {
 	LocalAID string `json:"local_aid,omitempty"`
 }
 
-func (d *Daemon) pickLocalAgent(body connectReq) (a2al.Address, error) {
-	if body.LocalAID != "" {
-		return a2al.ParseAddress(body.LocalAID)
+func (d *Daemon) pickLocalAgent(localAID string) (a2al.Address, error) {
+	if localAID != "" {
+		return a2al.ParseAddress(localAID)
 	}
 	// Outbound QUIC uses the host default identity (node); see CLI spec §1.4.
 	return d.nodeAddr, nil
@@ -829,6 +833,56 @@ func (d *Daemon) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]string{"tunnel": tun})
+}
+
+// ── Tunnel handlers ────────────────────────────────────────────────────────
+
+func (d *Daemon) handleTunnelOpen(w http.ResponseWriter, r *http.Request) {
+	var req tunnelOpenReq
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+	entry, err := d.execTunnelOpen(ctx, r.PathValue("aid"), req)
+	if err != nil {
+		switch {
+		case errors.Is(err, errBadAID):
+			writeJSONStatus(w, http.StatusBadRequest, map[string]string{"error": "bad aid"})
+		case errors.Is(err, errResolve):
+			writeJSONStatus(w, http.StatusBadGateway, map[string]string{"error": "resolve failed"})
+		case errors.Is(err, errListen):
+			writeJSONStatus(w, http.StatusInternalServerError, map[string]string{"error": "listen failed"})
+		case errors.Is(err, errConnectQUIC):
+			writeJSONStatus(w, http.StatusBadGateway, map[string]string{"error": "quic connect failed"})
+		default:
+			writeJSONStatus(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		}
+		return
+	}
+	writeJSONStatus(w, http.StatusCreated, entry.status())
+}
+
+func (d *Daemon) handleTunnelClose(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !d.closeTunnel(id) {
+		writeJSONStatus(w, http.StatusNotFound, map[string]string{"error": "tunnel not found"})
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (d *Daemon) handleTunnelList(w http.ResponseWriter, r *http.Request) {
+	_ = r
+	writeJSON(w, map[string]any{"tunnels": d.tunnels.list()})
+}
+
+func (d *Daemon) handleTunnelGet(w http.ResponseWriter, r *http.Request) {
+	_ = r
+	e, ok := d.tunnels.get(r.PathValue("id"))
+	if !ok {
+		writeJSONStatus(w, http.StatusNotFound, map[string]string{"error": "tunnel not found"})
+		return
+	}
+	writeJSON(w, e.status())
 }
 
 // ── Demo mode handlers ─────────────────────────────────────────────────────

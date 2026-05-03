@@ -150,7 +150,11 @@ func bridgeTCPQUICStream(str quic.Stream, tcp net.Conn) {
 	go func() {
 		defer wg.Done()
 		_, _ = io.Copy(str, tcp)
-		str.CancelWrite(0)
+		// Signal EOF on the QUIC send side with a clean FIN, not RESET_STREAM.
+		// CancelWrite would discard unacknowledged data in flight and send
+		// RESET_STREAM, causing the remote reader to get a StreamError instead
+		// of io.EOF — breaking HTTP responses that are still in transit.
+		_ = str.Close()
 	}()
 	wg.Wait()
 	_ = str.Close()

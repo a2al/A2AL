@@ -83,9 +83,13 @@ type Daemon struct {
 	gatewayConns atomic.Int64  // active gateway QUIC conns (direct + ICE)
 	sessions     sync.Map      // int (daemon-side TCP source port) → *sessionInfo
 
-	// connPool caches outbound Mode A data-plane QUIC connections for execFetch.
-	// Connections are established on demand and evicted passively (no keepalive).
+	// connPool caches outbound Mode A data-plane QUIC connections for execFetch
+	// and execConnect / execTunnelOpen. Connections are established on demand
+	// and evicted passively (no keepalive).
 	connPool *modeAConnPool
+
+	// tunnels tracks all open multiplexed tunnels (POST /tunnel/{aid}).
+	tunnels *tunnelRegistry
 
 	netMu                sync.Mutex
 	netStableFP          string
@@ -228,6 +232,7 @@ func New(cfg Config) (*Daemon, error) {
 		}
 		return h.ConnectFromRecordFor(ctx, local, remote, er)
 	}, log)
+	d.tunnels = newTunnelRegistry()
 	return d, nil
 }
 
@@ -273,6 +278,7 @@ func (d *Daemon) Run(ctx context.Context, mcpStdio bool) error {
 		if closeSignalHub != nil {
 			closeSignalHub()
 		}
+		d.tunnels.closeAll()
 		d.connPool.Close()
 		savePeersCache(filepath.Join(d.dataDir, "peers.cache"), d.h, d.log)
 		_ = d.h.Close()

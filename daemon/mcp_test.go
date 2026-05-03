@@ -35,6 +35,9 @@ var allExpectedTools = []string{
 	"a2al_service_unregister",
 	"a2al_discover",
 	"a2al_fetch",
+	"a2al_tunnel_open",
+	"a2al_tunnel_close",
+	"a2al_tunnel_list",
 }
 
 // newMCPClientSession returns a ClientSession connected to the given server
