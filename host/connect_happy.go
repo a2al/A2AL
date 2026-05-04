@@ -22,6 +22,15 @@ import (
 // DefaultConnectStagger is the delay between starting each QUIC dial (Happy Eyeballs).
 const DefaultConnectStagger = 250 * time.Millisecond
 
+// DefaultICEStagger is the delay before starting the ICE path when racing
+// direct QUIC against ICE in parallel. This gives direct QUIC a head start:
+// on open networks (FullCone / public IP) the handshake completes well under
+// 1 s, so the ICE path is never needed. On NAT-restricted networks where
+// direct QUIC cannot succeed, ICE kicks in after this delay and the overall
+// connection time is stagger + ICE setup (~2 s) rather than
+// HandshakeIdleTimeout (10 s) + ICE setup.
+const DefaultICEStagger = 2 * time.Second
+
 // shouldSkipDirect reports whether the direct QUIC/UDP dial should be skipped
 // for an endpoint record. Direct dialing is skipped when the peer's NAT type
 // makes a cold UDP connection essentially impossible and an ICE signal URL is
@@ -74,20 +83,22 @@ func QUICDialTargets(er *protocol.EndpointRecord) ([]*net.UDPAddr, error) {
 	return addrs, nil
 }
 
-// ConnectFromRecord dials expectRemote using the three-layer strategy:
-// ① Happy Eyeballs over quic:// candidates → ② ICE via signal (if record has Signal).
+// ConnectFromRecord dials expectRemote using the following strategy:
+//   - When both direct QUIC targets and a Signal URL are available and the NAT
+//     type does not mandate skipping direct: race direct QUIC against ICE in
+//     parallel (see connectRace). Direct gets a DefaultICEStagger head start.
+//   - When only direct targets are available (no Signal): Happy Eyeballs only.
+//   - When direct must be skipped or no targets exist (Signal required): ICE only.
+//
 // The host's default agent identity is used for mutual TLS.
 //
-// When all connection attempts fail the locally-cached endpoint record for
-// expectRemote is transparently invalidated so that the next Resolve call
-// fetches fresh data from the network rather than reusing the stale record.
+// On any failure the locally-cached endpoint record for expectRemote is
+// transparently invalidated so the next Resolve fetches fresh data.
 func (h *Host) ConnectFromRecord(ctx context.Context, expectRemote a2al.Address, er *protocol.EndpointRecord) (_ quic.Connection, err error) {
 	cert, certErr := h.defaultAgentCert()
 	if certErr != nil {
 		return nil, certErr
 	}
-	// Invalidate the cached endpoint on any connection failure so the next
-	// Resolve goes to the network for fresh data.  This is transparent to callers.
 	defer func() {
 		if err != nil {
 			h.node.LocalStoreInvalidate(a2al.NodeIDFromAddress(expectRemote), protocol.RecTypeEndpoint)
@@ -95,7 +106,6 @@ func (h *Host) ConnectFromRecord(ctx context.Context, expectRemote a2al.Address,
 	}()
 
 	targets, terr := QUICDialTargets(er)
-	var happyErr error
 	natType := protocol.NATUnknown
 	hasSignal := false
 	if er != nil {
@@ -110,37 +120,23 @@ func (h *Host) ConnectFromRecord(ctx context.Context, expectRemote a2al.Address,
 		"quic_targets", len(targets),
 		"skip_direct", skipDirect,
 	)
+	if !skipDirect && len(targets) > 0 && hasSignal {
+		return h.connectRace(ctx, cert, h.addr, expectRemote, targets, er)
+	}
 	if !skipDirect && len(targets) > 0 {
-		c, connErr := h.connectHappy(ctx, cert, expectRemote, targets, DefaultConnectStagger)
-		if connErr == nil {
-			return c, nil
-		}
-		h.log.Debug("connect direct failed, fallback maybe needed", "remote_aid", expectRemote.String(), "err", connErr)
-		happyErr = connErr
-	} else if len(targets) == 0 {
-		happyErr = terr
+		return h.connectHappy(ctx, cert, expectRemote, targets, DefaultConnectStagger)
 	}
-	if er == nil || er.Signal == "" {
-		if happyErr != nil {
-			return nil, happyErr
-		}
-		return nil, errors.New("a2al/host: no quic targets and no signal url")
+	if hasSignal {
+		return h.connectViaICESignal(ctx, cert, h.addr, expectRemote, er)
 	}
-	h.log.Debug("connect via ice", "remote_aid", expectRemote.String(), "signal", hasSignal)
-	iceConn, iceErr := h.connectViaICESignal(ctx, cert, h.addr, expectRemote, er)
-	if iceErr != nil {
-		h.log.Warn("connect ice failed", "remote_aid", expectRemote.String(), "err", iceErr)
-		if happyErr != nil {
-			return nil, errors.Join(happyErr, fmt.Errorf("ice: %w", iceErr))
-		}
-		return nil, iceErr
+	if terr != nil {
+		return nil, terr
 	}
-	return iceConn, nil
+	return nil, errors.New("a2al/host: no quic targets and no signal url")
 }
 
 // ConnectFromRecordFor dials as localAgent (must be registered) toward expectRemote.
-// After Happy Eyeballs over quic:// candidates fails, if the record includes Signal,
-// falls back to ICE+QUIC over WebSocket signaling.
+// Uses the same race/direct/ICE strategy as ConnectFromRecord.
 //
 // On failure the locally-cached endpoint record for expectRemote is transparently
 // invalidated (same as ConnectFromRecord).
@@ -149,10 +145,8 @@ func (h *Host) ConnectFromRecordFor(ctx context.Context, localAgent, expectRemot
 	ag, ok := h.agents[localAgent]
 	h.agentsMu.RUnlock()
 	if !ok {
-		// Local configuration error — not a stale endpoint, no invalidation.
 		return nil, fmt.Errorf("a2al/host: unknown agent %s", localAgent)
 	}
-	// Invalidate the cached endpoint on any subsequent connection failure.
 	defer func() {
 		if err != nil {
 			h.node.LocalStoreInvalidate(a2al.NodeIDFromAddress(expectRemote), protocol.RecTypeEndpoint)
@@ -160,7 +154,6 @@ func (h *Host) ConnectFromRecordFor(ctx context.Context, localAgent, expectRemot
 	}()
 
 	targets, terr := QUICDialTargets(er)
-	var happyErr error
 	natType := protocol.NATUnknown
 	hasSignal := false
 	if er != nil {
@@ -176,32 +169,83 @@ func (h *Host) ConnectFromRecordFor(ctx context.Context, localAgent, expectRemot
 		"quic_targets", len(targets),
 		"skip_direct", skipDirect,
 	)
+	if !skipDirect && len(targets) > 0 && hasSignal {
+		return h.connectRace(ctx, ag.cert, localAgent, expectRemote, targets, er)
+	}
 	if !skipDirect && len(targets) > 0 {
-		c, connErr := h.connectHappy(ctx, ag.cert, expectRemote, targets, DefaultConnectStagger)
-		if connErr == nil {
-			return c, nil
-		}
-		h.log.Debug("connect direct failed, fallback maybe needed", "local_aid", localAgent.String(), "remote_aid", expectRemote.String(), "err", connErr)
-		happyErr = connErr
-	} else if len(targets) == 0 {
-		happyErr = terr
+		return h.connectHappy(ctx, ag.cert, expectRemote, targets, DefaultConnectStagger)
 	}
-	if er == nil || er.Signal == "" {
-		if happyErr != nil {
-			return nil, happyErr
-		}
-		return nil, errors.New("a2al/host: no quic targets and no signal url")
+	if hasSignal {
+		return h.connectViaICESignal(ctx, ag.cert, localAgent, expectRemote, er)
 	}
-	h.log.Debug("connect via ice", "local_aid", localAgent.String(), "remote_aid", expectRemote.String(), "signal", hasSignal)
-	iceConn, iceErr := h.connectViaICESignal(ctx, ag.cert, localAgent, expectRemote, er)
-	if iceErr != nil {
-		h.log.Warn("connect ice failed", "local_aid", localAgent.String(), "remote_aid", expectRemote.String(), "err", iceErr)
-		if happyErr != nil {
-			return nil, errors.Join(happyErr, fmt.Errorf("ice: %w", iceErr))
-		}
-		return nil, iceErr
+	if terr != nil {
+		return nil, terr
 	}
-	return iceConn, nil
+	return nil, errors.New("a2al/host: no quic targets and no signal url")
+}
+
+// connectRace runs direct QUIC and ICE in parallel, returning the first
+// successful connection. Direct QUIC starts immediately; ICE starts after
+// DefaultICEStagger to give direct a head start on open networks.
+//
+// When a winner is found the losing path's context is cancelled so its
+// goroutine exits promptly. Both goroutines always send exactly one value to
+// the buffered channel, so the collector never blocks indefinitely.
+func (h *Host) connectRace(ctx context.Context, localCert tls.Certificate, localAgent, expectRemote a2al.Address, targets []*net.UDPAddr, er *protocol.EndpointRecord) (quic.Connection, error) {
+	type res struct {
+		c   quic.Connection
+		err error
+	}
+
+	raceCtx, raceCancel := context.WithCancel(ctx)
+	defer raceCancel()
+
+	ch := make(chan res, 2)
+
+	// Direct QUIC — starts immediately.
+	go func() {
+		c, err := h.connectHappy(raceCtx, localCert, expectRemote, targets, DefaultConnectStagger)
+		ch <- res{c, err}
+	}()
+
+	// ICE — starts after stagger so direct can win on open networks.
+	go func() {
+		t := time.NewTimer(DefaultICEStagger)
+		defer t.Stop()
+		select {
+		case <-raceCtx.Done():
+			ch <- res{err: raceCtx.Err()}
+			return
+		case <-t.C:
+		}
+		c, err := h.connectViaICESignal(raceCtx, localCert, localAgent, expectRemote, er)
+		ch <- res{c, err}
+	}()
+
+	var winner quic.Connection
+	var errs []error
+	for i := 0; i < 2; i++ {
+		r := <-ch
+		if r.err == nil && r.c != nil {
+			if winner == nil {
+				winner = r.c
+				raceCancel()
+			} else {
+				_ = r.c.CloseWithError(0, "superseded by faster candidate")
+			}
+			continue
+		}
+		if r.err != nil {
+			errs = append(errs, r.err)
+		}
+	}
+	if winner != nil {
+		return winner, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return nil, errors.Join(errs...)
 }
 
 func (h *Host) connectHappy(ctx context.Context, localCert tls.Certificate, expectRemote a2al.Address, targets []*net.UDPAddr, stagger time.Duration) (quic.Connection, error) {

@@ -37,7 +37,7 @@ const stunMagicCookie = uint32(0x2112A442)
 //
 // Currently queries IPv4 STUN only. TODO(ipv6): add a parallel probeSTUNv6 that
 // calls stunQuery with network="udp6" and a v6 STUN server list once dual-stack
-// socket support is in place (see IPv6 support plan).
+// socket support is in place (Layer 1 of the IPv6 support plan).
 func probeSTUN(ctx context.Context) (net.IP, uint16) {
 	type result struct {
 		ip   net.IP
@@ -69,7 +69,7 @@ func probeSTUN(ctx context.Context) (net.IP, uint16) {
 // MAPPED-ADDRESS) attribute from the response.
 //
 // Passing "udp6" and a v6-capable STUN server will return the IPv6 mapped
-// address once dual-stack socket support is enabled.
+// address once dual-stack socket support is enabled (Layer 1).
 func stunQuery(ctx context.Context, network, serverAddr string) (net.IP, uint16, error) {
 	raddr, err := net.ResolveUDPAddr(network, serverAddr)
 	if err != nil {

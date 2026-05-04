@@ -135,7 +135,7 @@ type Config struct {
 	// ICENetworkTypes lists the ICE network types used for candidate gathering.
 	// Defaults to {ice.NetworkTypeUDP4} (IPv4-only) when nil or empty.
 	// To enable IPv6 ICE, set to {ice.NetworkTypeUDP4, ice.NetworkTypeUDP6} after
-	// dual-stack socket support is implemented (see IPv6 support plan).
+	// dual-stack socket support is implemented (Layer 1 of the IPv6 support plan).
 	ICENetworkTypes []ice.NetworkType
 }
 
@@ -256,7 +256,7 @@ func New(cfg Config) (*Host, error) {
 	sense := natsense.NewSense(min)
 
 	// Apply ICE network types default: IPv4-only until dual-stack socket is ready.
-	// TODO(ipv6): change default to {UDP4, UDP6} once dual-stack socket support is ready.
+	// TODO(ipv6): change default to {UDP4, UDP6} in Layer 2 of the IPv6 support plan.
 	if len(cfg.ICENetworkTypes) == 0 {
 		cfg.ICENetworkTypes = []ice.NetworkType{ice.NetworkTypeUDP4}
 	}
@@ -1146,7 +1146,8 @@ func outboundIPv4() net.IP {
 }
 
 // outboundIPv6 returns the preferred IPv6 outbound address without sending any
-// packets. Currently returns nil; will be implemented alongside dual-stack socket setup.
+// packets. Currently returns nil; will be implemented in Layer 1 of the IPv6
+// support plan alongside dual-stack socket setup.
 //
 // TODO(ipv6): implement as net.Dial("udp6", "2001:4860:4860::8888:80") once
 // the DHT/QUIC socket supports IPv6.
@@ -1159,7 +1160,8 @@ func outboundIPv6() net.IP {
 // All DHT and QUIC sockets currently bind to IPv4 only.
 // TODO(ipv6): to enable dual-stack or IPv6-only, change "udp4" to "udp" (dual-stack
 // on Linux/macOS) or implement separate v4/v6 listeners here (required on Windows,
-// where net.ListenUDP("udp", ...) does not auto-bind IPv6).
+// where net.ListenUDP("udp", ...) does not auto-bind IPv6). See Layer 1 in the IPv6
+// support design plan.
 func listenUDP4(addr string) (*net.UDPConn, error) {
 	a, err := net.ResolveUDPAddr("udp4", addr)
 	if err != nil {
