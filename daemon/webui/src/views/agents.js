@@ -35,11 +35,16 @@ function agentKind(aid) {
 
 function agentStatus(ag) {
   if (!ag.published_to_dht) return { key: 'agent.status.unpublished', cls: 'b-gray' };
-  if (ag.next_republish_estimate) {
-    const overdueSec = (Date.now() - new Date(ag.next_republish_estimate).getTime()) / 1000;
-    if (overdueSec > 600) return { key: 'agent.status.refresh_failed', cls: 'b-yellow' };
+  if (ag.dht_record_expires_at && new Date(ag.dht_record_expires_at) < new Date()) {
+    return { key: 'agent.status.refresh_failed', cls: 'b-yellow' };
   }
   return { key: 'agent.status.published', cls: 'b-green' };
+}
+
+/** Returns true when a ping/connect test is likely to succeed. */
+function agentReachable(ag) {
+  const st = agentStatus(ag);
+  return st.key === 'agent.status.published';
 }
 
 // Left-border accent is driven by service_tcp connectivity, independent of DHT publish state.
@@ -221,7 +226,7 @@ export async function renderAgents(mount, ctx) {
           </div>
         </div>
         <div class="ag2-badges">
-          <span class="badge ${esc(st.cls)}">● ${esc(t(st.key))}</span>
+          <span class="badge ${esc(st.cls)}" data-aid-badge="${esc(ag.aid)}">● ${esc(t(st.key))}</span>
           <span class="badge b-blue">${esc(agentKind(ag.aid))}</span>
         </div>
       </div>
@@ -441,6 +446,7 @@ export async function renderAgents(mount, ctx) {
       { key: 'recv',       label: t('agent.fn.recv_notes') },
       { key: 'send',       label: t('agent.fn.send_note') },
       { key: 'ping',       label: t('agent.fn.ping') },
+      { key: 'aidproxy',   label: t('agent.fn.aidproxy') },
     ];
     FNS.forEach(({ key, label }) => {
       const btn = document.createElement('button');
@@ -624,11 +630,13 @@ export async function renderAgents(mount, ctx) {
         break;
       }
       case 'ping': {
+        const pingOk = agentReachable(ag);
         panel.innerHTML = `
           <div style="display:flex;gap:.75rem;align-items:center;flex-wrap:wrap">
-            <button type="button" class="btn btn-secondary btn-sm" id="fn-ping-btn">${esc(t('agent.fn.ping'))}</button>
-            <span id="fn-ping-out" class="muted" style="font-size:.9rem"></span>
+            <button type="button" class="btn btn-secondary btn-sm" id="fn-ping-btn"${pingOk ? '' : ' disabled'}>${esc(t('agent.fn.ping'))}</button>
+            <span id="fn-ping-out" class="muted" style="font-size:.9rem">${pingOk ? '' : esc(t('agent.fn.ping.not_reachable'))}</span>
           </div>`;
+        if (!pingOk) break;
         const doPing = async () => {
           const b = panel.querySelector('#fn-ping-btn');
           const el = panel.querySelector('#fn-ping-out');
@@ -651,7 +659,20 @@ export async function renderAgents(mount, ctx) {
         // Auto-execute on open
         doPing();
         break;
-      }    }
+      }
+      case 'aidproxy': {
+        const url = `${window.location.origin}/aid/${encodeURIComponent(ag.aid)}/`;
+        panel.innerHTML = `
+          <div class="muted" style="font-size:.82rem;margin-bottom:.3rem">${esc(t('discover.aidproxy.label'))}</div>
+          <div style="display:flex;align-items:center;gap:.5rem;flex-wrap:wrap">
+            <code class="mono" style="font-size:.9rem">${esc(url)}</code>
+            <button type="button" class="btn btn-ghost btn-sm" id="fn-ap-cp">\u29c9</button>
+          </div>
+          <p class="muted" style="font-size:.8rem;margin:.3rem 0 0">${esc(t('agent.fn.aidproxy.hint'))}</p>`;
+        panel.querySelector('#fn-ap-cp').onclick = () => copyText(url);
+        break;
+      }
+    }
   }
 
   // ── Modal functions (unchanged) ─────────────────────────────────────────
@@ -1165,4 +1186,21 @@ export async function renderAgents(mount, ctx) {
       },
     });
   }
+
+  // Background status refresh: re-fetch agents every 60 s and update badges
+  // without rebuilding cards (preserves open panels and edit state).
+  const statusTimer = setInterval(async () => {
+    if (!mount.isConnected) { clearInterval(statusTimer); return; }
+    try {
+      const r = await api('/agents');
+      agents = r.agents || [];
+      for (const ag of agents) {
+        const badge = mount.querySelector(`[data-aid-badge="${ag.aid}"]`);
+        if (!badge) continue;
+        const st = agentStatus(ag);
+        badge.className = `badge ${st.cls}`;
+        badge.textContent = `● ${t(st.key)}`;
+      }
+    } catch (_) {}
+  }, 60000);
 }

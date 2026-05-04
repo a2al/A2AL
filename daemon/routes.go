@@ -44,6 +44,8 @@ func (d *Daemon) routes() http.Handler {
 	mux.HandleFunc("POST /agents/{aid}/mailbox/poll", d.withAgentMiddleware(d.handleAgentsMailboxPoll))
 	mux.HandleFunc("POST /agents/{aid}/services", d.withAgentMiddleware(d.handleAgentsTopicsPost))
 	mux.HandleFunc("DELETE /agents/{aid}/services/{service...}", d.withAgentMiddleware(d.handleAgentsTopicsDelete))
+	mux.HandleFunc("POST /agents/{aid}/profile", d.withAgentMiddleware(d.handleAgentsProfilePost))
+	mux.HandleFunc("DELETE /agents/{aid}/profile", d.withAgentMiddleware(d.handleAgentsProfileDelete))
 	mux.HandleFunc("POST /discover", d.handleDiscover)
 	mux.HandleFunc("DELETE /agents/{aid}", d.withAgentMiddleware(d.handleAgentsDelete))
 	mux.HandleFunc("GET /resolve/{aid}/records", d.handleResolveRecords)
@@ -61,7 +63,13 @@ func (d *Daemon) routes() http.Handler {
 	mux.HandleFunc("GET /demo/status", d.handleDemoStatus)
 	mux.HandleFunc("GET /sessions/{port}", d.handleGetSession)
 	registerWebUIRoutes(mux)
-	return d.withMiddleware(mux)
+
+	// Mount the AID proxy outside withMiddleware: it must accept arbitrary
+	// Content-Types, large bodies, and requests without an API token.
+	outer := http.NewServeMux()
+	outer.Handle("/aid/", d.newAIDProxy())
+	outer.Handle("/", d.withMiddleware(mux))
+	return outer
 }
 
 // withAgentMiddleware wraps agent-specific handlers with:
@@ -736,6 +744,45 @@ func (d *Daemon) handleAgentsTopicsDelete(w http.ResponseWriter, r *http.Request
 		return
 	}
 	if err := d.execTopicUnregister(r.PathValue("aid"), topic); err != nil {
+		switch {
+		case errors.Is(err, errBadAID):
+			http.Error(w, `{"error":"bad aid"}`, http.StatusBadRequest)
+		case errors.Is(err, errNotFound):
+			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+		default:
+			http.Error(w, `{"error":"persist"}`, http.StatusInternalServerError)
+		}
+		return
+	}
+	writeJSON(w, map[string]bool{"ok": true})
+}
+
+func (d *Daemon) handleAgentsProfilePost(w http.ResponseWriter, r *http.Request) {
+	var req agentProfileReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	if err := d.execAgentSetProfile(ctx, r.PathValue("aid"), req); err != nil {
+		switch {
+		case errors.Is(err, errBadAID):
+			http.Error(w, `{"error":"bad aid"}`, http.StatusBadRequest)
+		case errors.Is(err, errNotFound):
+			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+		default:
+			http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusBadRequest)
+		}
+		return
+	}
+	writeJSON(w, map[string]bool{"ok": true})
+}
+
+func (d *Daemon) handleAgentsProfileDelete(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	if err := d.execAgentDeleteProfile(ctx, r.PathValue("aid")); err != nil {
 		switch {
 		case errors.Is(err, errBadAID):
 			http.Error(w, `{"error":"bad aid"}`, http.StatusBadRequest)
