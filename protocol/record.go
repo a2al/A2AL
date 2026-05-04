@@ -46,6 +46,9 @@ var (
 	ErrInvalidRecord = errors.New("a2al/protocol: invalid record")
 	// ErrRecordExpired means now is past Timestamp+TTL (VerifySignedRecord).
 	ErrRecordExpired = errors.New("a2al/protocol: record expired")
+	// ErrPayloadApproachingLimit is a non-fatal advisory: payload is valid but
+	// approaching the soft size threshold and may compete with routing nodes.
+	ErrPayloadApproachingLimit = errors.New("a2al/protocol: payload approaching size limit")
 )
 
 func init() {

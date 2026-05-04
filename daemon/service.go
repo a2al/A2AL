@@ -457,9 +457,11 @@ func (d *Daemon) execAgentsList() []map[string]any {
 		if lastPub := pubSnap[e.AID]; !lastPub.IsZero() {
 			m["last_publish_at"] = lastPub.UTC().Format(time.RFC3339)
 			m["next_republish_estimate"] = lastPub.Add(republishPeriod).UTC().Format(time.RFC3339)
+			m["dht_record_expires_at"] = lastPub.Add(time.Duration(endpointRecordTTL) * time.Second).UTC().Format(time.RFC3339)
 		} else {
 			m["last_publish_at"] = nil
 			m["next_republish_estimate"] = nil
+			m["dht_record_expires_at"] = nil
 		}
 		storeKey := a2al.NodeIDFromAddress(e.AID)
 		m["dht_local_replicas"] = d.h.Node().RepSetSize(storeKey, storeKey)
@@ -508,9 +510,11 @@ func (d *Daemon) execAgentGet(ctx context.Context, aidStr string) (map[string]an
 	if !lastPub.IsZero() {
 		out["last_publish_at"] = lastPub.UTC().Format(time.RFC3339)
 		out["next_republish_estimate"] = lastPub.Add(republishPeriod).UTC().Format(time.RFC3339)
+		out["dht_record_expires_at"] = lastPub.Add(time.Duration(endpointRecordTTL) * time.Second).UTC().Format(time.RFC3339)
 	} else {
 		out["last_publish_at"] = nil
 		out["next_republish_estimate"] = nil
+		out["dht_record_expires_at"] = nil
 	}
 	if e.Seq > 0 {
 		rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
@@ -811,7 +815,9 @@ func (d *Daemon) execConnect(ctx context.Context, remoteAidStr string, body conn
 		"endpoints", len(er.Endpoints),
 		"has_signal", er.Signal != "",
 	)
-	qc, err := d.h.ConnectFromRecordFor(ctx, local, remote, er)
+	// Acquire a pooled QUIC connection. The connection is NOT closed when the
+	// tunnel ends — it returns to the pool for reuse by subsequent calls.
+	qc, err := d.connPool.acquire(ctx, local, remote, er)
 	if err != nil {
 		d.log.Warn("connect quic", "remote", remote.String(), "err", err)
 		return "", errConnectQUIC
@@ -819,11 +825,9 @@ func (d *Daemon) execConnect(ctx context.Context, remoteAidStr string, body conn
 	d.log.Debug("connect quic ok", "local_aid", local.String(), "remote_aid", remote.String())
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		_ = qc.CloseWithError(0, "listen failed")
 		return "", errListen
 	}
 	go func() {
-		defer qc.CloseWithError(0, "tunnel done")
 		defer ln.Close()
 		_ = ln.(*net.TCPListener).SetDeadline(time.Now().Add(30 * time.Second))
 		d.log.Debug("tunnel local listen", "local_aid", local.String(), "remote_aid", remote.String(), "listen", ln.Addr().String(), "accept_timeout", "30s")
@@ -984,9 +988,9 @@ func (d *Daemon) execTopicRegister(ctx context.Context, aidStr string, req topic
 		return err
 	}
 	d.regMu.Lock()
-	defer d.regMu.Unlock()
 	e = d.reg.Get(aid)
 	if e == nil {
+		d.regMu.Unlock()
 		return errNotFound
 	}
 	// Build a map of existing services keyed by topic name for upsert.
@@ -1017,7 +1021,26 @@ func (d *Daemon) execTopicRegister(ctx context.Context, aidStr string, req topic
 		return strings.Compare(a.Topic, b.Topic)
 	})
 	e.Services = next
-	return d.reg.Put(e)
+	if err := d.reg.Put(e); err != nil {
+		d.regMu.Unlock()
+		return err
+	}
+	// Build record under lock; goroutine only publishes the immutable value.
+	rec, recErr := d.buildAgentProfileRecord(e)
+	d.regMu.Unlock()
+
+	go func() {
+		if recErr != nil {
+			d.log.Warn("agent profile build after service register", "aid", aid.String(), "err", recErr)
+			return
+		}
+		if rec != nil {
+			if pubErr := d.h.PublishRecord(context.Background(), *rec); pubErr != nil {
+				d.log.Warn("agent profile publish after service register", "aid", aid.String(), "err", pubErr)
+			}
+		}
+	}()
+	return nil
 }
 
 func (d *Daemon) execTopicUnregister(aidStr, topic string) error {
@@ -1099,6 +1122,36 @@ func signedRecordToAPI(sr protocol.SignedRecord) (map[string]any, error) {
 	}
 	if len(sr.Delegation) > 0 {
 		m["delegation_base64"] = base64.StdEncoding.EncodeToString(sr.Delegation)
+	}
+	// For RecType 0x02 attach decoded profile so callers don't need to re-parse CBOR.
+	if sr.RecType == protocol.RecTypeAgentProfile {
+		if p, perr := protocol.ParseAgentProfilePayload(sr); perr == nil {
+			prof := map[string]any{
+				"version": p.Version,
+			}
+			if p.Name != "" {
+				prof["name"] = p.Name
+			}
+			if p.Brief != "" {
+				prof["brief"] = p.Brief
+			}
+			if len(p.Protocols) > 0 {
+				prof["protocols"] = p.Protocols
+			}
+			if len(p.Skills) > 0 {
+				prof["skills"] = p.Skills
+			}
+			if len(p.CardHash) > 0 {
+				prof["card_hash"] = hex.EncodeToString(p.CardHash)
+			}
+			if len(p.Modalities) > 0 {
+				prof["modalities"] = p.Modalities
+			}
+			if len(p.Meta) > 0 {
+				prof["meta"] = p.Meta
+			}
+			m["profile"] = prof
+		}
 	}
 	return m, nil
 }

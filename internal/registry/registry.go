@@ -14,6 +14,19 @@ import (
 	"github.com/a2al/a2al"
 )
 
+// ProfileOverride holds user-supplied agent profile fields.
+// Non-zero fields take precedence over values inferred from Services when
+// assembling the RecType 0x02 sovereign record payload.
+type ProfileOverride struct {
+	Name       string         `json:"name,omitempty"`
+	Brief      string         `json:"brief,omitempty"`
+	Protocols  []string       `json:"protocols,omitempty"`
+	Skills     []string       `json:"skills,omitempty"`
+	CardHash   []byte         `json:"card_hash,omitempty"`
+	Modalities []string       `json:"modalities,omitempty"`
+	Meta       map[string]any `json:"meta,omitempty"`
+}
+
 // ServiceRecord persists a published service (full payload) for auto-renewal.
 // JSON key is "services" to align with user-facing terminology.
 type ServiceRecord struct {
@@ -35,6 +48,9 @@ type Entry struct {
 	Seq            uint64
 	// Services lists published service payloads for auto-renewal (user-facing name for DHT topics).
 	Services []ServiceRecord
+	// Profile holds user-supplied overrides for the RecType 0x02 sovereign record.
+	// Nil means use inferred values from Services only.
+	Profile *ProfileOverride
 }
 
 type diskAgent struct {
@@ -43,7 +59,8 @@ type diskAgent struct {
 	OpPrivateKeyHex    string          `json:"op_private_key_hex"`
 	DelegationProofHex string          `json:"delegation_proof_hex"`
 	Seq                uint64          `json:"seq"`
-	Services           []ServiceRecord `json:"services,omitempty"`
+	Services           []ServiceRecord  `json:"services,omitempty"`
+	Profile            *ProfileOverride `json:"profile,omitempty"`
 	// Topics is a legacy field (pre-v1.1); loaded for migration, never written.
 	Topics []string `json:"topics,omitempty"`
 }
@@ -108,6 +125,7 @@ func Load(path string) (*Registry, error) {
 			DelegationCBOR: proof,
 			Seq:            da.Seq,
 			Services:       svcs,
+			Profile:        da.Profile,
 		}
 	}
 	return r, nil
@@ -165,6 +183,7 @@ func (r *Registry) Save() error {
 			DelegationProofHex: hex.EncodeToString(e.DelegationCBOR),
 			Seq:                e.Seq,
 			Services:           append([]ServiceRecord(nil), e.Services...),
+			Profile:            e.Profile,
 		})
 	}
 	b, err := json.MarshalIndent(df, "", "  ")

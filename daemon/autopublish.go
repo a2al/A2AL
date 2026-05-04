@@ -266,6 +266,10 @@ func (d *Daemon) tryRepublishAgent(ctx context.Context, e *registry.Entry) {
 }
 
 func (d *Daemon) republishAgentServices(ctx context.Context, e *registry.Entry) {
+	// Re-publish RecType 0x02 sovereign profile alongside topic records.
+	if pubErr := d.publishAgentProfile(ctx, e); pubErr != nil {
+		d.log.Debug("agent profile republish", "aid", e.AID.String(), "err", pubErr)
+	}
 	if len(e.Services) == 0 {
 		return
 	}
