@@ -33,10 +33,39 @@ function agentKind(aid) {
   return /^0x[0-9a-fA-F]{40}$/.test(String(aid)) ? 'Ethereum' : 'Ed25519';
 }
 
+// Module-level sets for DHT-verified states, populated by the 120 s stale check.
+// Persisted to localStorage so results survive page reloads.
+const _LS_DHT_LIVE    = 'a2al.dht.confirmed.live';
+const _LS_DHT_EXPIRED = 'a2al.dht.confirmed.expired';
+
+const _dhtConfirmedLive    = new Set();
+const _dhtConfirmedExpired = new Set();
+
+// Restore from previous session on module load.
+try {
+  for (const aid of JSON.parse(localStorage.getItem(_LS_DHT_LIVE)    || '[]')) _dhtConfirmedLive.add(aid);
+  for (const aid of JSON.parse(localStorage.getItem(_LS_DHT_EXPIRED) || '[]')) _dhtConfirmedExpired.add(aid);
+} catch (_) {}
+
+function _saveDhtConfirmed() {
+  try {
+    localStorage.setItem(_LS_DHT_LIVE,    JSON.stringify([..._dhtConfirmedLive]));
+    localStorage.setItem(_LS_DHT_EXPIRED, JSON.stringify([..._dhtConfirmedExpired]));
+  } catch (_) {}
+}
+
 function agentStatus(ag) {
   if (!ag.published_to_dht) return { key: 'agent.status.unpublished', cls: 'b-gray' };
+  // No publish record in this daemon session: either restarted recently or
+  // auto-republish was permanently stopped (agent migrated/higher seq in network).
+  // Cannot confirm the DHT record is still live.
+  if (!ag.last_publish_at) {
+    if (_dhtConfirmedLive.has(ag.aid))    return { key: 'agent.status.published',     cls: 'b-green' };
+    if (_dhtConfirmedExpired.has(ag.aid)) return { key: 'agent.status.refresh_failed', cls: 'b-orange' };
+    return { key: 'agent.status.stale', cls: 'b-yellow' };
+  }
   if (ag.dht_record_expires_at && new Date(ag.dht_record_expires_at) < new Date()) {
-    return { key: 'agent.status.refresh_failed', cls: 'b-yellow' };
+    return { key: 'agent.status.refresh_failed', cls: 'b-orange' };
   }
   return { key: 'agent.status.published', cls: 'b-green' };
 }
@@ -1194,13 +1223,66 @@ export async function renderAgents(mount, ctx) {
     try {
       const r = await api('/agents');
       agents = r.agents || [];
+      let dhtChanged = false;
       for (const ag of agents) {
+        // Agent was republished by this daemon — clear any stale confirmed state
+        // so the normal publish path takes over and the badge reflects real data.
+        if (ag.last_publish_at) {
+          if (_dhtConfirmedExpired.delete(ag.aid) || _dhtConfirmedLive.delete(ag.aid)) {
+            dhtChanged = true;
+          }
+        }
         const badge = mount.querySelector(`[data-aid-badge="${ag.aid}"]`);
         if (!badge) continue;
         const st = agentStatus(ag);
         badge.className = `badge ${st.cls}`;
         badge.textContent = `● ${t(st.key)}`;
       }
+      if (dhtChanged) _saveDhtConfirmed();
     } catch (_) {}
   }, 60000);
+
+  // One-shot DHT verification for stale agents (last_publish_at=null).
+  // Fires 120 s after page load — by then the daemon warm-up (60–90 s) has
+  // completed and the DHT routing table has stabilised, so Resolve results
+  // are trustworthy.  Confirmed live/expired states are persisted to
+  // localStorage so subsequent page loads start with the right badge.
+  //
+  // Confirmed-expired agents are excluded from re-check (they stay expired
+  // until the agent is republished, detected by the 60 s refresh clearing
+  // the entry when last_publish_at becomes non-null).
+  // Confirmed-live agents ARE re-checked so a record that has since expired
+  // on the network is correctly moved to expired.
+  setTimeout(async () => {
+    if (!mount.isConnected) return;
+    const toCheck = agents
+      .filter(ag =>
+        ag.published_to_dht &&
+        !ag.last_publish_at &&
+        !_dhtConfirmedExpired.has(ag.aid), // skip already-confirmed-expired
+      )
+      .map(ag => ag.aid);
+    if (!toCheck.length) return;
+    await Promise.allSettled(toCheck.map(async (aid) => {
+      try {
+        const r = await api(`/agents/${encodeURIComponent(aid)}`);
+        if (r.published_record_seq != null) {
+          _dhtConfirmedLive.add(aid);
+          _dhtConfirmedExpired.delete(aid);
+        } else {
+          _dhtConfirmedExpired.add(aid);
+          _dhtConfirmedLive.delete(aid);
+        }
+        _saveDhtConfirmed();
+        const badge = mount.querySelector(`[data-aid-badge="${encodeURIComponent(aid)}"]`) ||
+                      mount.querySelector(`[data-aid-badge="${aid}"]`);
+        if (!badge) return;
+        const ag = agents.find(a => a.aid === aid);
+        if (!ag) return;
+        const st = agentStatus(ag);
+        badge.className = `badge ${st.cls}`;
+        badge.textContent = `● ${t(st.key)}`;
+      } catch (_) {}
+    }));
+  }, 120000);
 }

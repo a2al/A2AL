@@ -969,8 +969,14 @@ func (d *Daemon) handleDemoStart(w http.ResponseWriter, r *http.Request) {
 	prevTCP := e.ServiceTCP
 
 	// Start the internal HTTP server.
-	shortAID := demoShortAID(d.nodeAddr.String())
-	port, err := d.demo.startHTTP(shortAID)
+	port, err := d.demo.startHTTP(req.AID, func(p int) *sessionInfo {
+		v, ok := d.sessions.Load(p)
+		if !ok {
+			return nil
+		}
+		si, _ := v.(*sessionInfo)
+		return si
+	})
 	if err != nil {
 		http.Error(w, `{"error":"failed to start demo server"}`, http.StatusInternalServerError)
 		return

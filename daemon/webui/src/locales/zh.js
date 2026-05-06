@@ -26,6 +26,7 @@ export default {
   'agent.status.published': '已发布',
   'agent.status.unpublished': '未发布',
   'agent.status.refresh_failed': '已过期',
+  'agent.status.stale': '待确认',
   'agent.fn.ping.not_reachable': '请先发布此 Agent（或重新发布以刷新记录）',
 
   'agent.last_refresh': '上次更新 {ago}',

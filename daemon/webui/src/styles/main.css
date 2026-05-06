@@ -220,6 +220,7 @@ input:focus, textarea:focus, select:focus {
 .b-red    { background: #fee2e2; color: #b91c1c; }
 .b-gray   { background: #f1f5f9; color: #475569; }
 .b-yellow { background: #fef3c7; color: #92400e; }
+.b-orange { background: #ffedd5; color: #9a3412; }
 .b-blue   { background: #dbeafe; color: #1e40af; }
 
 /* ── Warn box ─────────────────────────────────────────────────────────────── */

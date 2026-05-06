@@ -630,8 +630,9 @@ export async function renderDiscover(mount, ctx) {
   /* ── Tools: ping ───────────────────────────────────────── */
   wrap.querySelector('#dPing').onclick = async (ev) => {
     if (!currentAid) return;
+    const btn = ev.currentTarget;
     const el = wrap.querySelector('#dPingOut');
-    setLoading(ev.currentTarget, true);
+    setLoading(btn, true);
     el.style.color = '';
     el.textContent = t('common.loading');
     const t0 = performance.now();
@@ -643,7 +644,7 @@ export async function renderDiscover(mount, ctx) {
       el.textContent = t('discover.ping.fail') + ': ' + e.message;
       el.style.color = 'var(--error)';
     } finally {
-      setLoading(ev.currentTarget, false);
+      setLoading(btn, false);
     }
   };
 
@@ -651,7 +652,8 @@ export async function renderDiscover(mount, ctx) {
   tunnelBtn.onclick = async (ev) => {
     if (!currentAid) return;
     if (!activateAction(tunnelBtn)) return;
-    setLoading(ev.currentTarget, true);
+    const btn = ev.currentTarget;
+    setLoading(btn, true);
     actionOut.innerHTML = `<p class="muted">${esc(t('common.loading'))}</p>`;
     if (currentTunnelId) {
       api(`/tunnel/${encodeURIComponent(currentTunnelId)}`, { method: 'DELETE' }).catch(() => {});
@@ -683,7 +685,7 @@ export async function renderDiscover(mount, ctx) {
     } catch (e) {
       actionOut.innerHTML = `<p style="color:var(--error);margin:0">${esc(t('common.error', { msg: e.message }))}</p>`;
     } finally {
-      setLoading(ev.currentTarget, false);
+      setLoading(btn, false);
     }
   };
 
@@ -691,7 +693,8 @@ export async function renderDiscover(mount, ctx) {
   oneshotBtn.onclick = async (ev) => {
     if (!currentAid) return;
     if (!activateAction(oneshotBtn)) return;
-    setLoading(ev.currentTarget, true);
+    const btn = ev.currentTarget;
+    setLoading(btn, true);
     actionOut.innerHTML = `<p class="muted">${esc(t('common.loading'))}</p>`;
     if (oneshotTimer) { clearInterval(oneshotTimer); oneshotTimer = null; }
     try {
@@ -719,7 +722,7 @@ export async function renderDiscover(mount, ctx) {
     } catch (e) {
       actionOut.innerHTML = `<p style="color:var(--error);margin:0">${esc(t('common.error', { msg: e.message }))}</p>`;
     } finally {
-      setLoading(ev.currentTarget, false);
+      setLoading(btn, false);
     }
   };
 
@@ -774,7 +777,8 @@ export async function renderDiscover(mount, ctx) {
     m.onchange = () => bw.classList.toggle('hidden', !['POST', 'PUT', 'PATCH'].includes(m.value));
     actionOut.querySelector('#rqGo').onclick = async (ev) => {
       if (!currentAid) return;
-      setLoading(ev.currentTarget, true);
+      const btn = ev.currentTarget;
+      setLoading(btn, true);
       const path = actionOut.querySelector('#rqP').value.trim() || '/';
       const method = m.value;
       const localAid = actionOut.querySelector('#rqAid').value;
@@ -801,7 +805,7 @@ export async function renderDiscover(mount, ctx) {
         actionOut.querySelector('#rqOut').textContent = e.message;
         actionOut.querySelector('#rqMeta').textContent = '';
       } finally {
-        setLoading(ev.currentTarget, false);
+        setLoading(btn, false);
       }
     };
   }
@@ -1095,7 +1099,8 @@ export async function renderDiscover(mount, ctx) {
       if (!from) { toast(t('discover.msg.need_from'), 'warn'); return; }
       const txt = panel.querySelector('[data-msg-txt]').value;
       if (!txt) return;
-      setLoading(ev.currentTarget, true);
+      const btn = ev.currentTarget;
+      setLoading(btn, true);
       try {
         await api(`/agents/${encodeURIComponent(from)}/mailbox/send`, {
           method: 'POST',
@@ -1106,7 +1111,7 @@ export async function renderDiscover(mount, ctx) {
       } catch (e) {
         toast(t('common.error', { msg: e.message }), 'err');
       } finally {
-        setLoading(ev.currentTarget, false);
+        setLoading(btn, false);
       }
     };
   }

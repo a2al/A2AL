@@ -59,6 +59,9 @@ type Config struct {
 	// on startup and on a schedule (default true). When false, the node stays off the DHT
 	// as a discoverable endpoint while still participating in routing.
 	AutoPublish bool `toml:"auto_publish" json:"auto_publish"`
+	// OpenBrowser controls whether a2ald opens the Web UI in the default browser on startup.
+	// Default true; set false for headless servers or when running as a system service.
+	OpenBrowser bool `toml:"open_browser" json:"open_browser"`
 	// BootstrapAssistMode enables passive routing and supplemental store writes for network resilience.
 	// Not included in user-facing documentation.
 	BeaconMode bool `toml:"beacon_mode" json:"beacon_mode,omitempty"`
@@ -83,6 +86,7 @@ func Default() Config {
 		LogFormat:        "text",
 		LogLevel:         "info",
 		AutoPublish:      true,
+		OpenBrowser:      true,
 		SignalListenAddr: "off",
 	}
 }

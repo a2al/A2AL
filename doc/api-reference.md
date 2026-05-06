@@ -179,6 +179,36 @@ Publish a custom signed record (RecType `0x02`–`0x0f`) for the agent.
 }
 ```
 
+#### `POST /agents/{aid}/profile`
+
+Set or update the agent's profile override. The daemon persists the fields and immediately publishes a RecType `0x02` sovereign record to the DHT. Any field omitted from the request leaves the daemon's inferred value (derived from registered services) as the fallback.
+
+**Request (all fields optional):**
+
+```json
+{
+  "name": "My Translation Agent",
+  "brief": "Specialized in legal document translation between Chinese and English.",
+  "protocols": ["mcp", "http"],
+  "skills": ["lang.translate"],
+  "modalities": ["text"],
+  "card_hash": "<64-char hex or 44-char base64 SHA-256 of agent.json>",
+  "meta": {"url": "https://example.com/agent"}
+}
+```
+
+`card_hash` must be the SHA-256 digest of the agent's `agent.json` card, encoded as 64-char lowercase hex or 44-char standard base64. Clients use it as an ETag to avoid re-fetching unchanged cards.
+
+**Response:** `{"ok": true}`
+
+#### `DELETE /agents/{aid}/profile`
+
+Remove the explicit profile override. The daemon falls back to inferring profile data from the agent's registered services and republishes the `0x02` record. If no services are registered, the record is not re-published (the previous DHT entry expires naturally).
+
+**Request:** `{}`
+
+**Response:** `{"ok": true}`
+
 ---
 
 ### Services (Capability Discovery)

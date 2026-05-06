@@ -26,6 +26,7 @@ export default {
   'agent.status.published': 'Published',
   'agent.status.unpublished': 'Unpublished',
   'agent.status.refresh_failed': 'Expired',
+  'agent.status.stale': 'Stale',
   'agent.fn.ping.not_reachable': 'Please publish this Agent first (or republish to refresh the record)',
 
   'agent.last_refresh': 'Last published {ago}',

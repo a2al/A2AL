@@ -26,6 +26,7 @@ export default {
   'agent.status.published': '公開済み',
   'agent.status.unpublished': '未公開',
   'agent.status.refresh_failed': '期限切れ',
+  'agent.status.stale': '要確認',
   'agent.fn.ping.not_reachable': 'まずAgentを公開してください（または再公開してレコードを更新してください）',
 
   'agent.last_refresh': '最終公開: {ago}',
