@@ -1024,7 +1024,7 @@ export async function renderDiscover(mount, ctx) {
         rowWrap.dataset.activeAction = action;
         if (action !== 'del') { btn.classList.remove(DEFAULT_CLS[action] || 'btn-ghost'); btn.classList.add('btn-primary'); }
         panel.style.display = '';
-        if (action === 'tunnel')   await setupFavTunnel(fav, panel);
+        if (action === 'tunnel')   await setupFavTunnel(fav, panel, deactivateFavBtns);
         else if (action === 'aidproxy') setupFavAidproxy(fav, panel);
         else if (action === 'msg')      setupFavMsg(fav, panel);
         else if (action === 'del')      setupFavDel(fav, panel, deactivateFavBtns);
@@ -1034,7 +1034,7 @@ export async function renderDiscover(mount, ctx) {
     return rowWrap;
   }
 
-  async function setupFavTunnel(fav, panel) {
+  async function setupFavTunnel(fav, panel, deactivateFavBtns) {
     panel.innerHTML = `<p class="muted" style="font-size:.87rem">${esc(t('common.loading'))}</p>`;
     const prevId = favTunnels.get(fav.id);
     if (prevId) { api(`/tunnel/${encodeURIComponent(prevId)}`, { method: 'DELETE' }).catch(() => {}); favTunnels.delete(fav.id); }

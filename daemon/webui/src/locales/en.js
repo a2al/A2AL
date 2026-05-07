@@ -15,8 +15,8 @@ export default {
   'agent.empty.body':
     'An AID is its autonomous, self-generated identity — issued by no authority, tied to no platform.\nLike a fingerprint, it proves this Agent is unlike any other in existence.\nWithout it, this Agent is invisible to the network.',
 
-  'agent.action.create': 'Generate New Identity',
-  'agent.action.import': 'Import Existing Identity',
+  'agent.action.create': 'Add Identity',
+  'agent.action.import': 'Import Identity',
   'agent.action.eth': 'Ethereum Identity',
   'agent.action.publish': 'Publish',
   'agent.action.republish': 'Update & Publish',
@@ -36,7 +36,17 @@ export default {
   'agent.sort.alias': 'Alias',
   'agent.dht_replicas': 'Replicas {n}/{target}',
 
-  'agent.modal.create.title': 'Generate New Identity',
+  'agent.modal.create.title': 'Add Identity',
+  'agent.modal.create.tab.new': 'Create New AID',
+  'agent.modal.create.tab.recover': 'Recover from Master Key',
+  'agent.modal.create.description': 'Generates a permanent AID unique to you. Anyone can reach you by AID.',
+  'agent.modal.create.generate_btn': 'Generate AID',
+  'agent.modal.create.aid_placeholder': 'Click the button to generate an AID',
+  'agent.modal.recover.master_key.label': 'Master private key (hex)',
+  'agent.modal.recover.hint': 'Enter the master private key of an existing AID to issue a publishing authorization for it on the local a2ald. The key is used only for in-browser signing — it is never uploaded or stored.',
+  'agent.modal.recover.aid_label': 'AID',
+  'agent.modal.recover.aid_empty': 'Enter or paste your master private key',
+  'agent.modal.recover.aid_invalid': 'Invalid master key format',
   'agent.modal.masterkey.warning':
     '⚠ This is the sole proof of ownership for this identity.\nCopy it now and save it somewhere safe — it will NOT be shown again.\nIt is stored on no server. If lost, this AID cannot be recovered.',
   'agent.modal.masterkey.key_label': 'Master Private Key — copy and save this',
@@ -47,8 +57,10 @@ export default {
   'agent.modal.service_tcp.optional': '(leave blank to configure later)',
   'agent.modal.service_tcp.hint': 'Supports URL or TCP host:port format, e.g. http://127.0.0.1:8080 or 127.0.0.1:8080.',
   'agent.modal.submit': 'Register',
+  'agent.modal.import.submit': 'Import',
+  'agent.modal.create.submit': 'Add',
 
-  'agent.modal.import.title': 'Import Existing Identity',
+  'agent.modal.import.title': 'Import Identity',
   'agent.modal.import.op_key.label': 'Operational private key (hex)',
   'agent.modal.import.del_proof.label': 'Delegation proof (hex)',
   'agent.modal.import.or_file': 'or upload identity file',

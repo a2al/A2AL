@@ -98,7 +98,7 @@ func cmdAgents(c *Client, g globalOpts, args []string) {
 			printJSON(true, map[string]any{"ok": true})
 		}
 	case "export":
-		cmdAgentsExport(g, rest)
+		cmdAgentsExport(c, g, rest)
 	case "import":
 		cmdAgentsImport(c, g, rest)
 	case "topic":
@@ -164,9 +164,9 @@ func cmdAgentsUpdate(c *Client, g globalOpts, args []string) {
 	}
 }
 
-func cmdAgentsExport(g globalOpts, args []string) {
+func cmdAgentsExport(c *Client, g globalOpts, args []string) {
 	if len(args) < 1 {
-		fatalf("usage: a2al agents export <local-aid> [-o file]")
+		fatalf("usage: a2al agents export <aid> [-o file]")
 	}
 	aid := args[0]
 	outPath := ""
@@ -176,8 +176,8 @@ func cmdAgentsExport(g globalOpts, args []string) {
 			outPath = args[i]
 		}
 	}
-	id, err := loadAgentIdentity(aid)
-	if err != nil {
+	var id agentIdentityFile
+	if _, _, err := c.DoRequest(http.MethodGet, "/agents/"+url.PathEscape(aid)+"/export", nil, &id); err != nil {
 		fatal(err)
 	}
 	b, err := json.MarshalIndent(id, "", "  ")

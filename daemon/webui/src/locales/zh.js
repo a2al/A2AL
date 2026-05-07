@@ -15,8 +15,8 @@ export default {
   'agent.empty.body':
     'AID 是它唯一的、自主生成的身份凭证——\n不依赖任何平台，不由任何机构颁发。\n如同 DNA，证明它有别于世界上任何其他存在。\n没有 AID，它对这片网络而言，一无所知。',
 
-  'agent.action.create': '生成新身份',
-  'agent.action.import': '导入已有身份',
+  'agent.action.create': '添加新身份',
+  'agent.action.import': '导入身份',
   'agent.action.eth': 'Ethereum 身份',
   'agent.action.publish': '发布',
   'agent.action.republish': '更新发布',
@@ -36,7 +36,17 @@ export default {
   'agent.sort.alias': '别名',
   'agent.dht_replicas': '副本 {n}/{target}',
 
-  'agent.modal.create.title': '生成新身份',
+  'agent.modal.create.title': '添加新身份',
+  'agent.modal.create.tab.new': '建立全新 AID',
+  'agent.modal.create.tab.recover': '从主私钥建立',
+  'agent.modal.create.description': '将生成您专属的、可永久持有的 AID，任何人可通过 AID 找到您。',
+  'agent.modal.create.generate_btn': '生成 AID',
+  'agent.modal.create.aid_placeholder': '点击右侧按钮生成 AID',
+  'agent.modal.recover.master_key.label': '主私钥（hex）',
+  'agent.modal.recover.hint': '输入已有 AID 的主私钥，为该 AID 签发在本机 a2ald 上发布的授权。主私钥仅在浏览器内完成签名，不会上传或存储。',
+  'agent.modal.recover.aid_label': 'AID',
+  'agent.modal.recover.aid_empty': '请输入或粘贴您的主私钥',
+  'agent.modal.recover.aid_invalid': '主私钥格式非法',
   'agent.modal.masterkey.warning':
     '⚠ 这是这个身份的唯一主权凭证，此刻之后不再显示。\n请立即点击下方按钮复制，并保存到安全位置。\n它不存储于任何服务器。一旦丢失，该 AID 的所有权将永久无法证明，身份本身也无法恢复。',
   'agent.modal.masterkey.key_label': '主私钥（Master Private Key）— 请复制并保存',
@@ -47,8 +57,10 @@ export default {
   'agent.modal.service_tcp.optional': '（暂无可留空，稍后配置）',
   'agent.modal.service_tcp.hint': '支持 URL 或 TCP 协议的 host:port 格式，如 http://127.0.0.1:8080 或 127.0.0.1:8080。',
   'agent.modal.submit': '注册',
+  'agent.modal.import.submit': '导入',
+  'agent.modal.create.submit': '添加',
 
-  'agent.modal.import.title': '导入已有身份',
+  'agent.modal.import.title': '导入身份',
   'agent.modal.import.op_key.label': '操作私钥（hex）',
   'agent.modal.import.del_proof.label': '授权凭证（hex）',
   'agent.modal.import.or_file': '或上传身份文件',

@@ -13,6 +13,134 @@ import {
   normalizeServiceTCP,
   base64ToUtf8,
 } from '../util.js';
+import { ed25519 } from '@noble/curves/ed25519.js';
+import { encode as cborEncode } from 'cborg';
+
+// ---------------------------------------------------------------------------
+// Local delegation signing — master private key never leaves the browser.
+// Mirrors identity.SignDelegation in Go (identity/delegation.go).
+// ---------------------------------------------------------------------------
+
+const SIGN_PREFIX = new TextEncoder().encode('a2al-del\x00');
+// VersionEd25519 = 0xA0 (address.go)
+const AID_VERSION_ED25519 = 0xA0;
+
+function hexToBytes(hex) {
+  if (hex.length % 2 !== 0) throw new Error('invalid hex length');
+  const b = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < b.length; i++) b[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  return b;
+}
+
+function bytesToHex(b) {
+  return Array.from(b).map((x) => x.toString(16).padStart(2, '0')).join('');
+}
+
+async function sha256bytes(data) {
+  return new Uint8Array(await crypto.subtle.digest('SHA-256', data));
+}
+
+// Validate master private key hex: exactly 128 hex chars, no whitespace.
+function isValidMasterKeyHex(s) {
+  return s.length === 128 && /^[0-9a-fA-F]{128}$/.test(s);
+}
+
+// Normalise user input: strip all whitespace.
+function normaliseMasterKeyInput(s) {
+  return s.replace(/\s/g, '');
+}
+
+// Derive AID (21 bytes) from Ed25519 master public key (32 bytes).
+// Mirrors crypto.AddressFromPublicKey: AID[0]=0xA0, AID[1:21]=SHA256(masterPub)[0:20]
+async function aidBytesFromMasterPub(masterPub) {
+  const h = await sha256bytes(masterPub);
+  const aid = new Uint8Array(21);
+  aid[0] = AID_VERSION_ED25519;
+  aid.set(h.slice(0, 20), 1);
+  return aid;
+}
+
+// Format AID bytes (21 bytes) to canonical string.
+// Mirrors nativeFormatAddress / nativeChecksumHex in native_address.go.
+// Result: 42-char hex with SHA256-based mixed-case checksum.
+async function formatAIDBytes(aidBytes) {
+  const lower = bytesToHex(aidBytes); // 42 lowercase hex chars
+  const hashBytes = await sha256bytes(new TextEncoder().encode(lower));
+  let out = '';
+  for (let i = 0; i < lower.length; i++) {
+    const c = lower[i];
+    if (c >= '0' && c <= '9') { out += c; continue; }
+    const nib = i % 2 === 0 ? (hashBytes[Math.floor(i / 2)] >> 4) : (hashBytes[Math.floor(i / 2)] & 0x0f);
+    out += nib >= 8 ? c.toUpperCase() : c;
+  }
+  return out;
+}
+
+// Derive displayable AID string from a validated 128-char master key hex.
+async function deriveAIDString(masterPrivHex) {
+  const masterPub = hexToBytes(masterPrivHex).slice(32, 64);
+  const aidBytes = await aidBytesFromMasterPub(masterPub);
+  return formatAIDBytes(aidBytes);
+}
+
+// Build canonical CBOR map with integer keys (matches Go fxamacker/cbor canonical mode).
+function buildDelegationCBOR(masterPub, opPub, aidBytes, issuedAt, expiresAt, scope) {
+  return cborEncode(new Map([
+    [1, masterPub],
+    [2, opPub],
+    [3, aidBytes],
+    [4, issuedAt],
+    [5, expiresAt],
+    [6, scope],
+  ]));
+}
+
+// Sign delegation and return { opPrivHex, delegationHex }.
+// AID string is read from the daemon's POST /agents response.
+async function signDelegationFromMaster(masterPrivHex) {
+  const masterPrivBytes = hexToBytes(masterPrivHex);
+  const masterSeed = masterPrivBytes.slice(0, 32);
+  const masterPub  = masterPrivBytes.slice(32, 64);
+  const aidBytes   = await aidBytesFromMasterPub(masterPub);
+
+  const opPrivBytes = ed25519.utils.randomSecretKey();
+  const opPub       = ed25519.getPublicKey(opPrivBytes);
+
+  const issuedAt  = BigInt(Math.floor(Date.now() / 1000));
+  const expiresAt = BigInt(0);
+  const scope     = 1;
+
+  const fieldsCBOR = buildDelegationCBOR(masterPub, opPub, aidBytes, issuedAt, expiresAt, scope);
+  const msg = new Uint8Array(SIGN_PREFIX.length + fieldsCBOR.length);
+  msg.set(SIGN_PREFIX, 0);
+  msg.set(fieldsCBOR, SIGN_PREFIX.length);
+
+  const sig = ed25519.sign(msg, masterSeed);
+
+  const proofCBOR = cborEncode(new Map([
+    [1, masterPub],
+    [2, opPub],
+    [3, aidBytes],
+    [4, issuedAt],
+    [5, expiresAt],
+    [6, scope],
+    [7, sig],
+  ]));
+
+  // Go ed25519.PrivateKey layout: seed || pub (64 bytes)
+  const opPrivFull = new Uint8Array(64);
+  opPrivFull.set(opPrivBytes, 0);
+  opPrivFull.set(opPub, 32);
+
+  return {
+    opPrivHex:     bytesToHex(opPrivFull),
+    delegationHex: bytesToHex(proofCBOR),
+  };
+}
+
+// Set before calling onRefresh so that renderAgents can highlight the new card.
+let _pendingNewAid = null;
+function markNewCard(aid) { _pendingNewAid = aid; }
 
 const CATS = ['lang', 'gen', 'sense', 'data', 'reason', 'code', 'tool'];
 
@@ -203,6 +331,17 @@ export async function renderAgents(mount, ctx) {
     for (let idx = 0; idx < sorted.length; idx++) {
       listContainer.appendChild(buildAgentCard(sorted[idx], idx === 0, sorted, idx, demoStatus));
     }
+    // Highlight and scroll to a newly registered card if pending
+    if (_pendingNewAid) {
+      const newCard = listContainer.querySelector(`[data-aid="${CSS.escape(_pendingNewAid)}"]`);
+      _pendingNewAid = null;
+      if (newCard) {
+        newCard.classList.add('card-new');
+        newCard.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        // Remove highlight on first click anywhere on the card
+        newCard.addEventListener('click', () => newCard.classList.remove('card-new'), { once: true });
+      }
+    }
   };
   renderList();
 
@@ -216,6 +355,7 @@ export async function renderAgents(mount, ctx) {
     const card = document.createElement('div');
     card.className = 'card ag2-card';
     card.dataset.status = tcpAccentCls(ag);
+    card.dataset.aid = ag.aid;
 
     // ── § Basic info ──
     const infoDiv = document.createElement('div');
@@ -707,41 +847,86 @@ export async function renderAgents(mount, ctx) {
   // ── Modal functions (unchanged) ─────────────────────────────────────────
 
   function openCreateModal() {
-    let step = 1;
+    let activeTab = 'new'; // 'new' | 'recover'
+    let step = 1;          // 1=idle, 2=loading, 3=ready  (only used by 'new' tab)
     let gen = null;
+
     openModal({
       title: t('agent.modal.create.title'),
-      body: `<div id="cmBody"></div>`,
+      noBackdropClose: true,
+      body: `
+        <div class="modal-tabs" id="cmTabs">
+          <button type="button" class="active" data-tab="new">${esc(t('agent.modal.create.tab.new'))}</button>
+          <button type="button" data-tab="recover">${esc(t('agent.modal.create.tab.recover'))}</button>
+        </div>
+        <div id="cmBody"></div>`,
       onMount(root, { close }) {
         const body = root.querySelector('#cmBody');
-        function render() {
+
+        // Tab switching
+        root.querySelectorAll('.modal-tabs button').forEach((btn) => {
+          btn.onclick = () => {
+            activeTab = btn.dataset.tab;
+            root.querySelectorAll('.modal-tabs button').forEach((b) => b.classList.toggle('active', b.dataset.tab === activeTab));
+            render();
+          };
+        });
+
+        // ── Tab: 建立全新 AID ──────────────────────────────────────────────
+        function renderNew() {
+          // step 1: idle — show AID input + generate button
           if (step === 1) {
-            body.innerHTML = `<p class="muted">${esc(t('common.loading'))}</p>`;
+            body.innerHTML = `
+              <p class="muted" style="font-size:.85rem;margin:.75rem 0 .9rem">${esc(t('agent.modal.create.description'))}</p>
+              <div style="display:flex;gap:.5rem;align-items:center;margin-bottom:1.25rem">
+                <input id="cmAid" readonly class="mono"
+                  placeholder="${esc(t('agent.modal.create.aid_placeholder'))}"
+                  style="flex:1;min-width:0;font-size:.8rem" />
+                <button type="button" class="btn btn-primary btn-sm" id="cmGenBtn" style="white-space:nowrap;flex-shrink:0">
+                  ${esc(t('agent.modal.create.generate_btn'))}
+                </button>
+              </div>
+              <div style="margin-top:1rem;display:flex;gap:.5rem;justify-content:flex-end">
+                <button type="button" class="btn btn-secondary" data-close>${esc(t('common.cancel'))}</button>
+              </div>`;
+            body.querySelector('#cmGenBtn').onclick = () => { step = 2; renderNew(); };
+            return;
+          }
+
+          // step 2: loading
+          if (step === 2) {
+            body.innerHTML = `
+              <p class="muted" style="font-size:.85rem;margin:.75rem 0 .9rem">${esc(t('agent.modal.create.description'))}</p>
+              <div style="display:flex;gap:.5rem;align-items:center;margin-bottom:1.25rem">
+                <input id="cmAid" readonly class="mono" style="flex:1;min-width:0;font-size:.8rem" />
+                <button type="button" class="btn btn-primary btn-sm" disabled style="white-space:nowrap;flex-shrink:0">…</button>
+              </div>
+              <div style="margin-top:1rem;display:flex;gap:.5rem;justify-content:flex-end">
+                <button type="button" class="btn btn-secondary" data-close>${esc(t('common.cancel'))}</button>
+              </div>`;
             api('/identity/generate', { method: 'POST', body: '{}' })
-              .then((r) => {
-                gen = r;
-                step = 2;
-                render();
-              })
+              .then((r) => { gen = r; step = 3; renderNew(); })
               .catch((e) => {
                 body.innerHTML = `<p style="color:var(--error)">${esc(t('common.error', { msg: e.message }))}</p>`;
               });
             return;
           }
-          if (step === 2 && gen) {
+
+          // step 3: generated — show master key, confirm, register
+          if (step === 3 && gen) {
             body.innerHTML = `
-              <div class="field">
+              <div class="field" style="margin-top:.75rem">
                 <label>AID</label>
-                <input readonly class="mono" value="${esc(gen.aid)}" style="width:100%" />
+                <input readonly class="mono" value="${esc(gen.aid)}" style="width:100%;font-size:.8rem" />
               </div>
-              <div class="warn-box">${esc(t('agent.modal.masterkey.warning')).replace(/\n/g, '<br/>')}</div>
               <div class="field">
                 <label>${esc(t('agent.modal.masterkey.key_label'))}</label>
+                <div class="warn-box" style="margin-bottom:.5rem">${esc(t('agent.modal.masterkey.warning')).replace(/\n/g, '<br/>')}</div>
                 <textarea readonly rows="3" class="mono" style="width:100%;font-size:.78rem">${esc(gen.master_private_key_hex)}</textarea>
-                <button type="button" class="btn btn-primary btn-sm" style="margin-top:.5rem;width:100%" id="cmCopy">\u29c9 ${esc(t('agent.modal.masterkey.copy_btn'))}</button>
+                <button type="button" class="btn btn-ghost btn-sm" style="margin-top:.4rem" id="cmCopy">\u29c9 ${esc(t('agent.modal.masterkey.copy_btn'))}</button>
               </div>
-              <label class="chk" style="margin-bottom:.5rem"><input type="checkbox" id="cmOk" /> <span>${esc(t('agent.modal.masterkey.confirm'))}</span></label>
-              <details style="margin-top:1rem">
+              <label class="chk" style="margin-bottom:.75rem"><input type="checkbox" id="cmOk" /> <span>${esc(t('agent.modal.masterkey.confirm'))}</span></label>
+              <details>
                 <summary>${esc(t('agent.modal.advanced'))}</summary>
                 <div class="field" style="margin-top:.75rem">
                   <label>${esc(t('agent.modal.service_tcp.label'))} <span class="muted" style="font-weight:400">${esc(t('agent.modal.service_tcp.optional'))}</span></label>
@@ -751,22 +936,18 @@ export async function renderAgents(mount, ctx) {
               </details>
               <div style="margin-top:1rem;display:flex;gap:.5rem;justify-content:flex-end">
                 <button type="button" class="btn btn-secondary" data-close>${esc(t('common.cancel'))}</button>
-                <button type="button" class="btn btn-secondary" id="cmReg">${esc(t('agent.modal.submit'))}</button>
+                <button type="button" class="btn btn-secondary" id="cmReg" disabled>${esc(t('agent.modal.create.submit'))}</button>
               </div>`;
             body.querySelector('#cmCopy').onclick = () =>
               navigator.clipboard.writeText(gen.master_private_key_hex)
                 .then(() => toast(t('common.copied'), 'ok', 1200));
-            // Enable Register only after confirming key is saved
-            const cmOk = body.querySelector('#cmOk');
+            const cmOk  = body.querySelector('#cmOk');
             const cmReg = body.querySelector('#cmReg');
             cmOk.addEventListener('change', () => {
+              cmReg.disabled  = !cmOk.checked;
               cmReg.className = cmOk.checked ? 'btn btn-primary' : 'btn btn-secondary';
             });
-            body.querySelector('#cmReg').onclick = async (ev) => {
-              if (!body.querySelector('#cmOk').checked) {
-                toast(t('agent.modal.masterkey.confirm'), 'warn');
-                return;
-              }
+            cmReg.onclick = async (ev) => {
               const b = ev.currentTarget;
               setLoading(b, true);
               try {
@@ -775,17 +956,13 @@ export async function renderAgents(mount, ctx) {
                   method: 'POST',
                   body: JSON.stringify({
                     operational_private_key_hex: gen.operational_private_key_hex,
-                    delegation_proof_hex: gen.delegation_proof_hex,
-                    service_tcp: tcp,
+                    delegation_proof_hex:        gen.delegation_proof_hex,
+                    service_tcp:                 tcp,
                   }),
                 });
                 toast(r.aid, 'ok');
-                try {
-                  await api(`/agents/${encodeURIComponent(r.aid)}/publish`, {
-                    method: 'POST',
-                    body: '{}',
-                  });
-                } catch (_) {}
+                try { await api(`/agents/${encodeURIComponent(r.aid)}/publish`, { method: 'POST', body: '{}' }); } catch (_) {}
+                markNewCard(r.aid);
                 close();
                 onRefresh();
               } catch (e) {
@@ -796,6 +973,109 @@ export async function renderAgents(mount, ctx) {
             };
           }
         }
+
+        // ── Tab: 从主私钥建立 ──────────────────────────────────────────────
+        function renderRecover() {
+          body.innerHTML = `
+            <p class="muted" style="margin:.75rem 0 .9rem;font-size:.85rem">${esc(t('agent.modal.recover.hint'))}</p>
+            <div class="field">
+              <label>${esc(t('agent.modal.recover.master_key.label'))}</label>
+              <textarea id="rcKey" rows="2" class="mono" style="width:100%;font-size:.78rem"
+                placeholder="128-char hex"
+                autocomplete="off" autocorrect="off" spellcheck="false"></textarea>
+            </div>
+            <div class="field">
+              <label>${esc(t('agent.modal.recover.aid_label'))}</label>
+              <input id="rcAid" readonly class="mono"
+                value="${esc(t('agent.modal.recover.aid_empty'))}"
+                style="width:100%;font-size:.8rem;color:var(--muted)" />
+            </div>
+            <details style="margin-top:.25rem">
+              <summary>${esc(t('agent.modal.advanced'))}</summary>
+              <div class="field" style="margin-top:.75rem">
+                <label>${esc(t('agent.modal.service_tcp.label'))} <span class="muted" style="font-weight:400">${esc(t('agent.modal.service_tcp.optional'))}</span></label>
+                <input type="text" id="rcTcp" placeholder="http://127.0.0.1:8080" style="width:100%" />
+                <div class="hint">${esc(t('agent.modal.service_tcp.hint'))}</div>
+              </div>
+            </details>
+            <div style="margin-top:1rem;display:flex;gap:.5rem;justify-content:flex-end">
+              <button type="button" class="btn btn-secondary" data-close>${esc(t('common.cancel'))}</button>
+              <button type="button" class="btn btn-primary" id="rcGo" disabled>${esc(t('agent.modal.create.submit'))}</button>
+            </div>`;
+
+          const rcKey = body.querySelector('#rcKey');
+          const rcAid = body.querySelector('#rcAid');
+          const rcGo  = body.querySelector('#rcGo');
+
+          // Real-time validation and AID preview
+          let aidDeriveTimer = null;
+          rcKey.addEventListener('input', () => {
+            clearTimeout(aidDeriveTimer);
+            const raw = normaliseMasterKeyInput(rcKey.value);
+            if (raw.length === 0) {
+              rcAid.value       = t('agent.modal.recover.aid_empty');
+              rcAid.style.color = 'var(--muted)';
+              rcGo.disabled     = true;
+              return;
+            }
+            if (!isValidMasterKeyHex(raw)) {
+              rcAid.value       = t('agent.modal.recover.aid_invalid');
+              rcAid.style.color = 'var(--error)';
+              rcGo.disabled     = true;
+              return;
+            }
+            // Valid — derive AID asynchronously (debounced 150 ms)
+            rcAid.value       = '…';
+            rcAid.style.color = 'var(--muted)';
+            rcGo.disabled     = true;
+            aidDeriveTimer = setTimeout(async () => {
+              try {
+                const aidStr      = await deriveAIDString(raw);
+                rcAid.value       = aidStr;
+                rcAid.style.color = '';
+                rcGo.disabled     = false;
+              } catch (_) {
+                rcAid.value       = t('agent.modal.recover.aid_invalid');
+                rcAid.style.color = 'var(--error)';
+                rcGo.disabled     = true;
+              }
+            }, 150);
+          });
+
+          rcGo.onclick = async (ev) => {
+            const keyHex = normaliseMasterKeyInput(rcKey.value);
+            if (!isValidMasterKeyHex(keyHex)) return;
+            const b = ev.currentTarget;
+            setLoading(b, true);
+            try {
+              const { opPrivHex, delegationHex } = await signDelegationFromMaster(keyHex);
+              const tcp = normalizeServiceTCP(body.querySelector('#rcTcp').value);
+              const r = await api('/agents', {
+                method: 'POST',
+                body: JSON.stringify({
+                  operational_private_key_hex: opPrivHex,
+                  delegation_proof_hex:        delegationHex,
+                  service_tcp:                 tcp,
+                }),
+              });
+              toast(r.aid, 'ok');
+              try { await api(`/agents/${encodeURIComponent(r.aid)}/publish`, { method: 'POST', body: '{}' }); } catch (_) {}
+              markNewCard(r.aid);
+              close();
+              onRefresh();
+            } catch (e) {
+              toast(t('common.error', { msg: e.message }), 'err');
+            } finally {
+              setLoading(b, false);
+            }
+          };
+        }
+
+        function render() {
+          if (activeTab === 'recover') { renderRecover(); return; }
+          renderNew();
+        }
+
         render();
       },
     });
@@ -827,7 +1107,7 @@ export async function renderAgents(mount, ctx) {
         </details>
         <div style="margin-top:1rem;display:flex;gap:.5rem;justify-content:flex-end">
           <button type="button" class="btn btn-secondary" data-close>${esc(t('common.cancel'))}</button>
-          <button type="button" class="btn btn-primary" id="imGo">${esc(t('agent.modal.submit'))}</button>
+          <button type="button" class="btn btn-primary" id="imGo">${esc(t('agent.modal.import.submit'))}</button>
         </div>`,
       onMount(root, { close }) {
         root.querySelector('#imFile').onchange = (e) => {

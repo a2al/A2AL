@@ -57,6 +57,26 @@ func (d *Daemon) execIdentityGenerate() (identityGenResp, error) {
 	}, nil
 }
 
+// execAgentExport returns the stored operational credentials for a registered agent.
+func (d *Daemon) execAgentExport(aidStr string) (map[string]any, error) {
+	aid, err := a2al.ParseAddress(aidStr)
+	if err != nil {
+		return nil, errBadAID
+	}
+	d.regMu.RLock()
+	e := d.reg.Get(aid)
+	d.regMu.RUnlock()
+	if e == nil {
+		return nil, errNotFound
+	}
+	return map[string]any{
+		"aid":                        e.AID.String(),
+		"operational_private_key_hex": hex.EncodeToString(e.OpPriv),
+		"delegation_proof_hex":        hex.EncodeToString(e.DelegationCBOR),
+		"service_tcp":                 e.ServiceTCP,
+	}, nil
+}
+
 type ethereumGenResp struct {
 	EthereumPrivateKeyHex    string `json:"ethereum_private_key_hex"`
 	OperationalPrivateKeyHex string `json:"operational_private_key_hex"`

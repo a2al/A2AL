@@ -11,7 +11,7 @@ let tab = 'agents';
 let _ver = ''; // cached version string, populated by refreshHeader()
 
 /** Open a modal. onMount receives (modalEl, { close }). */
-function openModal({ title, body, footer, wide, onMount }) {
+function openModal({ title, body, footer, wide, noBackdropClose, onMount }) {
   const backdrop = document.createElement('div');
   backdrop.className = 'modal-backdrop';
   const modal = document.createElement('div');
@@ -48,9 +48,11 @@ function openModal({ title, body, footer, wide, onMount }) {
   document.addEventListener('keydown', onKey);
 
   head.querySelector('[data-x]').onclick = close;
-  backdrop.addEventListener('click', (e) => {
-    if (e.target === backdrop) close();
-  });
+  if (!noBackdropClose) {
+    backdrop.addEventListener('click', (e) => {
+      if (e.target === backdrop) close();
+    });
+  }
   modal.addEventListener('click', (e) => {
     if (e.target.closest('[data-close]')) close();
   });

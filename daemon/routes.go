@@ -28,6 +28,7 @@ func (d *Daemon) routes() http.Handler {
 	mux.HandleFunc("PATCH /config", d.handlePatchConfig)
 	mux.HandleFunc("GET /config/schema", d.handleConfigSchema)
 	mux.HandleFunc("POST /identity/generate", d.handleIdentityGenerate)
+	mux.HandleFunc("GET /agents/{aid}/export", d.handleAgentsExport)
 	mux.HandleFunc("POST /agents", d.handleAgentsPost)
 	mux.HandleFunc("POST /agents/generate", d.handleAgentsGenerate)
 	mux.HandleFunc("POST /agents/ethereum/delegation-message", d.handleEthDelegationMessage)
@@ -291,17 +292,30 @@ func (d *Daemon) handleConfigSchema(w http.ResponseWriter, _ *http.Request) {
 }
 
 type identityGenResp struct {
-	MasterPrivateKeyHex      string `json:"master_private_key_hex"`
+	MasterPrivateKeyHex      string `json:"master_private_key_hex,omitempty"`
 	OperationalPrivateKeyHex string `json:"operational_private_key_hex"`
 	DelegationProofHex       string `json:"delegation_proof_hex"`
 	AID                      string `json:"aid"`
-	Warning                  string `json:"warning"`
+	Warning                  string `json:"warning,omitempty"`
 }
 
-func (d *Daemon) handleIdentityGenerate(w http.ResponseWriter, _ *http.Request) {
+func (d *Daemon) handleIdentityGenerate(w http.ResponseWriter, r *http.Request) {
 	out, err := d.execIdentityGenerate()
 	if err != nil {
-		http.Error(w, `{"error":"keygen"}`, http.StatusInternalServerError)
+		http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, out)
+}
+
+func (d *Daemon) handleAgentsExport(w http.ResponseWriter, r *http.Request) {
+	out, err := d.execAgentExport(r.PathValue("aid"))
+	if err != nil {
+		if errors.Is(err, errBadAID) {
+			http.Error(w, `{"error":"bad aid"}`, http.StatusBadRequest)
+			return
+		}
+		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
 		return
 	}
 	writeJSON(w, out)

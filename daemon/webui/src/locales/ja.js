@@ -15,8 +15,8 @@ export default {
   'agent.empty.body':
     'AIDは、いかなる機関にも依存しない、自律的に生成される唯一の身元証明です。\nDNAのように、このAgentが他の誰とも異なる存在であることを証明します。\nAIDがなければ、このAgentはネットワークに対して完全に不可視です。',
 
-  'agent.action.create': '新しいIDを生成',
-  'agent.action.import': '既存のIDをインポート',
+  'agent.action.create': 'IDを追加',
+  'agent.action.import': 'IDをインポート',
   'agent.action.eth': 'Ethereumアイデンティティ',
   'agent.action.publish': '公開',
   'agent.action.republish': '更新して公開',
@@ -36,7 +36,17 @@ export default {
   'agent.sort.alias': 'エイリアス',
   'agent.dht_replicas': 'レプリカ {n}/{target}',
 
-  'agent.modal.create.title': '新しいIDを生成',
+  'agent.modal.create.title': 'IDを追加',
+  'agent.modal.create.tab.new': '新規AIDを作成',
+  'agent.modal.create.tab.recover': 'マスターキーから復元',
+  'agent.modal.create.description': '永続的なAIDを生成します。AIDを通じて誰でもあなたに接続できます。',
+  'agent.modal.create.generate_btn': 'AIDを生成',
+  'agent.modal.create.aid_placeholder': '右のボタンをクリックしてAIDを生成',
+  'agent.modal.recover.master_key.label': 'マスター秘密鍵（hex）',
+  'agent.modal.recover.hint': '既存AIDのマスター秘密鍵を入力して、本機のa2aldでの公開に必要な認可を発行します。秘密鍵はブラウザ内での署名のみに使用され、送信・保存されません。',
+  'agent.modal.recover.aid_label': 'AID',
+  'agent.modal.recover.aid_empty': 'マスター秘密鍵を入力または貼り付けてください',
+  'agent.modal.recover.aid_invalid': 'マスター秘密鍵の形式が正しくありません',
   'agent.modal.masterkey.warning':
     '⚠ これはこのIDの唯一の所有権証明であり、この後は表示されません。\n今すぐ下のボタンでコピーし、安全な場所に保存してください。\nいかなるサーバーにも保存されません。紛失した場合、このAIDの所有権は永久に証明できなくなります。',
   'agent.modal.masterkey.key_label': 'マスター秘密鍵（Master Private Key）— コピーして保存',
@@ -47,8 +57,10 @@ export default {
   'agent.modal.service_tcp.optional': '（後で設定可）',
   'agent.modal.service_tcp.hint': 'URLまたはTCP host:port形式に対応。例: http://127.0.0.1:8080 または 127.0.0.1:8080。',
   'agent.modal.submit': '登録',
+  'agent.modal.import.submit': 'インポート',
+  'agent.modal.create.submit': '追加',
 
-  'agent.modal.import.title': '既存のIDをインポート',
+  'agent.modal.import.title': 'IDをインポート',
   'agent.modal.import.op_key.label': '操作秘密鍵（hex）',
   'agent.modal.import.del_proof.label': '委任証明（hex）',
   'agent.modal.import.or_file': 'またはIDファイルをアップロード',
