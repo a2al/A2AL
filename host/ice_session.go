@@ -12,7 +12,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
+	"net/url"
 	"strconv"
 	"time"
 
@@ -127,7 +129,17 @@ func (h *Host) mergeICEURLs(ctx context.Context) []*stun.URI {
 		addURI(u)
 	}
 	if len(out) == 0 {
+		// Derive STUN candidates from known-reachable signal hubs (requires coturn
+		// co-located on the hub server at port 3478; harmless if not deployed yet).
+		for _, signalURL := range h.effectiveICESignalURLs() {
+			u, err := url.Parse(signalURL)
+			if err == nil && u.Hostname() != "" {
+				addRaw("stun:" + u.Hostname() + ":3478")
+			}
+		}
+		// Public fallback, queried in parallel with hub-derived candidates.
 		addRaw("stun:stun.l.google.com:19302")
+		addRaw("stun:stun.cloudflare.com:3478")
 	}
 	return out
 }
@@ -252,6 +264,8 @@ func runICESession(ctx context.Context, wsURL string, urls []*stun.URI, controll
 	}
 	sess.ws = ws
 
+	slog.Debug("ice agent urls", "controlling", controlling, "count", len(urls), "urls", fmt.Sprintf("%v", urls))
+
 	// --- 2. ICE agent ---
 	agent, err := newICEAgent(urls, hostOnly, networkTypes)
 	if err != nil {
@@ -267,6 +281,7 @@ func runICESession(ctx context.Context, wsURL string, urls []*stun.URI, controll
 			_ = ws.Write(ctx, websocket.MessageBinary, b)
 			return
 		}
+		// [debug] slog.Debug("ice local cand", "controlling", controlling, "type", c.Type(), "addr", c.Address(), "port", c.Port())
 		b, _ := signaling.EncodeFrame(signaling.Frame{T: "cand", C: c.Marshal()})
 		_ = ws.Write(ctx, websocket.MessageBinary, b)
 	}); err != nil {
@@ -310,6 +325,7 @@ func runICESession(ctx context.Context, wsURL string, urls []*stun.URI, controll
 				if err != nil {
 					continue // best-effort; don't tear down the session
 				}
+				// [debug] slog.Debug("ice remote cand", "controlling", controlling, "type", cand.Type(), "addr", cand.Address(), "port", cand.Port())
 				_ = agent.AddRemoteCandidate(cand)
 			case "eoc":
 				// Informational; ICE handles this naturally.

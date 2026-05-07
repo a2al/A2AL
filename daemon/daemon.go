@@ -174,6 +174,7 @@ func New(cfg Config) (*Daemon, error) {
 			h = slog.NewTextHandler(os.Stdout, opts)
 		}
 		log = slog.New(h)
+		slog.SetDefault(log)
 	}
 
 	keyPath := filepath.Join(nodeCfg.KeyDirOrDefault(cfg.DataDir), "node.key")
