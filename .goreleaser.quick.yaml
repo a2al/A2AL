@@ -1,5 +1,9 @@
 version: 2
 
+before:
+  hooks:
+    - sh -c "cd daemon/webui && npm ci && npm run build"
+
 snapshot:
   version_template: '0-{{ .ShortCommit }}-dev'
 
