@@ -285,8 +285,8 @@ func TestAPI_register_emptyServiceTCP(t *testing.T) {
 	if ag["service_tcp"] != "" {
 		t.Fatalf("service_tcp %#v", ag["service_tcp"])
 	}
-	if _, ok := ag["service_tcp_ok"]; ok && ag["service_tcp_ok"] != nil {
-		t.Fatalf("service_tcp_ok should be null when unset, got %#v", ag["service_tcp_ok"])
+	if _, ok := ag["service_tcp_ok"]; ok {
+		t.Fatalf("service_tcp_ok should not appear in list response, got %#v", ag["service_tcp_ok"])
 	}
 }
 

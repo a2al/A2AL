@@ -6,9 +6,11 @@ package daemon
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/tls"
 	"encoding/base64"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,6 +18,41 @@ import (
 	"github.com/a2al/a2al/host"
 	"github.com/quic-go/quic-go"
 )
+
+// parseServiceTCP splits a service_tcp value into (scheme, addr).
+// Recognised prefixes: "https://", "http://".
+// Anything else is returned as ("tcp", raw) for plain TCP forwarding.
+func parseServiceTCP(raw string) (scheme, addr string) {
+	if strings.HasPrefix(raw, "https://") {
+		return "https", strings.TrimPrefix(raw, "https://")
+	}
+	if strings.HasPrefix(raw, "http://") {
+		return "http", strings.TrimPrefix(raw, "http://")
+	}
+	return "tcp", raw
+}
+
+// dialServiceTCP opens a connection to the service described by serviceTCP.
+// For "https://…" it wraps the connection in TLS with InsecureSkipVerify —
+// the daemon and the backend share the same trust domain (local/LAN).
+func dialServiceTCP(ctx context.Context, serviceTCP string, timeout time.Duration) (net.Conn, error) {
+	scheme, addr := parseServiceTCP(serviceTCP)
+	d := &net.Dialer{Timeout: timeout}
+	if scheme == "https" {
+		raw, err := d.DialContext(ctx, "tcp", addr)
+		if err != nil {
+			return nil, err
+		}
+		tlsCfg := &tls.Config{InsecureSkipVerify: true} //nolint:gosec
+		tc := tls.Client(raw, tlsCfg)
+		if err := tc.HandshakeContext(ctx); err != nil {
+			_ = raw.Close()
+			return nil, err
+		}
+		return tc, nil
+	}
+	return d.DialContext(ctx, "tcp", addr)
+}
 
 // sessionInfo is the per-connection metadata stored while a gateway TCP bridge
 // is active. It is exposed via GET /sessions/{port}.
@@ -106,7 +143,9 @@ func (d *Daemon) bridgeInboundStream(ac *host.AgentConn, str quic.Stream, servic
 		_ = str.Close()
 		return
 	}
-	tcp, err := net.DialTimeout("tcp", serviceTCP, 5*time.Second)
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer dialCancel()
+	tcp, err := dialServiceTCP(dialCtx, serviceTCP, 5*time.Second)
 	if err != nil {
 		d.log.Warn("gateway: tcp dial", "local_aid", ac.Local.String(), "remote_aid", ac.Remote.String(), "target", serviceTCP, "err", err)
 		_ = str.Close()

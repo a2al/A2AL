@@ -37,6 +37,7 @@ func (d *Daemon) routes() http.Handler {
 	mux.HandleFunc("POST /agents/paralism/proof", d.handleParalismProof)
 	mux.HandleFunc("GET /agents", d.handleAgentsList)
 	mux.HandleFunc("GET /agents/{aid}", d.handleAgentsGet)
+	mux.HandleFunc("GET /agents/{aid}/probe", d.handleAgentsProbe)
 	mux.HandleFunc("PATCH /agents/{aid}", d.withAgentMiddleware(d.handleAgentsPatch))
 	mux.HandleFunc("POST /agents/{aid}/heartbeat", d.withAgentMiddleware(d.handleAgentHeartbeat))
 	mux.HandleFunc("POST /agents/{aid}/publish", d.withAgentMiddleware(d.handleAgentsPublish))
@@ -61,7 +62,6 @@ func (d *Daemon) routes() http.Handler {
 	mux.Handle("/mcp/", d.mcpHTTPHandler())
 	mux.HandleFunc("POST /demo/start", d.handleDemoStart)
 	mux.HandleFunc("POST /demo/stop", d.handleDemoStop)
-	mux.HandleFunc("GET /demo/status", d.handleDemoStatus)
 	mux.HandleFunc("GET /sessions/{port}", d.handleGetSession)
 	registerWebUIRoutes(mux)
 
@@ -328,11 +328,16 @@ type registerAgentReq struct {
 }
 
 type patchAgentReq struct {
-	OperationalPrivateKeyHex string `json:"operational_private_key_hex"`
-	ServiceTCP               string `json:"service_tcp"`
+	OperationalPrivateKeyHex string  `json:"operational_private_key_hex"`
+	ServiceTCP               *string `json:"service_tcp"`
 }
 
-func probeTCP(addr string, d time.Duration) bool {
+// probeTCP dials addr (which may carry an "https://" or "http://" scheme
+// prefix as accepted by parseServiceTCP) and returns true on success.
+// The scheme is stripped before dialling; TLS handshake is not attempted —
+// a successful TCP connect is sufficient to confirm reachability.
+func probeTCP(raw string, d time.Duration) bool {
+	_, addr := parseServiceTCP(raw)
 	h, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		return false
@@ -351,6 +356,19 @@ func probeTCP(addr string, d time.Duration) bool {
 	}
 	_ = c.Close()
 	return true
+}
+
+// validateServiceTCP returns an error when v contains a path component.
+// Accepted formats: "host:port", "http://host:port", "https://host:port".
+func validateServiceTCP(v string) error {
+	if v == "" {
+		return nil
+	}
+	_, addr := parseServiceTCP(v)
+	if strings.Contains(addr, "/") {
+		return errBadServiceTCP
+	}
+	return nil
 }
 
 type agentsGenerateReq struct {
@@ -574,6 +592,19 @@ func (d *Daemon) handleAgentsGet(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, out)
 }
 
+func (d *Daemon) handleAgentsProbe(w http.ResponseWriter, r *http.Request) {
+	out, err := d.execAgentProbe(r.Context(), r.PathValue("aid"))
+	if err != nil {
+		if errors.Is(err, errBadAID) {
+			http.Error(w, `{"error":"bad aid"}`, http.StatusBadRequest)
+			return
+		}
+		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+		return
+	}
+	writeJSON(w, out)
+}
+
 func (d *Daemon) handleAgentsPatch(w http.ResponseWriter, r *http.Request) {
 	var req patchAgentReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -590,6 +621,8 @@ func (d *Daemon) handleAgentsPatch(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error":"bad operational_private_key_hex"}`, http.StatusBadRequest)
 		case errors.Is(err, errOpKeyMismatch):
 			http.Error(w, `{"error":"operational key mismatch"}`, http.StatusForbidden)
+		case errors.Is(err, errBadServiceTCP):
+			http.Error(w, `{"error":"service_tcp cannot contain a path — use host:port or https://host:port"}`, http.StatusBadRequest)
 		case errors.Is(err, errPersist):
 			http.Error(w, `{"error":"persist"}`, http.StatusInternalServerError)
 		default:
@@ -963,48 +996,31 @@ func (d *Daemon) handleDemoStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	d.demo.mu.Lock()
-	defer d.demo.mu.Unlock()
-
-	// Refuse if demo is already running for a different agent.
-	if d.demo.running() && d.demo.activeAID != "" && d.demo.activeAID != req.AID {
-		http.Error(w, `{"error":"demo already running for another agent"}`, http.StatusConflict)
-		return
-	}
-
-	// Save current service_tcp for later restoration.
-	d.regMu.RLock()
+	d.regMu.Lock()
 	e := d.reg.Get(mustParseAddress(req.AID))
-	d.regMu.RUnlock()
 	if e == nil {
+		d.regMu.Unlock()
 		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
 		return
 	}
-	prevTCP := e.ServiceTCP
 
-	// Start the internal HTTP server.
-	port, err := d.demo.startHTTP(req.AID, func(p int) *sessionInfo {
-		v, ok := d.sessions.Load(p)
-		if !ok {
-			return nil
-		}
-		si, _ := v.(*sessionInfo)
-		return si
-	})
+	port, err := d.demo.startForAgent(req.AID, d.sessionLookup)
 	if err != nil {
+		d.regMu.Unlock()
 		http.Error(w, `{"error":"failed to start demo server"}`, http.StatusInternalServerError)
 		return
 	}
 	tcpAddr := fmt.Sprintf("127.0.0.1:%d", port)
-
-	// Update service_tcp to point at the demo server.
-	if err := d.execAgentPatch(req.AID, patchAgentReq{ServiceTCP: tcpAddr}); err != nil {
-		d.demo.stopHTTP()
-		http.Error(w, `{"error":"failed to set service_tcp"}`, http.StatusInternalServerError)
+	e.ServiceTCP = tcpAddr
+	e.DemoActive = true
+	if err := d.reg.Put(e); err != nil {
+		d.regMu.Unlock()
+		d.demo.stopForAgent(req.AID)
+		http.Error(w, `{"error":"persist"}`, http.StatusInternalServerError)
 		return
 	}
+	d.regMu.Unlock()
 
-	// Register the demo.echo capability.
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
 	_ = d.execTopicRegister(ctx, req.AID, topicRegisterReq{
@@ -1015,8 +1031,6 @@ func (d *Daemon) handleDemoStart(w http.ResponseWriter, r *http.Request) {
 		TTL:       3600,
 	})
 
-	d.demo.activeAID = req.AID
-	d.demo.prevTCP = prevTCP
 	writeJSON(w, map[string]any{"port": port, "service_tcp": tcpAddr})
 }
 
@@ -1026,60 +1040,27 @@ func (d *Daemon) handleDemoStop(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
 		return
 	}
-
-	d.demo.mu.Lock()
-	defer d.demo.mu.Unlock()
-
-	aidStr := req.AID
-	if aidStr == "" {
-		aidStr = d.demo.activeAID
+	if req.AID == "" {
+		http.Error(w, `{"error":"aid required"}`, http.StatusBadRequest)
+		return
 	}
-
-	// If neither the HTTP server is running nor an AID was provided, nothing to do.
-	if aidStr == "" && !d.demo.running() {
-		writeJSON(w, map[string]string{"status": "not running"})
+	if _, err := a2al.ParseAddress(req.AID); err != nil {
+		http.Error(w, `{"error":"bad aid"}`, http.StatusBadRequest)
 		return
 	}
 
-	if aidStr != "" {
-		// Remove the demo.echo capability.
-		_ = d.execTopicUnregister(aidStr, "demo.echo")
+	_ = d.execTopicUnregister(req.AID, "demo.echo")
+	d.demo.stopForAgent(req.AID)
 
-		// Determine which service_tcp to restore.
-		// prevTCP is set when this daemon session started the demo.
-		// After a daemon restart prevTCP is empty; in that case we inspect the
-		// current value: if it is a loopback address it was set by a previous demo
-		// session and is now dead, so clear it.  Otherwise leave it alone.
-		restoreTCP := d.demo.prevTCP
-		shouldPatch := true
-		if restoreTCP == "" {
-			if aid, err := a2al.ParseAddress(aidStr); err == nil {
-				d.regMu.RLock()
-				e := d.reg.Get(aid)
-				d.regMu.RUnlock()
-				if e != nil && strings.HasPrefix(e.ServiceTCP, "127.0.0.1:") {
-					restoreTCP = "" // clear the stale demo address
-				} else {
-					shouldPatch = false // real address or already empty — don't touch
-				}
-			} else {
-				shouldPatch = false
-			}
-		}
-		if shouldPatch {
-			_ = d.execAgentPatch(aidStr, patchAgentReq{ServiceTCP: restoreTCP})
-		}
+	d.regMu.Lock()
+	if e := d.reg.Get(mustParseAddress(req.AID)); e != nil {
+		e.ServiceTCP = ""
+		e.DemoActive = false
+		_ = d.reg.Put(e)
 	}
+	d.regMu.Unlock()
 
-	d.demo.stopHTTP()
-	d.demo.activeAID = ""
-	d.demo.prevTCP = ""
 	writeJSON(w, map[string]string{"status": "stopped"})
-}
-
-func (d *Daemon) handleDemoStatus(w http.ResponseWriter, _ *http.Request) {
-	running, aid, port := d.demo.Status()
-	writeJSON(w, map[string]any{"running": running, "aid": aid, "port": port})
 }
 
 // handleGetSession returns the caller metadata for an active gateway TCP bridge,

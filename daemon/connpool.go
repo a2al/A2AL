@@ -18,9 +18,17 @@ import (
 )
 
 const (
-	// connPoolMaxSize caps the number of cached outbound Mode A connections.
-	// Small by design: fetch is on-demand; we are not an "octopus" node.
-	connPoolMaxSize = 8
+	// connPoolMaxSize caps the number of cached outbound Mode A connections
+	// as a safety net against connection leaks. Normal pool size is bounded
+	// naturally by idle eviction (connPoolIdleTimeout); this hard cap only
+	// fires if something creates connections much faster than they are used.
+	connPoolMaxSize = 256
+
+	// connPoolIdleTimeout is the maximum time a cached connection may sit
+	// unused before the background evictor closes it. Connections in active
+	// use (tunnel, streaming fetch) are never idle, so only genuinely dormant
+	// connections are affected.
+	connPoolIdleTimeout = 5 * time.Minute
 
 	// connPoolDialTimeout is the independent timeout for a single dial attempt.
 	// Deliberately decoupled from the caller's context so that a user hang-up
@@ -55,12 +63,16 @@ type connPoolEntry struct {
 type dialFunc func(ctx context.Context, local, remote a2al.Address, er *protocol.EndpointRecord) (quic.Connection, error)
 
 // modeAConnPool caches outbound data-plane QUIC connections for reuse across
-// execConnect and execFetch calls. Connections are established lazily, evicted
-// passively (dead-on-use detection) or via LRU when the pool is at capacity.
+// execConnect and execFetch calls. Connections are established lazily and
+// evicted in three ways:
+//   - passively on next acquire when the QUIC context is already dead
+//   - proactively by the background idle evictor after connPoolIdleTimeout
+//   - via LRU when the pool exceeds connPoolMaxSize (safety-net only)
 //
-// Lifecycle: no keepalive pings are sent — connections live as long as QUIC
-// considers them alive (MaxIdleTimeout from defaultQUICConfig, currently 90 s).
-// If a connection dies between calls, acquire detects it and reconnects.
+// Lifecycle: defaultQUICConfig sends QUIC PING keepalives every 25 s, so
+// connections remain live as long as the network path holds. The idle evictor
+// closes connections unused for connPoolIdleTimeout (5 min) regardless of
+// QUIC liveness, keeping resource usage proportional to actual activity.
 type modeAConnPool struct {
 	mu     sync.Mutex
 	pool   map[connPoolKey]*connPoolEntry
@@ -204,6 +216,38 @@ func (p *modeAConnPool) evictIfFull() {
 	// Close outside the lock to avoid holding the mutex during network I/O.
 	if toClose != nil {
 		go func() { _ = toClose.CloseWithError(0, "pool eviction") }()
+	}
+}
+
+// startIdleEvictor runs a background goroutine that closes connections that
+// have not been used for connPoolIdleTimeout. It returns when ctx is cancelled.
+// Call once from the daemon's Run loop.
+func (p *modeAConnPool) startIdleEvictor(ctx context.Context) {
+	ticker := time.NewTicker(connPoolIdleTimeout / 2)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			p.evictIdle()
+		}
+	}
+}
+
+func (p *modeAConnPool) evictIdle() {
+	p.mu.Lock()
+	var toClose []quic.Connection
+	for k, ent := range p.pool {
+		if ent.conn != nil && time.Since(ent.lastUsed) > connPoolIdleTimeout {
+			toClose = append(toClose, ent.conn)
+			delete(p.pool, k)
+			p.log.Debug("connpool: evicting idle connection", "key", k.String())
+		}
+	}
+	p.mu.Unlock()
+	for _, c := range toClose {
+		_ = c.CloseWithError(0, "idle timeout")
 	}
 }
 

@@ -24,6 +24,7 @@ type tunnelEntry struct {
 	localAID  a2al.Address
 	remoteAID a2al.Address
 	listen    string // "127.0.0.1:PORT"
+	httpsURL  string // "https://127.0.0.1:PORT" when TLS is available, else ""
 	openedAt  time.Time
 
 	// liveness tracking
@@ -41,6 +42,7 @@ type tunnelStatus struct {
 	LocalAID     string    `json:"local_aid"`
 	RemoteAID    string    `json:"remote_aid"`
 	Listen       string    `json:"listen"`
+	HTTPSURL     string    `json:"https_url,omitempty"`
 	OpenedAt     time.Time `json:"opened_at"`
 	LastActivity time.Time `json:"last_activity,omitempty"`
 	ActiveConns  int32     `json:"active_conns"`
@@ -52,6 +54,7 @@ func (e *tunnelEntry) status() tunnelStatus {
 		LocalAID:    e.localAID.String(),
 		RemoteAID:   e.remoteAID.String(),
 		Listen:      e.listen,
+		HTTPSURL:    e.httpsURL,
 		OpenedAt:    e.openedAt,
 		ActiveConns: e.activeConns.Load(),
 	}
@@ -178,11 +181,17 @@ func (d *Daemon) execTunnelOpen(ctx context.Context, remoteAidStr string, req tu
 	done := make(chan struct{})
 	idleTimeout := time.Duration(req.IdleTimeoutSec) * time.Second
 
+	listenAddr := ln.Addr().String()
+	httpsURL := ""
+	if d.tunnelTLS != nil {
+		httpsURL = "https://" + listenAddr
+	}
 	entry := &tunnelEntry{
 		id:        randomID(),
 		localAID:  local,
 		remoteAID: remote,
-		listen:    ln.Addr().String(),
+		listen:    listenAddr,
+		httpsURL:  httpsURL,
 		openedAt:  time.Now(),
 		cancel:    cancel,
 		done:      done,
@@ -256,7 +265,11 @@ func (d *Daemon) execTunnelOpen(ctx context.Context, remoteAidStr string, req tu
 					_ = tcpConn.Close()
 					return
 				}
-				bridgeTCPQUICStream(qs, tcpConn)
+				// Sniff and optionally upgrade to TLS so the browser
+				// can use https://127.0.0.1:PORT with the persisted
+				// self-signed certificate.
+				conn := sniffAndUpgrade(tcpConn, d.tunnelTLS)
+				bridgeTCPQUICStream(qs, conn)
 			}()
 		}
 	}()

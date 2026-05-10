@@ -396,8 +396,13 @@ func (d *Daemon) readICELoopFor(ctx context.Context, conn *websocket.Conn, base 
 		// fr.Room from the hub, which may be absent in non-conformant servers.
 		// Dedup: only the first hub to deliver incoming for this room triggers Accept.
 		room := signaling.RoomID(localAgent.String(), callerAID.String())
+		d.log.Debug("ice incoming", "component", "ice",
+			"base", base,
+			"target", fr.Target,
+			"caller", fr.Caller,
+			"room", room[:8])
 		if !seen.tryMark(room) {
-			d.log.Debug("ice incoming dedup", "base", base, "room", room)
+			d.log.Debug("ice incoming dedup", "component", "ice", "base", base, "room", room[:8])
 			continue
 		}
 
@@ -419,10 +424,13 @@ func (d *Daemon) readICELoopFor(ctx context.Context, conn *websocket.Conn, base 
 			// so that a subsequent session for the same peer pair is never blocked.
 			defer seen.release(room)
 			actx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+			d.log.Debug("ice accept: start", "component", "ice",
+				"local", localAgent.String(), "remote", callerAID.String(), "hub", base)
 			ac, err := d.h.AcceptICEViaSignal(actx, localAgent, callerAID, base)
 			cancel() // handshake established (or failed); no longer need startup timeout context.
 			if err != nil {
-				d.log.Debug("ice accept", "err", err, "local", localAgent.String(), "remote", callerAID.String())
+				d.log.Debug("ice accept: failed", "component", "ice",
+					"err", err, "local", localAgent.String(), "remote", callerAID.String())
 				return
 			}
 			if !d.tryAcquireGatewayConn() {

@@ -4,6 +4,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/subtle"
@@ -14,6 +15,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/a2al/a2al"
@@ -141,8 +143,38 @@ func (d *Daemon) persistDelegatedAgent(aid a2al.Address, opPriv ed25519.PrivateK
 	if aid == d.nodeAddr {
 		return errNodeAsAgent
 	}
-	// service_tcp is optional: agents with their own public URL don't need daemon gateway forwarding.
-	// Warn when set but unreachable; do not block registration.
+	// Callers hold d.regMu.Lock(); we can safely access the registry directly.
+	// If the agent is already registered, preserve all runtime state and only
+	// update credentials. This makes POST /agents idempotent for re-imports.
+	existing := d.reg.Get(aid)
+	if existing != nil {
+		// Security: reject if the operational key doesn't match the stored one.
+		if !bytes.Equal(existing.OpPriv, opPriv) {
+			return errOpKeyMismatch
+		}
+		// Update delegation proof in case it was renewed.
+		existing.DelegationCBOR = proofRaw
+		// If the caller supplies a non-empty service_tcp that differs from the
+		// stored value, treat it as an explicit update (same semantics as PATCH).
+		// If demo is active, stop it first — the caller is taking control.
+		if serviceTCP != "" && serviceTCP != existing.ServiceTCP {
+			if existing.DemoActive {
+				d.demo.stopForAgent(existing.AID.String())
+				existing.DemoActive = false
+			}
+			existing.ServiceTCP = serviceTCP
+		}
+		if err := d.reg.Put(existing); err != nil {
+			return errPersist
+		}
+		// Re-register (or refresh) with host — upserts credentials in h.agents.
+		if err := d.h.RegisterDelegatedAgent(aid, opPriv, proofRaw); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	// New agent: service_tcp is optional.
 	if serviceTCP != "" && !probeTCP(serviceTCP, 2*time.Second) {
 		d.log.Warn("service_tcp unreachable at registration time; daemon gateway forwarding will not work until it becomes reachable", "aid", aid.String(), "service_tcp", serviceTCP)
 	}
@@ -457,15 +489,11 @@ func (d *Daemon) execAgentsList() []map[string]any {
 
 	out := make([]map[string]any, 0, len(list))
 	for _, e := range list {
-		var tcpOK any // nil = not configured; bool = probe result
-		if e.ServiceTCP != "" {
-			tcpOK = probeTCP(e.ServiceTCP, 2*time.Second)
-		}
 		m := map[string]any{
 			"aid":              e.AID.String(),
 			"service_tcp":      e.ServiceTCP,
+			"demo_active":      e.DemoActive,
 			"seq":              e.Seq,
-			"service_tcp_ok":   tcpOK,
 			"published_to_dht": e.Seq > 0,
 			"services":         e.Services,
 		}
@@ -501,20 +529,13 @@ func (d *Daemon) execAgentGet(ctx context.Context, aidStr string) (map[string]an
 	if e == nil {
 		return nil, errNotFound
 	}
-	var tcpOK any // nil = not configured; bool = probe result
-	if e.ServiceTCP != "" {
-		tcpOK = probeTCP(e.ServiceTCP, 2*time.Second)
-	}
 	out := map[string]any{
-		"aid":                  e.AID.String(),
-		"service_tcp":          e.ServiceTCP,
-		"seq":                  e.Seq,
-		"service_tcp_ok":       tcpOK,
-		"published_to_dht":     e.Seq > 0,
-		"services":             e.Services,
-		"published_endpoints":  nil,
-		"published_nat_type":   nil,
-		"published_record_seq": nil,
+		"aid":              e.AID.String(),
+		"service_tcp":      e.ServiceTCP,
+		"demo_active":      e.DemoActive,
+		"seq":              e.Seq,
+		"published_to_dht": e.Seq > 0,
+		"services":         e.Services,
 	}
 	d.heartbeatMu.Lock()
 	hbT, hbOK := d.heartbeatAt[e.AID]
@@ -536,21 +557,62 @@ func (d *Daemon) execAgentGet(ctx context.Context, aidStr string) (map[string]an
 		out["next_republish_estimate"] = nil
 		out["dht_record_expires_at"] = nil
 	}
-	if e.Seq > 0 {
-		rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		er, err := d.h.Resolve(rctx, aid)
-		cancel()
-		if err == nil && er != nil {
-			out["published_endpoints"] = er.Endpoints
-			out["published_nat_type"] = er.NatType
-			out["published_record_seq"] = er.Seq
-		}
-	}
-	// Local repSet size: how many confirmed remote replicas this node is
-	// currently tracking for the agent's AID record.  Pure in-memory read,
-	// no RPC.  Useful for debugging DHT propagation health.
+	// Local repSet size: pure in-memory read, no RPC.
 	storeKey := a2al.NodeIDFromAddress(aid)
 	out["dht_local_replicas"] = d.h.Node().RepSetSize(storeKey, storeKey)
+	return out, nil
+}
+
+// execAgentProbe performs on-demand IO checks for a single agent: TCP
+// reachability of service_tcp and DHT endpoint resolution.  Both are run
+// concurrently.  Call this only when the caller explicitly requests probe
+// results; never from list/get hot paths.
+func (d *Daemon) execAgentProbe(ctx context.Context, aidStr string) (map[string]any, error) {
+	aid, err := a2al.ParseAddress(aidStr)
+	if err != nil {
+		return nil, errBadAID
+	}
+	d.regMu.RLock()
+	e := d.reg.Get(aid)
+	d.regMu.RUnlock()
+	if e == nil {
+		return nil, errNotFound
+	}
+	out := map[string]any{
+		"service_tcp_ok":       nil,
+		"published_endpoints":  nil,
+		"published_nat_type":   nil,
+		"published_record_seq": nil,
+	}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	if e.ServiceTCP != "" {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ok := probeTCP(e.ServiceTCP, 2*time.Second)
+			mu.Lock()
+			out["service_tcp_ok"] = ok
+			mu.Unlock()
+		}()
+	}
+	if e.Seq > 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			er, rerr := d.h.Resolve(rctx, aid)
+			if rerr == nil && er != nil {
+				mu.Lock()
+				out["published_endpoints"] = er.Endpoints
+				out["published_nat_type"] = er.NatType
+				out["published_record_seq"] = er.Seq
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
 	return out, nil
 }
 
@@ -658,11 +720,11 @@ func (d *Daemon) touchHeartbeat(aid a2al.Address) {
 		e := d.reg.Get(aid)
 		d.regMu.RUnlock()
 		if e != nil {
-			go func() {
-				ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-				defer cancel()
-				d.tryRepublishAgent(ctx, e)
-			}()
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+			defer cancel()
+			d.tryRepublishAgent(ctx, aid)
+		}()
 		}
 	}
 }
@@ -759,27 +821,35 @@ func (d *Daemon) execAgentPatch(aidStr string, req patchAgentReq) error {
 			return errOpKeyMismatch
 		}
 	}
-	// service_tcp is optional; probe reachability before persisting so we can
-	// decide whether to trigger an immediate republish below.
-	tcpReachable := req.ServiceTCP == "" || probeTCP(req.ServiceTCP, 2*time.Second)
-	if req.ServiceTCP != "" && !tcpReachable {
-		d.log.Warn("service_tcp unreachable", "aid", aid.String(), "service_tcp", req.ServiceTCP)
+	// service_tcp: only update when explicitly provided (nil = no-op).
+	// When the user sets any service_tcp value (including empty) and the agent
+	// is in demo mode, the demo is stopped first — the user is taking control.
+	var tcpReachable bool
+	if req.ServiceTCP != nil {
+		if err := validateServiceTCP(*req.ServiceTCP); err != nil {
+			return err
+		}
+		tcp := *req.ServiceTCP
+		if e.DemoActive {
+			d.demo.stopForAgent(e.AID.String())
+			e.DemoActive = false
+		}
+		tcpReachable = tcp == "" || probeTCP(tcp, 2*time.Second)
+		if tcp != "" && !tcpReachable {
+			d.log.Warn("service_tcp unreachable", "aid", aid.String(), "service_tcp", tcp)
+		}
+		e.ServiceTCP = tcp
 	}
-	e.ServiceTCP = req.ServiceTCP
 	if err := d.reg.Put(e); err != nil {
 		return err
 	}
 	// When the new service_tcp is confirmed reachable and the agent has already
-	// been published (seq > 0), trigger an immediate republish. This unblocks
-	// agents whose periodic republish was skipped because the old TCP address
-	// was unreachable (e.g. after a port change), without waiting for the next
-	// 30-minute tick.
-	if tcpReachable && req.ServiceTCP != "" && e.Seq > 0 {
-		snap := *e
+	// been published (seq > 0), trigger an immediate republish.
+	if req.ServiceTCP != nil && tcpReachable && e.ServiceTCP != "" && e.Seq > 0 {
 		go func() {
 			rCtx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 			defer cancel()
-			d.tryRepublishAgent(rCtx, &snap)
+			d.tryRepublishAgent(rCtx, e.AID)
 		}()
 	}
 	return nil
@@ -1273,4 +1343,5 @@ var (
 	errTTLRequired           = errors.New("ttl required")
 	errBadPayloadB64         = errors.New("invalid payload_base64")
 	errNoDelegation          = errors.New("delegation required")
+	errBadServiceTCP         = errors.New("service_tcp cannot contain a path — use host:port or https://host:port")
 )
