@@ -175,7 +175,7 @@ func (p *DHTpunchPool) HandleIncomingPunch(ctx context.Context, callerNodeID a2a
 		return
 	}
 
-	qc, peerUDP, isDirect, teardown, err := p.h.acceptICEToQUIC(ctx, wsURL, nodeCert, modeBQUICConfig())
+	qc, peerUDP, isDirect, teardown, err := p.h.acceptICEToQUIC(ctx, wsURL, nodeCert, modeBQUICConfig(), callerLogicalAddr, nil)
 	n := p.node()
 	if err != nil {
 		p.log.Debug("dht punch accept: ice failed", "caller", callerNodeID, "err", err)

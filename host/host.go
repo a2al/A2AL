@@ -48,6 +48,7 @@ func defaultQUICConfig() *quic.Config {
 		MaxIdleTimeout:        90 * time.Second,
 		MaxIncomingStreams:    100,
 		MaxIncomingUniStreams: 10,
+		KeepAlivePeriod:       25 * time.Second,
 	}
 }
 
@@ -195,6 +196,11 @@ type Host struct {
 	// Used by SendMailboxForAgent to skip a DHT endpoint lookup when possible.
 	peerPubkeys sync.Map // a2al.Address → ed25519.PublicKey
 
+	// punchExpect routes incoming QUIC connections to waiting punchDial goroutines.
+	// Key: a2al.Address (expected remote peer), Value: chan quic.Connection.
+	// Accept() delivers matching connections here instead of returning them to callers.
+	punchExpect sync.Map // a2al.Address → chan quic.Connection
+
 	upnpMu             sync.Mutex
 	upnpURL            string
 	upnpCleanup        func()
@@ -217,6 +223,8 @@ type Host struct {
 	natProbeMu sync.Mutex // guards RunNATProbe (only one probe at a time)
 
 	punchPool *DHTpunchPool
+
+	iceCache peerICECache
 }
 
 // New creates a Host with one initial agent identity from cfg.KeyStore.
@@ -255,10 +263,10 @@ func New(cfg Config) (*Host, error) {
 	}
 	sense := natsense.NewSense(min)
 
-	// Apply ICE network types default: IPv4-only until dual-stack socket is ready.
-	// TODO(ipv6): change default to {UDP4, UDP6} in Layer 2 of the IPv6 support plan.
+	// ICE gathers its own sockets independently of the main 4121 QUIC socket,
+	// so IPv6 ICE works even though the main socket is udp4-only.
 	if len(cfg.ICENetworkTypes) == 0 {
-		cfg.ICENetworkTypes = []ice.NetworkType{ice.NetworkTypeUDP4}
+		cfg.ICENetworkTypes = []ice.NetworkType{ice.NetworkTypeUDP4, ice.NetworkTypeUDP6}
 	}
 
 	// Create the punch pool before the DHT node so it can be injected into
@@ -339,6 +347,7 @@ func New(cfg Config) (*Host, error) {
 			myAddr: {addr: myAddr, priv: priv, cert: defaultCert},
 		},
 	}
+	h.iceCache.init()
 	punchPool.bind(h)
 
 	srvTLS := quicServerTLSWithSNI(defaultCert, h.certForSNI)
@@ -396,7 +405,7 @@ func (h *Host) RegisterDelegatedAgent(addr a2al.Address, opPriv ed25519.PrivateK
 	h.agentsMu.Lock()
 	defer h.agentsMu.Unlock()
 	if _, exists := h.agents[addr]; exists {
-		return fmt.Errorf("a2al/host: agent %s already registered", addr)
+		h.log.Warn("RegisterDelegatedAgent: overwriting existing entry", "aid", addr.String())
 	}
 	h.agents[addr] = &agentEntry{addr: addr, priv: opPriv, cert: cert, delegationCBOR: delegationCBOR}
 	return nil
@@ -973,11 +982,26 @@ func (h *Host) defaultAgentCert() (tls.Certificate, error) {
 //
 // Remote peer AID is extracted from the mutual TLS client certificate.
 func (h *Host) Accept(ctx context.Context) (*AgentConn, error) {
-	conn, err := h.qListen.Accept(ctx)
-	if err != nil {
-		return nil, err
+	for {
+		conn, err := h.qListen.Accept(ctx)
+		if err != nil {
+			return nil, err
+		}
+		// Route incoming punch connections to the waiting punchDial goroutine.
+		state := conn.ConnectionState().TLS
+		if remote, rErr := peerAddrFromTLSState(state); rErr == nil {
+			if v, ok := h.punchExpect.Load(remote); ok {
+				ch := v.(chan quic.Connection)
+				select {
+				case ch <- conn:
+				default:
+					_ = conn.CloseWithError(0, "punch: expect queue full")
+				}
+				continue
+			}
+		}
+		return h.agentConnFromQUIC(ctx, conn, h.addr)
 	}
-	return h.agentConnFromQUIC(ctx, conn, h.addr)
 }
 
 func (h *Host) agentConnFromQUIC(ctx context.Context, conn quic.Connection, fallbackLocal a2al.Address) (*AgentConn, error) {

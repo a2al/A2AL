@@ -11,17 +11,22 @@ import (
 const SubprotocolICE = "a2al.ice.v1"
 
 // Frame is a CBOR envelope on the signaling WebSocket.
-// T is "cred" | "cand" | "eoc" | "reg" | "incoming" | "noagent".
+// T is "cred" | "cand" | "eoc" | "reg" | "incoming" | "noagent" |
+// "punch-init" | "punch-ack" | "punch-go".
 type Frame struct {
-	T string `cbor:"t"`
-	U string `cbor:"u,omitempty"` // ufrag (cred)
-	P string `cbor:"p,omitempty"` // pwd (cred)
-	C string `cbor:"c,omitempty"` // ice candidate Marshal string
-	AID    string `cbor:"a,omitempty"` // reg: callee AID; reserved for future use
-	Sig    string `cbor:"s,omitempty"` // reg: reserved (AID squatting prevention)
-	Room   string `cbor:"r,omitempty"` // incoming: room id
-	Caller string `cbor:"f,omitempty"` // incoming: caller AID string
-	Target string `cbor:"g,omitempty"` // incoming: callee AID (hub lookup key)
+	T      string   `cbor:"t"`
+	U      string   `cbor:"u,omitempty"`    // ufrag (cred)
+	P      string   `cbor:"p,omitempty"`    // pwd (cred)
+	C      string   `cbor:"c,omitempty"`    // ice candidate Marshal string
+	AID    string   `cbor:"a,omitempty"`    // reg: callee AID; reserved for future use
+	Sig    string   `cbor:"s,omitempty"`    // reg: reserved (AID squatting prevention)
+	Room   string   `cbor:"r,omitempty"`    // incoming: room id
+	Caller string   `cbor:"f,omitempty"`    // incoming: caller AID string
+	Target string   `cbor:"g,omitempty"`    // incoming: callee AID (hub lookup key)
+	Addrs  []string `cbor:"addrs,omitempty"` // punch-init/ack: srflx address list ("ip:port")
+	Ts     int64    `cbor:"ts,omitempty"`   // punch-init/ack: Unix millisecond timestamp
+	T0     int64    `cbor:"t0,omitempty"`   // punch-go: agreed fire time (Unix milliseconds)
+	Nat    uint8    `cbor:"nt,omitempty"`   // punch-init/ack: sender's NAT type (natsense constants)
 }
 
 // EncodeFrame CBOR-encodes a frame.

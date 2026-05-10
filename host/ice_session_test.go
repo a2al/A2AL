@@ -38,11 +38,11 @@ func TestICESessionHostOnlyLoopback(t *testing.T) {
 
 	v4Only := []ice.NetworkType{ice.NetworkTypeUDP4}
 	go func() {
-		s, e := runICESession(ctx, wsURL, nil, true, true, v4Only)
+		s, e := runICESession(ctx, wsURL, nil, true, true, v4Only, nil)
 		ctrlCh <- res{s, e}
 	}()
 	go func() {
-		s, e := runICESession(ctx, wsURL, nil, false, true, v4Only)
+		s, e := runICESession(ctx, wsURL, nil, false, true, v4Only, nil)
 		othCh <- res{s, e}
 	}()
 

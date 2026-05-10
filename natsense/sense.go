@@ -6,6 +6,8 @@
 package natsense
 
 import (
+	"fmt"
+	"log/slog"
 	"net"
 	"strconv"
 	"sync"
@@ -124,6 +126,43 @@ func (s *Sense) InvalidateObservations() {
 	s.votes = make(map[string]map[nodeIDKey]vote)
 	s.observedPorts = make(map[uint16]struct{})
 	s.mu.Unlock()
+}
+
+// HasMultiPortEvidence reports whether ≥2 distinct external ports have been
+// observed in the live (non-expired) vote window. Used to overrule probe-based
+// FullCone classification when there is any indication of port-varying
+// (Symmetric) NAT behavior, but the strict supportedPorts threshold has not
+// yet been met (e.g. shortly after InvalidateObservations).
+func (s *Sense) HasMultiPortEvidence() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cutoff := time.Now().Add(-voteTTL)
+	ports := make(map[uint16]struct{})
+	for key, m := range s.votes {
+		alive := false
+		for _, v := range m {
+			if v.at.After(cutoff) {
+				alive = true
+				break
+			}
+		}
+		if !alive {
+			continue
+		}
+		_, ps, err := net.SplitHostPort(key)
+		if err != nil {
+			continue
+		}
+		p, err := strconv.ParseUint(ps, 10, 16)
+		if err != nil {
+			continue
+		}
+		ports[uint16(p)] = struct{}{}
+		if len(ports) > 1 {
+			return true
+		}
+	}
+	return false
 }
 
 // IsBindPublic returns true when the local socket has a direct public WAN IP.
@@ -273,6 +312,12 @@ func (s *Sense) InferNATType() uint8 {
 		}
 	}
 	if supportedPorts >= 2 {
+		ports := make([]string, 0, len(portReporters))
+		for p := range portReporters {
+			ports = append(ports, fmt.Sprintf("%d(%d)", p, len(portReporters[p])))
+		}
+		slog.Debug("nat: symmetric detected", "component", "natsense",
+			"supported_ports", supportedPorts, "ports", ports, "total_reporters", total)
 		return NATSymmetric // different ports per destination → symmetric mapping
 	}
 

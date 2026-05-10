@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/coder/websocket"
@@ -43,15 +44,84 @@ type iceSession struct {
 	iceConn *ice.Conn
 	ws      *websocket.Conn
 	agent   *ice.Agent
+
+	// remoteCands accumulates non-relay remote candidates received via trickle
+	// ICE. Written by the read goroutine concurrently with agent.Dial/Accept;
+	// mu must be held for all access.
+	mu          sync.Mutex
+	remoteCands []ice.Candidate
+
+	// wsMu serializes writes to ws. OnCandidate fires in an ICE-internal
+	// goroutine while the DCUtR punch protocol may also write; all callers
+	// must go through writeFrame.
+	wsMu sync.Mutex
+
+	// punchCh receives punch-init/ack/go frames from the read goroutine so
+	// that the DCUtR punch protocol can consume them concurrently with ICE
+	// Dial/Accept. Buffered to avoid blocking the read goroutine.
+	punchCh chan signaling.Frame
+
+	// localSrflx accumulates server-reflexive candidate addresses ("ip:port")
+	// as they are gathered. Protected by srflxMu.
+	localSrflx []string
+	srflxMu    sync.Mutex
+}
+
+// snapshotRemoteCands returns a copy of all accumulated trickle remote candidates.
+// Safe to call after agent.Dial/Accept returns while the read goroutine is still running.
+func (s *iceSession) snapshotRemoteCands() []ice.Candidate {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.remoteCands) == 0 {
+		return nil
+	}
+	cp := make([]ice.Candidate, len(s.remoteCands))
+	copy(cp, s.remoteCands)
+	return cp
+}
+
+// writeFrame encodes f as CBOR and writes it to the signaling WebSocket.
+// Safe to call concurrently (serialized via wsMu).
+func (s *iceSession) writeFrame(ctx context.Context, f signaling.Frame) error {
+	b, err := signaling.EncodeFrame(f)
+	if err != nil {
+		return err
+	}
+	s.wsMu.Lock()
+	defer s.wsMu.Unlock()
+	if s.ws == nil {
+		return errors.New("a2al/host: ice ws already closed")
+	}
+	return s.ws.Write(ctx, websocket.MessageBinary, b)
+}
+
+// copyLocalSrflx returns a snapshot of the locally gathered server-reflexive
+// candidate addresses collected so far.
+func (s *iceSession) copyLocalSrflx() []string {
+	s.srflxMu.Lock()
+	defer s.srflxMu.Unlock()
+	out := make([]string, len(s.localSrflx))
+	copy(out, s.localSrflx)
+	return out
 }
 
 // CloseSignaling shuts down the WebSocket only, leaving the ICE data path
 // intact. Call this after QUIC is established on top of the ICE connection.
+//
+// Uses a graceful WebSocket close (sends Close frame with 5 s timeout, waits
+// for peer ack) so the hub receives a clean TCP FIN instead of RST. On
+// Windows, an abrupt close (CloseNow) triggers WSAECONNABORTED (10053) when
+// there is pending send data, which also disrupts the hub's read loop for
+// unrelated sessions on the same connection.
 func (s *iceSession) CloseSignaling() {
-	if s.ws != nil {
-		_ = s.ws.CloseNow()
-		s.ws = nil
+	s.wsMu.Lock()
+	ws := s.ws
+	s.ws = nil
+	s.wsMu.Unlock()
+	if ws == nil {
+		return
 	}
+	_ = ws.Close(websocket.StatusNormalClosure, "")
 }
 
 // isDirectCandidate reports whether the ICE-selected path is host or
@@ -213,6 +283,28 @@ func fetchTURNRESTCredentials(ctx context.Context, apiURL, auth string) (usernam
 	return body.Username, body.Password, nil
 }
 
+// hintToRemoteCandidate converts a peerICECache hint into a pion/ice remote
+// candidate that can be injected via agent.AddRemoteCandidate. Relay candidates
+// are never cached, so only host and server-reflexive types are handled.
+func hintToRemoteCandidate(h iceHint) (ice.Candidate, error) {
+	ip := h.addr.IP.String()
+	port := h.addr.Port
+	switch h.candType {
+	case ice.CandidateTypeServerReflexive:
+		return ice.NewCandidateServerReflexive(&ice.CandidateServerReflexiveConfig{
+			Network: "udp",
+			Address: ip,
+			Port:    port,
+		})
+	default: // CandidateTypeHost and anything else
+		return ice.NewCandidateHost(&ice.CandidateHostConfig{
+			Network: "udp",
+			Address: ip,
+			Port:    port,
+		})
+	}
+}
+
 func newICEAgent(urls []*stun.URI, hostOnly bool, networkTypes []ice.NetworkType) (*ice.Agent, error) {
 	cfg := &ice.AgentConfig{
 		Urls:             urls,
@@ -222,32 +314,44 @@ func newICEAgent(urls []*stun.URI, hostOnly bool, networkTypes []ice.NetworkType
 	if hostOnly {
 		cfg.CandidateTypes = []ice.CandidateType{ice.CandidateTypeHost}
 		cfg.Urls = nil
+	} else {
+		hasTURN := false
+		for _, u := range urls {
+			if u.Scheme == stun.SchemeTypeTURN || u.Scheme == stun.SchemeTypeTURNS {
+				hasTURN = true
+				break
+			}
+		}
+		if hasTURN {
+			cfg.CandidateTypes = []ice.CandidateType{
+				ice.CandidateTypeHost,
+				ice.CandidateTypeServerReflexive,
+				ice.CandidateTypeRelay,
+			}
+		} else {
+			cfg.CandidateTypes = []ice.CandidateType{
+				ice.CandidateTypeHost,
+				ice.CandidateTypeServerReflexive,
+			}
+		}
 	}
 	return ice.NewAgent(cfg)
 }
 
-// runICESession performs trickle-ICE signaling over a WebSocket, following the
-// standard pion/ice pattern:
+// startICESession performs steps 1–6 of trickle-ICE signaling: WebSocket dial,
+// ICE agent creation, local candidate trickle setup, read goroutine startup,
+// credential exchange, hint injection, and GatherCandidates.
 //
-//  1. Connect to the signaling WebSocket.
-//  2. Create an ICE agent and register a trickle OnCandidate handler that sends
-//     each local candidate to the remote peer immediately.
-//  3. Start a read goroutine that feeds remote credentials and candidates from
-//     the WebSocket into the ICE agent.
-//  4. Exchange local/remote credentials.
-//  5. Begin candidate gathering (trickle: candidates flow as they are discovered).
-//  6. Call agent.Dial (controlling) or agent.Accept (controlled), which runs
-//     connectivity checks concurrently with gathering and returns when a pair is
-//     selected.
+// The returned session has gathering running but agent.Dial/Accept not yet
+// called. Call completeICESession to finish (blocking). The session's punchCh
+// receives any "punch-init/ack/go" frames so that DCUtR can run concurrently.
 //
-// networkTypes controls which address families are included in ICE candidate
-// gathering (e.g. {UDP4} or {UDP4, UDP6}). Callers pass h.cfg.ICENetworkTypes.
-//
-// On success the returned *iceSession owns the ICE connection, the underlying
-// agent, and the WebSocket. The caller must eventually close them (directly or
-// by tying their lifetime to a QUIC connection).
-func runICESession(ctx context.Context, wsURL string, urls []*stun.URI, controlling, hostOnly bool, networkTypes []ice.NetworkType) (*iceSession, error) {
-	sess := &iceSession{}
+// Returns the session and the remote ICE credentials needed by completeICESession.
+// If the remote hub reports the target is not registered, the error wraps ErrNoAgent.
+func startICESession(ctx context.Context, wsURL string, urls []*stun.URI, controlling, hostOnly bool, networkTypes []ice.NetworkType, hintRemotes []iceHint) (*iceSession, [2]string, error) {
+	sess := &iceSession{
+		punchCh: make(chan signaling.Frame, 8),
+	}
 	ok := false
 	defer func() {
 		if !ok {
@@ -260,35 +364,50 @@ func runICESession(ctx context.Context, wsURL string, urls []*stun.URI, controll
 		Subprotocols: []string{signaling.SubprotocolICE},
 	})
 	if err != nil {
-		return nil, fmt.Errorf("a2al/host: ice ws dial: %w", err)
+		return nil, [2]string{}, fmt.Errorf("a2al/host: ice ws dial: %w", err)
 	}
 	sess.ws = ws
 
-	slog.Debug("ice agent urls", "controlling", controlling, "count", len(urls), "urls", fmt.Sprintf("%v", urls))
+	// slog.Debug("ice agent urls", "controlling", controlling, "count", len(urls), "urls", fmt.Sprintf("%v", urls))
 
 	// --- 2. ICE agent ---
 	agent, err := newICEAgent(urls, hostOnly, networkTypes)
 	if err != nil {
-		return nil, err
+		return nil, [2]string{}, err
 	}
 	sess.agent = agent
+
+	_ = agent.OnConnectionStateChange(func(st ice.ConnectionState) {
+		slog.Debug("ice state changed", "controlling", controlling, "state", st)
+	})
+	_ = agent.OnSelectedCandidatePairChange(func(local, remote ice.Candidate) {
+		slog.Debug("ice pair selected",
+			"controlling", controlling,
+			"local", fmt.Sprintf("%s:%d(%s)", local.Address(), local.Port(), local.Type()),
+			"remote", fmt.Sprintf("%s:%d(%s)", remote.Address(), remote.Port(), remote.Type()),
+		)
+	})
 
 	// --- 3. Trickle: send local candidates as they are gathered ---
 	if err := agent.OnCandidate(func(c ice.Candidate) {
 		if c == nil {
 			// Gathering complete – notify remote (informational).
-			b, _ := signaling.EncodeFrame(signaling.Frame{T: "eoc"})
-			_ = ws.Write(ctx, websocket.MessageBinary, b)
+			_ = sess.writeFrame(ctx, signaling.Frame{T: "eoc"})
 			return
 		}
-		// [debug] slog.Debug("ice local cand", "controlling", controlling, "type", c.Type(), "addr", c.Address(), "port", c.Port())
-		b, _ := signaling.EncodeFrame(signaling.Frame{T: "cand", C: c.Marshal()})
-		_ = ws.Write(ctx, websocket.MessageBinary, b)
+		// slog.Debug("ice local cand", "controlling", controlling, "type", c.Type(), "addr", c.Address(), "port", c.Port())
+		// Accumulate srflx addresses for DCUtR punch.
+		if c.Type() == ice.CandidateTypeServerReflexive {
+			sess.srflxMu.Lock()
+			sess.localSrflx = append(sess.localSrflx, fmt.Sprintf("%s:%d", c.Address(), c.Port()))
+			sess.srflxMu.Unlock()
+		}
+		_ = sess.writeFrame(ctx, signaling.Frame{T: "cand", C: c.Marshal()})
 	}); err != nil {
-		return nil, err
+		return nil, [2]string{}, err
 	}
 
-	// --- 4. Read goroutine: remote cred + trickle candidates ---
+	// --- 4. Read goroutine: remote cred + trickle candidates + punch frames ---
 	credCh := make(chan [2]string, 1)
 	readErr := make(chan error, 1)
 	go func() {
@@ -325,18 +444,28 @@ func runICESession(ctx context.Context, wsURL string, urls []*stun.URI, controll
 				if err != nil {
 					continue // best-effort; don't tear down the session
 				}
-				// [debug] slog.Debug("ice remote cand", "controlling", controlling, "type", cand.Type(), "addr", cand.Address(), "port", cand.Port())
+				// slog.Debug("ice remote cand", "controlling", controlling, "type", cand.Type(), "addr", cand.Address(), "port", cand.Port())
 				_ = agent.AddRemoteCandidate(cand)
+				if cand.Type() != ice.CandidateTypeRelay {
+					sess.mu.Lock()
+					sess.remoteCands = append(sess.remoteCands, cand)
+					sess.mu.Unlock()
+				}
 			case "eoc":
 				// Informational; ICE handles this naturally.
 			case "noagent":
-				// Target agent is not registered on the hub. Signal the caller
-				// with a typed error so it can decide whether to retry.
+				// Target agent is not registered on the hub.
 				select {
 				case readErr <- ErrNoAgent:
 				default:
 				}
 				return
+			case "punch-init", "punch-ack", "punch-go":
+				// Route punch frames to DCUtR handler (non-blocking; drop if full).
+				select {
+				case sess.punchCh <- fr:
+				default:
+				}
 			}
 		}
 	}()
@@ -344,11 +473,10 @@ func runICESession(ctx context.Context, wsURL string, urls []*stun.URI, controll
 	// --- 5. Exchange credentials ---
 	ufrag, pwd, err := agent.GetLocalUserCredentials()
 	if err != nil {
-		return nil, err
+		return nil, [2]string{}, err
 	}
-	credFrame, _ := signaling.EncodeFrame(signaling.Frame{T: "cred", U: ufrag, P: pwd})
-	if err := ws.Write(ctx, websocket.MessageBinary, credFrame); err != nil {
-		return nil, fmt.Errorf("a2al/host: ice send cred: %w", err)
+	if err := sess.writeFrame(ctx, signaling.Frame{T: "cred", U: ufrag, P: pwd}); err != nil {
+		return nil, [2]string{}, fmt.Errorf("a2al/host: ice send cred: %w", err)
 	}
 
 	credTimer := time.NewTimer(defaultICECredentialTimeout)
@@ -357,27 +485,60 @@ func runICESession(ctx context.Context, wsURL string, urls []*stun.URI, controll
 	var remoteCred [2]string
 	select {
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return nil, [2]string{}, ctx.Err()
 	case err := <-readErr:
-		return nil, fmt.Errorf("a2al/host: signaling read: %w", err)
+		return nil, [2]string{}, fmt.Errorf("a2al/host: signaling read: %w", err)
 	case <-credTimer.C:
-		return nil, errors.New("a2al/host: ice credentials timeout")
+		return nil, [2]string{}, errors.New("a2al/host: ice credentials timeout")
 	case remoteCred = <-credCh:
 	}
 
-	// --- 6. Gather + connectivity checks (concurrent, standard trickle) ---
+	// --- 6. Inject cached hints as remote candidates (best-effort) ---
+	// Hints from peerICECache represent endpoints that worked in a recent session.
+	// Injecting them before GatherCandidates lets connectivity checks start on
+	// known-good paths immediately, without waiting for trickle. Failures are
+	// silently ignored — fresh trickle candidates still arrive via the read goroutine.
+	for _, h := range hintRemotes {
+		cand, err := hintToRemoteCandidate(h)
+		if err != nil {
+			continue
+		}
+		_ = agent.AddRemoteCandidate(cand)
+	}
+
+	// --- 7. Begin candidate gathering (non-blocking; candidates trickle via OnCandidate) ---
 	if err := agent.GatherCandidates(); err != nil {
-		return nil, err
-	}
-	if controlling {
-		sess.iceConn, err = agent.Dial(ctx, remoteCred[0], remoteCred[1])
-	} else {
-		sess.iceConn, err = agent.Accept(ctx, remoteCred[0], remoteCred[1])
-	}
-	if err != nil {
-		return nil, err
+		return nil, [2]string{}, err
 	}
 
 	ok = true
+	return sess, remoteCred, nil
+}
+
+// completeICESession calls agent.Dial (controlling) or agent.Accept (!controlling)
+// to run ICE connectivity checks and select a candidate pair. On success
+// sess.iceConn is set. Designed to run concurrently with punchDial.
+func completeICESession(ctx context.Context, sess *iceSession, controlling bool, remoteCred [2]string) error {
+	var err error
+	if controlling {
+		sess.iceConn, err = sess.agent.Dial(ctx, remoteCred[0], remoteCred[1])
+	} else {
+		sess.iceConn, err = sess.agent.Accept(ctx, remoteCred[0], remoteCred[1])
+	}
+	return err
+}
+
+// runICESession is a convenience wrapper around startICESession +
+// completeICESession. Used by callers that do not race ICE against DCUtR punch
+// and by existing tests.
+func runICESession(ctx context.Context, wsURL string, urls []*stun.URI, controlling, hostOnly bool, networkTypes []ice.NetworkType, hintRemotes []iceHint) (*iceSession, error) {
+	sess, remoteCred, err := startICESession(ctx, wsURL, urls, controlling, hostOnly, networkTypes, hintRemotes)
+	if err != nil {
+		return nil, err
+	}
+	if err := completeICESession(ctx, sess, controlling, remoteCred); err != nil {
+		sess.Close()
+		return nil, err
+	}
 	return sess, nil
 }
