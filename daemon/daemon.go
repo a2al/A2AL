@@ -8,7 +8,9 @@ package daemon
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -79,7 +81,7 @@ type Daemon struct {
 
 	iceRegNotify chan struct{} // ICE /signal registration refresh (buffered)
 
-	demo         *demoServer    // built-in demo capability server (nil until New())
+	demo         *demoManager   // built-in demo capability server (per-agent)
 	gatewayConns atomic.Int64  // active gateway QUIC conns (direct + ICE)
 	sessions     sync.Map      // int (daemon-side TCP source port) → *sessionInfo
 
@@ -90,6 +92,10 @@ type Daemon struct {
 
 	// tunnels tracks all open multiplexed tunnels (POST /tunnel/{aid}).
 	tunnels *tunnelRegistry
+
+	// tunnelTLS is the persistent self-signed TLS config for tunnel listeners.
+	// Loaded once at startup; nil if cert generation fails (tunnel falls back to HTTP).
+	tunnelTLS *tls.Config
 
 	netMu                sync.Mutex
 	netStableFP          string
@@ -110,6 +116,11 @@ type Daemon struct {
 	testMaybeRebootstrapFn func(context.Context) // if set, maybeRebootstrap calls this instead
 
 	beacon *beaconManager
+
+	// agentPubLocks provides a per-AID mutex so concurrent calls to
+	// tryRepublishAgent for the same agent skip rather than race.
+	// Value type: *sync.Mutex.
+	agentPubLocks sync.Map
 }
 
 // APIAddr returns the REST API / Web UI listen address from the loaded config.
@@ -173,6 +184,7 @@ func New(cfg Config) (*Daemon, error) {
 		} else {
 			h = slog.NewTextHandler(os.Stdout, opts)
 		}
+		h = newComponentFilterHandler(h, nodeCfg.LogDebugComponents)
 		log = slog.New(h)
 		slog.SetDefault(log)
 	}
@@ -223,7 +235,7 @@ func New(cfg Config) (*Daemon, error) {
 		iceRegNotify:     make(chan struct{}, 1),
 		netChangeNotify:  make(chan struct{}, 1),
 		beacon:           newBeaconManager(h.Node(), &nodeCfg, log),
-		demo:             newDemoServer(),
+		demo:             newDemoManager(),
 	}
 	// connPool dial function: use node identity by default, agent cert when
 	// a registered local AID is specified (mirrors execConnect's pickLocalAgent).
@@ -234,6 +246,11 @@ func New(cfg Config) (*Daemon, error) {
 		return h.ConnectFromRecordFor(ctx, local, remote, er)
 	}, log)
 	d.tunnels = newTunnelRegistry()
+	if tlsCfg, err := loadOrCreateTunnelTLS(cfg.DataDir); err != nil {
+		log.Warn("tunnel tls: cert init failed, tunnel will use plain HTTP", "err", err)
+	} else {
+		d.tunnelTLS = tlsCfg
+	}
 	return d, nil
 }
 
@@ -298,6 +315,28 @@ func (d *Daemon) Run(ctx context.Context, mcpStdio bool) error {
 		}
 	}
 
+	// Recover demo servers for agents that were in demo mode when the daemon last
+	// stopped. DemoActive=true means the user intended the agent to be in demo mode;
+	// honouring that intent after restart provides a consistent experience.
+	for _, e := range d.reg.List() {
+		if !e.DemoActive {
+			continue
+		}
+		port, err := d.demo.startForAgent(e.AID.String(), d.sessionLookup)
+		if err != nil {
+			d.log.Warn("demo recovery: failed to restart", "aid", e.AID.String(), "err", err)
+			e.DemoActive = false
+			_ = d.reg.Put(e)
+			continue
+		}
+		e.ServiceTCP = fmt.Sprintf("127.0.0.1:%d", port)
+		if err := d.reg.Put(e); err != nil {
+			d.log.Warn("demo recovery: persist failed", "aid", e.AID.String(), "err", err)
+		} else {
+			d.log.Debug("demo recovered", "aid", e.AID.String(), "port", port)
+		}
+	}
+
 	netCtx, netCancel := context.WithCancel(ctx)
 	defer netCancel()
 
@@ -321,6 +360,7 @@ func (d *Daemon) Run(ctx context.Context, mcpStdio bool) error {
 	go d.runNetworkMonitor(netCtx)
 
 	go d.gatewayAcceptLoop(netCtx)
+	go d.connPool.startIdleEvictor(netCtx)
 
 	if mcpStdio {
 		d.log.Info("a2ald ready",
@@ -410,4 +450,15 @@ func mcpRunErr(err error) bool {
 		return false
 	}
 	return true
+}
+
+// sessionLookup returns the sessionInfo for an active gateway TCP bridge keyed
+// by the daemon-side TCP source port, or nil if no active session exists.
+func (d *Daemon) sessionLookup(port int) *sessionInfo {
+	v, ok := d.sessions.Load(port)
+	if !ok {
+		return nil
+	}
+	si, _ := v.(*sessionInfo)
+	return si
 }

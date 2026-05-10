@@ -20,6 +20,7 @@ var allExpectedTools = []string{
 	"a2al_ethereum_proof",
 	"a2al_agent_register",
 	"a2al_agent_get",
+	"a2al_agent_probe",
 	"a2al_agent_patch",
 	"a2al_agent_publish",
 	"a2al_agent_heartbeat",

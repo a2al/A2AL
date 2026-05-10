@@ -6,7 +6,6 @@ package daemon
 import (
 	"context"
 	"io"
-	"net"
 	"time"
 
 	"github.com/a2al/a2al"
@@ -40,7 +39,7 @@ func (dd *daemonDialer) Dial(ctx context.Context, remote a2al.Address) (io.ReadW
 		// Use DialContext so caller context cancellation (client disconnect,
 		// dial timeout) is respected rather than running the full 5-second
 		// hardcoded timeout independently.
-		return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "tcp", localEntry.ServiceTCP)
+		return dialServiceTCP(ctx, localEntry.ServiceTCP, 5*time.Second)
 	}
 
 	// Resolve remote endpoint (20 s budget; shares the caller's context).

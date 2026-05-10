@@ -11,30 +11,38 @@ import (
 	"time"
 )
 
-// demoServer manages the lifecycle of the optional built-in demo HTTP service.
-// When not started it has zero overhead; the HTTP listener is created on demand.
-type demoServer struct {
-	mu        sync.Mutex
-	ln        net.Listener
-	srv       *http.Server
-	port      int
-	activeAID string // AID of the agent currently using demo mode
-	prevTCP   string // saved service_tcp value, restored on stop
+// demoInstance holds the resources for a single agent's demo HTTP server.
+type demoInstance struct {
+	ln   net.Listener
+	srv  *http.Server
+	port int
 }
 
-func newDemoServer() *demoServer { return &demoServer{} }
+// demoManager manages per-agent demo HTTP server instances. Each agent gets its
+// own independent listener and HTTP server; there is no global singleton and no
+// mutual exclusion between agents.
+type demoManager struct {
+	mu      sync.Mutex
+	servers map[string]*demoInstance // keyed by AID string
+}
 
-// startHTTP starts the internal HTTP server on a random loopback port.
+func newDemoManager() *demoManager {
+	return &demoManager{servers: make(map[string]*demoInstance)}
+}
+
+// startForAgent starts a demo HTTP server for the given agent and returns the
+// port it is listening on. If a server is already running for that agent the
+// existing port is returned without starting a new one.
 //
-// agentAID is the full AID of the agent activating demo mode.
-// sessionLookup returns caller session info keyed by daemon-side TCP source port;
-// it is used to identify callers reaching this server via a Tangled Network tunnel.
-//
-// Callers must hold ds.mu.
-func (ds *demoServer) startHTTP(agentAID string, sessionLookup func(int) *sessionInfo) (int, error) {
-	if ds.ln != nil {
-		return ds.port, nil // already listening
+// sessionLookup returns caller session info keyed by daemon-side TCP source port.
+func (dm *demoManager) startForAgent(agentAID string, sessionLookup func(int) *sessionInfo) (int, error) {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+
+	if inst, ok := dm.servers[agentAID]; ok {
+		return inst.port, nil // already running
 	}
+
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return 0, err
@@ -42,9 +50,6 @@ func (ds *demoServer) startHTTP(agentAID string, sessionLookup func(int) *sessio
 	port := ln.Addr().(*net.TCPAddr).Port
 	shortAID := demoShortAID(agentAID)
 
-	// callerAID extracts the verified remote AID from the session map using
-	// the daemon-side TCP source port embedded in r.RemoteAddr.
-	// Returns "" when the request did not arrive via a Tangled Network tunnel.
 	callerAID := func(r *http.Request) string {
 		_, portStr, err := net.SplitHostPort(r.RemoteAddr)
 		if err != nil {
@@ -401,35 +406,32 @@ Endpoints
 	}
 	go srv.Serve(ln) //nolint:errcheck
 
-	ds.ln = ln
-	ds.srv = srv
-	ds.port = port
+	dm.servers[agentAID] = &demoInstance{ln: ln, srv: srv, port: port}
 	return port, nil
 }
 
-// stopHTTP shuts down the HTTP server. Callers must hold ds.mu.
-func (ds *demoServer) stopHTTP() {
-	if ds.srv != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-		_ = ds.srv.Shutdown(ctx)
-		ds.srv = nil
+// stopForAgent shuts down the demo HTTP server for the given agent.
+// No-op if no server is running for that agent.
+func (dm *demoManager) stopForAgent(agentAID string) {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+	inst, ok := dm.servers[agentAID]
+	if !ok {
+		return
 	}
-	if ds.ln != nil {
-		_ = ds.ln.Close()
-		ds.ln = nil
-	}
-	ds.port = 0
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_ = inst.srv.Shutdown(ctx)
+	_ = inst.ln.Close()
+	delete(dm.servers, agentAID)
 }
 
-// running reports whether the demo HTTP server is active. Callers must hold ds.mu.
-func (ds *demoServer) running() bool { return ds.ln != nil }
-
-// Status returns a snapshot of the demo server state (safe to call without holding mu).
-func (ds *demoServer) Status() (running bool, aid string, port int) {
-	ds.mu.Lock()
-	defer ds.mu.Unlock()
-	return ds.running(), ds.activeAID, ds.port
+// isRunning reports whether a demo server is active for the given agent.
+func (dm *demoManager) isRunning(agentAID string) bool {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+	_, ok := dm.servers[agentAID]
+	return ok
 }
 
 // demoShortAID returns the first-7 + last-4 abbreviated form of an AID string,

@@ -40,6 +40,11 @@ type Config struct {
 	KeyDir           string   `toml:"key_dir" json:"key_dir"`
 	LogFormat        string   `toml:"log_format" json:"log_format"`
 	LogLevel         string   `toml:"log_level" json:"log_level"`
+	// LogDebugComponents lists subsystem names whose DEBUG-level logs are emitted
+	// regardless of log_level. Useful for targeted diagnostics without enabling
+	// all DEBUG output. Recognized names: "ice", "punch", "natsense".
+	// Has no effect when log_level is already "debug".
+	LogDebugComponents []string `toml:"log_debug_components" json:"log_debug_components,omitempty"`
 
 	ICESignalURL  string   `toml:"ice_signal_url" json:"ice_signal_url"`
 	ICESignalURLs []string `toml:"ice_signal_urls" json:"ice_signal_urls"`

@@ -61,8 +61,12 @@ func buildMCPServer(d *Daemon) *mcp.Server {
 	}, d.mcpAgentRegister)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_agent_get",
-		Description: "Check a local agent's current status: service address, whether it is reachable on the network, and when it was last published.",
+		Description: "Get a local agent's configuration and publish status (service address, DHT publish times, replica count). Returns immediately from in-memory state — no network IO.",
 	}, d.mcpAgentGet)
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "a2al_agent_probe",
+		Description: "Check a local agent's live reachability: whether its service_tcp address is currently connectable, and the latest endpoints/NAT type from the DHT. Performs real network IO (TCP probe + DHT resolve); call only when the user explicitly wants a live status check.",
+	}, d.mcpAgentProbe)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_agent_patch",
 		Description: "Update the service address for a registered agent (e.g. after the local HTTP server moves to a different port).",
@@ -269,10 +273,18 @@ func (d *Daemon) mcpAgentGet(ctx context.Context, _ *mcp.ServerSession, params *
 	return &mcp.CallToolResultFor[map[string]any]{StructuredContent: out}, nil
 }
 
+func (d *Daemon) mcpAgentProbe(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[mcpAIDArgs]) (*mcp.CallToolResultFor[map[string]any], error) {
+	out, err := d.execAgentProbe(ctx, params.Arguments.AID)
+	if err != nil {
+		return nil, err
+	}
+	return &mcp.CallToolResultFor[map[string]any]{StructuredContent: out}, nil
+}
+
 type mcpPatchArgs struct {
-	AID                      string `json:"aid"`
-	OperationalPrivateKeyHex string `json:"operational_private_key_hex"`
-	ServiceTCP               string `json:"service_tcp"`
+	AID                      string  `json:"aid"`
+	OperationalPrivateKeyHex string  `json:"operational_private_key_hex"`
+	ServiceTCP               *string `json:"service_tcp"`
 }
 
 func (d *Daemon) mcpAgentPatch(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[mcpPatchArgs]) (*mcp.CallToolResultFor[map[string]any], error) {

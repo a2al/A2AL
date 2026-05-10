@@ -55,7 +55,7 @@ export default {
   'agent.modal.advanced': 'Advanced',
   'agent.modal.service_tcp.label': 'Agent URL',
   'agent.modal.service_tcp.optional': '(leave blank to configure later)',
-  'agent.modal.service_tcp.hint': 'Supports URL or TCP host:port format, e.g. http://127.0.0.1:8080 or 127.0.0.1:8080.',
+  'agent.modal.service_tcp.hint': 'Accepts host:port (TCP/HTTP) or https://host:port (HTTPS, TLS handled by daemon).',
   'agent.modal.submit': 'Register',
   'agent.modal.import.submit': 'Import',
   'agent.modal.create.submit': 'Add',
@@ -260,7 +260,8 @@ export default {
   'discover.tunnel.btn2': 'Encrypted Direct Tunnel',
   'discover.tunnel.ok': 'Encrypted tunnel ready — multiple concurrent connections supported',
   'discover.tunnel.open': 'Open in Browser',
-  'discover.tunnel.open_hint': 'HTTP endpoints only',
+  'discover.tunnel.open_https': 'Open with HTTPS',
+  'discover.tunnel.open_hint': 'Accept the browser\'s certificate prompt — local self-signed cert, no network risk',
   'discover.tunnel.close': 'Close',
   'discover.tunnel.closed': 'Tunnel closed.',
 

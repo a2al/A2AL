@@ -188,6 +188,7 @@ function renderMain() {
   const pane = document.getElementById('mainPane');
   if (!pane) return;
   pane.innerHTML = '';
+  pane.dataset.renderTab = tab; // stamp: async probe callbacks check this to avoid writing stale tab
   const ctx = {
     t,
     api,
@@ -196,6 +197,7 @@ function renderMain() {
     openModal,
     onRefresh: renderMain,
     copyText,
+    isStale: () => pane.dataset.renderTab !== tab,
   };
   if (tab === 'agents') {
     renderAgents(pane, ctx);

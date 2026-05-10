@@ -70,7 +70,7 @@ const SP = 'padding:.7rem .95rem';
 const SP_SM = 'padding:.55rem .95rem';
 
 export async function renderDiscover(mount, ctx) {
-  const { t, api, toast, copyText } = ctx;
+  const { t, api, toast, copyText, isStale } = ctx;
   let agents = [];
   try {
     const r = await api('/agents');
@@ -235,6 +235,7 @@ export async function renderDiscover(mount, ctx) {
 
     </div>`;
 
+  if (isStale?.()) return;
   mount.appendChild(wrap);
 
   /* ── Element refs ──────────────────────────────────────── */
@@ -671,10 +672,11 @@ export async function renderDiscover(mount, ctx) {
         </div>
         <div style="display:flex;gap:.4rem;flex-wrap:wrap;align-items:center">
           <button type="button" class="btn btn-secondary btn-sm" id="dTunnelOpen">${esc(t('discover.tunnel.open'))}</button>
-          <span class="muted" style="font-size:.79rem">${esc(t('discover.tunnel.open_hint'))}</span>
+          ${tr.https_url ? `<button type="button" class="btn btn-ghost btn-sm" id="dTunnelOpenHttps">${esc(t('discover.tunnel.open_https'))}</button><span class="muted" style="font-size:.79rem">${esc(t('discover.tunnel.open_hint'))}</span>` : ''}
         </div>`;
       actionOut.querySelector('#dTunnelCp').onclick = () => copyText(tr.listen);
       actionOut.querySelector('#dTunnelOpen').onclick = () => window.open('http://' + tr.listen, '_blank', 'noopener');
+      if (tr.https_url) actionOut.querySelector('#dTunnelOpenHttps').onclick = () => window.open(tr.https_url, '_blank', 'noopener');
       actionOut.querySelector('#dTunnelClose').onclick = async () => {
         if (!currentTunnelId) return;
         try { await api(`/tunnel/${encodeURIComponent(currentTunnelId)}`, { method: 'DELETE' }); } catch (_) {}
@@ -1048,12 +1050,13 @@ export async function renderDiscover(mount, ctx) {
           <button type="button" class="btn btn-ghost btn-xs" data-tcp>\u29c9</button>
           <button type="button" class="btn btn-ghost btn-xs" data-tclose>${esc(t('discover.tunnel.close'))}</button>
         </div>
-        <div style="display:flex;gap:.35rem;align-items:center">
+        <div style="display:flex;gap:.35rem;align-items:center;flex-wrap:wrap">
           <button type="button" class="btn btn-secondary btn-sm" data-topen>${esc(t('discover.tunnel.open'))}</button>
-          <span class="muted" style="font-size:.78rem">${esc(t('discover.tunnel.open_hint'))}</span>
+          ${tr.https_url ? `<button type="button" class="btn btn-ghost btn-sm" data-topen-https>${esc(t('discover.tunnel.open_https'))}</button><span class="muted" style="font-size:.78rem">${esc(t('discover.tunnel.open_hint'))}</span>` : ''}
         </div>`;
       panel.querySelector('[data-tcp]').onclick = () => copyText(tr.listen);
       panel.querySelector('[data-topen]').onclick = () => window.open('http://' + tr.listen, '_blank', 'noopener');
+      if (tr.https_url) panel.querySelector('[data-topen-https]').onclick = () => window.open(tr.https_url, '_blank', 'noopener');
       panel.querySelector('[data-tclose]').onclick = async () => {
         const tid = favTunnels.get(fav.id);
         if (tid) { try { await api(`/tunnel/${encodeURIComponent(tid)}`, { method: 'DELETE' }); } catch (_) {} favTunnels.delete(fav.id); }

@@ -55,7 +55,7 @@ export default {
   'agent.modal.advanced': '高级设置',
   'agent.modal.service_tcp.label': 'Agent URL',
   'agent.modal.service_tcp.optional': '（暂无可留空，稍后配置）',
-  'agent.modal.service_tcp.hint': '支持 URL 或 TCP 协议的 host:port 格式，如 http://127.0.0.1:8080 或 127.0.0.1:8080。',
+  'agent.modal.service_tcp.hint': '支持 host:port（TCP/HTTP）或 https://host:port（HTTPS，TLS 由 daemon 处理）。',
   'agent.modal.submit': '注册',
   'agent.modal.import.submit': '导入',
   'agent.modal.create.submit': '添加',
@@ -260,7 +260,8 @@ export default {
   'discover.tunnel.btn2': '加密隧道直连',
   'discover.tunnel.ok': '加密隧道已就绪，支持多连接并发',
   'discover.tunnel.open': '在浏览器中打开',
-  'discover.tunnel.open_hint': '需对端为 HTTP 服务',
+  'discover.tunnel.open_https': '以 HTTPS 打开',
+  'discover.tunnel.open_hint': '需接受证书提示（本地自签名证书，非网络安全风险）',
   'discover.tunnel.close': '关闭隧道',
   'discover.tunnel.closed': '隧道已关闭。',
 

@@ -55,7 +55,7 @@ export default {
   'agent.modal.advanced': '詳細設定',
   'agent.modal.service_tcp.label': 'Agent URL',
   'agent.modal.service_tcp.optional': '（後で設定可）',
-  'agent.modal.service_tcp.hint': 'URLまたはTCP host:port形式に対応。例: http://127.0.0.1:8080 または 127.0.0.1:8080。',
+  'agent.modal.service_tcp.hint': 'host:port（TCP/HTTP）または https://host:port（HTTPS、TLS は daemon が処理）を指定。',
   'agent.modal.submit': '登録',
   'agent.modal.import.submit': 'インポート',
   'agent.modal.create.submit': '追加',
@@ -260,7 +260,8 @@ export default {
   'discover.tunnel.btn2': '暗号化ダイレクトトンネル',
   'discover.tunnel.ok': '暗号化トンネル準備完了 — 複数同時接続対応',
   'discover.tunnel.open': 'ブラウザで開く',
-  'discover.tunnel.open_hint': 'HTTP サービスのみ対応',
+  'discover.tunnel.open_https': 'HTTPS で開く',
+  'discover.tunnel.open_hint': '証明書の警告を承認してください（ローカル自己署名証明書、ネットワーク上のリスクはありません）',
   'discover.tunnel.close': '閉じる',
   'discover.tunnel.closed': 'トンネルを閉じました。',
 

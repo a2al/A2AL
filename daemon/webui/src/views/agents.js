@@ -230,17 +230,11 @@ function tcpDot(ag, t) {
 }
 
 export async function renderAgents(mount, ctx) {
-  const { t, api, toast, relTime, openModal, onRefresh, copyText } = ctx;
+  const { t, api, toast, relTime, openModal, onRefresh, copyText, isStale } = ctx;
   let agents = [];
-  let demoStatus = { running: false, aid: '', port: 0 };
   try {
-    const [agentsRes, demoRes] = await Promise.allSettled([
-      api('/agents'),
-      api('/demo/status'),
-    ]);
-    if (agentsRes.status === 'fulfilled') agents = agentsRes.value.agents || [];
-    else { mount.innerHTML = `<p class="muted">${esc(t('common.error', { msg: agentsRes.reason?.message }))}</p>`; return; }
-    if (demoRes.status === 'fulfilled') demoStatus = demoRes.value;
+    const res = await api('/agents');
+    agents = res.agents || [];
   } catch (e) {
     mount.innerHTML = `<p class="muted">${esc(t('common.error', { msg: e.message }))}</p>`;
     return;
@@ -329,7 +323,7 @@ export async function renderAgents(mount, ctx) {
     listContainer.innerHTML = '';
     const sorted = sortedAgents();
     for (let idx = 0; idx < sorted.length; idx++) {
-      listContainer.appendChild(buildAgentCard(sorted[idx], idx === 0, sorted, idx, demoStatus));
+      listContainer.appendChild(buildAgentCard(sorted[idx], idx === 0, sorted, idx));
     }
     // Highlight and scroll to a newly registered card if pending
     if (_pendingNewAid) {
@@ -346,12 +340,12 @@ export async function renderAgents(mount, ctx) {
   renderList();
 
   // ── Agent card builder ──────────────────────────────────────────────────
-  function buildAgentCard(ag, svcExpanded, allAgents, idx, demoStatus) {
+  function buildAgentCard(ag, svcExpanded, allAgents, idx) {
     const st = agentStatus(ag);
     // Auto-assign a default alias if none is stored yet
     if (!aliasOf(ag.aid)) setAliasOf(ag.aid, generateDefaultAlias());
     const alias = aliasOf(ag.aid);
-    const isDemoActive = demoStatus.running && demoStatus.aid === ag.aid;
+    const isDemoActive = ag.demo_active;
     const card = document.createElement('div');
     card.className = 'card ag2-card';
     card.dataset.status = tcpAccentCls(ag);
@@ -375,7 +369,7 @@ export async function renderAgents(mount, ctx) {
               style="width:100%;max-width:16rem" />
           </div>
           <div class="ag2-tcp-row">
-            ${tcpDot(ag, t)}
+            <span data-tcp-status="${esc(ag.aid)}">${tcpDot(ag, t)}</span>
             ${ag.service_tcp ? `<span class="mono ag2-tcp-addr">${esc(ag.service_tcp)}</span>` : ''}
             ${isDemoActive ? `<span class="badge b-blue demo-badge">${esc(t('demo.badge'))}</span>` : ''}
             <button type="button" class="btn btn-ghost btn-xs" data-edit-tcp>${esc(t('agent.tcp.edit'))}</button>
@@ -388,7 +382,7 @@ export async function renderAgents(mount, ctx) {
           <div id="ag-tcp-form-${idx}" style="display:none;margin:.25rem 0 .4rem">
             <div style="display:flex;gap:.35rem;flex-wrap:wrap">
               <input type="text" class="ag2-tcp-input" value="${esc(ag.service_tcp || '')}"
-                placeholder="http://127.0.0.1:8080" style="flex:1;min-width:10rem" />
+                placeholder="127.0.0.1:8080 or https://host:443" style="flex:1;min-width:10rem" />
               <button type="button" class="btn btn-primary btn-sm" data-tcp-save>${esc(t('agent.tcp.save'))}</button>
               <button type="button" class="btn btn-ghost btn-sm" data-tcp-cancel>${esc(t('common.cancel'))}</button>
             </div>
@@ -690,11 +684,11 @@ export async function renderAgents(mount, ctx) {
       case 'network': {
         panel.innerHTML = `<p class="muted">${esc(t('common.loading'))}</p>`;
         try {
-          const r = await api(`/agents/${encodeURIComponent(ag.aid)}`);
-          const eps = Array.isArray(r.published_endpoints) && r.published_endpoints.length
-            ? r.published_endpoints.map((e) => `<span class="mono" style="font-size:.83rem">${esc(e)}</span>`).join('<br/>')
+          const r = await api(`/resolve/${encodeURIComponent(ag.aid)}`, { method: 'POST', body: '{}' });
+          const eps = Array.isArray(r.endpoints) && r.endpoints.length
+            ? r.endpoints.map((e) => `<span class="mono" style="font-size:.83rem">${esc(e)}</span>`).join('<br/>')
             : '—';
-          const nat = r.published_nat_type != null ? natLabel(t, r.published_nat_type) : '—';
+          const nat = r.nat_type != null ? natLabel(t, r.nat_type) : '—';
           panel.innerHTML = `
             <div style="margin-bottom:.35rem"><strong>${esc(t('agent.fn.network.endpoints'))}</strong><br/>${eps}</div>
             <div><strong>${esc(t('agent.fn.network.nat'))}</strong> ${esc(nat)}</div>`;
@@ -1330,9 +1324,14 @@ export async function renderAgents(mount, ctx) {
     }).join('');
     const customOn = !CATS.includes(preCat);
     const initialAgent = agentList.find((a) => a.aid === editAid) || agentList[0];
-    const preUrl = initialAgent?.service_tcp
-      ? 'http://' + initialAgent.service_tcp + '/.well-known/agent.json'
-      : '';
+    const preUrl = (() => {
+      const tcp = initialAgent?.service_tcp;
+      if (!tcp) return '';
+      const base = (tcp.startsWith('https://') || tcp.startsWith('http://'))
+        ? tcp.replace(/\/$/, '')
+        : 'http://' + tcp;
+      return base + '/.well-known/agent.json';
+    })();
     openModal({
       title: t('service.modal.title'),
       wide: true,
@@ -1496,6 +1495,25 @@ export async function renderAgents(mount, ctx) {
     });
   }
 
+  // Probe tcp status for all agents with service_tcp, concurrently.
+  // Each probe has its own 2.5s timeout so one slow endpoint can't block others.
+  // When rendered from cache, also refresh agent list + demo status in background.
+  function _runProbes(agList) {
+    agList.filter(ag => ag.service_tcp).forEach(ag => {
+      const ctrl = new AbortController();
+      setTimeout(() => ctrl.abort(), 2500);
+      api(`/agents/${encodeURIComponent(ag.aid)}/probe`, { signal: ctrl.signal })
+        .then(r => {
+          if (!mount.isConnected) return;
+          const tcpEl = mount.querySelector(`[data-tcp-status="${CSS.escape(ag.aid)}"]`);
+          if (tcpEl) tcpEl.innerHTML = tcpDot({ ...ag, service_tcp_ok: r.service_tcp_ok }, t);
+          const card = mount.querySelector(`[data-aid="${CSS.escape(ag.aid)}"]`);
+          if (card) card.dataset.status = tcpAccentCls({ ...ag, service_tcp_ok: r.service_tcp_ok });
+        }).catch(() => {});
+    });
+  }
+  _runProbes(agents);
+
   // Background status refresh: re-fetch agents every 60 s and update badges
   // without rebuilding cards (preserves open panels and edit state).
   const statusTimer = setInterval(async () => {
@@ -1545,7 +1563,7 @@ export async function renderAgents(mount, ctx) {
     if (!toCheck.length) return;
     await Promise.allSettled(toCheck.map(async (aid) => {
       try {
-        const r = await api(`/agents/${encodeURIComponent(aid)}`);
+        const r = await api(`/agents/${encodeURIComponent(aid)}/probe`);
         if (r.published_record_seq != null) {
           _dhtConfirmedLive.add(aid);
           _dhtConfirmedExpired.delete(aid);

@@ -140,7 +140,7 @@ func flagBool(args []string, name string) bool {
 
 func cmdAgentsUpdate(c *Client, g globalOpts, args []string) {
 	if len(args) < 1 {
-		fatalf("usage: a2al agents update <local-aid> [--service-tcp <addr>]")
+		fatalf("usage: a2al agents update <local-aid> [--service-tcp <addr>]\n  <addr>: host:port  or  https://host:port  (path not allowed)")
 	}
 	aid := args[0]
 	tcp := flagString(args[1:], "--service-tcp")

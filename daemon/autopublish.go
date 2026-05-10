@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/a2al/a2al"
@@ -217,19 +218,34 @@ func (d *Daemon) maybeRepublishNodeOnEndpointChange(ctx context.Context) {
 	agents := d.reg.List()
 	d.regMu.RUnlock()
 	for _, e := range agents {
-		d.tryRepublishAgent(ctx, e)
+		d.tryRepublishAgent(ctx, e.AID)
 	}
 }
 
-func (d *Daemon) tryRepublishAgent(ctx context.Context, e *registry.Entry) {
-	if e.Seq == 0 {
+func (d *Daemon) tryRepublishAgent(ctx context.Context, aid a2al.Address) {
+	// Per-AID try-lock: if a publish is already in flight for this agent,
+	// skip rather than race (concurrent callers would compute the same nextSeq
+	// and one would receive ErrStaleRecord, incorrectly marking the agent as migrated).
+	actual, _ := d.agentPubLocks.LoadOrStore(aid, &sync.Mutex{})
+	mu := actual.(*sync.Mutex)
+	if !mu.TryLock() {
+		return
+	}
+	defer mu.Unlock()
+
+	// Re-read the entry so we always use the latest persisted seq, even when
+	// the caller passed a value-copy snapshot (e.g. service.go snap := *e).
+	d.regMu.RLock()
+	e := d.reg.Get(aid)
+	d.regMu.RUnlock()
+	if e == nil || e.Seq == 0 {
 		return
 	}
 	if !d.agentAliveForRepublish(e) {
 		return
 	}
 	nextSeq := e.Seq + 1
-	if err := d.h.PublishEndpointForAgent(ctx, e.AID, nextSeq, endpointRecordTTL); err != nil {
+	if err := d.h.PublishEndpointForAgent(ctx, aid, nextSeq, endpointRecordTTL); err != nil {
 		if errors.Is(err, dht.ErrStaleRecord) {
 			// Network has a higher seq: another node has taken over publishing for this agent.
 			// Set zero sentinel to suppress both heartbeat and TCP-probe paths until the
@@ -238,18 +254,18 @@ func (d *Daemon) tryRepublishAgent(ctx context.Context, e *registry.Entry) {
 			if d.heartbeatAt == nil {
 				d.heartbeatAt = make(map[a2al.Address]time.Time)
 			}
-			d.heartbeatAt[e.AID] = time.Time{}
+			d.heartbeatAt[aid] = time.Time{}
 			d.heartbeatMu.Unlock()
-			d.log.Info("agent auto-republish stopped: stale record, agent may have migrated", "aid", e.AID.String())
+			d.log.Info("agent auto-republish stopped: stale record, agent may have migrated", "aid", aid.String())
 		} else {
-			d.log.Debug("agent auto-republish", "aid", e.AID.String(), "err", err)
+			d.log.Debug("agent auto-republish", "aid", aid.String(), "err", err)
 		}
 		return
 	}
 
 	d.regMu.Lock()
 	defer d.regMu.Unlock()
-	e2 := d.reg.Get(e.AID)
+	e2 := d.reg.Get(aid)
 	if e2 == nil {
 		return
 	}
@@ -258,8 +274,8 @@ func (d *Daemon) tryRepublishAgent(ctx context.Context, e *registry.Entry) {
 		d.log.Warn("agent republish persist", "err", err)
 		return
 	}
-	d.recordAgentPublishTime(e.AID)
-	d.log.Debug("agent endpoint republished", "aid", e.AID.String(), "seq", nextSeq)
+	d.recordAgentPublishTime(aid)
+	d.log.Debug("agent endpoint republished", "aid", aid.String(), "seq", nextSeq)
 
 	// Also re-publish all registered services (topic records) for this agent.
 	d.republishAgentServices(ctx, e2)
@@ -316,7 +332,7 @@ func (d *Daemon) runPeriodicRepublish(ctx context.Context) {
 	agCtx, agCancel := context.WithTimeout(ctx, 120*time.Second)
 	defer agCancel()
 	for _, e := range agents {
-		d.tryRepublishAgent(agCtx, e)
+		d.tryRepublishAgent(agCtx, e.AID)
 	}
 
 	// Refresh supplemental bootstrap addresses and push locally-published records.
@@ -375,7 +391,7 @@ func (d *Daemon) initialAutoPublish(ctx context.Context) {
 						return
 					case <-jt.C:
 					}
-					d.tryRepublishAgent(ctx, e)
+					d.tryRepublishAgent(ctx, e.AID)
 				}()
 			}
 		}()

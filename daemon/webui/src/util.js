@@ -31,20 +31,29 @@ export function labelAid(aid) {
   return a ? `${a} (${shortAid(aid)})` : shortAid(aid);
 }
 
-/** Normalize a user-entered Agent URL or host:port into the host:port format
- *  required by service_tcp. Accepts:
- *    http://127.0.0.1:8080  → 127.0.0.1:8080
- *    https://host           → host:443
- *    http://host            → host:80
- *    127.0.0.1:8080         → 127.0.0.1:8080  (pass-through)
+/** Normalize a user-entered service_tcp value.
+ *  Accepted formats (paths are stripped):
+ *    https://host:port  → https://host:port  (TLS mode — scheme preserved)
+ *    https://host       → https://host:443
+ *    http://host:port   → host:port          (plain TCP, same as no scheme)
+ *    http://host        → host:80
+ *    host:port          → host:port          (pass-through)
  */
 export function normalizeServiceTCP(input) {
   const s = (input || '').trim();
   if (!s) return '';
-  if (s.startsWith('http://') || s.startsWith('https://')) {
+  if (s.startsWith('https://')) {
     try {
       const u = new URL(s);
-      const port = u.port || (u.protocol === 'https:' ? '443' : '80');
+      const port = u.port || '443';
+      return `https://${u.hostname}:${port}`;
+    } catch (_) {}
+    return s;
+  }
+  if (s.startsWith('http://')) {
+    try {
+      const u = new URL(s);
+      const port = u.port || '80';
       return `${u.hostname}:${port}`;
     } catch (_) {}
   }

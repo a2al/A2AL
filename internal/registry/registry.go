@@ -51,6 +51,10 @@ type Entry struct {
 	// Profile holds user-supplied overrides for the RecType 0x02 sovereign record.
 	// Nil means use inferred values from Services only.
 	Profile *ProfileOverride
+	// DemoActive records that the built-in demo HTTP server is running for this agent.
+	// Set by demo start; cleared by demo stop. On daemon restart, any entry with
+	// DemoActive=true is recovered by re-starting the demo server automatically.
+	DemoActive bool
 }
 
 type diskAgent struct {
@@ -61,6 +65,7 @@ type diskAgent struct {
 	Seq                uint64          `json:"seq"`
 	Services           []ServiceRecord  `json:"services,omitempty"`
 	Profile            *ProfileOverride `json:"profile,omitempty"`
+	DemoActive         bool             `json:"demo_active,omitempty"`
 	// Topics is a legacy field (pre-v1.1); loaded for migration, never written.
 	Topics []string `json:"topics,omitempty"`
 }
@@ -126,6 +131,7 @@ func Load(path string) (*Registry, error) {
 			Seq:            da.Seq,
 			Services:       svcs,
 			Profile:        da.Profile,
+			DemoActive:     da.DemoActive,
 		}
 	}
 	return r, nil
@@ -184,6 +190,7 @@ func (r *Registry) Save() error {
 			Seq:                e.Seq,
 			Services:           append([]ServiceRecord(nil), e.Services...),
 			Profile:            e.Profile,
+			DemoActive:         e.DemoActive,
 		})
 	}
 	b, err := json.MarshalIndent(df, "", "  ")
