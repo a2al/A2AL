@@ -21,6 +21,7 @@ import (
 	"github.com/a2al/a2al"
 	"github.com/a2al/a2al/crypto"
 	"github.com/a2al/a2al/dht"
+	"github.com/a2al/a2al/host"
 	"github.com/a2al/a2al/identity"
 	"github.com/a2al/a2al/internal/registry"
 	"github.com/a2al/a2al/internal/version"
@@ -907,9 +908,13 @@ func (d *Daemon) execConnect(ctx context.Context, remoteAidStr string, body conn
 	)
 	// Acquire a pooled QUIC connection. The connection is NOT closed when the
 	// tunnel ends — it returns to the pool for reuse by subsequent calls.
-	qc, err := d.connPool.acquire(ctx, local, remote, er)
+	nr := resolveNoRelay(body.DisableRelay, d.cfg.DisableRelay)
+	qc, _, err := d.connPool.acquire(ctx, local, remote, er, nr)
 	if err != nil {
 		d.log.Warn("connect quic", "remote", remote.String(), "err", err)
+		if errors.Is(err, host.ErrRelayRequired) {
+			return "", err
+		}
 		return "", errConnectQUIC
 	}
 	d.log.Debug("connect quic ok", "local_aid", local.String(), "remote_aid", remote.String())
@@ -1345,3 +1350,12 @@ var (
 	errNoDelegation          = errors.New("delegation required")
 	errBadServiceTCP         = errors.New("service_tcp cannot contain a path — use host:port or https://host:port")
 )
+
+// resolveNoRelay returns the effective noRelay flag for a connection request.
+// The per-call override (*bool) takes precedence over the node-level config default.
+func resolveNoRelay(override *bool, cfgDefault bool) bool {
+	if override != nil {
+		return *override
+	}
+	return cfgDefault
+}

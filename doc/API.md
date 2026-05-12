@@ -31,8 +31,10 @@ A `Host` runs a DHT `Node`, optional UDP demux for DHT+QUIC on a single port, a 
 | `DisableUPnP` | If true, skips IGD UDP port mapping for the QUIC listen port. |
 | `ICESignalURL` | WebSocket base URL published in endpoint records for ICE trickle signaling (optional). When set, `ConnectFromRecord` uses the ICE path as a fallback when direct QUIC fails. |
 | `ICESTUNURLs` | `stun:` URIs for ICE gathering. Empty means default public STUN when no TURN is configured. |
-| `ICETURNURLs` | `turn:` URIs (may include credentials) used locally for ICE relay. Not published to the DHT. |
-| `ICEPublishTurns` | Credential-free `turn:` hints stored in `EndpointPayload.Turns` for remote peers to use. |
+| `ICETURNURLs` | Legacy `turn:` URIs with embedded credentials. Still supported; prefer `TURNServers` for new deployments. |
+| `ICEPublishTurns` | Deprecated. Credential-free `turn:` hints formerly stored in `EndpointPayload.Turns`; new nodes do not publish these. |
+| `TURNServers` | Structured TURN server list (`[]TURNServer`). Each entry has `URL`, `Username`, `Credential`, and `CredentialType` (`"static"` / `"hmac"` / `"rest_api"`). Credentials are resolved per ICE session and never published to the DHT. |
+| `DisableRelay` | If true, the node will not use TURN relay by default. Can be overridden per-connection via `DialOptions.DisableRelay`. |
 | `Logger` | `*slog.Logger` forwarded to the DHT node. If nil, `slog.Default()` is used. |
 
 The DHT node created by `Host` sets `dht.Config.RecordAuth` so stored records must be either self-signed for their address or carry a valid operational-key delegation (see `identity`).
@@ -53,8 +55,8 @@ The DHT node created by `Host` sets `dht.Config.RecordAuth` so stored records mu
 | `PublishEndpointForAgent(ctx, agentAddr, seq, ttl)` | Same as `PublishEndpoint` but for a **registered** delegated agent (operational key + delegation on the host). |
 | `Resolve(ctx, target Address)` | Iterative lookup; returns `*protocol.EndpointRecord`. |
 | `Connect(ctx, expectRemote Address, udpAddr)` | QUIC dial to one UDP address with mutual TLS + agent-route (see below). |
-| `ConnectFromRecord(ctx, expectRemote Address, er)` | Happy Eyeballs: staggered dials over every `quic://` / `udp://` in `er` (deduped); if all fail and `er.Signal` is set, falls back to ICE trickle via WebSocket signaling. |
-| `ConnectFromRecordFor(ctx, localAgent, expectRemote Address, er)` | Same as `ConnectFromRecord` but dials using TLS credentials for `localAgent` (must be registered on this host). |
+| `ConnectFromRecord(ctx, expectRemote Address, er)` | Happy Eyeballs: staggered dials over every `quic://` / `udp://` in `er` (deduped); if all fail and `er.Signal` is set, falls back to ICE trickle via WebSocket signaling (with relay allowed). Returns `(quic.Connection, isRelayed bool, error)`. |
+| `ConnectFromRecordFor(ctx, localAgent, expectRemote Address, er, opts DialOptions)` | Same as `ConnectFromRecord` but dials using TLS credentials for `localAgent` and respects `opts.DisableRelay`. Returns `(quic.Connection, isRelayed bool, error)`. If `DisableRelay=true` and TURN is configured but direct connection fails, returns `ErrRelayRequired`. |
 | `Accept(ctx)` | Blocks for inbound QUIC; returns `*AgentConn` with `Local` / `Remote` addresses. |
 | `FirstQUICAddr(er)` | First `quic://` or legacy `udp://` entry as `*net.UDPAddr` (same order as `QUICDialTargets`). |
 | `QUICDialTargets(er)` | Ordered, deduplicated `[]*net.UDPAddr` from an `EndpointRecord`. |
@@ -256,7 +258,6 @@ When using `Host`, `Sense()` exposes consensus over reflected UDP endpoints:
 
 ## Not yet implemented (library / network)
 
-- **TURN relay** — `ICETURNURLs` / `ICEPublishTurns` config fields exist; relay addresses can be published and hinted, but `pion/turn` server-side relay is not yet integrated for the symmetric-NAT fallback path.
 - **IPv6 dual-stack `Host` listener** — wire format supports IPv6; `New()` currently uses `udp4` only.
 
 ---

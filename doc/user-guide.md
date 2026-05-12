@@ -217,7 +217,33 @@ Notes are end-to-end encrypted — only the holder of the recipient's private ke
 - **UPnP**: on supporting routers, `a2ald` requests a port mapping automatically
 - **ICE / hole-punching**: when direct connection isn't possible, `a2ald` attempts coordinated hole-punching through a signaling channel
 
-This works transparently for most environments: home routers, corporate NAT, cloud instances. The one case that may not work without a relay is symmetric NAT on both sides simultaneously — `a2ald` will warn you in the Web UI if it detects this condition. TURN relay support for symmetric NAT is in development.
+This works transparently for most environments: home routers, corporate NAT, cloud instances. The one case that may not work without a relay is symmetric NAT on both sides simultaneously — `a2ald` will warn you in the Web UI if it detects this condition.
+
+When direct connection and hole-punching both fail, `a2ald` can fall back to a TURN relay if one is configured. Relay is transparent to applications; the connection API is identical. To enable relay, add one or more `[[turn_servers]]` entries to your config:
+
+```toml
+# Static credentials
+[[turn_servers]]
+url = "turn:turn.example.com:3478?transport=udp"
+username = "alice"
+credential = "s3cr3t"
+
+# Time-limited HMAC credentials (coturn use-auth-secret)
+[[turn_servers]]
+url = "turn:coturn.example.com:3478"
+credential_type = "hmac"
+username = "a2ald"
+credential = "<shared_secret>"
+
+# REST API credentials (Twilio, Metered.ca, etc.)
+[[turn_servers]]
+url = "turn:global.turn.twilio.com:3478?transport=udp"
+credential_type = "rest_api"
+credential_url = "https://api.twilio.com/.../Tokens.json"
+credential = "Basic <base64(AccountSID:AuthToken)>"
+```
+
+Relay is the last-resort fallback — direct paths are always attempted first. To disable relay entirely, set `disable_relay = true` in your config. Individual connections can also override this via the `disable_relay` field on connect/tunnel requests; when relay is available but explicitly disabled and direct connection fails, the API returns HTTP 412 with `"relay_required"` so the caller can retry with relay enabled.
 
 ### Endpoint refresh
 

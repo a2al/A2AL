@@ -158,6 +158,9 @@ type AgentConn struct {
 	Local a2al.Address
 	// Remote is the connecting peer's Address (from mutual TLS client cert).
 	Remote a2al.Address
+	// IsRelayed reports whether the underlying ICE path uses a TURN relay on
+	// either side. False for direct (host/srflx) and DCUtR punch paths.
+	IsRelayed bool
 }
 
 // agentEntry is a registered agent in the SNI router.

@@ -36,6 +36,18 @@ const noAgentRetryDelay = 3 * time.Second
 // the winner can be returned promptly.
 const iceHubTimeout = 30 * time.Second
 
+// hasTURNURLs reports whether the given STUN/TURN URL list contains at least
+// one TURN or TURNS entry. Used to determine whether ErrRelayRequired should
+// be returned when relay is disabled and direct connectivity fails.
+func hasTURNURLs(urls []*stun.URI) bool {
+	for _, u := range urls {
+		if u.Scheme == stun.SchemeTypeTURN || u.Scheme == stun.SchemeTypeTURNS {
+			return true
+		}
+	}
+	return false
+}
+
 // recordICESession extracts the selected candidate pair and all collected
 // trickle candidates from a completed ICE session and writes them into the
 // peerICECache for future dial acceleration.
@@ -65,26 +77,27 @@ func (h *Host) recordICESession(remote a2al.Address, sess *iceSession) {
 // to the returned quic.Connection via a background goroutine that cleans them
 // up when the connection closes. The caller must NOT close these resources
 // separately.
-func (h *Host) connectViaICESignal(ctx context.Context, localCert tls.Certificate, localAgent, expectRemote a2al.Address, er *protocol.EndpointRecord) (quic.Connection, error) {
+func (h *Host) connectViaICESignal(ctx context.Context, localCert tls.Certificate, localAgent, expectRemote a2al.Address, er *protocol.EndpointRecord, disableRelay bool) (quic.Connection, bool, error) {
 	signalURLs := er.Signals
 	if len(signalURLs) == 0 && er.Signal != "" {
 		signalURLs = []string{er.Signal}
 	}
 	if len(signalURLs) == 0 {
-		return nil, errors.New("a2al/host: no signal url in record")
+		return nil, false, errors.New("a2al/host: no signal url in record")
 	}
 
 	room := signaling.RoomID(localAgent.String(), expectRemote.String())
 	iceURLs := h.mergeICEURLs(ctx)
 
 	if len(signalURLs) == 1 {
-		return h.tryICEViaHub(ctx, localCert, localAgent, expectRemote, signalURLs[0], room, iceURLs)
+		return h.tryICEViaHub(ctx, localCert, localAgent, expectRemote, signalURLs[0], room, iceURLs, disableRelay)
 	}
 
 	// Race all hubs in parallel; return the first success.
 	type res struct {
-		conn quic.Connection
-		err  error
+		conn      quic.Connection
+		isRelayed bool
+		err       error
 	}
 
 	raceCtx, raceCancel := context.WithCancel(ctx)
@@ -96,8 +109,8 @@ func (h *Host) connectViaICESignal(ctx context.Context, localCert tls.Certificat
 		go func() {
 			hubCtx, hubCancel := context.WithTimeout(raceCtx, iceHubTimeout)
 			defer hubCancel()
-			conn, err := h.tryICEViaHub(hubCtx, localCert, localAgent, expectRemote, hub, room, iceURLs)
-			ch <- res{conn, err}
+			conn, relayed, err := h.tryICEViaHub(hubCtx, localCert, localAgent, expectRemote, hub, room, iceURLs, disableRelay)
+			ch <- res{conn, relayed, err}
 		}()
 	}
 
@@ -116,29 +129,29 @@ func (h *Host) connectViaICESignal(ctx context.Context, localCert tls.Certificat
 					}
 				}(remaining)
 			}
-			return r.conn, nil
+			return r.conn, r.isRelayed, nil
 		}
 		lastErr = r.err
 	}
-	return nil, lastErr
+	return nil, false, lastErr
 }
 
 // tryICEViaHub attempts an ICE → QUIC handshake through one signal hub.
 // ICE connectivity checks race against a DCUtR punch attempt on the same
 // WebSocket; the first QUIC connection to be established wins.
 // noAgentRetries are applied when the hub reports the callee is not registered.
-func (h *Host) tryICEViaHub(ctx context.Context, localCert tls.Certificate, localAgent, expectRemote a2al.Address, signalBase, room string, iceURLs []*stun.URI) (quic.Connection, error) {
+func (h *Host) tryICEViaHub(ctx context.Context, localCert tls.Certificate, localAgent, expectRemote a2al.Address, signalBase, room string, iceURLs []*stun.URI, disableRelay bool) (quic.Connection, bool, error) {
 	wsURL, err := signaling.AppendRoomToICEURL(signalBase, room)
 	if err != nil {
-		return nil, fmt.Errorf("a2al/host: ice signal url: %w", err)
+		return nil, false, fmt.Errorf("a2al/host: ice signal url: %w", err)
 	}
 	wsURL, err = signaling.AppendQuery(wsURL, "target", expectRemote.String())
 	if err != nil {
-		return nil, fmt.Errorf("a2al/host: ice signal url: %w", err)
+		return nil, false, fmt.Errorf("a2al/host: ice signal url: %w", err)
 	}
 	wsURL, err = signaling.AppendQuery(wsURL, "caller", localAgent.String())
 	if err != nil {
-		return nil, fmt.Errorf("a2al/host: ice signal url: %w", err)
+		return nil, false, fmt.Errorf("a2al/host: ice signal url: %w", err)
 	}
 
 	hints := h.iceCache.Hints(expectRemote)
@@ -153,11 +166,11 @@ func (h *Host) tryICEViaHub(ctx context.Context, localCert tls.Certificate, loca
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
-				return nil, ctx.Err()
+				return nil, false, ctx.Err()
 			case <-time.After(noAgentRetryDelay):
 			}
 		}
-		sess, remoteCred, err = startICESession(ctx, wsURL, iceURLs, true, false, h.cfg.ICENetworkTypes, hints)
+		sess, remoteCred, err = startICESession(ctx, wsURL, iceURLs, true, false, disableRelay, h.cfg.ICENetworkTypes, hints)
 		if !errors.Is(err, ErrNoAgent) {
 			break
 		}
@@ -169,7 +182,7 @@ func (h *Host) tryICEViaHub(ctx context.Context, localCert tls.Certificate, loca
 	}
 	if err != nil {
 		h.log.Warn("ice session start failed", "local_aid", localAgent.String(), "remote_aid", expectRemote.String(), "hub", signalBase, "err", err)
-		return nil, err
+		return nil, false, err
 	}
 
 	sessOwned := true
@@ -184,10 +197,11 @@ func (h *Host) tryICEViaHub(ctx context.Context, localCert tls.Certificate, loca
 	// Each of the two goroutines (ICE and punch) emits exactly one pathEnd when done.
 	// Connections are emitted to ch as they are established (punch may yield 0-2).
 	type connResult struct {
-		qc       quic.Connection
-		teardown func()
-		fromICE  bool
-		pathEnd  bool // sentinel: goroutine finished
+		qc        quic.Connection
+		teardown  func()
+		fromICE   bool
+		isRelayed bool
+		pathEnd   bool // sentinel: goroutine finished
 		err      error
 	}
 
@@ -229,9 +243,10 @@ func (h *Host) tryICEViaHub(ctx context.Context, localCert tls.Certificate, loca
 		}
 		h.log.Debug("quic dial over ice ok", "local_aid", localAgent.String(), "remote_aid", expectRemote.String(), "hub", signalBase, "dst", ra)
 		ch <- connResult{
-			qc:      qc,
-			teardown: func() { _ = tr.Close(); sess.CloseSignaling() },
-			fromICE: true,
+			qc:        qc,
+			teardown:  func() { _ = tr.Close(); sess.CloseSignaling() },
+			fromICE:   true,
+			isRelayed: sess.isRelayedCandidate(),
 		}
 		ch <- connResult{pathEnd: true}
 	}()
@@ -289,7 +304,11 @@ func (h *Host) tryICEViaHub(ctx context.Context, localCert tls.Certificate, loca
 
 	if winnerR == nil {
 		h.log.Warn("ice+punch both failed", "local_aid", localAgent.String(), "remote_aid", expectRemote.String(), "hub", signalBase, "errs", errs)
-		return nil, errors.Join(errs...)
+		joined := errors.Join(errs...)
+		if disableRelay && hasTURNURLs(iceURLs) {
+			return nil, false, fmt.Errorf("%w: %w", ErrRelayRequired, joined)
+		}
+		return nil, false, joined
 	}
 
 	// Drain remaining goroutine outputs (pathEnds + any trailing connections) in background.
@@ -316,7 +335,7 @@ func (h *Host) tryICEViaHub(ctx context.Context, localCert tls.Certificate, loca
 		if winnerR.teardown != nil {
 			winnerR.teardown()
 		}
-		return nil, ctrlErr
+		return nil, false, ctrlErr
 	}
 	go func(td func()) {
 		<-winnerR.qc.Context().Done()
@@ -325,7 +344,7 @@ func (h *Host) tryICEViaHub(ctx context.Context, localCert tls.Certificate, loca
 			td()
 		}
 	}(winnerR.teardown)
-	return winnerR.qc, nil
+	return winnerR.qc, winnerR.isRelayed, nil
 }
 
 // acceptICEToQUIC runs the controlled (callee) side of ICE signaling, then
@@ -353,7 +372,7 @@ func (h *Host) tryICEViaHub(ctx context.Context, localCert tls.Certificate, loca
 // expectRemote, when non-zero, is used to look up cached ICE hints for the
 // peer and to record the session outcome into peerICECache. Pass a zero value
 // (e.g. for DHT Mode B callers that use NodeID-keyed routing) to skip caching.
-func (h *Host) acceptICEToQUIC(ctx context.Context, wsURL string, cert tls.Certificate, qcfg *quic.Config, expectRemote a2al.Address, onConn func(context.Context, quic.Connection) error) (qc quic.Connection, peerUDP *net.UDPAddr, isDirect bool, teardown func(), err error) {
+func (h *Host) acceptICEToQUIC(ctx context.Context, wsURL string, cert tls.Certificate, qcfg *quic.Config, expectRemote a2al.Address, onConn func(context.Context, quic.Connection) error, disableRelay bool) (qc quic.Connection, peerUDP *net.UDPAddr, isDirect bool, isRelayed bool, teardown func(), err error) {
 	zeroAddr := a2al.Address{}
 	var hints []iceHint
 	if expectRemote != zeroAddr {
@@ -361,9 +380,9 @@ func (h *Host) acceptICEToQUIC(ctx context.Context, wsURL string, cert tls.Certi
 	}
 	iceURLs := h.mergeICEURLs(ctx)
 
-	sess, remoteCred, err := startICESession(ctx, wsURL, iceURLs, false, false, h.cfg.ICENetworkTypes, hints)
+	sess, remoteCred, err := startICESession(ctx, wsURL, iceURLs, false, false, disableRelay, h.cfg.ICENetworkTypes, hints)
 	if err != nil {
-		return nil, nil, false, nil, err
+		return nil, nil, false, false, nil, err
 	}
 
 	sessOwned := true
@@ -377,12 +396,13 @@ func (h *Host) acceptICEToQUIC(ctx context.Context, wsURL string, cert tls.Certi
 	// pathEnd=true is a sentinel: goroutine finished sending connections.
 	// ICE emits 0-1 connection + 1 pathEnd; punch emits 0-2 connections + 1 pathEnd.
 	type connResult struct {
-		qc       quic.Connection
-		peerUDP  *net.UDPAddr
-		isDirect bool
-		teardown func()
-		pathEnd  bool // sentinel: goroutine finished
-		err      error
+		qc        quic.Connection
+		peerUDP   *net.UDPAddr
+		isDirect  bool
+		isRelayed bool
+		teardown  func()
+		pathEnd   bool // sentinel: goroutine finished
+		err       error
 	}
 
 	raceCtx, raceCancel := context.WithCancel(ctx)
@@ -428,10 +448,11 @@ func (h *Host) acceptICEToQUIC(ctx context.Context, wsURL string, cert tls.Certi
 			return
 		}
 		ch <- connResult{
-			qc:       iqc,
-			peerUDP:  ra,
-			isDirect: direct,
-			teardown: func() { _ = tr.Close(); sess.CloseSignaling() },
+			qc:        iqc,
+			peerUDP:   ra,
+			isDirect:  direct,
+			isRelayed: sess.isRelayedCandidate(),
+			teardown:  func() { _ = tr.Close(); sess.CloseSignaling() },
 		}
 		ch <- connResult{pathEnd: true}
 	}()
@@ -497,9 +518,9 @@ func (h *Host) acceptICEToQUIC(ctx context.Context, wsURL string, cert tls.Certi
 			raceCancel()
 			sessOwned = false
 			go drainCh(2 - pathsDone)
-			return r.qc, r.peerUDP, r.isDirect, r.teardown, nil
+			return r.qc, r.peerUDP, r.isDirect, r.isRelayed, r.teardown, nil
 		}
-		return nil, nil, false, nil, errors.Join(errs...)
+		return nil, nil, false, false, nil, errors.Join(errs...)
 	}
 
 	// Mode A (agent): race control streams across all established QUIC connections.
@@ -596,7 +617,7 @@ func (h *Host) acceptICEToQUIC(ctx context.Context, wsURL string, cert tls.Certi
 						}
 					}
 				}(remPaths, remStrm)
-				return sr.qc, sr.peerUDP, sr.isDirect, winTD, nil
+				return sr.qc, sr.peerUDP, sr.isDirect, sr.isRelayed, winTD, nil
 			}
 			// This connection's stream failed; close it and try others.
 			strmErrs = append(strmErrs, sr.streamErr)
@@ -608,10 +629,10 @@ func (h *Host) acceptICEToQUIC(ctx context.Context, wsURL string, cert tls.Certi
 	}
 
 	if strmLaunched > 0 {
-		return nil, nil, false, nil, fmt.Errorf("a2al/host: all paths rejected control stream: %w",
+		return nil, nil, false, false, nil, fmt.Errorf("a2al/host: all paths rejected control stream: %w",
 			errors.Join(strmErrs...))
 	}
-	return nil, nil, false, nil, errors.Join(pathErrs...)
+	return nil, nil, false, false, nil, errors.Join(pathErrs...)
 }
 
 // AcceptICEViaSignal is the controlled (callee) side: WebSocket ICE signaling
@@ -653,13 +674,13 @@ func (h *Host) AcceptICEViaSignal(ctx context.Context, localAgent, expectRemote 
 		return nil
 	}
 
-	qc, _, _, teardown, err := h.acceptICEToQUIC(ctx, wsURL, ag.cert, defaultQUICConfig(), expectRemote, onConn)
+	qc, _, _, isRelayed, teardown, err := h.acceptICEToQUIC(ctx, wsURL, ag.cert, defaultQUICConfig(), expectRemote, onConn, false)
 	if err != nil {
 		return nil, err
 	}
 
 	// Build AgentConn; doAcceptorControlStream already ran inside acceptICEToQUIC.
-	ac := &AgentConn{Connection: qc, Local: localAgent}
+	ac := &AgentConn{Connection: qc, Local: localAgent, IsRelayed: isRelayed}
 	if remote, err := peerAddrFromTLSState(qc.ConnectionState().TLS); err == nil {
 		ac.Remote = remote
 	}
@@ -803,7 +824,7 @@ func (h *Host) tryICEForDHT(ctx context.Context, cert tls.Certificate, expectRem
 			case <-time.After(noAgentRetryDelay):
 			}
 		}
-		sess, lerr = runICESession(ctx, wsURL, iceURLs, true, false, h.cfg.ICENetworkTypes, hints)
+		sess, lerr = runICESession(ctx, wsURL, iceURLs, true, false, true, h.cfg.ICENetworkTypes, hints)
 		if !errors.Is(lerr, ErrNoAgent) {
 			break
 		}

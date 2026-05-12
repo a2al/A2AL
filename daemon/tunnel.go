@@ -7,12 +7,14 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"net"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/a2al/a2al"
+	"github.com/a2al/a2al/host"
 )
 
 // tunnelEntry represents a persistent multiplexed TCP→QUIC tunnel.
@@ -25,6 +27,8 @@ type tunnelEntry struct {
 	remoteAID a2al.Address
 	listen    string // "127.0.0.1:PORT"
 	httpsURL  string // "https://127.0.0.1:PORT" when TLS is available, else ""
+	isRelayed bool   // whether the underlying QUIC connection uses a relay path
+	noRelay   bool   // whether relay was disabled for this tunnel
 	openedAt  time.Time
 
 	// liveness tracking
@@ -43,6 +47,7 @@ type tunnelStatus struct {
 	RemoteAID    string    `json:"remote_aid"`
 	Listen       string    `json:"listen"`
 	HTTPSURL     string    `json:"https_url,omitempty"`
+	IsRelayed    bool      `json:"is_relayed"`
 	OpenedAt     time.Time `json:"opened_at"`
 	LastActivity time.Time `json:"last_activity,omitempty"`
 	ActiveConns  int32     `json:"active_conns"`
@@ -55,6 +60,7 @@ func (e *tunnelEntry) status() tunnelStatus {
 		RemoteAID:   e.remoteAID.String(),
 		Listen:      e.listen,
 		HTTPSURL:    e.httpsURL,
+		IsRelayed:   e.isRelayed,
 		OpenedAt:    e.openedAt,
 		ActiveConns: e.activeConns.Load(),
 	}
@@ -127,10 +133,13 @@ func (r *tunnelRegistry) closeAll() {
 
 // ── tunnel open/close ────────────────────────────────────────────────────────
 
+const tunnelDefaultIdleTimeout = 6 * time.Minute
+
 // tunnelOpenReq is the body for POST /tunnel/{aid}.
 type tunnelOpenReq struct {
-	LocalAID        string `json:"local_aid,omitempty"`
-	IdleTimeoutSec  int    `json:"idle_timeout_sec,omitempty"` // 0 = no idle timeout
+	LocalAID       string `json:"local_aid,omitempty"`
+	IdleTimeoutSec int    `json:"idle_timeout_sec,omitempty"` // 0 = default (6 min), -1 = no timeout
+	DisableRelay   *bool  `json:"disable_relay,omitempty"`    // nil = use node default
 }
 
 func randomID() string {
@@ -142,8 +151,8 @@ func randomID() string {
 // execTunnelOpen resolves the remote agent, acquires a pooled QUIC connection,
 // starts a local TCP listener, and runs an accept loop in the background.
 // Each accepted TCP connection gets its own QUIC stream (up to the gateway's
-// maxStreamsPerConn=100 limit). The QUIC connection is NOT closed when the
-// tunnel is closed — it returns to the pool.
+// maxStreamsPerConn=100 limit). The tunnel holds a retain on the QUIC connection
+// for its lifetime; the connection is released (not closed) when the tunnel exits.
 func (d *Daemon) execTunnelOpen(ctx context.Context, remoteAidStr string, req tunnelOpenReq) (*tunnelEntry, error) {
 	remote, err := a2al.ParseAddress(remoteAidStr)
 	if err != nil {
@@ -167,19 +176,34 @@ func (d *Daemon) execTunnelOpen(ctx context.Context, remoteAidStr string, req tu
 		}
 	}
 
-	qc, err := d.connPool.acquire(ctx, local, remote, er)
+	nr := resolveNoRelay(req.DisableRelay, d.cfg.DisableRelay)
+	qc, isRelayed, err := d.connPool.acquire(ctx, local, remote, er, nr)
 	if err != nil {
+		if errors.Is(err, host.ErrRelayRequired) {
+			return nil, err
+		}
 		return nil, errConnectQUIC
 	}
+	// Hold a reference so the idle evictor does not close this connection
+	// while the tunnel is active. Released in the accept loop's defer.
+	d.connPool.retain(local, remote, nr)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
+		d.connPool.release(local, remote, nr)
 		return nil, errListen
 	}
 
 	tctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	idleTimeout := time.Duration(req.IdleTimeoutSec) * time.Second
+	var idleTimeout time.Duration
+	switch {
+	case req.IdleTimeoutSec > 0:
+		idleTimeout = time.Duration(req.IdleTimeoutSec) * time.Second
+	case req.IdleTimeoutSec == 0:
+		idleTimeout = tunnelDefaultIdleTimeout
+	// req.IdleTimeoutSec < 0: no idle timeout (idleTimeout stays 0)
+	}
 
 	listenAddr := ln.Addr().String()
 	httpsURL := ""
@@ -192,6 +216,8 @@ func (d *Daemon) execTunnelOpen(ctx context.Context, remoteAidStr string, req tu
 		remoteAID: remote,
 		listen:    listenAddr,
 		httpsURL:  httpsURL,
+		isRelayed: isRelayed,
+		noRelay:   nr,
 		openedAt:  time.Now(),
 		cancel:    cancel,
 		done:      done,
@@ -204,6 +230,7 @@ func (d *Daemon) execTunnelOpen(ctx context.Context, remoteAidStr string, req tu
 		defer func() {
 			_ = ln.Close()
 			d.tunnels.delete(entry.id)
+			d.connPool.release(local, remote, entry.noRelay)
 			close(done)
 		}()
 
@@ -221,7 +248,8 @@ func (d *Daemon) execTunnelOpen(ctx context.Context, remoteAidStr string, req tu
 			_ = ln.Close() // unblock Accept()
 		}()
 
-		// Optional idle watcher: close when no new connections for idleTimeout.
+		// Idle watcher: close when no new connections for idleTimeout.
+		// Only started when idleTimeout > 0; a negative IdleTimeoutSec disables it.
 		if idleTimeout > 0 {
 			go func() {
 				tick := time.NewTicker(10 * time.Second)

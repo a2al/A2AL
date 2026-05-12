@@ -94,10 +94,10 @@ func QUICDialTargets(er *protocol.EndpointRecord) ([]*net.UDPAddr, error) {
 //
 // On any failure the locally-cached endpoint record for expectRemote is
 // transparently invalidated so the next Resolve fetches fresh data.
-func (h *Host) ConnectFromRecord(ctx context.Context, expectRemote a2al.Address, er *protocol.EndpointRecord) (_ quic.Connection, err error) {
+func (h *Host) ConnectFromRecord(ctx context.Context, expectRemote a2al.Address, er *protocol.EndpointRecord) (_ quic.Connection, _ bool, err error) {
 	cert, certErr := h.defaultAgentCert()
 	if certErr != nil {
-		return nil, certErr
+		return nil, false, certErr
 	}
 	defer func() {
 		if err != nil {
@@ -121,18 +121,19 @@ func (h *Host) ConnectFromRecord(ctx context.Context, expectRemote a2al.Address,
 		"skip_direct", skipDirect,
 	)
 	if !skipDirect && len(targets) > 0 && hasSignal {
-		return h.connectRace(ctx, cert, h.addr, expectRemote, targets, er)
+		return h.connectRace(ctx, cert, h.addr, expectRemote, targets, er, false)
 	}
 	if !skipDirect && len(targets) > 0 {
-		return h.connectHappy(ctx, cert, expectRemote, targets, DefaultConnectStagger)
+		conn, err := h.connectHappy(ctx, cert, expectRemote, targets, DefaultConnectStagger)
+		return conn, false, err
 	}
 	if hasSignal {
-		return h.connectViaICESignal(ctx, cert, h.addr, expectRemote, er)
+		return h.connectViaICESignal(ctx, cert, h.addr, expectRemote, er, false)
 	}
 	if terr != nil {
-		return nil, terr
+		return nil, false, terr
 	}
-	return nil, errors.New("a2al/host: no quic targets and no signal url")
+	return nil, false, errors.New("a2al/host: no quic targets and no signal url")
 }
 
 // ConnectFromRecordFor dials as localAgent (must be registered) toward expectRemote.
@@ -140,12 +141,12 @@ func (h *Host) ConnectFromRecord(ctx context.Context, expectRemote a2al.Address,
 //
 // On failure the locally-cached endpoint record for expectRemote is transparently
 // invalidated (same as ConnectFromRecord).
-func (h *Host) ConnectFromRecordFor(ctx context.Context, localAgent, expectRemote a2al.Address, er *protocol.EndpointRecord) (_ quic.Connection, err error) {
+func (h *Host) ConnectFromRecordFor(ctx context.Context, localAgent, expectRemote a2al.Address, er *protocol.EndpointRecord, opts DialOptions) (_ quic.Connection, _ bool, err error) {
 	h.agentsMu.RLock()
 	ag, ok := h.agents[localAgent]
 	h.agentsMu.RUnlock()
 	if !ok {
-		return nil, fmt.Errorf("a2al/host: unknown agent %s", localAgent)
+		return nil, false, fmt.Errorf("a2al/host: unknown agent %s", localAgent)
 	}
 	defer func() {
 		if err != nil {
@@ -170,18 +171,19 @@ func (h *Host) ConnectFromRecordFor(ctx context.Context, localAgent, expectRemot
 		"skip_direct", skipDirect,
 	)
 	if !skipDirect && len(targets) > 0 && hasSignal {
-		return h.connectRace(ctx, ag.cert, localAgent, expectRemote, targets, er)
+		return h.connectRace(ctx, ag.cert, localAgent, expectRemote, targets, er, opts.DisableRelay)
 	}
 	if !skipDirect && len(targets) > 0 {
-		return h.connectHappy(ctx, ag.cert, expectRemote, targets, DefaultConnectStagger)
+		conn, err := h.connectHappy(ctx, ag.cert, expectRemote, targets, DefaultConnectStagger)
+		return conn, false, err
 	}
 	if hasSignal {
-		return h.connectViaICESignal(ctx, ag.cert, localAgent, expectRemote, er)
+		return h.connectViaICESignal(ctx, ag.cert, localAgent, expectRemote, er, opts.DisableRelay)
 	}
 	if terr != nil {
-		return nil, terr
+		return nil, false, terr
 	}
-	return nil, errors.New("a2al/host: no quic targets and no signal url")
+	return nil, false, errors.New("a2al/host: no quic targets and no signal url")
 }
 
 // connectRace runs direct QUIC and ICE in parallel, returning the first
@@ -191,10 +193,11 @@ func (h *Host) ConnectFromRecordFor(ctx context.Context, localAgent, expectRemot
 // When a winner is found the losing path's context is cancelled so its
 // goroutine exits promptly. Both goroutines always send exactly one value to
 // the buffered channel, so the collector never blocks indefinitely.
-func (h *Host) connectRace(ctx context.Context, localCert tls.Certificate, localAgent, expectRemote a2al.Address, targets []*net.UDPAddr, er *protocol.EndpointRecord) (quic.Connection, error) {
+func (h *Host) connectRace(ctx context.Context, localCert tls.Certificate, localAgent, expectRemote a2al.Address, targets []*net.UDPAddr, er *protocol.EndpointRecord, disableRelay bool) (quic.Connection, bool, error) {
 	type res struct {
-		c   quic.Connection
-		err error
+		c         quic.Connection
+		isRelayed bool
+		err       error
 	}
 
 	raceCtx, raceCancel := context.WithCancel(ctx)
@@ -205,7 +208,7 @@ func (h *Host) connectRace(ctx context.Context, localCert tls.Certificate, local
 	// Direct QUIC — starts immediately.
 	go func() {
 		c, err := h.connectHappy(raceCtx, localCert, expectRemote, targets, DefaultConnectStagger)
-		ch <- res{c, err}
+		ch <- res{c: c, err: err}
 	}()
 
 	// ICE — starts after stagger so direct can win on open networks.
@@ -218,17 +221,19 @@ func (h *Host) connectRace(ctx context.Context, localCert tls.Certificate, local
 			return
 		case <-t.C:
 		}
-		c, err := h.connectViaICESignal(raceCtx, localCert, localAgent, expectRemote, er)
-		ch <- res{c, err}
+		c, relayed, err := h.connectViaICESignal(raceCtx, localCert, localAgent, expectRemote, er, disableRelay)
+		ch <- res{c: c, isRelayed: relayed, err: err}
 	}()
 
 	var winner quic.Connection
+	var winnerRelayed bool
 	var errs []error
 	for i := 0; i < 2; i++ {
 		r := <-ch
 		if r.err == nil && r.c != nil {
 			if winner == nil {
 				winner = r.c
+				winnerRelayed = r.isRelayed
 				raceCancel()
 			} else {
 				_ = r.c.CloseWithError(0, "superseded by faster candidate")
@@ -240,12 +245,12 @@ func (h *Host) connectRace(ctx context.Context, localCert tls.Certificate, local
 		}
 	}
 	if winner != nil {
-		return winner, nil
+		return winner, winnerRelayed, nil
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return nil, errors.Join(errs...)
+	return nil, false, errors.Join(errs...)
 }
 
 func (h *Host) connectHappy(ctx context.Context, localCert tls.Certificate, expectRemote a2al.Address, targets []*net.UDPAddr, stagger time.Duration) (quic.Connection, error) {

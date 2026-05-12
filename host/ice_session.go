@@ -65,6 +65,7 @@ type iceSession struct {
 	// as they are gathered. Protected by srflxMu.
 	localSrflx []string
 	srflxMu    sync.Mutex
+
 }
 
 // snapshotRemoteCands returns a copy of all accumulated trickle remote candidates.
@@ -124,9 +125,22 @@ func (s *iceSession) CloseSignaling() {
 	_ = ws.Close(websocket.StatusNormalClosure, "")
 }
 
+// isRelayedCandidate reports whether the selected ICE candidate pair uses a
+// TURN relay on either the local or remote side.
+func (s *iceSession) isRelayedCandidate() bool {
+	if s.agent == nil {
+		return false
+	}
+	pair, err := s.agent.GetSelectedCandidatePair()
+	if err != nil || pair == nil {
+		return false
+	}
+	return pair.Local.Type() == ice.CandidateTypeRelay || pair.Remote.Type() == ice.CandidateTypeRelay
+}
+
 // isDirectCandidate reports whether the ICE-selected path is host or
-// server-reflexive on the remote side, meaning the remote peer is directly
-// reachable via plain UDP without NAT hole-punching.
+// server-reflexive on both local and remote sides, meaning neither end is
+// going through a TURN relay.
 //
 // Used by Phase 8 (误分类纠正): if true the remote should be reclassified as
 // a direct node rather than a punched node in the routing table.
@@ -138,8 +152,10 @@ func (s *iceSession) isDirectCandidate() bool {
 	if err != nil || pair == nil {
 		return false
 	}
-	t := pair.Remote.Type()
-	return t == ice.CandidateTypeHost || t == ice.CandidateTypeServerReflexive
+	isDirect := func(t ice.CandidateType) bool {
+		return t == ice.CandidateTypeHost || t == ice.CandidateTypeServerReflexive
+	}
+	return isDirect(pair.Local.Type()) && isDirect(pair.Remote.Type())
 }
 
 // Close tears down all resources: WebSocket, ICE connection, and agent.
@@ -305,7 +321,7 @@ func hintToRemoteCandidate(h iceHint) (ice.Candidate, error) {
 	}
 }
 
-func newICEAgent(urls []*stun.URI, hostOnly bool, networkTypes []ice.NetworkType) (*ice.Agent, error) {
+func newICEAgent(urls []*stun.URI, hostOnly, disableRelay bool, networkTypes []ice.NetworkType) (*ice.Agent, error) {
 	cfg := &ice.AgentConfig{
 		Urls:             urls,
 		NetworkTypes:     networkTypes,
@@ -322,7 +338,7 @@ func newICEAgent(urls []*stun.URI, hostOnly bool, networkTypes []ice.NetworkType
 				break
 			}
 		}
-		if hasTURN {
+		if hasTURN && !disableRelay {
 			cfg.CandidateTypes = []ice.CandidateType{
 				ice.CandidateTypeHost,
 				ice.CandidateTypeServerReflexive,
@@ -348,7 +364,7 @@ func newICEAgent(urls []*stun.URI, hostOnly bool, networkTypes []ice.NetworkType
 //
 // Returns the session and the remote ICE credentials needed by completeICESession.
 // If the remote hub reports the target is not registered, the error wraps ErrNoAgent.
-func startICESession(ctx context.Context, wsURL string, urls []*stun.URI, controlling, hostOnly bool, networkTypes []ice.NetworkType, hintRemotes []iceHint) (*iceSession, [2]string, error) {
+func startICESession(ctx context.Context, wsURL string, urls []*stun.URI, controlling, hostOnly, disableRelay bool, networkTypes []ice.NetworkType, hintRemotes []iceHint) (*iceSession, [2]string, error) {
 	sess := &iceSession{
 		punchCh: make(chan signaling.Frame, 8),
 	}
@@ -371,7 +387,7 @@ func startICESession(ctx context.Context, wsURL string, urls []*stun.URI, contro
 	// slog.Debug("ice agent urls", "controlling", controlling, "count", len(urls), "urls", fmt.Sprintf("%v", urls))
 
 	// --- 2. ICE agent ---
-	agent, err := newICEAgent(urls, hostOnly, networkTypes)
+	agent, err := newICEAgent(urls, hostOnly, disableRelay, networkTypes)
 	if err != nil {
 		return nil, [2]string{}, err
 	}
@@ -381,10 +397,12 @@ func startICESession(ctx context.Context, wsURL string, urls []*stun.URI, contro
 		slog.Debug("ice state changed", "controlling", controlling, "state", st)
 	})
 	_ = agent.OnSelectedCandidatePairChange(func(local, remote ice.Candidate) {
-		slog.Debug("ice pair selected",
+		relayed := local.Type() == ice.CandidateTypeRelay || remote.Type() == ice.CandidateTypeRelay
+		slog.Info("ice pair selected",
 			"controlling", controlling,
 			"local", fmt.Sprintf("%s:%d(%s)", local.Address(), local.Port(), local.Type()),
 			"remote", fmt.Sprintf("%s:%d(%s)", remote.Address(), remote.Port(), remote.Type()),
+			"relayed", relayed,
 		)
 	})
 
@@ -396,7 +414,6 @@ func startICESession(ctx context.Context, wsURL string, urls []*stun.URI, contro
 			return
 		}
 		// slog.Debug("ice local cand", "controlling", controlling, "type", c.Type(), "addr", c.Address(), "port", c.Port())
-		// Accumulate srflx addresses for DCUtR punch.
 		if c.Type() == ice.CandidateTypeServerReflexive {
 			sess.srflxMu.Lock()
 			sess.localSrflx = append(sess.localSrflx, fmt.Sprintf("%s:%d", c.Address(), c.Port()))
@@ -531,8 +548,8 @@ func completeICESession(ctx context.Context, sess *iceSession, controlling bool,
 // runICESession is a convenience wrapper around startICESession +
 // completeICESession. Used by callers that do not race ICE against DCUtR punch
 // and by existing tests.
-func runICESession(ctx context.Context, wsURL string, urls []*stun.URI, controlling, hostOnly bool, networkTypes []ice.NetworkType, hintRemotes []iceHint) (*iceSession, error) {
-	sess, remoteCred, err := startICESession(ctx, wsURL, urls, controlling, hostOnly, networkTypes, hintRemotes)
+func runICESession(ctx context.Context, wsURL string, urls []*stun.URI, controlling, hostOnly, disableRelay bool, networkTypes []ice.NetworkType, hintRemotes []iceHint) (*iceSession, error) {
+	sess, remoteCred, err := startICESession(ctx, wsURL, urls, controlling, hostOnly, disableRelay, networkTypes, hintRemotes)
 	if err != nil {
 		return nil, err
 	}

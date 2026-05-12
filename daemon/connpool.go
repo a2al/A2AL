@@ -42,37 +42,45 @@ const (
 
 // connPoolKey identifies a cached outbound connection.
 type connPoolKey struct {
-	local  a2al.Address
-	remote a2al.Address
+	local   a2al.Address
+	remote  a2al.Address
+	noRelay bool // when true, only direct (no TURN relay) connections are cached here
 }
 
 func (k connPoolKey) String() string {
+	if k.noRelay {
+		return k.local.String() + "→" + k.remote.String() + "(direct)"
+	}
 	return k.local.String() + "→" + k.remote.String()
 }
 
 // connPoolEntry holds one cached connection or a failure-backoff record.
 type connPoolEntry struct {
 	conn       quic.Connection // nil when in backoff
+	refs       int32           // active long-lived users (tunnels); evictor skips when > 0
+	isRelayed  bool            // true when the connection uses a TURN relay path
 	lastUsed   time.Time
 	failCount  int
 	lastFailAt time.Time
 }
 
 // dialFunc is the dialing strategy injected at construction.
+// noRelay requests a direct-only connection (no TURN relay candidates).
 // The pool does not import host directly, keeping the dependency direction clean.
-type dialFunc func(ctx context.Context, local, remote a2al.Address, er *protocol.EndpointRecord) (quic.Connection, error)
+type dialFunc func(ctx context.Context, local, remote a2al.Address, er *protocol.EndpointRecord, noRelay bool) (quic.Connection, bool, error)
 
 // modeAConnPool caches outbound data-plane QUIC connections for reuse across
-// execConnect and execFetch calls. Connections are established lazily and
-// evicted in three ways:
+// execConnect, execFetch, and execTunnelOpen calls. Connections are established
+// lazily and evicted in three ways:
 //   - passively on next acquire when the QUIC context is already dead
-//   - proactively by the background idle evictor after connPoolIdleTimeout
+//   - proactively by the background idle evictor after connPoolIdleTimeout,
+//     but only when refs == 0 (no active tunnels hold the connection)
 //   - via LRU when the pool exceeds connPoolMaxSize (safety-net only)
 //
 // Lifecycle: defaultQUICConfig sends QUIC PING keepalives every 25 s, so
-// connections remain live as long as the network path holds. The idle evictor
-// closes connections unused for connPoolIdleTimeout (5 min) regardless of
-// QUIC liveness, keeping resource usage proportional to actual activity.
+// connections remain live as long as the network path holds. Long-lived users
+// (tunnels) call retain/release to increment/decrement refs; the evictor skips
+// any connection with refs > 0, preventing premature closure of active tunnels.
 type modeAConnPool struct {
 	mu     sync.Mutex
 	pool   map[connPoolKey]*connPoolEntry
@@ -90,14 +98,16 @@ func newModeAConnPool(dial dialFunc, log *slog.Logger) *modeAConnPool {
 }
 
 // acquire returns a live QUIC connection for (local → remote).
+// noRelay=true requests a direct-only connection (relay candidates excluded).
+// Returns the connection and whether it uses a relay path.
 // er must be a freshly resolved EndpointRecord for remote; the caller resolves
 // it so that any reconnect after a dead-connection eviction uses current data.
 //
 // On a network failure the entry is kept as a backoff record; subsequent calls
 // within the backoff window return immediately without dialing.
 // Context cancellation (caller hang-up) does NOT set a backoff record.
-func (p *modeAConnPool) acquire(ctx context.Context, local, remote a2al.Address, er *protocol.EndpointRecord) (quic.Connection, error) {
-	key := connPoolKey{local, remote}
+func (p *modeAConnPool) acquire(ctx context.Context, local, remote a2al.Address, er *protocol.EndpointRecord, noRelay bool) (quic.Connection, bool, error) {
+	key := connPoolKey{local, remote, noRelay}
 
 	// ── Fast path: return a cached live connection ────────────────────────
 	p.mu.Lock()
@@ -107,8 +117,9 @@ func (p *modeAConnPool) acquire(ctx context.Context, local, remote a2al.Address,
 			// Alive: update lastUsed and return.
 			ent.lastUsed = time.Now()
 			conn := ent.conn
+			relayed := ent.isRelayed
 			p.mu.Unlock()
-			return conn, nil
+			return conn, relayed, nil
 
 		case ent.conn != nil:
 			// Dead connection: evict and fall through to re-dial.
@@ -119,7 +130,7 @@ func (p *modeAConnPool) acquire(ctx context.Context, local, remote a2al.Address,
 			// Backoff entry: check whether the window has elapsed.
 			if time.Since(ent.lastFailAt) < connPoolBackoff(ent.failCount) {
 				p.mu.Unlock()
-				return nil, errors.New("a2al/daemon: connect in backoff, try again later")
+				return nil, false, errors.New("a2al/daemon: connect in backoff, try again later")
 			}
 			// Backoff elapsed: remove and try again.
 			delete(p.pool, key)
@@ -138,10 +149,14 @@ func (p *modeAConnPool) acquire(ctx context.Context, local, remote a2al.Address,
 	// trace spans) but not the cancellation signal, and cap it independently.
 	dialCtx, dialCancel := context.WithTimeout(context.WithoutCancel(ctx), connPoolDialTimeout)
 
+	type dialResult struct {
+		conn      quic.Connection
+		isRelayed bool
+	}
 	v, err, _ := p.flight.Do(key.String(), func() (any, error) {
 		defer dialCancel()
-		p.log.Debug("connpool: dialing", "local", local.String(), "remote", remote.String())
-		conn, dialErr := p.dial(dialCtx, local, remote, er)
+		p.log.Debug("connpool: dialing", "local", local.String(), "remote", remote.String(), "no_relay", noRelay)
+		conn, isRelayed, dialErr := p.dial(dialCtx, local, remote, er, noRelay)
 
 		p.mu.Lock()
 		defer p.mu.Unlock()
@@ -169,23 +184,27 @@ func (p *modeAConnPool) acquire(ctx context.Context, local, remote a2al.Address,
 		}
 
 		p.evictIfFull()
-		p.pool[key] = &connPoolEntry{conn: conn, lastUsed: time.Now()}
-		p.log.Debug("connpool: connection cached", "key", key.String())
-		return conn, nil
+		p.pool[key] = &connPoolEntry{conn: conn, isRelayed: isRelayed, lastUsed: time.Now()}
+		p.log.Debug("connpool: connection cached", "key", key.String(), "is_relayed", isRelayed)
+		return dialResult{conn, isRelayed}, nil
 	})
 	if err != nil {
 		// dialCancel may already have been called inside the flight func;
 		// calling it again is a no-op.
 		dialCancel()
-		return nil, err
+		return nil, false, err
 	}
 	dialCancel()
-	return v.(quic.Connection), nil
+	dr := v.(dialResult)
+	return dr.conn, dr.isRelayed, nil
 }
 
-// evictIfFull removes the least-recently-used entry when at capacity.
-// Must be called with p.mu held. The evicted connection is closed after
-// the lock is released to avoid holding the mutex during I/O.
+// evictIfFull removes the least-recently-used evictable entry when at capacity.
+// Entries with active refs (live tunnels) are skipped, so the pool may briefly
+// exceed connPoolMaxSize if all entries are in use — protecting active tunnels
+// takes precedence over the hard cap. Must be called with p.mu held. The evicted
+// connection is closed after the lock is released to avoid holding the mutex
+// during I/O.
 func (p *modeAConnPool) evictIfFull() {
 	if len(p.pool) < connPoolMaxSize {
 		return
@@ -194,6 +213,10 @@ func (p *modeAConnPool) evictIfFull() {
 	var oldestTime time.Time
 	found := false
 	for k, ent := range p.pool {
+		if ent.refs > 0 {
+			// Never evict connections with active long-lived users.
+			continue
+		}
 		if ent.conn == nil {
 			// Prefer evicting dead/backoff entries first (no I/O needed).
 			oldest = k
@@ -239,7 +262,7 @@ func (p *modeAConnPool) evictIdle() {
 	p.mu.Lock()
 	var toClose []quic.Connection
 	for k, ent := range p.pool {
-		if ent.conn != nil && time.Since(ent.lastUsed) > connPoolIdleTimeout {
+		if ent.conn != nil && ent.refs == 0 && time.Since(ent.lastUsed) > connPoolIdleTimeout {
 			toClose = append(toClose, ent.conn)
 			delete(p.pool, k)
 			p.log.Debug("connpool: evicting idle connection", "key", k.String())
@@ -249,6 +272,29 @@ func (p *modeAConnPool) evictIdle() {
 	for _, c := range toClose {
 		_ = c.CloseWithError(0, "idle timeout")
 	}
+}
+
+// retain increments the active-user count for the connection identified by
+// (local, remote, noRelay). While refs > 0 the background evictor will not close the
+// connection. Call once after a successful acquire for any long-lived use.
+func (p *modeAConnPool) retain(local, remote a2al.Address, noRelay bool) {
+	key := connPoolKey{local, remote, noRelay}
+	p.mu.Lock()
+	if ent, ok := p.pool[key]; ok {
+		ent.refs++
+	}
+	p.mu.Unlock()
+}
+
+// release decrements the active-user count. When refs reaches zero the
+// connection becomes eligible for normal idle eviction.
+func (p *modeAConnPool) release(local, remote a2al.Address, noRelay bool) {
+	key := connPoolKey{local, remote, noRelay}
+	p.mu.Lock()
+	if ent, ok := p.pool[key]; ok && ent.refs > 0 {
+		ent.refs--
+	}
+	p.mu.Unlock()
 }
 
 // Close shuts down all cached connections and clears the pool.

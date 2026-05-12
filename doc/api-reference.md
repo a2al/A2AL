@@ -296,11 +296,16 @@ Fetch raw `SignedRecord`s for a remote AID. Omit `type` or set `type=0` for all 
 
 Open a **one-shot** encrypted tunnel to a remote agent. Returns a local TCP address your application connects to. The tunnel is released when the TCP connection closes.
 
-**Request (optional):**
+**Request (all fields optional):**
 
 ```json
-{"local_aid": "a2alXYZ..."}
+{
+  "local_aid": "a2alXYZ...",
+  "disable_relay": false
+}
 ```
+
+`disable_relay`: if `true`, relay is suppressed for this connection even if TURN servers are configured. If direct connection then fails and TURN is available, returns HTTP 412 with `{"error":"relay_required"}`.
 
 **Response:**
 
@@ -350,9 +355,12 @@ Open a **persistent multiplexed** encrypted tunnel. A single tunnel accepts any 
 ```json
 {
   "local_aid": "a2alXYZ...",
-  "idle_timeout_sec": 90
+  "idle_timeout_sec": 90,
+  "disable_relay": false
 }
 ```
+
+`disable_relay`: same semantics as in `POST /connect/{aid}`.
 
 **Response:**
 
@@ -360,9 +368,12 @@ Open a **persistent multiplexed** encrypted tunnel. A single tunnel accepts any 
 {
   "id": "tun_abc123",
   "listen": "127.0.0.1:58320",
-  "remote_aid": "a2alRemote..."
+  "remote_aid": "a2alRemote...",
+  "is_relayed": false
 }
 ```
+
+`is_relayed`: `true` when the underlying QUIC connection was established via a TURN relay.
 
 Connect any number of TCP clients to `listen`. The tunnel persists until explicitly closed or the QUIC connection idles out (`idle_timeout_sec`, default 90 s).
 

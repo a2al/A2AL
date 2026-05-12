@@ -74,6 +74,11 @@ type Config struct {
 	// When non-empty, any bootstrap peer whose NodeID is not in this list is rejected.
 	// Applies to config-supplied and DNS-discovered bootstrap addresses.
 	BootstrapNodeIDs []string `toml:"bootstrap_node_ids" json:"bootstrap_node_ids,omitempty"`
+
+	// DisableRelay is the node-level default for relay usage on outbound connections.
+	// When true, relay (TURN) candidates are excluded unless the per-call API field
+	// override enables it. Default false (relay allowed).
+	DisableRelay bool `toml:"disable_relay" json:"disable_relay,omitempty"`
 }
 
 // Default returns a copy with zero values filled to spec defaults.
@@ -180,7 +185,9 @@ func LoadFile(path string) (Config, error) {
 	return base, nil
 }
 
-// Save writes c to path as TOML (0644) via a temp-file rename for atomicity.
+// Save writes c to path as TOML (0600) via a temp-file rename for atomicity.
+// Before overwriting, the existing file is copied to path+".bak" so the user
+// can restore manually if the new config causes a startup failure.
 func Save(path string, c Config) error {
 	b, err := toml.Marshal(c)
 	if err != nil {
@@ -189,6 +196,10 @@ func Save(path string, c Config) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
+	}
+	// Back up current file (best-effort; ignore errors).
+	if prev, rerr := os.ReadFile(path); rerr == nil {
+		_ = os.WriteFile(path+".bak", prev, 0o600)
 	}
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, b, 0o600); err != nil {
