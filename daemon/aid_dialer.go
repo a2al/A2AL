@@ -57,7 +57,7 @@ func (dd *daemonDialer) Dial(ctx context.Context, remote a2al.Address) (io.ReadW
 
 	// Acquire a pooled QUIC connection and open a new stream.
 	// Uses the node identity as the local AID (consistent with execFetch).
-	conn, err := dd.d.connPool.acquire(ctx, dd.d.nodeAddr, remote, er)
+	conn, _, err := dd.d.connPool.acquire(ctx, dd.d.nodeAddr, remote, er, false)
 	if err != nil {
 		return nil, errConnectQUIC
 	}

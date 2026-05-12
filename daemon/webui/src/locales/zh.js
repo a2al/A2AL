@@ -222,6 +222,9 @@ export default {
   'discover.ping': '连通测试',
   'discover.ping.ok': '测试通过 · {ms} ms',
   'discover.ping.fail': '连接失败',
+  'connect.no_direct_path': '无直连路径，需配置转发服务',
+  'connect.peer_offline': '对端离线',
+  'tunnel.relayed': '中继',
   'discover.card': '完整 Agent Card',
   'discover.card.fetching': '正在抓取 Agent Card…',
 

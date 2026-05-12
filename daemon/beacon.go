@@ -235,11 +235,9 @@ func (b *beaconManager) Stats() map[string]any {
 	}
 	b.mu.RUnlock()
 	out := map[string]any{
-		"beacon_store_sent": b.storeSent.Load(),
-		"beacon_query_hits": b.queryHits.Load(),
-	}
-	if b.active.Load() {
-		out["beacon_mode"] = true
+		"beacon_store_received":   b.node.StoreRxCount(),
+		"beacon_findvalue_served": b.node.FindValueServedCount(),
+		"beacon_mode":             true,
 	}
 	if len(addrStrs) > 0 {
 		out["beacon_addrs"] = addrStrs

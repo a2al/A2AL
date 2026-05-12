@@ -18,6 +18,7 @@ import (
 
 	"github.com/a2al/a2al"
 	"github.com/a2al/a2al/config"
+	"github.com/a2al/a2al/host"
 )
 
 func (d *Daemon) routes() http.Handler {
@@ -186,18 +187,20 @@ func (d *Daemon) handleGetConfig(w http.ResponseWriter, _ *http.Request) {
 }
 
 type patchConfigReq struct {
-	ListenAddr       *string   `json:"listen_addr,omitempty"`
-	QUICListenAddr   *string   `json:"quic_listen_addr,omitempty"`
-	Bootstrap        *[]string `json:"bootstrap,omitempty"`
-	DisableUPnP      *bool     `json:"disable_upnp,omitempty"`
-	FallbackHost     *string   `json:"fallback_host,omitempty"`
-	MinObservedPeers *int      `json:"min_observed_peers,omitempty"`
-	APIAddr          *string   `json:"api_addr,omitempty"`
-	APIToken         *string   `json:"api_token,omitempty"`
-	KeyDir           *string   `json:"key_dir,omitempty"`
-	LogFormat        *string   `json:"log_format,omitempty"`
-	LogLevel         *string   `json:"log_level,omitempty"`
-	AutoPublish      *bool     `json:"auto_publish,omitempty"`
+	ListenAddr       *string                     `json:"listen_addr,omitempty"`
+	QUICListenAddr   *string                     `json:"quic_listen_addr,omitempty"`
+	Bootstrap        *[]string                   `json:"bootstrap,omitempty"`
+	DisableUPnP      *bool                       `json:"disable_upnp,omitempty"`
+	FallbackHost     *string                     `json:"fallback_host,omitempty"`
+	MinObservedPeers *int                        `json:"min_observed_peers,omitempty"`
+	APIAddr          *string                     `json:"api_addr,omitempty"`
+	APIToken         *string                     `json:"api_token,omitempty"`
+	KeyDir           *string                     `json:"key_dir,omitempty"`
+	LogFormat        *string                     `json:"log_format,omitempty"`
+	LogLevel         *string                     `json:"log_level,omitempty"`
+	AutoPublish      *bool                       `json:"auto_publish,omitempty"`
+	TURNServers      *[]config.TURNServerConfig  `json:"turn_servers,omitempty"`
+	DisableRelay     *bool                       `json:"disable_relay,omitempty"`
 }
 
 func (d *Daemon) handlePatchConfig(w http.ResponseWriter, r *http.Request) {
@@ -253,6 +256,13 @@ func (d *Daemon) handlePatchConfig(w http.ResponseWriter, r *http.Request) {
 	if req.AutoPublish != nil {
 		cfg.AutoPublish = *req.AutoPublish
 	}
+	if req.TURNServers != nil {
+		cfg.TURNServers = *req.TURNServers
+		restart = append(restart, "turn_servers")
+	}
+	if req.DisableRelay != nil {
+		cfg.DisableRelay = *req.DisableRelay
+	}
 	if err := cfg.Validate(); err != nil {
 		http.Error(w, `{"error":"invalid config"}`, http.StatusBadRequest)
 		return
@@ -284,7 +294,9 @@ func (d *Daemon) handleConfigSchema(w http.ResponseWriter, _ *http.Request) {
     "log_format": {"type": "string", "enum": ["text","json"]},
     "log_level": {"type": "string"},
     "auto_publish": {"type": "boolean", "description": "Publish node AID to DHT on a schedule (default true)"},
-    "signal_listen_addr": {"type": "string", "description": "TCP address for embedded ICE hub; empty=same port as listen_addr; off=disable"}
+    "signal_listen_addr": {"type": "string", "description": "TCP address for embedded ICE hub; empty=same port as listen_addr; off=disable"},
+    "turn_servers": {"type": "array", "items": {"type": "object", "properties": {"url": {"type": "string"}, "credential_type": {"type": "string", "enum": ["static","hmac","rest_api"]}, "username": {"type": "string"}, "credential": {"type": "string"}, "credential_url": {"type": "string"}}}},
+    "disable_relay": {"type": "boolean", "description": "Disable TURN relay for outbound connections by default (default false)"}
   }
 }`
 	w.Header().Set("Content-Type", "application/json")
@@ -894,7 +906,8 @@ func (d *Daemon) handleResolve(w http.ResponseWriter, r *http.Request) {
 }
 
 type connectReq struct {
-	LocalAID string `json:"local_aid,omitempty"`
+	LocalAID     string `json:"local_aid,omitempty"`
+	DisableRelay *bool  `json:"disable_relay,omitempty"` // nil = use node default
 }
 
 func (d *Daemon) pickLocalAgent(localAID string) (a2al.Address, error) {
@@ -919,6 +932,8 @@ func (d *Daemon) handleConnect(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error":"resolve failed"}`, http.StatusNotFound)
 		case errors.Is(err, errListen):
 			http.Error(w, `{"error":"listen failed"}`, http.StatusInternalServerError)
+		case errors.Is(err, host.ErrRelayRequired):
+			writeJSONStatus(w, http.StatusPreconditionFailed, map[string]string{"error": "relay_required"})
 		case errors.Is(err, errConnectQUIC):
 			http.Error(w, `{"error":"quic connect failed"}`, http.StatusBadGateway)
 		default:
@@ -945,6 +960,8 @@ func (d *Daemon) handleTunnelOpen(w http.ResponseWriter, r *http.Request) {
 			writeJSONStatus(w, http.StatusBadGateway, map[string]string{"error": "resolve failed"})
 		case errors.Is(err, errListen):
 			writeJSONStatus(w, http.StatusInternalServerError, map[string]string{"error": "listen failed"})
+		case errors.Is(err, host.ErrRelayRequired):
+			writeJSONStatus(w, http.StatusPreconditionFailed, map[string]string{"error": "relay_required"})
 		case errors.Is(err, errConnectQUIC):
 			writeJSONStatus(w, http.StatusBadGateway, map[string]string{"error": "quic connect failed"})
 		default:

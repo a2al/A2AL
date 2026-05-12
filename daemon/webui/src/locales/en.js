@@ -222,6 +222,9 @@ export default {
   'discover.ping': 'Connectivity Test',
   'discover.ping.ok': 'Test passed · {ms} ms',
   'discover.ping.fail': 'Connection failed',
+  'connect.no_direct_path': 'No direct path — configure a relay server',
+  'connect.peer_offline': 'Peer offline',
+  'tunnel.relayed': 'relayed',
   'discover.card': 'Full Agent Card',
   'discover.card.fetching': 'Fetching Agent Card…',
 

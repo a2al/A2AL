@@ -160,7 +160,7 @@ func (d *Daemon) execFetch(ctx context.Context, localAID, remoteAID a2al.Address
 	// Returns errConnectQUIC when the connection appears dead so the caller can
 	// retry once.
 	doFetch := func() (fetchResp, error) {
-		conn, err := d.connPool.acquire(ctx, localAID, remoteAID, er)
+		conn, _, err := d.connPool.acquire(ctx, localAID, remoteAID, er, false)
 		if err != nil {
 			return fetchResp{}, errConnectQUIC
 		}

@@ -574,7 +574,7 @@ export async function renderDiscover(mount, ctx) {
       setStatus(null, ttlValid, lastSeenStr);
       api(`/connect/${encodeURIComponent(currentAid)}`, { method: 'POST', body: '{}' })
         .then(() => setStatus(true, ttlValid, lastSeenStr))
-        .catch(() => setStatus(false, ttlValid, lastSeenStr));
+        .catch((e) => setStatus(e.status === 412 ? true : false, ttlValid, lastSeenStr));
     } else {
       resolveBox.style.color = 'var(--error)';
       resolveBox.innerHTML = `<p style="margin:0">${esc(t('common.error', { msg: resRes.reason?.message ?? '' }))}</p>`;
@@ -642,7 +642,7 @@ export async function renderDiscover(mount, ctx) {
       el.textContent = t('discover.ping.ok', { ms: Math.round(performance.now() - t0) });
       el.style.color = 'var(--success)';
     } catch (e) {
-      el.textContent = t('discover.ping.fail') + ': ' + e.message;
+      el.textContent = e.status === 412 ? t('connect.no_direct_path') : t('connect.peer_offline');
       el.style.color = 'var(--error)';
     } finally {
       setLoading(btn, false);
@@ -663,8 +663,9 @@ export async function renderDiscover(mount, ctx) {
     try {
       const tr = await api(`/tunnel/${encodeURIComponent(currentAid)}`, { method: 'POST', body: '{}' });
       currentTunnelId = tr.id;
+      const relayBadge = tr.is_relayed ? `<span class="badge b-yellow" style="font-size:.75rem">${esc(t('tunnel.relayed'))}</span>` : '';
       actionOut.innerHTML = `
-        <p style="color:var(--success);margin:0 0 .35rem;font-size:.9rem">${esc(t('discover.tunnel.ok'))}</p>
+        <p style="color:var(--success);margin:0 0 .35rem;font-size:.9rem">${esc(t('discover.tunnel.ok'))} ${relayBadge}</p>
         <div style="display:flex;align-items:center;gap:.4rem;flex-wrap:wrap;margin-bottom:.4rem">
           <code class="mono" style="font-size:.87rem">${esc(tr.listen)}</code>
           <button type="button" class="btn btn-ghost btn-sm" id="dTunnelCp">\u29c9</button>
@@ -685,7 +686,7 @@ export async function renderDiscover(mount, ctx) {
         deactivateActions();
       };
     } catch (e) {
-      actionOut.innerHTML = `<p style="color:var(--error);margin:0">${esc(t('common.error', { msg: e.message }))}</p>`;
+      actionOut.innerHTML = `<p style="color:var(--error);margin:0">${esc(e.status === 412 ? t('connect.no_direct_path') : t('connect.peer_offline'))}</p>`;
     } finally {
       setLoading(btn, false);
     }
@@ -722,7 +723,7 @@ export async function renderDiscover(mount, ctx) {
         if (cd) cd.textContent = t('discover.oneshot.countdown', { n: remaining });
       }, 1000);
     } catch (e) {
-      actionOut.innerHTML = `<p style="color:var(--error);margin:0">${esc(t('common.error', { msg: e.message }))}</p>`;
+      actionOut.innerHTML = `<p style="color:var(--error);margin:0">${esc(e.status === 412 ? t('connect.no_direct_path') : t('connect.peer_offline'))}</p>`;
     } finally {
       setLoading(btn, false);
     }
@@ -1043,8 +1044,9 @@ export async function renderDiscover(mount, ctx) {
     try {
       const tr = await api(`/tunnel/${encodeURIComponent(fav.aid)}`, { method: 'POST', body: '{}' });
       favTunnels.set(fav.id, tr.id);
+      const relayBadge = tr.is_relayed ? `<span class="badge b-yellow" style="font-size:.72rem">${esc(t('tunnel.relayed'))}</span>` : '';
       panel.innerHTML = `
-        <p style="color:var(--success);margin:0 0 .3rem;font-size:.88rem">${esc(t('discover.tunnel.ok'))}</p>
+        <p style="color:var(--success);margin:0 0 .3rem;font-size:.88rem">${esc(t('discover.tunnel.ok'))} ${relayBadge}</p>
         <div style="display:flex;align-items:center;gap:.4rem;flex-wrap:wrap;margin-bottom:.35rem">
           <code class="mono" style="font-size:.84rem">${esc(tr.listen)}</code>
           <button type="button" class="btn btn-ghost btn-xs" data-tcp>\u29c9</button>
@@ -1063,7 +1065,7 @@ export async function renderDiscover(mount, ctx) {
         deactivateFavBtns();
       };
     } catch (e) {
-      panel.innerHTML = `<p style="color:var(--error);margin:0;font-size:.86rem">${esc(t('common.error', { msg: e.message }))}</p>`;
+      panel.innerHTML = `<p style="color:var(--error);margin:0;font-size:.86rem">${esc(e.status === 412 ? t('connect.no_direct_path') : t('connect.peer_offline'))}</p>`;
     }
   }
 

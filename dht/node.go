@@ -193,6 +193,9 @@ type Node struct {
 	statsTx  atomic.Uint64
 	statsRPC atomic.Uint64 // outbound request/response pairs (sendAndWait success)
 
+	statsStoreRx        atomic.Uint64 // incoming STORE RPCs accepted by this node
+	statsFindValueServed atomic.Uint64 // incoming FIND_VALUE RPCs answered with ≥1 record
+
 	decodeErrNext atomic.Int64 // unix-nano: next time a decode-error WARN may fire
 
 	// seenPeers maps NodeID → last tabAdd observation time (sliding-window stats).
@@ -994,6 +997,9 @@ func (n *Node) onFindValue(from net.Addr, dec *protocol.DecodedMessage) {
 		}
 		break
 	}
+	if len(resp.Records) > 0 || resp.Record != nil {
+		n.statsFindValueServed.Add(1)
+	}
 	n.reply(from, dec, protocol.MsgFindValueResp, resp)
 }
 
@@ -1007,6 +1013,9 @@ func (n *Node) onStore(from net.Addr, dec *protocol.DecodedMessage) {
 	err := n.store.Put(key, body.Record, time.Now())
 	alreadyHad := errors.Is(err, ErrStaleRecord)
 	ok := err == nil || alreadyHad
+	if ok {
+		n.statsStoreRx.Add(1)
+	}
 	var reason protocol.StoreReason
 	if !ok {
 		if errors.Is(err, ErrStorePolicy) {
@@ -1488,6 +1497,13 @@ func min(a, b int) int {
 
 // SetMaxStoreKeys updates the maximum number of distinct keys in the local store.
 func (n *Node) SetMaxStoreKeys(max int) { n.store.SetMaxKeys(max) }
+
+// StoreRxCount returns the cumulative number of STORE RPCs accepted by this node.
+func (n *Node) StoreRxCount() uint64 { return n.statsStoreRx.Load() }
+
+// FindValueServedCount returns the cumulative number of FIND_VALUE RPCs
+// answered with at least one record by this node.
+func (n *Node) FindValueServedCount() uint64 { return n.statsFindValueServed.Load() }
 
 // SetPassiveRouting controls whether this node suppresses proactive FindNode
 // queries. When true (passive mode), the node fills its routing table naturally

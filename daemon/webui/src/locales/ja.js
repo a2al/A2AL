@@ -222,6 +222,9 @@ export default {
   'discover.ping': '接続テスト',
   'discover.ping.ok': 'テスト通過 · {ms} ms',
   'discover.ping.fail': '接続失敗',
+  'connect.no_direct_path': '直接経路なし — リレーサーバーの設定が必要です',
+  'connect.peer_offline': '相手がオフライン',
+  'tunnel.relayed': 'リレー経由',
   'discover.card': '完全なAgent Card',
   'discover.card.fetching': 'Agent Cardを取得中…',
 

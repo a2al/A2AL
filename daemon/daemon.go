@@ -237,13 +237,11 @@ func New(cfg Config) (*Daemon, error) {
 		beacon:           newBeaconManager(h.Node(), &nodeCfg, log),
 		demo:             newDemoManager(),
 	}
-	// connPool dial function: use node identity by default, agent cert when
-	// a registered local AID is specified (mirrors execConnect's pickLocalAgent).
-	d.connPool = newModeAConnPool(func(ctx context.Context, local, remote a2al.Address, er *protocol.EndpointRecord) (quic.Connection, error) {
-		if local == nodeAddr {
-			return h.ConnectFromRecord(ctx, remote, er)
-		}
-		return h.ConnectFromRecordFor(ctx, local, remote, er)
+	// connPool dial function: always uses ConnectFromRecordFor with the resolved
+	// local identity (nodeAddr is registered as an agent so this covers the default
+	// case too, while correctly forwarding noRelay for all callers).
+	d.connPool = newModeAConnPool(func(ctx context.Context, local, remote a2al.Address, er *protocol.EndpointRecord, noRelay bool) (quic.Connection, bool, error) {
+		return h.ConnectFromRecordFor(ctx, local, remote, er, host.DialOptions{DisableRelay: noRelay})
 	}, log)
 	d.tunnels = newTunnelRegistry()
 	if tlsCfg, err := loadOrCreateTunnelTLS(cfg.DataDir); err != nil {

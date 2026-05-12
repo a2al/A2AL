@@ -812,7 +812,7 @@ export async function renderAgents(mount, ctx) {
             el.textContent = t('discover.ping.ok', { ms: Math.round(performance.now() - t0) });
             el.style.color = 'var(--success)';
           } catch (e) {
-            el.textContent = t('discover.ping.fail') + ': ' + e.message;
+            el.textContent = e.status === 412 ? t('connect.no_direct_path') : t('connect.peer_offline');
             el.style.color = 'var(--error)';
           } finally {
             setLoading(b, false);
