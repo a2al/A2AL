@@ -37,6 +37,11 @@ type Config struct {
 	MinObservedPeers int      `toml:"min_observed_peers" json:"min_observed_peers"`
 	APIAddr          string   `toml:"api_addr" json:"api_addr"`
 	APIToken         string   `toml:"api_token" json:"api_token"`
+	// RequireLocalToken forces token authentication even for loopback requests.
+	// Default false: loopback callers (CLI, local agents, browser on 127.0.0.1) bypass
+	// token auth, since OS-level user isolation already protects the API. Set true on
+	// shared/multi-user hosts where the daemon should refuse anonymous local access.
+	RequireLocalToken bool `toml:"require_local_token" json:"require_local_token,omitempty"`
 	KeyDir           string   `toml:"key_dir" json:"key_dir"`
 	LogFormat        string   `toml:"log_format" json:"log_format"`
 	LogLevel         string   `toml:"log_level" json:"log_level"`

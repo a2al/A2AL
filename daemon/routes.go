@@ -64,11 +64,12 @@ func (d *Daemon) routes() http.Handler {
 	mux.HandleFunc("POST /demo/start", d.handleDemoStart)
 	mux.HandleFunc("POST /demo/stop", d.handleDemoStop)
 	mux.HandleFunc("GET /sessions/{port}", d.handleGetSession)
-	registerWebUIRoutes(mux)
 
-	// Mount the AID proxy outside withMiddleware: it must accept arbitrary
-	// Content-Types, large bodies, and requests without an API token.
+	// Mount Web UI assets and the AID proxy outside withMiddleware:
+	// - Web UI HTML/JS/CSS contain no sensitive data; auth happens at the API call level.
+	// - AID proxy must accept arbitrary Content-Types and requests without an API token.
 	outer := http.NewServeMux()
+	registerWebUIRoutes(outer)
 	outer.Handle("/aid/", d.newAIDProxy())
 	outer.Handle("/", d.withMiddleware(mux))
 	return outer
@@ -119,7 +120,24 @@ func (d *Daemon) withMiddleware(next http.Handler) http.Handler {
 	const maxRequestBody = 1 << 20 // 1 MiB
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
-		if d.cfg.APIToken != "" {
+
+		// Auth model:
+		//   - No api_token configured  → fully open (local + remote).
+		//   - api_token configured     → loopback callers bypass by default;
+		//                                 remote callers must present Bearer token.
+		//   - require_local_token=true → loopback callers must also present token.
+		// Loopback access additionally enforces Host-header check to defeat DNS rebinding.
+		// Reject requests that arrive on loopback but carry a non-loopback Host
+		// header — this is the fingerprint of a DNS-rebinding attack from a browser.
+		// An absent Host header (HTTP/1.0 clients, raw TCP tools) is allowed because
+		// non-browser callers never send a spoofed Host.
+		if isLoopback(r) && r.Host != "" && !hostHeaderIsLoopback(r.Host) {
+			http.Error(w, `{"error":"host header not allowed"}`, http.StatusBadRequest)
+			return
+		}
+		isLocal := isLoopback(r) && (r.Host == "" || hostHeaderIsLoopback(r.Host))
+		needToken := d.cfg.APIToken != "" && (!isLocal || d.cfg.RequireLocalToken)
+		if needToken {
 			got := r.Header.Get("Authorization")
 			want := "Bearer " + d.cfg.APIToken
 			if subtle.ConstantTimeCompare([]byte(got), []byte(want)) != 1 {
@@ -138,6 +156,36 @@ func (d *Daemon) withMiddleware(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// isLoopback reports whether the request came from a loopback address.
+func isLoopback(r *http.Request) bool {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// hostHeaderIsLoopback reports whether the HTTP Host header refers to a loopback name.
+// Accepts "127.0.0.1", "localhost", "[::1]" with optional ":port".
+func hostHeaderIsLoopback(host string) bool {
+	if host == "" {
+		return false
+	}
+	h, _, err := net.SplitHostPort(host)
+	if err != nil {
+		h = host // no port
+	}
+	h = strings.TrimSuffix(strings.TrimPrefix(h, "["), "]")
+	if h == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(h); ip != nil && ip.IsLoopback() {
+		return true
+	}
+	return false
 }
 
 func writeJSON(w http.ResponseWriter, v any) {
@@ -321,6 +369,10 @@ func (d *Daemon) handleIdentityGenerate(w http.ResponseWriter, r *http.Request) 
 }
 
 func (d *Daemon) handleAgentsExport(w http.ResponseWriter, r *http.Request) {
+	if !isLoopback(r) {
+		http.Error(w, `{"error":"export only available on loopback"}`, http.StatusForbidden)
+		return
+	}
 	out, err := d.execAgentExport(r.PathValue("aid"))
 	if err != nil {
 		if errors.Is(err, errBadAID) {
@@ -330,6 +382,7 @@ func (d *Daemon) handleAgentsExport(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
 		return
 	}
+	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, out)
 }
 

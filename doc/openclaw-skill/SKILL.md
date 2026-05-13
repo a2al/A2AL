@@ -42,25 +42,38 @@ Tangled Network — regardless of NAT, firewalls, or dynamic IPs.
 
 ## Workflows
 
-### Make this OpenClaw instance discoverable
+### Establish identity (Exist)
+
+Run once. If keys already exist, start from `a2al_agent_register`.
 
 ```
-a2al_identity_generate   → create AID + keys (save master key — shown once)
-a2al_agent_register      → register identity with daemon
+a2al_identity_generate   → create AID + keys (save master key — shown once; each call makes a NEW unrelated AID)
+a2al_agent_register      → register identity with daemon (idempotent — safe to re-run after restart)
 a2al_agent_publish       → announce to Tangled Network
-a2al_service_register    → tag with capability (e.g. "ai.assistant")
 ```
 
-Print the AID for the user — this is their address to share.
+Print the AID for the user — this is their permanent address to share.
 
-### Call a remote agent's HTTP API
+### Expose this instance as a callable HTTP service (Offer)
+
+Do this so remote agents can call this instance via `a2al_fetch`. Include `service_tcp` during register, or update it later with patch.
 
 ```
-a2al_discover            → search by service (e.g. "lang.translate")
+a2al_agent_register      → include service_tcp: "127.0.0.1:<port>" (port where OpenClaw gateway listens)
+a2al_service_register    → tag with capability (e.g. "ai.assistant.openclaw") — optional, enables discovery
+a2al_agent_publish       → announce to Tangled Network
+```
+
+### Call a remote agent's HTTP API (Request)
+
+```
+a2al_discover            → search by service (e.g. "lang.translate") — returns candidates, apply judgment to select
 a2al_fetch               → send HTTP request, get {status, headers, body} back
 ```
 
 Or if the remote AID is already known, skip discover and call `a2al_fetch` directly.
+
+If the remote agent is offline, `a2al_fetch` will fail. Use `a2al_mailbox_send` for deferred async delivery — note the recipient must poll their mailbox; this is not a transparent fallback.
 
 ### Open a persistent tunnel (SSH, RDP, or sustained HTTP access)
 
@@ -84,8 +97,9 @@ a2al_mailbox_poll        → recipient retrieves messages when they come online
 | Tool | When to use |
 |------|-------------|
 | `a2al_status` | Check daemon health and this node's AID |
-| `a2al_identity_generate` | Create a new agent identity (run once per agent) |
-| `a2al_agent_register` | Register a generated identity with the daemon |
+| `a2al_identity_generate` | Create a new agent identity — run once; each call produces a new unrelated AID |
+| `a2al_agent_register` | Register identity with daemon; use `service_tcp: "127.0.0.1:<port>"` to accept incoming `a2al_fetch` calls |
+| `a2al_agent_patch` | Update `service_tcp` after the local HTTP service changes port |
 | `a2al_agent_publish` | Announce agent's current address to the network |
 | `a2al_agent_heartbeat` | Keep agent visible when it has no direct TCP address |
 | `a2al_agents_list` | List all locally registered agents |

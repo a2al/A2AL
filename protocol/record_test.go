@@ -10,6 +10,7 @@ import (
 	"time"
 
 	acrypto "github.com/a2al/a2al/crypto"
+	"github.com/a2al/a2al/identity"
 )
 
 func TestSignVerify_endpointRoundTrip(t *testing.T) {
@@ -81,6 +82,36 @@ func TestRecordIsNewer(t *testing.T) {
 	}
 	if !RecordIsNewer(d, c) {
 		t.Fatal("d newer by time")
+	}
+}
+
+// TestRecordIsNewer_delegationPriority verifies that a record signed with a newer
+// delegation beats one with an older delegation even if it has a lower seq.
+// This enables master key holders to revoke a stolen operational key.
+func TestRecordIsNewer_delegationPriority(t *testing.T) {
+	masterPub, masterPriv, _ := ed25519.GenerateKey(rand.Reader)
+	opPubA, opPrivA, _ := ed25519.GenerateKey(rand.Reader)
+	opPubB, opPrivB, _ := ed25519.GenerateKey(rand.Reader)
+	_ = opPrivA
+	_ = opPrivB
+	aid, _ := acrypto.AddressFromPublicKey(masterPub)
+
+	// Old delegation issued at t=1000, new at t=2000.
+	oldDel, _ := identity.SignDelegation(masterPriv, opPubA, aid, 1000, 0, identity.ScopeNetworkOps)
+	newDel, _ := identity.SignDelegation(masterPriv, opPubB, aid, 2000, 0, identity.ScopeNetworkOps)
+	oldDelCBOR, _ := identity.EncodeDelegationProof(oldDel)
+	newDelCBOR, _ := identity.EncodeDelegationProof(newDel)
+
+	// Attacker holds old op key and publishes a very high seq.
+	attacked := SignedRecord{Seq: 9999, Timestamp: 500, Delegation: oldDelCBOR}
+	// Legitimate owner publishes with new delegation at seq=1.
+	legit := SignedRecord{Seq: 1, Timestamp: 600, Delegation: newDelCBOR}
+
+	if !RecordIsNewer(legit, attacked) {
+		t.Fatal("new delegation must beat old delegation regardless of seq")
+	}
+	if RecordIsNewer(attacked, legit) {
+		t.Fatal("old delegation must not beat new delegation")
 	}
 }
 

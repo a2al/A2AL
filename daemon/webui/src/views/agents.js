@@ -15,6 +15,7 @@ import {
 } from '../util.js';
 import { ed25519 } from '@noble/curves/ed25519.js';
 import { encode as cborEncode } from 'cborg';
+import { encrypt, decrypt, isEnvelope } from '../crypto.js';
 
 // ---------------------------------------------------------------------------
 // Local delegation signing — master private key never leaves the browser.
@@ -403,6 +404,7 @@ export async function renderAgents(mount, ctx) {
         <div class="ag2-actions">
           ${!ag.published_to_dht ? `<button type="button" class="btn btn-primary btn-sm" data-pub-now>${esc(t('agent.action.publish'))}</button>` : ''}
           <button type="button" class="btn btn-secondary btn-sm" data-pub>${esc(t('agent.action.republish'))}</button>
+          <button type="button" class="btn btn-ghost btn-sm" data-export>${esc(t('agent.action.export'))}</button>
           <button type="button" class="btn btn-danger btn-sm" data-del>${esc(t('agent.action.delete'))}</button>
         </div>
       </div>`;
@@ -513,6 +515,8 @@ export async function renderAgents(mount, ctx) {
         toast(t('common.error', { msg: e.message }), 'err');
       }
     };
+
+    infoDiv.querySelector('[data-export]').onclick = () => openExportModal(ag.aid);
 
     card.appendChild(infoDiv);
 
@@ -1075,6 +1079,53 @@ export async function renderAgents(mount, ctx) {
     });
   }
 
+  function openExportModal(aid) {
+    openModal({
+      title: t('agent.action.export'),
+      body: `
+        <p class="muted" style="font-size:.85rem;margin:0 0 .75rem">${esc(t('agent.export.hint'))}</p>
+        <div class="field">
+          <label>${esc(t('agent.export.password'))}</label>
+          <input type="password" id="exPw" placeholder="${esc(t('agent.export.password_ph'))}" autocomplete="new-password" style="width:100%" />
+          <div class="hint">${esc(t('agent.export.password_hint'))}</div>
+        </div>
+        <div style="margin-top:1rem;display:flex;gap:.5rem;justify-content:flex-end">
+          <button type="button" class="btn btn-secondary" data-close>${esc(t('common.cancel'))}</button>
+          <button type="button" class="btn btn-primary" id="exGo">${esc(t('agent.export.btn'))}</button>
+        </div>`,
+      onMount(root, { close }) {
+        root.querySelector('#exGo').onclick = async (ev) => {
+          const pw = root.querySelector('#exPw').value;
+          const b = ev.currentTarget;
+          setLoading(b, true);
+          try {
+            const creds = await api(`/agents/${encodeURIComponent(aid)}/export`);
+            const json = JSON.stringify(creds, null, 2);
+            let content, filename;
+            if (pw) {
+              content = await encrypt(json, pw);
+              filename = `${aid.slice(0, 12)}.a2al-id.enc`;
+            } else {
+              content = json;
+              filename = `${aid.slice(0, 12)}.a2al-id.json`;
+            }
+            const blob = new Blob([content], { type: 'application/octet-stream' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url; a.download = filename; a.click();
+            URL.revokeObjectURL(url);
+            close();
+          } catch (e) {
+            toast(t('common.error', { msg: e.message }), 'err');
+          } finally {
+            setLoading(b, false);
+          }
+        };
+        root.querySelector('#exPw').focus();
+      },
+    });
+  }
+
   function openImportModal() {
     openModal({
       title: t('agent.modal.import.title'),
@@ -1089,7 +1140,11 @@ export async function renderAgents(mount, ctx) {
         </div>
         <div class="field">
           <label>${esc(t('agent.modal.import.or_file'))}</label>
-          <input type="file" id="imFile" accept=".json,application/json" />
+          <input type="file" id="imFile" accept=".json,.enc,application/json,application/octet-stream" />
+          <div id="imFilePwRow" class="field" style="display:none;margin-top:.5rem">
+            <label>${esc(t('agent.import.file_password'))}</label>
+            <input type="password" id="imFilePw" placeholder="${esc(t('agent.import.file_password_ph'))}" autocomplete="off" style="width:100%" />
+          </div>
         </div>
         <details style="margin-top:.5rem">
           <summary>${esc(t('agent.modal.advanced'))}</summary>
@@ -1108,9 +1163,15 @@ export async function renderAgents(mount, ctx) {
           const f = e.target.files?.[0];
           if (!f) return;
           const rd = new FileReader();
-          rd.onload = () => {
+          rd.onload = async () => {
+            const raw = String(rd.result);
+            if (isEnvelope(raw)) {
+              root.querySelector('#imFilePwRow').style.display = '';
+              root.querySelector('#imFilePw').focus();
+              return;
+            }
             try {
-              const j = JSON.parse(String(rd.result));
+              const j = JSON.parse(raw);
               if (j.operational_private_key_hex)
                 root.querySelector('#imOp').value = j.operational_private_key_hex;
               if (j.delegation_proof_hex) root.querySelector('#imDel').value = j.delegation_proof_hex;
@@ -1120,6 +1181,30 @@ export async function renderAgents(mount, ctx) {
           };
           rd.readAsText(f);
         };
+        // Decrypt encrypted file on password input.
+        const decryptFile = async () => {
+          const fileInput = root.querySelector('#imFile');
+          const pw = root.querySelector('#imFilePw').value;
+          if (!fileInput.files?.[0]) return;
+          const rd2 = new FileReader();
+          rd2.onload = async () => {
+            try {
+              const plain = await decrypt(String(rd2.result), pw);
+              const j = JSON.parse(plain);
+              if (j.operational_private_key_hex)
+                root.querySelector('#imOp').value = j.operational_private_key_hex;
+              if (j.delegation_proof_hex)
+                root.querySelector('#imDel').value = j.delegation_proof_hex;
+              root.querySelector('#imFilePwRow').style.display = 'none';
+            } catch (_) {
+              toast(t('vault.unlock.wrong'), 'err');
+            }
+          };
+          rd2.readAsText(fileInput.files[0]);
+        };
+        root.querySelector('#imFilePw').addEventListener('keydown', (e) => {
+          if (e.key === 'Enter') { e.preventDefault(); decryptFile(); }
+        });
         root.querySelector('#imGo').onclick = async (ev) => {
           const op = root.querySelector('#imOp').value.trim();
           const del = root.querySelector('#imDel').value.trim();

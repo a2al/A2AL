@@ -106,29 +106,91 @@ func TestAPI_getConfig_masksToken(t *testing.T) {
 }
 
 func TestAPI_middleware_token(t *testing.T) {
-	d := newTestDaemon(t)
-	d.cfg.APIToken = "tok"
-	srv := httptest.NewServer(d.routes())
-	defer srv.Close()
-	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/health", nil)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("without bearer: %d", resp.StatusCode)
-	}
-	req, _ = http.NewRequest(http.MethodGet, srv.URL+"/health", nil)
-	req.Header.Set("Authorization", "Bearer tok")
-	resp, err = http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("with bearer: %d", resp.StatusCode)
-	}
+	t.Run("loopback_bypass_default", func(t *testing.T) {
+		d := newTestDaemon(t)
+		d.cfg.APIToken = "tok"
+		srv := httptest.NewServer(d.routes())
+		defer srv.Close()
+		req, _ := http.NewRequest(http.MethodGet, srv.URL+"/health", nil)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("want 200, got %d", resp.StatusCode)
+		}
+	})
+
+	t.Run("loopback_forced_no_bearer", func(t *testing.T) {
+		d := newTestDaemon(t)
+		d.cfg.APIToken = "tok"
+		d.cfg.RequireLocalToken = true
+		srv := httptest.NewServer(d.routes())
+		defer srv.Close()
+		req, _ := http.NewRequest(http.MethodGet, srv.URL+"/health", nil)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("want 401, got %d", resp.StatusCode)
+		}
+	})
+
+	t.Run("loopback_forced_with_bearer", func(t *testing.T) {
+		d := newTestDaemon(t)
+		d.cfg.APIToken = "tok"
+		d.cfg.RequireLocalToken = true
+		srv := httptest.NewServer(d.routes())
+		defer srv.Close()
+		req, _ := http.NewRequest(http.MethodGet, srv.URL+"/health", nil)
+		req.Header.Set("Authorization", "Bearer tok")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("want 200, got %d", resp.StatusCode)
+		}
+	})
+}
+
+func TestAPI_middleware_hostHeader(t *testing.T) {
+	t.Run("rebinding_rejected", func(t *testing.T) {
+		d := newTestDaemon(t)
+		srv := httptest.NewServer(d.routes())
+		defer srv.Close()
+		req, _ := http.NewRequest(http.MethodGet, srv.URL+"/health", nil)
+		req.Host = "evil.example.com"
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("want 400, got %d", resp.StatusCode)
+		}
+	})
+
+	t.Run("no_host_header_allowed", func(t *testing.T) {
+		// HTTP/1.0 or raw clients that omit Host should not be rejected.
+		d := newTestDaemon(t)
+		srv := httptest.NewServer(d.routes())
+		defer srv.Close()
+		req, _ := http.NewRequest(http.MethodGet, srv.URL+"/health", nil)
+		req.Host = "" // force empty Host header
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("want 200, got %d", resp.StatusCode)
+		}
+	})
 }
 
 func TestAPI_contentTypeJSON(t *testing.T) {

@@ -1,4 +1,7 @@
 import { setLoading } from '../util.js';
+import { getToken, setToken, api } from '../api.js';
+import { vaultSave, vaultIsLocked, vaultHasStored, vaultUnlock, vaultClear,
+         shadowHas, shadowSave, shadowClear, shadowVerify } from '../vault.js';
 
 const RESTART_FIELDS = new Set([
   'listen_addr',
@@ -280,19 +283,170 @@ export async function renderNode(mount, ctx) {
 
   renderCfg();
 
+  // ── Token card ──────────────────────────────────────────────────────────────
   const tok = document.createElement('div');
   tok.className = 'card';
-  tok.innerHTML = `
-    <div class="card-h">${esc(t('node.token.label'))}</div>
-    <div class="card-b" style="display:flex;gap:.5rem;flex-wrap:wrap;align-items:center">
-      <input type="password" id="apiTok" style="flex:1;min-width:12rem" placeholder="${esc(t('node.token.placeholder'))}" autocomplete="off" />
-      <button type="button" class="btn btn-primary btn-sm" id="tokSv">${esc(t('node.token.save'))}</button>
-    </div>`;
   root.appendChild(tok);
-  tok.querySelector('#tokSv').onclick = () => {
-    setToken(tok.querySelector('#apiTok').value.trim());
-    toast('ok', 'ok');
-  };
+  renderTokenCard();
+
+  function genToken() {
+    const arr = new Uint8Array(32);
+    crypto.getRandomValues(arr);
+    return btoa(String.fromCharCode(...arr)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+  }
+
+  function renderTokenCard() {
+    const active = getToken();
+    const remembered = vaultHasStored();
+
+    if (active) {
+      // ── Has token: display/edit mode ──
+      const short = active.length > 16
+        ? active.slice(0, 6) + '…' + active.slice(-4)
+        : active;
+      const hasPw = vaultIsLocked() || shadowHas();
+      tok.innerHTML = `
+        <div class="card-h">${esc(t('node.token.label'))}</div>
+        <div class="card-b" id="tokDisplay" style="display:flex;gap:.5rem;align-items:center;flex-wrap:wrap">
+          <code class="mono" style="flex:1;min-width:8rem;background:var(--surface2,#f5f5f5);padding:.2rem .5rem;border-radius:4px">${esc(short)}</code>
+          <button type="button" class="btn btn-ghost btn-sm" id="tokCopy">${esc(t('common.copy'))}</button>
+          <button type="button" class="btn btn-secondary btn-sm" id="tokEdit">${esc(t('common.edit'))}</button>
+        </div>
+        <div class="card-b" id="tokEditArea" style="display:none;flex-direction:column;gap:.5rem">
+          <div style="display:flex;gap:.5rem;flex-wrap:wrap">
+            <input type="text" id="tokInput" style="flex:1;min-width:12rem;font-family:monospace" autocomplete="off" spellcheck="false" />
+            <button type="button" class="btn btn-ghost btn-sm" id="tokGen">${esc(t('node.token.generate'))}</button>
+          </div>
+          ${hasPw
+            ? `<input type="password" id="tokPw" placeholder="${esc(t('node.token.pw_verify_ph'))}" autocomplete="current-password" style="max-width:20rem" />`
+            : `<label style="display:flex;align-items:center;gap:.5rem;cursor:pointer">
+                 <input type="checkbox" id="tokRemember" ${remembered ? 'checked' : ''} />
+                 <span style="font-size:.85rem">${esc(t('node.token.remember'))}</span>
+               </label>
+               <p id="tokPwHint" class="muted" style="font-size:.8rem;margin:-.25rem 0 0 1.5rem">${esc(t('node.token.pw_hint'))}</p>`
+          }
+          <div style="display:flex;gap:.5rem">
+            <button type="button" class="btn btn-primary btn-sm" id="tokSave">${esc(t('common.save'))}</button>
+            <button type="button" class="btn btn-ghost btn-sm" id="tokCancel">${esc(t('common.cancel'))}</button>
+          </div>
+        </div>`;
+
+      tok.querySelector('#tokCopy').onclick = () => {
+        navigator.clipboard.writeText(active).then(() => toast(t('common.copied'), 'ok', 1200));
+      };
+      tok.querySelector('#tokEdit').onclick = () => {
+        tok.querySelector('#tokInput').value = active;
+        tok.querySelector('#tokDisplay').style.display = 'none';
+        tok.querySelector('#tokEditArea').style.display = 'flex';
+        tok.querySelector('#tokInput').focus();
+      };
+      tok.querySelector('#tokCancel').onclick = () => {
+        tok.querySelector('#tokDisplay').style.display = 'flex';
+        tok.querySelector('#tokEditArea').style.display = 'none';
+      };
+      tok.querySelector('#tokGen').onclick = () => {
+        tok.querySelector('#tokInput').value = genToken();
+      };
+      tok.querySelector('#tokSave').onclick = async () => {
+        const v   = tok.querySelector('#tokInput').value.trim();
+        const isDelete = v === '';
+        if (!confirm(t(isDelete ? 'node.token.delete_confirm' : 'node.token.overwrite_confirm'))) return;
+        const btn = tok.querySelector('#tokSave');
+        setLoading(btn, true);
+        try {
+          if (hasPw) {
+            const pw = tok.querySelector('#tokPw')?.value ?? '';
+            // Verify password against vault (if locked) or shadow.
+            if (vaultIsLocked()) {
+              try { await vaultUnlock(pw); } catch { toast(t('node.token.vault_wrong_pw'), 'err'); return; }
+            } else {
+              if (!await shadowVerify(pw)) { toast(t('node.token.vault_wrong_pw'), 'err'); return; }
+            }
+            await api('/config', { method: 'PATCH', body: JSON.stringify({ api_token: v }) });
+            setToken(v);
+            if (isDelete) {
+              vaultClear();
+              await shadowSave(pw); // keep Web UI protected even without a token
+            } else {
+              await vaultSave(v, pw); // upgrade/maintain vault encryption
+              shadowClear();
+            }
+          } else {
+            await api('/config', { method: 'PATCH', body: JSON.stringify({ api_token: v }) });
+            setToken(v);
+            if (isDelete) {
+              vaultClear();
+            } else if (tok.querySelector('#tokRemember')?.checked) {
+              await vaultSave(v, '');
+            } else {
+              vaultClear();
+            }
+          }
+          renderTokenCard();
+          toast(isDelete ? t('node.token.deleted') : t('node.token.saved'), 'ok');
+        } catch (e) {
+          toast(t('common.error', { msg: e.message }), 'err');
+        } finally {
+          setLoading(btn, false);
+        }
+      };
+
+    } else {
+      // ── No token: open access ──
+      const hasPw = shadowHas();
+      tok.innerHTML = `
+        <div class="card-h">${esc(t('node.token.label'))}</div>
+        <div class="card-b">
+          <p class="muted" style="margin:0 0 .75rem">${esc(t('node.token.none_hint'))}</p>
+          <div style="display:flex;gap:.5rem;flex-wrap:wrap">
+            <input type="text" id="tokInput" style="flex:1;min-width:12rem;font-family:monospace" placeholder="${esc(t('node.token.paste_ph'))}" autocomplete="off" spellcheck="false" />
+            <button type="button" class="btn btn-ghost btn-sm" id="tokGen">${esc(t('node.token.generate'))}</button>
+          </div>
+          ${hasPw
+            ? `<input type="password" id="tokPw" placeholder="${esc(t('node.token.pw_verify_ph'))}" autocomplete="current-password" style="max-width:20rem;margin-top:.4rem" />`
+            : ''}
+          <div style="margin-top:.5rem;display:flex;gap:.5rem;flex-wrap:wrap;align-items:center">
+            <button type="button" class="btn btn-primary btn-sm" id="tokApply">${esc(t('node.token.apply'))}</button>
+            ${!hasPw ? `<label style="display:flex;align-items:center;gap:.4rem;cursor:pointer">
+              <input type="checkbox" id="tokRemember" />
+              <span style="font-size:.85rem">${esc(t('node.token.remember'))}</span>
+            </label>` : ''}
+          </div>
+        </div>`;
+
+      tok.querySelector('#tokGen').onclick = () => {
+        tok.querySelector('#tokInput').value = genToken();
+      };
+      tok.querySelector('#tokApply').onclick = async () => {
+        const v = tok.querySelector('#tokInput').value.trim();
+        if (!v) return;
+        const btn = tok.querySelector('#tokApply');
+        setLoading(btn, true);
+        try {
+          if (hasPw) {
+            const pw = tok.querySelector('#tokPw')?.value ?? '';
+            if (!await shadowVerify(pw)) { toast(t('node.token.vault_wrong_pw'), 'err'); return; }
+            await api('/config', { method: 'PATCH', body: JSON.stringify({ api_token: v }) });
+            setToken(v);
+            await vaultSave(v, pw); // promote shadow → vault, keep password
+            shadowClear();
+          } else {
+            await api('/config', { method: 'PATCH', body: JSON.stringify({ api_token: v }) });
+            setToken(v);
+            if (tok.querySelector('#tokRemember')?.checked) {
+              await vaultSave(v, '');
+            }
+          }
+          renderTokenCard();
+          toast(t('node.token.saved'), 'ok');
+        } catch (e) {
+          toast(t('common.error', { msg: e.message }), 'err');
+        } finally {
+          setLoading(btn, false);
+        }
+      };
+    }
+  }
 
   const dbg = document.createElement('div');
   dbg.className = 'muted';

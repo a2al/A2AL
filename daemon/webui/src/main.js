@@ -1,8 +1,10 @@
 import './styles/main.css';
 import { init, t, setLocale, getLocale, subscribe, relTime } from './i18n.js';
-import { api, setToken } from './api.js';
+import { api, getToken, setToken } from './api.js';
+import { vaultLoad, vaultUnlock, vaultClear, vaultSave, vaultIsLocked, vaultHasStored,
+         shadowHas, shadowSave, shadowClear, shadowVerify } from './vault.js';
 import { toast } from './toast.js';
-import { shortAid, esc } from './util.js';
+import { shortAid, esc, setLoading } from './util.js';
 import { renderAgents } from './views/agents.js';
 import { renderDiscover } from './views/discover.js';
 import { renderNode } from './views/node.js';
@@ -107,6 +109,54 @@ function updateNavActive() {
   });
 }
 
+/** Open the login-password management popover. */
+function openPasswordModal() {
+  openModal({
+    title: t('webui.access.title'),
+    body: `
+      <p class="muted" style="font-size:.85rem;margin:0 0 .75rem">${esc(t('webui.access.hint'))}</p>
+      <div class="field">
+        <label>${esc(t('webui.access.new_pw'))}</label>
+        <input type="password" id="pwNew" autocomplete="new-password" style="width:100%" />
+      </div>
+      <div class="field">
+        <label>${esc(t('webui.access.confirm_pw'))}</label>
+        <input type="password" id="pwConfirm" autocomplete="new-password" style="width:100%" />
+      </div>
+      <div style="margin-top:1rem;display:flex;gap:.5rem;justify-content:flex-end">
+        <button type="button" class="btn btn-secondary" data-close>${esc(t('common.cancel'))}</button>
+        <button type="button" class="btn btn-primary" id="pwSave">${esc(t('common.save'))}</button>
+      </div>`,
+    onMount(root, { close }) {
+      root.querySelector('#pwSave').onclick = async (ev) => {
+        const nw = root.querySelector('#pwNew').value;
+        const cf = root.querySelector('#pwConfirm').value;
+        if (nw !== cf) { toast(t('webui.access.mismatch'), 'err'); return; }
+        const btn = ev.currentTarget;
+        setLoading(btn, true);
+        try {
+          const active = getToken();
+          if (active) {
+            // Has token: store/protect via vault; remove any shadow.
+            await vaultSave(active, nw);
+            shadowClear();
+          } else {
+            // No token: store/clear shadow as Web UI gate.
+            if (nw) await shadowSave(nw); else shadowClear();
+          }
+          toast(t('webui.access.saved'), 'ok');
+          close();
+        } catch (e) {
+          toast(t('common.error', { msg: e.message }), 'err');
+        } finally {
+          setLoading(btn, false);
+        }
+      };
+      root.querySelector('#pwNew').focus();
+    },
+  });
+}
+
 /** Full shell rebuild — called on init and language change. */
 function renderShell() {
   const app = document.getElementById('app');
@@ -118,9 +168,11 @@ function renderShell() {
       <h1><span class="status-dot" id="statusDot"></span> a2ald · <span id="stLabel" class="muted">${esc(t('status.connecting'))}</span></h1>
       <nav class="nav-tabs" id="navTabs"></nav>
       <div class="lang-btns" id="langBtns"></div>
+      <button type="button" class="btn btn-ghost btn-sm" id="hdrPw" title="${esc(t('webui.access.title'))}">⚙</button>
       <button type="button" class="btn btn-ghost btn-sm" id="hdrRefresh" title="${esc(t('common.refresh'))}">${esc(t('common.refresh'))}</button>
       <div class="header-meta" id="headerMeta"></div>
     </header>
+    <div id="secBanner" style="display:none"></div>
     <main class="main" id="mainPane"></main>
     <footer class="app-footer">
       <div class="footer-inner">
@@ -175,13 +227,35 @@ function renderShell() {
     lb.appendChild(btn);
   }
 
+  app.querySelector('#hdrPw').onclick = () => openPasswordModal();
   app.querySelector('#hdrRefresh').onclick = () => {
     refreshHeader();
     renderMain();
   };
 
-  refreshHeader();
+  refreshHeader().then(() => maybeShowBanner());
   renderMain();
+}
+
+// Security nudge banner — only shown when a remembered token is stored without
+// password protection (sensitive data at risk if other browser code reads localStorage).
+const BANNER_NO_PW = 'a2al_banner_nopw';
+
+function maybeShowBanner() {
+  const el = document.getElementById('secBanner');
+  if (!el) return;
+  el.innerHTML = '';
+
+  const show = !!getToken() && vaultHasStored() && !vaultIsLocked()
+    && !localStorage.getItem(BANNER_NO_PW);
+  if (!show) return;
+
+  el.style.cssText = 'background:var(--warn-bg,#fff8e1);border-bottom:1px solid var(--warn-border,#ffe082);padding:.5rem 1rem;display:flex;justify-content:space-between;align-items:center;font-size:.85rem;gap:.5rem';
+  el.innerHTML = `<span>⚠ ${esc(t('banner.no_pw'))}</span><button type="button" class="btn btn-ghost btn-sm" id="bannerDismiss" style="white-space:nowrap">${esc(t('banner.dismiss'))}</button>`;
+  el.querySelector('#bannerDismiss').onclick = () => {
+    localStorage.setItem(BANNER_NO_PW, '1');
+    el.style.display = 'none';
+  };
 }
 
 function renderMain() {
@@ -210,4 +284,134 @@ function renderMain() {
 
 init();
 subscribe(() => renderShell());
-renderShell();
+
+// ── Startup password gate helpers ────────────────────────────────────────────
+
+function _buildGateModal({ title, hint, onUnlock, onForgot, confirmKey, clearedKey }) {
+  return new Promise((resolve) => {
+    const backdrop = document.createElement('div');
+    backdrop.className = 'modal-backdrop';
+    backdrop.style.cssText = 'display:flex;align-items:center;justify-content:center';
+    const box = document.createElement('div');
+    box.className = 'modal';
+    box.style.maxWidth = '360px';
+    box.innerHTML = `
+      <div class="modal-h"><span>${esc(title)}</span></div>
+      <div class="modal-b">
+        <p class="muted" style="margin:0 0 .75rem">${esc(hint)}</p>
+        <input id="gatePw" type="password" style="width:100%" placeholder="${esc(t('vault.unlock.placeholder'))}" autocomplete="current-password" />
+        <p id="gateErr" class="muted" style="color:var(--danger,#e53935);margin:.5rem 0 0;display:none">${esc(t('vault.unlock.wrong'))}</p>
+      </div>
+      <div class="modal-f" style="display:flex;justify-content:space-between;align-items:center">
+        <button type="button" class="btn btn-ghost btn-sm" id="gateForgot" style="color:var(--muted,#888);font-size:.8rem">${esc(t('vault.unlock.forgot'))}</button>
+        <button type="button" class="btn btn-primary" id="gateOk">${esc(t('vault.unlock.btn'))}</button>
+      </div>`;
+    backdrop.appendChild(box);
+    document.getElementById('app').appendChild(backdrop);
+
+    const pwEl  = box.querySelector('#gatePw');
+    const errEl = box.querySelector('#gateErr');
+    const btn   = box.querySelector('#gateOk');
+
+    const tryUnlock = async () => {
+      btn.disabled = true;
+      errEl.style.display = 'none';
+      try {
+        await onUnlock(pwEl.value);
+        backdrop.remove();
+        resolve();
+      } catch {
+        errEl.style.display = '';
+        pwEl.value = '';
+        pwEl.focus();
+      } finally {
+        btn.disabled = false;
+      }
+    };
+
+    btn.onclick = tryUnlock;
+    pwEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') tryUnlock(); });
+    box.querySelector('#gateForgot').onclick = () => {
+      if (confirm(t(confirmKey || 'vault.unlock.clear_confirm'))) {
+        onForgot();
+        toast(t(clearedKey || 'vault.unlock.cleared'), 'ok');
+        backdrop.remove();
+        resolve();
+      }
+    };
+    setTimeout(() => pwEl.focus(), 50);
+  });
+}
+
+// Load persisted credentials before rendering.
+// Possible states:
+//   1. Vault encrypted (token+pw)  → show vault unlock gate
+//   2. Vault plaintext             → setToken; then check shadow
+//   3. No vault + shadow exists    → show shadow gate (Web UI password, no token)
+//   4. Nothing                     → render directly
+(async () => {
+  const { token, encrypted } = vaultLoad();
+
+  if (encrypted) {
+    await _buildGateModal({
+      title:    t('vault.unlock.title'),
+      hint:     t('vault.unlock.hint'),
+      onUnlock: async (pw) => { setToken(await vaultUnlock(pw)); },
+      onForgot: () => { vaultClear(); },
+    });
+  } else {
+    if (token) setToken(token);
+    if (shadowHas()) {
+      await _buildGateModal({
+        title:      t('shadow.unlock.title'),
+        hint:       t('shadow.unlock.hint'),
+        confirmKey: 'shadow.unlock.clear_confirm',
+        clearedKey: 'shadow.unlock.cleared',
+        onUnlock:   async (pw) => {
+          const ok = await shadowVerify(pw);
+          if (!ok) throw new Error('wrong');
+        },
+        onForgot: () => { shadowClear(); },
+      });
+    }
+  }
+
+  renderShell();
+})();
+
+// Global 401 handler — show enter-token modal when daemon requires auth but browser has none.
+let _unauthorizedModalOpen = false;
+window.addEventListener('a2al:unauthorized', () => {
+  if (_unauthorizedModalOpen || getToken()) return; // already handled or token was just set
+  _unauthorizedModalOpen = true;
+  openModal({
+    noBackdropClose: true,
+    title: t('token.required.title'),
+    body: `
+      <p class="muted" style="margin:0 0 .75rem">${esc(t('token.required.hint'))}</p>
+      <input type="password" id="reqTok" style="width:100%" placeholder="${esc(t('token.required.placeholder'))}" autocomplete="off" />
+      <label style="display:flex;align-items:center;gap:.5rem;margin-top:.6rem;cursor:pointer">
+        <input type="checkbox" id="reqRemember" />
+        <span style="font-size:.85rem">${esc(t('node.token.remember'))}</span>
+      </label>
+      <div style="margin-top:1rem;text-align:right">
+        <button type="button" class="btn btn-primary" id="reqApply">${esc(t('token.required.btn'))}</button>
+      </div>`,
+    onMount(root, { close }) {
+      const apply = async () => {
+        const v = root.querySelector('#reqTok').value.trim();
+        if (!v) return;
+        setToken(v);
+        if (root.querySelector('#reqRemember').checked) {
+          await vaultSave(v, '');
+        }
+        _unauthorizedModalOpen = false;
+        close();
+        renderMain();
+      };
+      root.querySelector('#reqApply').onclick = apply;
+      root.querySelector('#reqTok').addEventListener('keydown', (e) => { if (e.key === 'Enter') apply(); });
+      setTimeout(() => root.querySelector('#reqTok').focus(), 50);
+    },
+  });
+});

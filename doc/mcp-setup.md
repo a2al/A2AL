@@ -101,6 +101,19 @@ Open Cline settings → MCP Servers → Add Server → paste:
 }
 ```
 
+### Hermes (NousResearch)
+
+Add to `~/.hermes/config.yaml`:
+
+```yaml
+mcp_servers:
+  a2al:
+    command: "a2ald"
+    args: ["--mcp-stdio"]
+```
+
+Restart Hermes. The full A2AL tool set is available immediately.
+
 ### OpenClaw
 
 Copy the skill file to your workspace and restart OpenClaw:

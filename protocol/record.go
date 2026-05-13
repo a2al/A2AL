@@ -12,6 +12,7 @@ import (
 
 	"github.com/a2al/a2al"
 	acrypto "github.com/a2al/a2al/crypto"
+	"github.com/a2al/a2al/identity"
 	"github.com/fxamacker/cbor/v2"
 )
 
@@ -312,10 +313,32 @@ func ParseEndpointRecord(sr SignedRecord) (EndpointRecord, error) {
 	}, nil
 }
 
-// RecordIsNewer reports whether a should replace b (spec: larger seq wins; tie-break by timestamp).
+// RecordIsNewer reports whether a should replace b.
+// Priority: delegation.IssuedAt → Seq → Timestamp.
+// A newer delegation always wins regardless of seq, enabling master key holders
+// to revoke a stolen operational key by issuing a fresh delegation.
 func RecordIsNewer(a, b SignedRecord) bool {
+	aIssued := delegationIssuedAt(a.Delegation)
+	bIssued := delegationIssuedAt(b.Delegation)
+	if aIssued != bIssued {
+		return aIssued > bIssued
+	}
 	if a.Seq != b.Seq {
 		return a.Seq > b.Seq
 	}
 	return a.Timestamp > b.Timestamp
+}
+
+// delegationIssuedAt returns the IssuedAt field from a delegation CBOR blob,
+// or 0 if absent or unparseable. The value is trustworthy because it is
+// covered by the master key signature verified upstream in VerifySignedRecord.
+func delegationIssuedAt(delegation []byte) uint64 {
+	if len(delegation) == 0 {
+		return 0
+	}
+	p, err := identity.ParseDelegationProof(delegation)
+	if err != nil {
+		return 0
+	}
+	return p.IssuedAt
 }

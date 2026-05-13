@@ -161,9 +161,12 @@ func New(cfg Config) (*Daemon, error) {
 	if err := nodeCfg.Validate(); err != nil {
 		return nil, err
 	}
-	// Write default config if not present.
-	if _, err := os.Stat(cfgPath); os.IsNotExist(err) {
-		_ = config.Save(cfgPath, nodeCfg)
+
+	// Write default config if not already present.
+	if _, statErr := os.Stat(cfgPath); os.IsNotExist(statErr) {
+		if saveErr := config.Save(cfgPath, nodeCfg); saveErr != nil {
+			return nil, fmt.Errorf("daemon: save config: %w", saveErr)
+		}
 	}
 
 	log := cfg.Log

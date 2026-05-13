@@ -33,7 +33,7 @@ func buildMCPServer(d *Daemon) *mcp.Server {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_identity_generate",
-		Description: "Create a new permanent cryptographic identity (AID) for an agent. Returns the AID address, keys, and delegation proof. Run once per agent; the master key is shown once and must be saved by the user — the daemon does not retain it.",
+		Description: "Create a new permanent cryptographic identity (AID) for an agent. Each call produces a brand-new, unrelated AID — if the agent already has keys from a previous call, use a2al_agent_register to restore them instead of generating again. The master key is shown once and must be saved; the daemon does not retain it.",
 	}, d.mcpIdentityGenerate)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_agents_list",
@@ -57,7 +57,7 @@ func buildMCPServer(d *Daemon) *mcp.Server {
 	}, d.mcpEthereumProof)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_agent_register",
-		Description: "Register a generated agent identity with the daemon so it can publish to and connect via the Tangled Network. Requires the keys returned by identity_generate.",
+		Description: "Register an agent identity with the daemon. Idempotent — safe to call again with the same keys to re-import after a daemon restart. Set service_tcp (e.g. '127.0.0.1:8080') to expose a local HTTP service so remote agents can reach this agent via a2al_fetch; omit if this agent only calls others.",
 	}, d.mcpAgentRegister)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_agent_get",
@@ -69,7 +69,7 @@ func buildMCPServer(d *Daemon) *mcp.Server {
 	}, d.mcpAgentProbe)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_agent_patch",
-		Description: "Update the service address for a registered agent (e.g. after the local HTTP server moves to a different port).",
+		Description: "Update a registered agent's service_tcp address (e.g. after the local HTTP service moves to a different port). Pass an empty string to stop exposing a local service.",
 	}, d.mcpAgentPatch)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_agent_publish",
@@ -113,7 +113,7 @@ func buildMCPServer(d *Daemon) *mcp.Server {
 	}, d.mcpMailboxPoll)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_service_register",
-		Description: "Publish capability tags for an agent so other agents can find it by searching for services. Use dot-namespaced labels like 'ai.assistant', 'lang.translate', or 'code.review'.",
+		Description: "Publish capability tags for an agent so other agents can discover it by service type. Use dot-namespaced labels like 'ai.assistant', 'lang.translate', or 'code.review'. Optional and independent from identity registration — an agent can be reachable by AID without publishing any service tags.",
 	}, d.mcpTopicRegister)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_service_unregister",
@@ -121,11 +121,11 @@ func buildMCPServer(d *Daemon) *mcp.Server {
 	}, d.mcpTopicUnregister)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_discover",
-		Description: "Search the Tangled Network for agents offering specific capabilities. Returns matching agents with their names, protocols, and AIDs. Optionally filter by protocol (e.g. 'mcp', 'a2a') or tags.",
+		Description: "Search the Tangled Network for agents by capability. Returns candidate agents with their names, protocols, and AIDs — results are not guaranteed exact matches, so apply your own judgment to select the right one. Optionally filter by protocol (e.g. 'mcp', 'a2a') or tags.",
 	}, d.mcpDiscover)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_fetch",
-		Description: "Make an HTTP request to a remote agent's service through the Tangled Network. The request travels end-to-end encrypted via QUIC; no ports are exposed. Returns HTTP status, headers, and body. Use for querying a remote agent's REST API, health check, or any HTTP endpoint it serves.",
+		Description: "Send an HTTP request to a remote agent over the Tangled Network. End-to-end encrypted via QUIC; no ports are exposed. Returns {status, headers, body}. The remote agent must have a service_tcp registered; if it is offline or unreachable, the request fails — use a2al_mailbox_send as an async fallback (note: mailbox is fire-and-forget, not an HTTP response).",
 	}, d.mcpFetch)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_tunnel_open",
@@ -508,9 +508,9 @@ func (d *Daemon) mcpFetch(ctx context.Context, _ *mcp.ServerSession, params *mcp
 	if err != nil {
 		switch {
 		case errors.Is(err, errResolve):
-			return nil, errors.New("resolve failed: remote agent not found on the network")
+			return nil, errors.New("resolve failed: remote agent not found on the network — try a2al_discover to search by capability, or a2al_mailbox_send for deferred delivery")
 		case errors.Is(err, errConnectQUIC):
-			return nil, errors.New("connect failed: could not establish QUIC connection to remote agent")
+			return nil, errors.New("connect failed: remote agent is unreachable right now — try a2al_mailbox_send for deferred async delivery")
 		default:
 			return nil, err
 		}
@@ -542,7 +542,7 @@ func (d *Daemon) mcpTunnelOpen(ctx context.Context, _ *mcp.ServerSession, params
 		case errors.Is(err, errBadAID):
 			return nil, errors.New("bad remote_aid")
 		case errors.Is(err, errResolve):
-			return nil, errors.New("resolve failed: remote agent not found on the network")
+			return nil, errors.New("resolve failed: remote agent not found on the network — try a2al_discover to search by capability")
 		case errors.Is(err, errConnectQUIC):
 			return nil, errors.New("connect failed: could not establish QUIC connection to remote agent")
 		default:
