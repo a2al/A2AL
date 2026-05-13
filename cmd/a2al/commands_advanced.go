@@ -10,6 +10,8 @@ import (
 	"net/url"
 	"os"
 	"strings"
+
+	"github.com/a2al/a2al/internal/envelope"
 )
 
 func cmdAgents(c *Client, g globalOpts, args []string) {
@@ -166,14 +168,18 @@ func cmdAgentsUpdate(c *Client, g globalOpts, args []string) {
 
 func cmdAgentsExport(c *Client, g globalOpts, args []string) {
 	if len(args) < 1 {
-		fatalf("usage: a2al agents export <aid> [-o file]")
+		fatalf("usage: a2al agents export <aid> [-o file] [--password pw]")
 	}
 	aid := args[0]
-	outPath := ""
+	outPath, password := "", ""
 	for i := 1; i < len(args); i++ {
-		if args[i] == "-o" && i+1 < len(args) {
-			i++
-			outPath = args[i]
+		switch {
+		case args[i] == "-o" && i+1 < len(args):
+			i++; outPath = args[i]
+		case args[i] == "--password" && i+1 < len(args):
+			i++; password = args[i]
+		case strings.HasPrefix(args[i], "--password="):
+			password = strings.TrimPrefix(args[i], "--password=")
 		}
 	}
 	var id agentIdentityFile
@@ -184,8 +190,21 @@ func cmdAgentsExport(c *Client, g globalOpts, args []string) {
 	if err != nil {
 		fatal(err)
 	}
+	var out []byte
+	if password != "" {
+		sealed, err := envelope.Seal(b, password)
+		if err != nil {
+			fatal(err)
+		}
+		out = []byte(sealed)
+	} else {
+		out = b
+		if outPath != "" && !g.Quiet && !g.JSON {
+			fmt.Fprintln(os.Stderr, "warning: exporting without --password stores credentials in plaintext")
+		}
+	}
 	if outPath != "" {
-		if err := os.WriteFile(outPath, b, 0o600); err != nil {
+		if err := os.WriteFile(outPath, out, 0o600); err != nil {
 			fatal(err)
 		}
 		if !g.Quiet && !g.JSON {
@@ -193,20 +212,39 @@ func cmdAgentsExport(c *Client, g globalOpts, args []string) {
 		}
 		return
 	}
-	if g.JSON {
+	if g.JSON && password == "" {
 		printJSON(true, id)
 		return
 	}
-	fmt.Println(string(b))
+	fmt.Println(string(out))
 }
 
 func cmdAgentsImport(c *Client, g globalOpts, args []string) {
-	if len(args) != 1 {
-		fatalf("usage: a2al agents import <file>")
+	if len(args) < 1 {
+		fatalf("usage: a2al agents import <file> [--password pw]")
 	}
-	b, err := os.ReadFile(args[0])
+	filePath, password := args[0], ""
+	for i := 1; i < len(args); i++ {
+		switch {
+		case args[i] == "--password" && i+1 < len(args):
+			i++; password = args[i]
+		case strings.HasPrefix(args[i], "--password="):
+			password = strings.TrimPrefix(args[i], "--password=")
+		}
+	}
+	raw, err := os.ReadFile(filePath)
 	if err != nil {
 		fatal(err)
+	}
+	b := raw
+	if envelope.IsEnvelope(string(raw)) {
+		if password == "" {
+			fatalf("file is encrypted — provide --password")
+		}
+		b, err = envelope.Open(string(raw), password)
+		if err != nil {
+			fatalf("decrypt failed: wrong password or corrupted file")
+		}
 	}
 	var id agentIdentityFile
 	if err := json.Unmarshal(b, &id); err != nil {
