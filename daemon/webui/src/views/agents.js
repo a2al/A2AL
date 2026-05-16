@@ -1131,23 +1131,23 @@ export async function renderAgents(mount, ctx) {
       title: t('agent.modal.import.title'),
       body: `
         <div class="field">
-          <label>${esc(t('agent.modal.import.op_key.label'))}</label>
-          <textarea id="imOp" rows="2" class="mono" style="width:100%"></textarea>
-        </div>
-        <div class="field">
-          <label>${esc(t('agent.modal.import.del_proof.label'))}</label>
-          <textarea id="imDel" rows="3" class="mono" style="width:100%"></textarea>
-        </div>
-        <div class="field">
-          <label>${esc(t('agent.modal.import.or_file'))}</label>
+          <label>${esc(t('agent.import.file_label'))}</label>
           <input type="file" id="imFile" accept=".json,.enc,application/json,application/octet-stream" />
-          <div id="imFilePwRow" class="field" style="display:none;margin-top:.5rem">
-            <label>${esc(t('agent.import.file_password'))}</label>
-            <input type="password" id="imFilePw" placeholder="${esc(t('agent.import.file_password_ph'))}" autocomplete="off" style="width:100%" />
-          </div>
+          <div id="imFileStatus" class="hint" style="display:none;margin-top:.35rem"></div>
         </div>
+        <details id="imManual" style="margin-top:.5rem">
+          <summary style="cursor:pointer;font-size:.85rem;color:var(--muted,#888)">${esc(t('agent.import.manual_label'))}</summary>
+          <div class="field" style="margin-top:.75rem">
+            <label>${esc(t('agent.modal.import.op_key.label'))}</label>
+            <textarea id="imOp" rows="2" class="mono" style="width:100%"></textarea>
+          </div>
+          <div class="field">
+            <label>${esc(t('agent.modal.import.del_proof.label'))}</label>
+            <textarea id="imDel" rows="3" class="mono" style="width:100%"></textarea>
+          </div>
+        </details>
         <details style="margin-top:.5rem">
-          <summary>${esc(t('agent.modal.advanced'))}</summary>
+          <summary style="cursor:pointer;font-size:.85rem;color:var(--muted,#888)">${esc(t('agent.modal.advanced'))}</summary>
           <div class="field" style="margin-top:.75rem">
             <label>${esc(t('agent.modal.service_tcp.label'))} <span class="muted" style="font-weight:400">${esc(t('agent.modal.service_tcp.optional'))}</span></label>
             <input type="text" id="imTcp" placeholder="http://127.0.0.1:8080" style="width:100%" />
@@ -1166,45 +1166,72 @@ export async function renderAgents(mount, ctx) {
           rd.onload = async () => {
             const raw = String(rd.result);
             if (isEnvelope(raw)) {
-              root.querySelector('#imFilePwRow').style.display = '';
-              root.querySelector('#imFilePw').focus();
+              // Encrypted file — open password prompt
+              openModal({
+                title: t('agent.import.decrypt_title'),
+                noBackdropClose: true,
+                body: `
+                  <p class="muted" style="font-size:.85rem;margin:0 0 .75rem">${esc(t('agent.import.decrypt_hint'))}</p>
+                  <div class="field">
+                    <input type="password" id="decPw" placeholder="${esc(t('agent.import.file_password_ph'))}" autocomplete="off" style="width:100%" />
+                    <p id="decErr" class="muted" style="color:var(--danger,#e53935);margin:.35rem 0 0;display:none">${esc(t('vault.unlock.wrong'))}</p>
+                  </div>
+                  <div style="margin-top:1rem;display:flex;gap:.5rem;justify-content:flex-end">
+                    <button type="button" class="btn btn-secondary" data-close>${esc(t('common.cancel'))}</button>
+                    <button type="button" class="btn btn-primary" id="decOk">${esc(t('common.confirm'))}</button>
+                  </div>`,
+                onMount(dr, { close: closeDecrypt }) {
+                  const doDecrypt = async () => {
+                    const pw = dr.querySelector('#decPw').value;
+                    const btn = dr.querySelector('#decOk');
+                    setLoading(btn, true);
+                    dr.querySelector('#decErr').style.display = 'none';
+                    try {
+                      const plain = await decrypt(raw, pw);
+                      const j = JSON.parse(plain);
+                      if (j.operational_private_key_hex) {
+                        root.querySelector('#imOp').value = j.operational_private_key_hex;
+                        root.querySelector('#imManual').open = true;
+                      }
+                      if (j.delegation_proof_hex)
+                        root.querySelector('#imDel').value = j.delegation_proof_hex;
+                      const status = root.querySelector('#imFileStatus');
+                      status.textContent = f.name;
+                      status.style.display = '';
+                      closeDecrypt();
+                    } catch (_) {
+                      dr.querySelector('#decErr').style.display = '';
+                      dr.querySelector('#decPw').value = '';
+                      dr.querySelector('#decPw').focus();
+                    } finally {
+                      setLoading(btn, false);
+                    }
+                  };
+                  dr.querySelector('#decOk').onclick = doDecrypt;
+                  dr.querySelector('#decPw').addEventListener('keydown', (e) => {
+                    if (e.key === 'Enter') { e.preventDefault(); doDecrypt(); }
+                  });
+                  setTimeout(() => dr.querySelector('#decPw').focus(), 50);
+                },
+              });
               return;
             }
             try {
               const j = JSON.parse(raw);
-              if (j.operational_private_key_hex)
+              if (j.operational_private_key_hex) {
                 root.querySelector('#imOp').value = j.operational_private_key_hex;
+                root.querySelector('#imManual').open = true;
+              }
               if (j.delegation_proof_hex) root.querySelector('#imDel').value = j.delegation_proof_hex;
+              const status = root.querySelector('#imFileStatus');
+              status.textContent = f.name;
+              status.style.display = '';
             } catch (_) {
               toast(t('common.error', { msg: 'JSON' }), 'err');
             }
           };
           rd.readAsText(f);
         };
-        // Decrypt encrypted file on password input.
-        const decryptFile = async () => {
-          const fileInput = root.querySelector('#imFile');
-          const pw = root.querySelector('#imFilePw').value;
-          if (!fileInput.files?.[0]) return;
-          const rd2 = new FileReader();
-          rd2.onload = async () => {
-            try {
-              const plain = await decrypt(String(rd2.result), pw);
-              const j = JSON.parse(plain);
-              if (j.operational_private_key_hex)
-                root.querySelector('#imOp').value = j.operational_private_key_hex;
-              if (j.delegation_proof_hex)
-                root.querySelector('#imDel').value = j.delegation_proof_hex;
-              root.querySelector('#imFilePwRow').style.display = 'none';
-            } catch (_) {
-              toast(t('vault.unlock.wrong'), 'err');
-            }
-          };
-          rd2.readAsText(fileInput.files[0]);
-        };
-        root.querySelector('#imFilePw').addEventListener('keydown', (e) => {
-          if (e.key === 'Enter') { e.preventDefault(); decryptFile(); }
-        });
         root.querySelector('#imGo').onclick = async (ev) => {
           const op = root.querySelector('#imOp').value.trim();
           const del = root.querySelector('#imDel').value.trim();

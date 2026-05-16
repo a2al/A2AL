@@ -287,6 +287,11 @@ subscribe(() => renderShell());
 
 // ── Startup password gate helpers ────────────────────────────────────────────
 
+function isLocalOrigin() {
+  const h = location.hostname;
+  return h === '127.0.0.1' || h === 'localhost' || h === '::1';
+}
+
 function _buildGateModal({ title, hint, onUnlock, onForgot, confirmKey, clearedKey }) {
   return new Promise((resolve) => {
     const backdrop = document.createElement('div');
@@ -303,7 +308,10 @@ function _buildGateModal({ title, hint, onUnlock, onForgot, confirmKey, clearedK
         <p id="gateErr" class="muted" style="color:var(--danger,#e53935);margin:.5rem 0 0;display:none">${esc(t('vault.unlock.wrong'))}</p>
       </div>
       <div class="modal-f" style="display:flex;justify-content:space-between;align-items:center">
-        <button type="button" class="btn btn-ghost btn-sm" id="gateForgot" style="color:var(--muted,#888);font-size:.8rem">${esc(t('vault.unlock.forgot'))}</button>
+        ${isLocalOrigin()
+          ? `<button type="button" class="btn btn-ghost btn-sm" id="gateForgot" style="color:var(--muted,#888);font-size:.8rem">${esc(t('vault.unlock.forgot'))}</button>`
+          : `<span class="muted" style="font-size:.78rem">${esc(t('shadow.local_only'))}</span>`
+        }
         <button type="button" class="btn btn-primary" id="gateOk">${esc(t('vault.unlock.btn'))}</button>
       </div>`;
     backdrop.appendChild(box);
@@ -331,7 +339,8 @@ function _buildGateModal({ title, hint, onUnlock, onForgot, confirmKey, clearedK
 
     btn.onclick = tryUnlock;
     pwEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') tryUnlock(); });
-    box.querySelector('#gateForgot').onclick = () => {
+    const forgotBtn = box.querySelector('#gateForgot');
+    if (forgotBtn) forgotBtn.onclick = () => {
       if (confirm(t(confirmKey || 'vault.unlock.clear_confirm'))) {
         onForgot();
         toast(t(clearedKey || 'vault.unlock.cleared'), 'ok');
