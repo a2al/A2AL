@@ -706,6 +706,12 @@ const (
 	maintPendingPerCycle = 5  // max pending-list PINGs per heartbeat
 	maintStalePerCycle   = 10 // max stale-unverified main-bucket PINGs per heartbeat
 	maintRefillPerCycle  = 2  // max FindNode refill queries launched per heartbeat
+
+	// stalePunchBucketThreshold is the minimum bucket index (CPL) at which a
+	// stale-probe failure triggers ICE instead of (or in addition to) immediate
+	// removal.  Bucket ≥ 3 means the peer occupies ≤ 1/16 of the key space and
+	// is hard to replace; the ICE cost is justified by the routing value.
+	stalePunchBucketThreshold = 3
 )
 
 // runRoutingMaintenance performs one pass of routing table upkeep:
@@ -801,6 +807,20 @@ func (n *Node) runRoutingMaintenance(ctx context.Context) {
 				continue
 			}
 		}
+
+		// For high-CPL buckets (≥ stalePunchBucketThreshold), nodes occupy a
+		// small slice of key space and are hard to replace.  If an endpoint
+		// record with a signal URL is available, trigger ICE speculatively
+		// before the UDP probe so both paths run in parallel.  At this point the
+		// health entry is nil (hearsay, never contacted), which lets the request
+		// bypass triggerPunch's punchMinBackoff gate naturally.  If ICE succeeds,
+		// OnPunchComplete re-adds the node as verified even if the UDP probe fails.
+		if routing.BucketIndex(n.nid, id) >= stalePunchBucketThreshold {
+			if er := n.lookupEndpointRecord(id); er != nil {
+				n.triggerPunch(id, er, PunchPriorityHigh)
+			}
+		}
+
 		pctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 		_, err := n.PingIdentity(pctx, addr)
 		cancel()
@@ -900,29 +920,67 @@ func randomIDInBucket(self a2al.NodeID, bi int) a2al.NodeID {
 // Fix 7: rs.mu is always released before calling enqueueReplication to avoid
 // holding the lock while touching the channel.
 func (n *Node) probeRepNode(ctx context.Context, rk repKey, rs *repSet, e *repNodeEntry) {
-	addr, ok := n.lookupPeer(e.nodeID)
-	if !ok {
-		// Address unknown: count as a miss and retry soon.
-		rs.mu.Lock()
-		e.failCount++
-		e.nextProbeAt = time.Now().Add(probeInitDelay)
-		rs.mu.Unlock()
-		return
+	// For ICE-capable NAT peers (signal URL present), consult the punch channel
+	// before attempting a UDP probe — stale NAT-mapped ports always time out.
+	//
+	// probeSkip=true  → no probe RPC was sent; failure path still runs so the
+	//                   grace+evict state machine advances normally.
+	// punchAttempted  → triggerPunch already called; skip redundant Low-priority
+	//                   re-trigger in the badHealthThreshold case.
+	var (
+		probeSkip      bool
+		punchAttempted bool
+	)
+	if n.punch != nil {
+		if er := n.lookupEndpointRecord(e.nodeID); er != nil {
+			if n.punch.HasConn(e.nodeID) {
+				// Active punch channel: treat as a successful probe.
+				rs.mu.Lock()
+				e.failCount = 0
+				e.badSince = time.Time{}
+				next := e.nextProbeDelay * 2
+				if next == 0 || next > probeMaxDelay {
+					next = probeMaxDelay
+				}
+				e.nextProbeDelay = next
+				e.nextProbeAt = time.Now().Add(next)
+				rs.mu.Unlock()
+				return
+			}
+			// No active channel: trigger ICE redialing and count this round as
+			// a miss so the state machine advances (dead peers get evicted).
+			n.triggerPunch(e.nodeID, er, PunchPriorityHigh)
+			probeSkip = true
+			punchAttempted = true
+		}
 	}
 
-	pctx, cancel := context.WithTimeout(ctx, queryPeerTimeout)
-	_, err := n.PingIdentity(pctx, addr)
-	cancel()
+	var err error
+	if !probeSkip {
+		addr, ok := n.lookupPeer(e.nodeID)
+		if !ok {
+			// Address unknown: count as a miss and retry soon.
+			rs.mu.Lock()
+			e.failCount++
+			e.nextProbeAt = time.Now().Add(probeInitDelay)
+			rs.mu.Unlock()
+			return
+		}
 
-	if err != nil {
-		// PingIdentity called recordFailure internally (penalty++, backoff
-		// extended).  Since this is a dedicated health probe — not a "real"
-		// communication — undo the increment and halve the remaining back-off
-		// instead of growing it, giving the node a chance to recover.
-		n.recordProbeFailure(e.nodeID)
+		pctx, cancel := context.WithTimeout(ctx, queryPeerTimeout)
+		_, err = n.PingIdentity(pctx, addr)
+		cancel()
+
+		if err != nil {
+			// PingIdentity called recordFailure internally (penalty++, backoff
+			// extended).  Since this is a dedicated health probe — not a "real"
+			// communication — undo the increment and halve the remaining back-off
+			// instead of growing it, giving the node a chance to recover.
+			n.recordProbeFailure(e.nodeID)
+		}
 	}
 
-	if err == nil {
+	if !probeSkip && err == nil {
 		// Success: advance the exponential back-off, clear bad state.
 		rs.mu.Lock()
 		e.failCount = 0
@@ -937,7 +995,7 @@ func (n *Node) probeRepNode(ctx context.Context, rk repKey, rs *repSet, e *repNo
 		return
 	}
 
-	// Failure path.
+	// Failure path (UDP failure or punch-channel miss).
 	rs.mu.Lock()
 	e.failCount++
 
@@ -959,8 +1017,12 @@ func (n *Node) probeRepNode(ctx context.Context, rk repKey, rs *repSet, e *repNo
 		// Proactively look for a replacement while waiting.
 		n.enqueueReplication(rk, protocol.SignedRecord{})
 		// Phase 6 (过程三, Low priority): UDP has confirmed unreachable; try ICE.
-		if er := n.lookupEndpointRecord(e.nodeID); er != nil {
-			n.triggerPunch(e.nodeID, er, PunchPriorityLow)
+		// Skip if already triggered above (triggerPunch deduplicates anyway, but
+		// avoid the lock overhead).
+		if !punchAttempted {
+			if er := n.lookupEndpointRecord(e.nodeID); er != nil {
+				n.triggerPunch(e.nodeID, er, PunchPriorityLow)
+			}
 		}
 
 	default:

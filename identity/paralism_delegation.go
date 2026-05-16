@@ -54,7 +54,7 @@ func verifyParalismDelegation(p DelegationProof, nowUnix uint64, opPriv ed25519.
 	if mf.Scope != p.Scope || mf.IssuedAt != p.IssuedAt || mf.Expires != p.ExpiresAt {
 		return fmt.Errorf("%w: message/proof field mismatch", ErrInvalidDelegation)
 	}
-	if p.ExpiresAt != 0 && nowUnix >= p.ExpiresAt {
+	if p.ExpiresAt != 0 && nowUnix >= p.ExpiresAt+delegationExpiryGrace {
 		return fmt.Errorf("%w: expired", ErrInvalidDelegation)
 	}
 	if p.Scope != ScopeNetworkOps {

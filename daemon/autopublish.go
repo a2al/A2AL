@@ -22,11 +22,12 @@ import (
 )
 
 const (
-	endpointRecordTTL   = uint32(3600)
-	republishPeriod     = time.Duration(endpointRecordTTL/2) * time.Second // 30m
-	endpointWatchPeriod = 60 * time.Second
-	heartbeatTTL        = time.Duration(endpointRecordTTL) * time.Second
-	guardTickPeriod     = 5 * time.Second
+	endpointRecordTTL    = uint32(3600)
+	republishPeriod      = time.Duration(endpointRecordTTL/2) * time.Second // 30m
+	endpointWatchPeriod  = 60 * time.Second
+	heartbeatTTL         = time.Duration(endpointRecordTTL) * time.Second
+	guardTickPeriod      = 5 * time.Second
+	anchorKeepalivePeriod = 20 * time.Second // keep NAT bindings alive; feeds observed-addr back to natsense
 )
 
 type nodePublishDisk struct {
@@ -478,6 +479,8 @@ func (d *Daemon) autoPublishMainLoop(ctx context.Context) {
 	defer probe.Stop()
 	guard := time.NewTicker(guardTickPeriod)
 	defer guard.Stop()
+	anchor := time.NewTicker(anchorKeepalivePeriod)
+	defer anchor.Stop()
 
 	for {
 		select {
@@ -485,6 +488,8 @@ func (d *Daemon) autoPublishMainLoop(ctx context.Context) {
 			return
 		case <-guard.C:
 			d.handleGuardTick(ctx)
+		case <-anchor.C:
+			go d.runAnchorKeepalive(ctx)
 		case <-repub.C:
 			runCtx, cancel := context.WithTimeout(ctx, 150*time.Second)
 			d.runPeriodicRepublish(runCtx)
@@ -503,5 +508,33 @@ func (d *Daemon) autoPublishMainLoop(ctx context.Context) {
 				cancel2()
 			}()
 		}
+	}
+}
+
+// runAnchorKeepalive pings up to 2 healthy routing-table peers.
+//
+// Purpose (dual):
+//  1. Keep the local UDP NAT binding active by sending periodic outbound packets.
+//  2. Collect observed_addr from PONG responses; natsense aggregates these and
+//     the endpointWatchPeriod ticker triggers maybeRepublishNodeOnEndpointChange
+//     if our external address has genuinely changed.
+//
+// Skipped when the local node has a direct public WAN binding: NAT mappings do
+// not apply and observed_addr changes are handled by netchange.go instead.
+// Errors are intentionally ignored: this is best-effort keep-alive.
+func (d *Daemon) runAnchorKeepalive(ctx context.Context) {
+	if d.h.Sense().IsBindPublic() {
+		return
+	}
+	addrs := d.h.Node().BootstrapCandidateAddrs(4)
+	sent := 0
+	for _, addr := range addrs {
+		if sent >= 2 {
+			break
+		}
+		pctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		_, _ = d.h.Node().PingIdentity(pctx, addr)
+		cancel()
+		sent++
 	}
 }

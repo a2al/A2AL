@@ -61,7 +61,7 @@ func TestDelegationExpiry(t *testing.T) {
 	if err := VerifyDelegation(p, now+5, oPriv); err != nil {
 		t.Fatal(err)
 	}
-	if err := VerifyDelegation(p, now+10, oPriv); err == nil {
+	if err := VerifyDelegation(p, now+71, oPriv); err == nil {
 		t.Fatal("expected expired")
 	}
 }

@@ -21,6 +21,13 @@ const (
 	// RecTypeEndpoint is the Phase 1 endpoint advertisement (spec §7.6).
 	RecTypeEndpoint uint8 = 0x01
 
+	// maxFutureClockSkew is the tolerance for "timestamp in future" checks.
+	// Records whose timestamp is no more than this many seconds ahead of the
+	// verifier's clock are accepted to accommodate NTP drift and VM wake/sleep
+	// skew between nodes. 60 s aligns with JWT industry practice and is
+	// negligible relative to the minimum TTL of 3600 s.
+	maxFutureClockSkew uint64 = 60
+
 	// MaxEndpointSignalURLLen caps each URL in EndpointPayload.Signal / Signals.
 	MaxEndpointSignalURLLen = 2048
 	// MaxSignalURLs caps EndpointPayload.Signals entry count (multi-center signal URLs).
@@ -278,7 +285,7 @@ func VerifySignedRecord(sr SignedRecord, now time.Time) error {
 		return fmt.Errorf("%w: mailbox payload size", ErrInvalidRecord)
 	}
 	nowUnix := uint64(now.Unix())
-	if nowUnix < sr.Timestamp {
+	if sr.Timestamp > nowUnix+maxFutureClockSkew {
 		return fmt.Errorf("%w: timestamp in future", ErrInvalidRecord)
 	}
 	if sr.Timestamp+uint64(sr.TTL) < nowUnix {

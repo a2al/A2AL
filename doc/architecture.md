@@ -91,6 +91,16 @@ Most Go applications that embed A2AL depend only on this package.
 
 The `a2ald` binary. Wraps `host` with a persistent service layer: auto-publish on a schedule, agent registration and lifecycle management, REST API, MCP server, embedded Web UI, and a config/persistence layer. Non-Go integrations use `a2ald` exclusively and never call `host` directly.
 
+**Management API access control.** The HTTP management API (`127.0.0.1:2121` by default) enforces token-based access when `api_token` is set in `config.toml`:
+
+- Loopback requests (`127.0.0.1` / `::1`) bypass token checks unless `require_local_token = true` is set, enabling frictionless integration for local tools and AI agents.
+- Non-loopback requests always require a valid `Authorization: Bearer <token>` header when a token is configured.
+- An empty `api_token` means unconditional open access — intentional, not an error. A security nudge is surfaced in the Web UI.
+- The Host header is validated on loopback requests: if the header is present and resolves to a non-loopback address, the request is rejected (DNS rebinding defense).
+- The credential export endpoint (`GET /agents/{aid}/export`) is unconditionally restricted to loopback regardless of token configuration. Responses carry `Cache-Control: no-store`.
+
+**Credential encryption.** The `internal/envelope` package implements PBKDF2-SHA256 (100 000 iterations) + AES-256-GCM encryption with a random 16-byte salt and 12-byte nonce. This shared primitive is used by both the CLI (`a2al export/import`) and the Web UI vault.
+
 ---
 
 ## Key Data Structures
@@ -141,6 +151,8 @@ The universal on-wire container stored in the DHT:
 | `Delegation` | bytes | Optional CBOR `DelegationProof` (present when an operational key signs for a master-derived AID) |
 
 Records are verified before storage and on retrieval: signature integrity, timestamp + TTL coverage of "now", and (at storage time) authority — the signing key must either derive the record's `Address` directly, or carry a valid `Delegation` from the master key that does.
+
+**Operational key revocation.** `RecordIsNewer` — the function that determines which of two DHT records for the same AID takes precedence — uses `delegation.IssuedAt` as the highest-priority tiebreaker. A legitimate owner can revoke a stolen or compromised operational key by issuing a new `DelegationProof` with a higher `IssuedAt` timestamp and re-publishing. Any peer that holds both records will keep the newer delegation, pushing out the stolen key without requiring a sequence number increment.
 
 ### `EndpointPayload`
 

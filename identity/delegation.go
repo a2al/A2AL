@@ -20,6 +20,10 @@ const signPrefix = "a2al-del\x00"
 // ScopeNetworkOps is the only delegation scope in Phase 3 (QUIC/DHT signing).
 const ScopeNetworkOps uint8 = 1
 
+// delegationExpiryGrace is the tolerance added to ExpiresAt checks to absorb
+// NTP clock skew between the issuing node and the verifying peer.
+const delegationExpiryGrace uint64 = 60
+
 var (
 	delCanonical cbor.EncMode
 
@@ -187,7 +191,7 @@ func verifyEd25519Delegation(p DelegationProof, nowUnix uint64, opPriv ed25519.P
 	if err != nil || gotAID != aid {
 		return fmt.Errorf("%w: AID/master mismatch", ErrInvalidDelegation)
 	}
-	if p.ExpiresAt != 0 && nowUnix >= p.ExpiresAt {
+	if p.ExpiresAt != 0 && nowUnix >= p.ExpiresAt+delegationExpiryGrace {
 		return fmt.Errorf("%w: expired", ErrInvalidDelegation)
 	}
 	if p.Scope != ScopeNetworkOps {

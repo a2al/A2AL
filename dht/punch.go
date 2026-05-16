@@ -182,7 +182,22 @@ func (n *Node) OnPunchComplete(nodeID a2al.NodeID, peerLogicalAddr a2al.Address,
 
 	if isDirect {
 		// Phase 8: remote is directly reachable — admit as standard direct node.
-		// tabAdd handles bucket eviction logic (including punched-zone priority).
+		// Prefer the peer's self-advertised stable address over the ephemeral ICE
+		// pair port: public nodes may bind a different local port for ICE sessions.
+		recs := n.LocalStoreGet(nodeID, protocol.RecTypeEndpoint)
+		for _, sr := range recs {
+			if er, err := protocol.ParseEndpointRecord(sr); err == nil {
+				if ua := firstEndpointAddr(&er); ua != nil {
+					if ip4 := ua.IP.To4(); ip4 != nil {
+						ni.IP = append([]byte(nil), ip4...)
+					} else {
+						ni.IP = append([]byte(nil), ua.IP.To16()...)
+					}
+					ni.Port = uint16(ua.Port)
+				}
+				break
+			}
+		}
 		n.tabAdd(ni, meta)
 		n.log.Debug("punch complete: reclassified as direct node", "node", nodeID)
 	} else {
@@ -203,4 +218,17 @@ func (n *Node) OnPunchComplete(nodeID a2al.NodeID, peerLogicalAddr a2al.Address,
 
 	// Phase 5: exchange routing info with the newly-reachable peer.
 	go n.exchangeAfterPunch(nodeID, peerNetAddr)
+}
+
+// firstEndpointAddr returns the first quic:// address from an EndpointRecord,
+// or nil if none is present or parseable.
+func firstEndpointAddr(er *protocol.EndpointRecord) *net.UDPAddr {
+	for _, e := range er.Endpoints {
+		if len(e) > 7 && e[:7] == "quic://" {
+			if a, err := net.ResolveUDPAddr("udp", e[7:]); err == nil {
+				return a
+			}
+		}
+	}
+	return nil
 }

@@ -461,6 +461,29 @@ func (n *Node) tabAdd(ni protocol.NodeInfo, meta routing.EntryMeta) {
 	}
 
 	// Direct-contact path: existing manual LRU-eviction logic.
+	//
+	// If the peer self-advertises a stable quic:// address (non-symmetric NAT or
+	// public) and the caller supplied an ephemeral address (e.g. from ICE), prefer
+	// the advertised one so the routing table always points to the persistent port.
+	if len(ni.IP) > 0 {
+		recs := n.LocalStoreGet(nid, protocol.RecTypeEndpoint)
+		for _, sr := range recs {
+			if er, err := protocol.ParseEndpointRecord(sr); err == nil {
+				if er.NatType < protocol.NATSymmetric {
+					if ua := firstEndpointAddr(&er); ua != nil {
+						if ip4 := ua.IP.To4(); ip4 != nil {
+							ni.IP = append([]byte(nil), ip4...)
+						} else {
+							ni.IP = append([]byte(nil), ua.IP.To16()...)
+						}
+						ni.Port = uint16(ua.Port)
+					}
+				}
+				break
+			}
+		}
+	}
+
 	n.tabMu.Lock()
 	if n.table.Contains(nid) {
 		n.table.Add(ni, meta, now) // touch + update IP:Port + update VerifiedAt

@@ -97,7 +97,7 @@ func TestParalismDelegation_expired(t *testing.T) {
 	if err := VerifyDelegation(p, now+5, opPriv); err != nil {
 		t.Fatal(err)
 	}
-	if err := VerifyDelegation(p, now+10, opPriv); err == nil {
+	if err := VerifyDelegation(p, now+71, opPriv); err == nil {
 		t.Fatal("expected expired error")
 	}
 }
