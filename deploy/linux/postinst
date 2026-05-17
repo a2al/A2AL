@@ -16,6 +16,12 @@ if command -v semanage >/dev/null 2>&1 && command -v restorecon >/dev/null 2>&1;
     restorecon -Rv /opt/a2al/data >/dev/null 2>&1 || true
 fi
 
+# Save the installed binary as .old so the updater can roll back to it
+# if an auto-update is applied and the new binary fails health checks.
+if [ -f /opt/a2al/bin/a2ald ]; then
+    cp -f /opt/a2al/bin/a2ald /opt/a2al/bin/a2ald.old
+fi
+
 systemctl daemon-reload
 systemctl enable a2ald
 systemctl restart a2ald

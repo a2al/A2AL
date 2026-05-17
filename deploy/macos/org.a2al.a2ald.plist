@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>org.a2al.a2ald</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/a2ald</string>
+    </array>
+
+    <!-- Start automatically when the user logs in and keep it alive. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Log path: replace /Users/YOU with your actual home directory path.
+         Run: sed -i '' "s|/Users/YOU|$HOME|g" ~/Library/LaunchAgents/org.a2al.a2ald.plist -->
+    <key>StandardOutPath</key>
+    <string>/Users/YOU/Library/Logs/a2ald.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/YOU/Library/Logs/a2ald.log</string>
+</dict>
+</plist>

@@ -141,6 +141,24 @@ Or configure directly in `config.toml`:
 bootstrap = ["<your-public-ip>:4121"]
 ```
 
+## MCP client config (HTTP mode — use when running as a service)
+
+Once the service is running, point MCP clients at the HTTP endpoint instead of using `--mcp-stdio`:
+
+```json
+{
+  "mcpServers": {
+    "a2al": {
+      "url": "http://127.0.0.1:2121/mcp/"
+    }
+  }
+}
+```
+
+Call `a2al_status` and confirm `network_ready: true` (usually within 60–120 seconds of daemon start).
+
+---
+
 ## Management
 
 ```bash
