@@ -283,6 +283,27 @@ func decodeBody(msgType uint8, raw cbor.RawMessage) (any, error) {
 			return nil, ErrInvalidMessage
 		}
 		return &b, nil
+	case MsgDHTPush:
+		var b BodyDHTPush
+		if err := cbor.Unmarshal(raw, &b); err != nil {
+			return nil, err
+		}
+		if len(b.Key) != len(a2al.NodeID{}) {
+			return nil, ErrInvalidMessage
+		}
+		if err := signedRecordCheck(b.Record); err != nil {
+			return nil, err
+		}
+		return &b, nil
+	case MsgDHTPushACK:
+		var b BodyDHTPushACK
+		if err := cbor.Unmarshal(raw, &b); err != nil {
+			return nil, err
+		}
+		if len(b.Key) != len(a2al.NodeID{}) || len(b.MsgID) != 32 {
+			return nil, ErrInvalidMessage
+		}
+		return &b, nil
 	default:
 		return nil, ErrUnknownMsgType
 	}
@@ -388,6 +409,25 @@ func bodyWireCheck(msgType uint8, body any) error {
 			return fmt.Errorf("%w: body type for NAT_PROBE_ECHO", ErrInvalidMessage)
 		}
 		if len(b.Token) != 8 {
+			return ErrInvalidMessage
+		}
+	case MsgDHTPush:
+		b, ok := body.(*BodyDHTPush)
+		if !ok {
+			return fmt.Errorf("%w: body type for DHT_PUSH", ErrInvalidMessage)
+		}
+		if len(b.Key) != len(a2al.NodeID{}) {
+			return ErrInvalidMessage
+		}
+		if err := signedRecordCheck(b.Record); err != nil {
+			return err
+		}
+	case MsgDHTPushACK:
+		b, ok := body.(*BodyDHTPushACK)
+		if !ok {
+			return fmt.Errorf("%w: body type for DHT_PUSH_ACK", ErrInvalidMessage)
+		}
+		if len(b.Key) != len(a2al.NodeID{}) || len(b.MsgID) != 32 {
 			return ErrInvalidMessage
 		}
 	default:

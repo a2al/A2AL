@@ -316,7 +316,9 @@ func (q *Query) runIterQuery(
 		pctx, cancel := context.WithTimeout(ctx, queryPeerTimeout)
 		defer cancel()
 		if findValue {
-			recs, nodes, rpcErr := n.FindValueWithNodes(pctx, addr, target, recType)
+			// subscribe=true only in AggregateRecords mode (hitThreshold==0): request
+			// the peer to push future records via MsgDHTPush when they become available.
+			recs, nodes, rpcErr := n.FindValueWithNodes(pctx, addr, target, recType, hitThreshold == 0)
 			if rpcErr != nil {
 				// Phase 6 (查询引擎, Lowest): bad-track RPC failure → speculative punch.
 				if track == trackBad {

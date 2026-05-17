@@ -6,6 +6,7 @@ package dht
 import (
 	"context"
 	crand "crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"log/slog"
@@ -117,6 +118,11 @@ type Config struct {
 	// fully backward-compatible. Set by the host layer at startup via the same
 	// injection pattern as OnObservedAddr.
 	PunchTransport PunchTransport
+
+	// PushHandler is called when this node receives a MsgDHTPush (oneShot delivery).
+	// Returns true if the record was new (daemon renews subscription via ACK).
+	// Optional; nil disables push reception (node still participates as a pusher).
+	PushHandler func(key a2al.NodeID, rec protocol.SignedRecord) bool
 }
 
 // PeerHealthState classifies a peer's reachability based on observed RPC outcomes.
@@ -232,6 +238,12 @@ type Node struct {
 	// punch is the optional ICE hole-punch integration, injected via Config.
 	// Nil when running in direct-UDP-only mode (default).
 	punch PunchTransport
+
+	// pushMu guards pushHandler.
+	pushMu      sync.RWMutex
+	// pushHandler is called when this node receives a MsgDHTPush from a DHT node.
+	// Returns true if the message was new (causing the sender to renew its oneShot subscription).
+	pushHandler func(key a2al.NodeID, rec protocol.SignedRecord) bool
 }
 
 type waitEntry struct {
@@ -284,6 +296,7 @@ func NewNode(cfg Config) (*Node, error) {
 		onObservedAddr: cfg.OnObservedAddr,
 		auth:           cfg.RecordAuth,
 		punch:          cfg.PunchTransport,
+		pushHandler:    cfg.PushHandler,
 	}
 	n.table = routing.NewTable(nid, nil)
 	if cfg.SeenPeersPath != "" {
@@ -326,7 +339,8 @@ func (n *Node) recvLoop() {
 			continue
 		}
 		switch dec.Header.MsgType {
-		case protocol.MsgPong, protocol.MsgFindValueResp, protocol.MsgFindNodeResp, protocol.MsgStoreResp:
+		case protocol.MsgPong, protocol.MsgFindValueResp, protocol.MsgFindNodeResp, protocol.MsgStoreResp,
+			protocol.MsgDHTPushACK:
 			continue
 		case protocol.MsgPing:
 			n.onPing(from, dec)
@@ -340,6 +354,8 @@ func (n *Node) recvLoop() {
 			n.onNATProbeReq(from, dec)
 		case protocol.MsgNATProbeEcho:
 			n.onNATProbeEcho(from, dec)
+		case protocol.MsgDHTPush:
+			n.onDHTPush(from, dec)
 		default:
 		}
 	}
@@ -364,7 +380,8 @@ func (n *Node) InjectReceived(data []byte, from net.Addr) {
 		return
 	}
 	switch dec.Header.MsgType {
-	case protocol.MsgPong, protocol.MsgFindValueResp, protocol.MsgFindNodeResp, protocol.MsgStoreResp:
+	case protocol.MsgPong, protocol.MsgFindValueResp, protocol.MsgFindNodeResp, protocol.MsgStoreResp,
+		protocol.MsgDHTPushACK:
 		return
 	case protocol.MsgPing:
 		n.onPing(from, dec)
@@ -378,6 +395,8 @@ func (n *Node) InjectReceived(data []byte, from net.Addr) {
 		n.onNATProbeReq(from, dec)
 	case protocol.MsgNATProbeEcho:
 		n.onNATProbeEcho(from, dec)
+	case protocol.MsgDHTPush:
+		n.onDHTPush(from, dec)
 	}
 }
 
@@ -1020,10 +1039,20 @@ func (n *Node) onFindValue(from net.Addr, dec *protocol.DecodedMessage) {
 		}
 		break
 	}
-	if len(resp.Records) > 0 || resp.Record != nil {
+	hasRecords := len(resp.Records) > 0 || resp.Record != nil
+	if hasRecords {
 		n.statsFindValueServed.Add(1)
 	}
 	n.reply(from, dec, protocol.MsgFindValueResp, resp)
+
+	// Register oneShot subscription only when this node confirmed it holds records
+	// (proven valid neighbor principle: §4.2). Nodes that returned nothing are
+	// not in the hot STORE path and would produce dead pushes.
+	if body.OneShotSubscribe && hasRecords {
+		if udpAddr, ok := from.(*net.UDPAddr); ok && udpAddr != nil {
+			n.store.AddOneShotSub(tid, *udpAddr)
+		}
+	}
 }
 
 func (n *Node) onStore(from net.Addr, dec *protocol.DecodedMessage) {
@@ -1049,6 +1078,72 @@ func (n *Node) onStore(from net.Addr, dec *protocol.DecodedMessage) {
 		n.log.Debug("store rejected", "from", from, "key", hex.EncodeToString(key[:4]), "reason", reason, "err", err)
 	}
 	n.reply(from, dec, protocol.MsgStoreResp, &protocol.BodyStoreResp{Stored: ok, AlreadyHad: alreadyHad, Reason: reason})
+
+	// Deliver DHT_PUSH to all one-shot subscribers for this key.
+	// Only fires on genuinely new records (not already-had / rejected).
+	if err == nil {
+		n.dispatchDHTPush(key, body.Record)
+	}
+}
+
+// dispatchDHTPush delivers a newly stored record to all oneShot subscribers via MsgDHTPush.
+// Each subscriber goroutine uses sendAndWait; ACK with OneShotSubscribe=true renews the sub.
+func (n *Node) dispatchDHTPush(key a2al.NodeID, rec protocol.SignedRecord) {
+	subs := n.store.ConsumeOneShotSubs(key)
+	for _, sub := range subs {
+		sub := sub // capture
+		go n.pushToSubscriber(key, rec, sub)
+	}
+}
+
+// pushToSubscriber sends MsgDHTPush to one subscriber and processes the ACK.
+func (n *Node) pushToSubscriber(key a2al.NodeID, rec protocol.SignedRecord, sub oneShotSub) {
+	ctx, cancel := context.WithTimeout(n.ctx, 2*time.Second)
+	defer cancel()
+	addr := sub.addr
+	hdr := protocol.Header{Version: protocol.ProtocolVersion, MsgType: protocol.MsgDHTPush}
+	body := &protocol.BodyDHTPush{Key: key[:], Record: rec}
+	dec, err := n.sendAndWait(ctx, &addr, hdr, body, protocol.MsgDHTPushACK)
+	if err != nil {
+		n.log.Debug("dht_push: failed", "dst", addr.String(), "err", err)
+		return
+	}
+	ack := dec.Body.(*protocol.BodyDHTPushACK)
+	if ack.OneShotSubscribe {
+		// Recipient accepted the record as new → renew subscription for next delivery.
+		n.store.AddOneShotSub(key, addr)
+	}
+}
+
+// onDHTPush handles an incoming MsgDHTPush (this node is the subscriber / daemon).
+func (n *Node) onDHTPush(from net.Addr, dec *protocol.DecodedMessage) {
+	body := dec.Body.(*protocol.BodyDHTPush)
+	var key a2al.NodeID
+	copy(key[:], body.Key)
+
+	resubscribe := false
+	n.pushMu.RLock()
+	h := n.pushHandler
+	n.pushMu.RUnlock()
+	if h != nil {
+		resubscribe = h(key, body.Record)
+	}
+
+	msgID := sha256.Sum256(body.Record.Payload)
+	n.reply(from, dec, protocol.MsgDHTPushACK, &protocol.BodyDHTPushACK{
+		Key:              key[:],
+		MsgID:            msgID[:],
+		OneShotSubscribe: resubscribe,
+	})
+}
+
+// SetPushHandler registers fn as the handler for incoming MsgDHTPush messages.
+// fn(key, record) should return true if the record was new (causing ACK to renew
+// the subscription). Thread-safe; can be called at any time.
+func (n *Node) SetPushHandler(fn func(key a2al.NodeID, rec protocol.SignedRecord) bool) {
+	n.pushMu.Lock()
+	n.pushHandler = fn
+	n.pushMu.Unlock()
 }
 
 // natProbeEchoMax is the maximum number of NAT probe echoes sent per source IP
@@ -1364,9 +1459,11 @@ func (n *Node) FindNode(ctx context.Context, peer net.Addr, target a2al.NodeID) 
 }
 
 // FindValueWithNodes queries peer. recType 0 requests all record types in the response.
-func (n *Node) FindValueWithNodes(ctx context.Context, peer net.Addr, key a2al.NodeID, recType uint8) ([]protocol.SignedRecord, []protocol.NodeInfo, error) {
+// subscribe=true sets OneShotSubscribe in the request, asking the peer to push future records.
+// Only pass subscribe=true in AggregateRecords mode (not point-in-time FindRecords lookups).
+func (n *Node) FindValueWithNodes(ctx context.Context, peer net.Addr, key a2al.NodeID, recType uint8, subscribe bool) ([]protocol.SignedRecord, []protocol.NodeInfo, error) {
 	hdr := protocol.Header{Version: protocol.ProtocolVersion, MsgType: protocol.MsgFindValue}
-	body := &protocol.BodyFindValue{Target: key[:], RecType: recType}
+	body := &protocol.BodyFindValue{Target: key[:], RecType: recType, OneShotSubscribe: subscribe}
 	t0 := time.Now()
 	dec, err := n.sendAndWait(ctx, peer, hdr, body, protocol.MsgFindValueResp)
 	if err != nil {
@@ -1390,7 +1487,7 @@ func (n *Node) FindValueWithNodes(ctx context.Context, peer net.Addr, key a2al.N
 
 // FindValue queries peer for the best endpoint record at key NodeID (legacy helper).
 func (n *Node) FindValue(ctx context.Context, peer net.Addr, key a2al.NodeID) (*protocol.SignedRecord, error) {
-	recs, _, err := n.FindValueWithNodes(ctx, peer, key, 0)
+	recs, _, err := n.FindValueWithNodes(ctx, peer, key, 0, false)
 	if err != nil {
 		return nil, err
 	}
@@ -1576,3 +1673,4 @@ func (n *Node) Close() error {
 	n.wg.Wait()
 	return err
 }
+

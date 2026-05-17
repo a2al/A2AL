@@ -651,6 +651,7 @@ func (n *Node) healthProbeLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			n.runHealthProbes(ctx)
+			n.store.PruneExpiredOneShotSubs()
 		}
 	}
 }

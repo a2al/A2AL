@@ -15,6 +15,8 @@ const (
 	MsgStoreResp      uint8 = 0x08
 	MsgNATProbeReq    uint8 = 0x09 // NAT probe request: ask peer to echo to our claimed address
 	MsgNATProbeEcho   uint8 = 0x0A // NAT probe echo: sent by responder directly to claimed address
+	MsgDHTPush        uint8 = 0x0B // DHT_PUSH: DHT node → subscriber daemon, delivers new record (oneShot)
+	MsgDHTPushACK     uint8 = 0x0C // DHT_PUSH_ACK: daemon → DHT node, optionally renews subscription
 )
 
 // ProtocolVersion is the wire protocol version (spec §7.3).
@@ -73,8 +75,24 @@ type BodyFindNodeResp struct {
 }
 
 type BodyFindValue struct {
-	Target  []byte `cbor:"1,keyasint"`
-	RecType uint8  `cbor:"2,keyasint,omitempty"` // 0 = all types
+	Target           []byte `cbor:"1,keyasint"`
+	RecType          uint8  `cbor:"2,keyasint,omitempty"` // 0 = all types
+	OneShotSubscribe bool   `cbor:"3,keyasint,omitempty"` // request DHT node to push new records via DHT_PUSH
+}
+
+// BodyDHTPush is the body of MsgDHTPush sent from a DHT node to a subscribed daemon.
+// Key is the 32-byte DHT key; Record is the newly stored SignedRecord.
+type BodyDHTPush struct {
+	Key    []byte       `cbor:"1,keyasint"` // 32 bytes
+	Record SignedRecord `cbor:"2,keyasint"`
+}
+
+// BodyDHTPushACK is the body of MsgDHTPushACK sent from daemon back to the DHT node.
+// OneShotSubscribe=true renews the subscription for future records on the same key.
+type BodyDHTPushACK struct {
+	Key              []byte `cbor:"1,keyasint"` // 32 bytes
+	MsgID            []byte `cbor:"2,keyasint"` // 32-byte SHA-256 of Record.Payload
+	OneShotSubscribe bool   `cbor:"3,keyasint,omitempty"`
 }
 
 type BodyFindValueResp struct {

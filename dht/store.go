@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"encoding/hex"
 	"errors"
+	"net"
 	"slices"
 	"sync"
 	"time"
@@ -14,6 +15,14 @@ import (
 	"github.com/a2al/a2al"
 	"github.com/a2al/a2al/protocol"
 )
+
+const oneShotSubTTL = 60 * time.Second
+
+// oneShotSub is a single one-shot push subscription entry.
+type oneShotSub struct {
+	addr      net.UDPAddr
+	expiresAt time.Time
+}
 
 const (
 	maxSovereignPerKey  = 8
@@ -43,9 +52,12 @@ var ErrStorePolicy = errors.New("dht: policy rejected")
 type Store struct {
 	mu          sync.Mutex
 	m           map[string][]protocol.SignedRecord
-	lastAccess  map[string]int64 // key → unix timestamp of last Put or Get
-	auth        RecordAuthFunc   // nil → no authority check
+	lastAccess  map[string]int64 // key -> unix timestamp of last Put or Get
+	auth        RecordAuthFunc   // nil -> no authority check
 	maxKeys     int
+
+	oneShotMu      sync.Mutex
+	oneShotPending map[string][]oneShotSub // nodeIDKey -> []sub
 }
 
 // SetMaxKeys updates the maximum number of distinct DHT keys stored in-place.
@@ -63,10 +75,11 @@ func NewStore(auth RecordAuthFunc, maxKeys int) *Store {
 		maxKeys = DefaultMaxTotalKeys
 	}
 	return &Store{
-		m:          make(map[string][]protocol.SignedRecord),
-		lastAccess: make(map[string]int64),
-		auth:       auth,
-		maxKeys:    maxKeys,
+		m:              make(map[string][]protocol.SignedRecord),
+		lastAccess:     make(map[string]int64),
+		auth:           auth,
+		maxKeys:        maxKeys,
+		oneShotPending: make(map[string][]oneShotSub),
 	}
 }
 
@@ -179,7 +192,7 @@ func evictSovereign(list []protocol.SignedRecord, now time.Time) []protocol.Sign
 			}
 		}
 		if idx < 0 {
-			// only endpoints left — drop oldest endpoint by timestamp
+			// only endpoints left - drop oldest endpoint by timestamp
 			idx = oldestSovereignIndex(sov)
 		}
 		sov = slices.Delete(sov, idx, idx+1)
@@ -500,4 +513,61 @@ func (s *Store) DebugRecords(now time.Time) []StoreRecordDebug {
 		}
 	}
 	return out
+}
+
+// AddOneShotSub registers addr to receive a DHT_PUSH when a new record is stored at key.
+// Duplicate addr entries for the same key are deduplicated; existing TTL is refreshed.
+func (s *Store) AddOneShotSub(key a2al.NodeID, addr net.UDPAddr) {
+	k := nodeIDKey(key)
+	exp := time.Now().Add(oneShotSubTTL)
+	s.oneShotMu.Lock()
+	defer s.oneShotMu.Unlock()
+	subs := s.oneShotPending[k]
+	for i, sub := range subs {
+		if sub.addr.IP.Equal(addr.IP) && sub.addr.Port == addr.Port {
+			subs[i].expiresAt = exp
+			s.oneShotPending[k] = subs
+			return
+		}
+	}
+	s.oneShotPending[k] = append(subs, oneShotSub{addr: addr, expiresAt: exp})
+}
+
+// ConsumeOneShotSubs atomically removes and returns all valid (non-expired) subscriptions
+// for key. The caller is responsible for sending DHT_PUSH to each returned address.
+func (s *Store) ConsumeOneShotSubs(key a2al.NodeID) []oneShotSub {
+	k := nodeIDKey(key)
+	now := time.Now()
+	s.oneShotMu.Lock()
+	defer s.oneShotMu.Unlock()
+	subs := s.oneShotPending[k]
+	delete(s.oneShotPending, k)
+	var valid []oneShotSub
+	for _, sub := range subs {
+		if !sub.addr.IP.IsUnspecified() && sub.expiresAt.After(now) {
+			valid = append(valid, sub)
+		}
+	}
+	return valid
+}
+
+// PruneExpiredOneShotSubs removes all expired one-shot subscriptions across all keys.
+// Should be called periodically (e.g. every 30s).
+func (s *Store) PruneExpiredOneShotSubs() {
+	now := time.Now()
+	s.oneShotMu.Lock()
+	defer s.oneShotMu.Unlock()
+	for k, subs := range s.oneShotPending {
+		var live []oneShotSub
+		for _, sub := range subs {
+			if sub.expiresAt.After(now) {
+				live = append(live, sub)
+			}
+		}
+		if len(live) == 0 {
+			delete(s.oneShotPending, k)
+		} else {
+			s.oneShotPending[k] = live
+		}
+	}
 }
