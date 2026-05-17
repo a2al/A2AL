@@ -195,7 +195,7 @@ func (b *beaconManager) FindRecords(ctx context.Context, key a2al.NodeID, recTyp
 	}
 	now := time.Now()
 	for _, addr := range addrs {
-		recs, _, err := b.node.FindValueWithNodes(ctx, addr, key, recType)
+		recs, _, err := b.node.FindValueWithNodes(ctx, addr, key, recType, false)
 		if err != nil {
 			b.log.Debug("aux-dht find", "addr", addr, "err", err)
 			continue // listed peer unreachable, try next
@@ -275,7 +275,7 @@ func (b *beaconManager) refreshAddrs() []net.Addr {
 	if err != nil {
 		var dnsErr *net.DNSError
 		if errors.As(err, &dnsErr) && dnsErr.IsNotFound {
-			// NXDOMAIN: record actively removed — clear cached well-known addresses.
+			// NXDOMAIN: record actively removed - clear cached well-known addresses.
 			b.mu.Lock()
 			b.addrs = nil
 			b.lastDNSAt = time.Now()
@@ -406,7 +406,7 @@ func beaconQueryServicesAt(ctx context.Context, b *beaconManager, addr net.Addr,
 		return m
 	}
 
-	recs, _, err := b.node.FindValueWithNodes(ctx, addr, protocol.TopicNodeID(services[0]), protocol.RecTypeTopic)
+	recs, _, err := b.node.FindValueWithNodes(ctx, addr, protocol.TopicNodeID(services[0]), protocol.RecTypeTopic, false)
 	if err != nil {
 		return nil // unreachable
 	}
@@ -423,7 +423,7 @@ func beaconQueryServicesAt(ctx context.Context, b *beaconManager, addr net.Addr,
 	}
 
 	for _, svc := range services[1:] {
-		recs, _, err = b.node.FindValueWithNodes(ctx, addr, protocol.TopicNodeID(svc), protocol.RecTypeTopic)
+		recs, _, err = b.node.FindValueWithNodes(ctx, addr, protocol.TopicNodeID(svc), protocol.RecTypeTopic, false)
 		if err != nil {
 			return nil // well-known address dropped mid-query; let caller try next
 		}

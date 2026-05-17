@@ -274,6 +274,23 @@ func (p *modeAConnPool) evictIdle() {
 	}
 }
 
+// getLive returns a cached live QUIC connection without dialing.
+// Returns nil if no live connection is cached for (local, remote).
+// Used by M6 QUIC direct delivery to check before falling back to DHT.
+func (p *modeAConnPool) getLive(local, remote a2al.Address) quic.Connection {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	// Try noRelay=false first (most common), then noRelay=true.
+	for _, noRelay := range []bool{false, true} {
+		key := connPoolKey{local, remote, noRelay}
+		if ent, ok := p.pool[key]; ok && ent.conn != nil && ent.conn.Context().Err() == nil {
+			ent.lastUsed = time.Now()
+			return ent.conn
+		}
+	}
+	return nil
+}
+
 // retain increments the active-user count for the connection identified by
 // (local, remote, noRelay). While refs > 0 the background evictor will not close the
 // connection. Call once after a successful acquire for any long-lived use.

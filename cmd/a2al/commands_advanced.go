@@ -667,6 +667,53 @@ func parseInt(s string) (int, error) {
 	return n, err
 }
 
+func cmdUpdate(c *Client, g globalOpts, args []string) {
+	checkOnly := false
+	confirm := false
+	for _, a := range args {
+		switch a {
+		case "--check":
+			checkOnly = true
+		case "--confirm":
+			confirm = true
+		}
+	}
+
+	if checkOnly {
+		var out map[string]any
+		if _, _, err := c.DoRequest(http.MethodGet, "/update/status", nil, &out); err != nil {
+			fatal(err)
+		}
+		printJSON(true, out)
+		return
+	}
+
+	// Gate: if daemon is not a persistent service, require explicit --confirm
+	// to protect against unrecoverable outage on manual-run nodes.
+	if !confirm {
+		var status map[string]any
+		if _, _, err := c.DoRequest(http.MethodGet, "/update/status", nil, &status); err == nil {
+			if ps, _ := status["persistent_service"].(bool); !ps {
+				fmt.Fprintln(os.Stderr, "WARNING: daemon is not running as a managed service.")
+				fmt.Fprintln(os.Stderr, "If the new binary crashes immediately, the node will not self-recover.")
+				fmt.Fprintln(os.Stderr, "Re-run with --confirm to proceed, or install as a service first:")
+				fmt.Fprintln(os.Stderr, "  a2ald service install")
+				os.Exit(1)
+			}
+		}
+	}
+
+	var out map[string]any
+	if _, _, err := c.DoRequest(http.MethodPost, "/update/apply", nil, &out); err != nil {
+		fatal(err)
+	}
+	if g.JSON {
+		printJSON(true, out)
+		return
+	}
+	fmt.Println("Update check initiated. Run 'a2al update --check' to see status.")
+}
+
 func cmdHelp() {
 	fmt.Print(`a2al — A2AL daemon CLI
 
@@ -697,6 +744,7 @@ Commands (advanced):
   tunnel          Manage persistent multiplexed encrypted tunnels
   note            Send / poll encrypted offline messages
   config          Get or set daemon configuration
+  update          Check for or apply a2al updates
   help            Show this help
 
 Examples:

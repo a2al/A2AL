@@ -28,6 +28,7 @@ import (
 	"github.com/a2al/a2al/internal/nodeks"
 	"github.com/a2al/a2al/internal/peerscache"
 	"github.com/a2al/a2al/internal/registry"
+	"github.com/a2al/a2al/internal/updater"
 	"github.com/a2al/a2al/protocol"
 	"github.com/a2al/a2al/signaling"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -51,22 +52,30 @@ type Config struct {
 
 // Daemon is the a2ald runtime.
 type Daemon struct {
-	dataDir  string
-	cfgPath  string
-	cfg      *config.Config
-	log      *slog.Logger
-	h        *host.Host
-	reg      *registry.Registry
-	nodeAddr a2al.Address
-	regMu    sync.RWMutex
+	dataDir   string
+	cfgPath   string
+	cfg       *config.Config
+	log       *slog.Logger
+	h         *host.Host
+	reg       *registry.Registry
+	nodeAddr  a2al.Address
+	regMu     sync.RWMutex
+	startedAt time.Time
+	lockFile  *os.File // held for process lifetime; released on Close/exit
 
 	mcpOnce sync.Once
 	mcpSrv  *mcp.Server
 
-	// mailboxSeen prevents duplicate delivery of mailbox messages within a
-	// daemon session (DHT records persist until TTL expiry).
-	mailboxSeenMu sync.Mutex
-	mailboxSeen   map[string]map[string]time.Time // aidStr → msgKey → first-seen time
+	// mboxStore is the persistent mailbox store (cross-restart dedup, TTL cleanup).
+	mboxStore *mailboxStore
+	// mboxStoreStop signals the background flush/cleanup goroutine to stop.
+	mboxStoreStop chan struct{}
+
+	// bus is the daemon-internal event bus (mailbox.received, etc.).
+	bus *EventBus
+
+	// subMgr manages per-AID backoff poll timers for SSE subscribers.
+	subMgr *subscriptionManager
 
 	nodePublishMu  sync.Mutex
 	nodePublishSeq uint64 // last successfully published DHT seq for node identity
@@ -121,6 +130,13 @@ type Daemon struct {
 	// tryRepublishAgent for the same agent skip rather than race.
 	// Value type: *sync.Mutex.
 	agentPubLocks sync.Map
+
+	// persistentService is true when a2ald is managed by a service manager
+	// (systemd, SCM, launchd) that provides automatic restart on failure.
+	persistentService bool
+
+	// upd handles periodic version checks, binary replacement, and rollback watchdog.
+	upd *updater.Updater
 }
 
 // APIAddr returns the REST API / Web UI listen address from the loaded config.
@@ -144,6 +160,10 @@ func New(cfg Config) (*Daemon, error) {
 		return nil, errors.New("daemon: DataDir is required")
 	}
 	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
+		return nil, err
+	}
+	lockFile, err := acquireDataDirLock(cfg.DataDir)
+	if err != nil {
 		return nil, err
 	}
 
@@ -232,9 +252,13 @@ func New(cfg Config) (*Daemon, error) {
 		h:                h,
 		reg:              reg,
 		nodeAddr:         nodeAddr,
+		startedAt:        time.Now(),
+		lockFile:         lockFile,
 		agentLastPublish: make(map[a2al.Address]time.Time),
 		heartbeatAt:      make(map[a2al.Address]time.Time),
-		mailboxSeen:      make(map[string]map[string]time.Time),
+		mboxStoreStop:    make(chan struct{}),
+		bus:              NewEventBus(log),
+		// subMgr is initialised in Run() after mboxStore is ready.
 		iceRegNotify:     make(chan struct{}, 1),
 		netChangeNotify:  make(chan struct{}, 1),
 		beacon:           newBeaconManager(h.Node(), &nodeCfg, log),
@@ -252,7 +276,30 @@ func New(cfg Config) (*Daemon, error) {
 	} else {
 		d.tunnelTLS = tlsCfg
 	}
+
+	d.persistentService = updater.IsPersistentService()
+
+	// Initialise the updater with the node address string as the stable per-node ID.
+	d.upd = updater.New(
+		cfg.DataDir,
+		nodeAddr.String(),
+		nodeCfg.Update.Auto,
+		d.persistentService,
+		d.networkHealthy,
+		log,
+	)
+
 	return d, nil
+}
+
+// networkHealthy returns true when DHT connectivity has been established for
+// at least 10 minutes — used by the update watchdog to confirm the new binary
+// is functional before marking the update as successful.
+func (d *Daemon) networkHealthy() bool {
+	if time.Since(d.startedAt) < 8*time.Minute {
+		return false
+	}
+	return d.h.Node().DebugStatsData().TotalPeers >= 3
 }
 
 // toHostTURNServers converts config.TURNServerConfig slice to host.TURNServer slice,
@@ -301,7 +348,35 @@ func (d *Daemon) Run(ctx context.Context, mcpStdio bool) error {
 		d.connPool.Close()
 		savePeersCache(filepath.Join(d.dataDir, "peers.cache"), d.h, d.log)
 		_ = d.h.Close()
+		_ = d.lockFile.Close() // release data-dir exclusive lock
 	}()
+
+	// Initialise persistent mailbox store.
+	storePath := filepath.Join(d.dataDir, "mailbox_store.cbor")
+	d.mboxStore = newMailboxStore(storePath, d.log)
+	if err := d.mboxStore.Load(); err != nil {
+		d.log.Warn("mailbox store: load failed, starting fresh", "err", err)
+	}
+	go d.mboxStore.runBackground(d.mboxStoreStop)
+	defer func() {
+		close(d.mboxStoreStop)
+		if err := d.mboxStore.Flush(); err != nil {
+			d.log.Warn("mailbox store: final flush error", "err", err)
+		}
+	}()
+
+	// Register DHT_PUSH handler: incoming MsgDHTPush (0x0B) messages from DHT
+	// nodes are dispatched by the DHT node's recvLoop to the push handler.
+	d.registerDHTPushHandler()
+
+	// Initialise the subscription manager; pollFn executes an in-process mailbox poll.
+	d.subMgr = newSubscriptionManager(func(aid a2al.Address) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if _, err := d.execMailboxPoll(ctx, aid.String()); err != nil {
+			d.log.Debug("subMgr poll", "aid", aid.String(), "err", err)
+		}
+	})
 
 	d.log.Info("a2ald starting",
 		"node_aid", d.nodeAddr.String(),
@@ -362,6 +437,7 @@ func (d *Daemon) Run(ctx context.Context, mcpStdio bool) error {
 
 	go d.gatewayAcceptLoop(netCtx)
 	go d.connPool.startIdleEvictor(netCtx)
+	go d.upd.Run(netCtx)
 
 	if mcpStdio {
 		d.log.Info("a2ald ready",

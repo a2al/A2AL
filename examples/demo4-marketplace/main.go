@@ -414,14 +414,22 @@ func tryBobWithAlice(c *client, bobAID, aliceAID string) (string, string, error)
 	fmt.Printf("  Reading service record (rec_type=2)...")
 	var recResp struct {
 		Records []struct {
-			PayloadBase64 string `json:"payload_base64"`
+			PayloadBase64 string         `json:"payload_base64"`
+			Profile       map[string]any `json:"profile"` // decoded by daemon for rec_type=0x02
 		} `json:"records"`
 	}
 	if err := c.do("GET", "/resolve/"+aliceAID+"/records?type=2", nil, &recResp); err != nil {
 		fmt.Printf(" skipped\n")
 	} else if len(recResp.Records) > 0 {
-		payload, _ := base64.StdEncoding.DecodeString(recResp.Records[0].PayloadBase64)
-		fmt.Printf(" %s\n", string(payload))
+		rec := recResp.Records[0]
+		if len(rec.Profile) > 0 {
+			b, _ := json.Marshal(rec.Profile)
+			fmt.Printf(" %s\n", string(b))
+		} else if p, _ := base64.StdEncoding.DecodeString(rec.PayloadBase64); json.Valid(p) {
+			fmt.Printf(" %s\n", string(p))
+		} else {
+			fmt.Println(" (binary profile)")
+		}
 	} else {
 		fmt.Println(" no records")
 	}

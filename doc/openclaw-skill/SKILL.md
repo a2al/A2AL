@@ -17,11 +17,31 @@ Tangled Network — regardless of NAT, firewalls, or dynamic IPs.
 
 ## Prerequisites
 
-`a2ald` must be running as an MCP server. Verify with `a2al_status`.
+`a2ald` must be running. **Always call `a2al_status` first** and check:
+
+- `network_ready: true` — DHT is online; safe to proceed with any network operation.
+- `network_ready: false` — daemon just started; DHT peers still connecting (~1–2 min). Poll `a2al_status` and wait before retrying network operations.
+- `dht_peers: 0` — daemon cannot reach the network; check connectivity or restart `a2ald`.
+
+**When must `a2ald` stay running persistently?**
+
+- **Outbound-only** (resolve, discover, connect, fetch, mailbox to others): persistence is *not required*. Start `a2ald`, wait ~60–120 s for `network_ready: true`, use normally. Recommended but optional.
+- **Published / inbound agent** (you called `a2al_agent_publish`): persistence is **required**. Published records have a TTL. `a2ald` auto-renews them while running — if it stops, records expire within minutes and the agent becomes **unreachable**. Publishing once does NOT make the agent permanently discoverable. **After publishing, always install `a2ald` as a service** so the agent stays reachable 24/7.
+
+> To install: run `a2ald service install`
+
+**Two ways to run `a2ald`:**
+
+| Mode | How | When to use |
+|------|-----|-------------|
+| **Service mode** (recommended) | Install as a system service; MCP client connects via `http://127.0.0.1:2121/mcp/` | Daily AI assistant work; `network_ready` true from session start — network ops **near-instant** |
+| **Stdio mode** | MCP client launches `a2ald --mcp-stdio` as a subprocess | CI/scripts, isolated sessions; if a service is already running, automatically proxies to it — no cold-start; otherwise DHT cold-starts **60–120 s** |
+
+> **Note:** a single data directory can only be used by one `a2ald` process at a time. Do not run service mode and stdio mode with the same data directory simultaneously.
 
 **Setup (if not yet installed):**
 1. Download `a2ald` from https://github.com/a2al/a2al/releases
-2. Add to OpenClaw MCP config and restart:
+2. For stdio mode, add to OpenClaw MCP config and restart:
 
 ```json
 {
@@ -30,6 +50,8 @@ Tangled Network — regardless of NAT, firewalls, or dynamic IPs.
   }
 }
 ```
+
+For service mode, install as a system service first — see https://github.com/a2al/a2al/tree/main/deploy — then use `"url": "http://127.0.0.1:2121/mcp/"` instead.
 
 ## Core Concepts
 
@@ -53,6 +75,8 @@ a2al_agent_publish       → announce to Tangled Network
 ```
 
 Print the AID for the user — this is their permanent address to share.
+
+> **Important after publishing:** the agent is reachable only while `a2ald` is running. Published records have a TTL and expire if `a2ald` stops. Recommend the user run `a2ald service install` to keep the agent permanently online.
 
 ### Expose this instance as a callable HTTP service (Offer)
 

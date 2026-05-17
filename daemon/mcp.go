@@ -29,7 +29,28 @@ func (d *Daemon) mcpInstance() *mcp.Server {
 }
 
 func buildMCPServer(d *Daemon) *mcp.Server {
-	s := mcp.NewServer(&mcp.Implementation{Name: "a2ald", Title: "A2AL Daemon", Version: "0.1"}, nil)
+	s := mcp.NewServer(&mcp.Implementation{Name: "a2ald", Title: "A2AL Daemon", Version: "0.1"}, &mcp.ServerOptions{
+		Instructions: `a2ald is the A2AL peer-to-peer daemon (DHT + QUIC).
+
+ALWAYS call a2al_status first and check these fields before any network operation (resolve, discover, fetch, mailbox, connect):
+  - network_ready: true  → DHT is online, safe to proceed.
+  - network_ready: false → daemon just started; DHT connections still initialising (~1–2 min). Poll a2al_status and wait before retrying.
+  - dht_peers: 0         → daemon cannot reach the network; check connectivity or restart a2ald.
+
+When to keep a2ald running persistently:
+  - OUTBOUND-ONLY use (resolve, discover, connect, fetch, mailbox): persistence is NOT required. Start a2ald, wait 60–120 s for network_ready, then use normally. Recommended but optional.
+  - INBOUND / PUBLISHED agent (agent has called a2al_agent_publish): persistence IS REQUIRED. Published endpoint records have a TTL. a2ald automatically renews them while running — if it stops, the records expire and the agent becomes UNREACHABLE within minutes. Never assume "publish once = permanently reachable". The agent is online only as long as a2ald is running.
+
+After publishing an agent, always recommend the user install a2ald as a persistent service:
+  Run: a2ald service install
+  This ensures the agent stays reachable 24/7 without manual intervention.
+
+Two operating modes:
+  - Service mode (recommended): a2ald runs as a persistent system service (Linux: systemd, macOS: launchd, Windows: Task Scheduler/SCM). network_ready is true by the time any AI session starts — network operations are near-instant with no wait. MCP clients connect via HTTP: http://127.0.0.1:2121/mcp/
+  - Stdio mode: a2ald is launched as a subprocess by the MCP client (--mcp-stdio). If a service is already running, a2ald --mcp-stdio automatically proxies to it (no cold-start, no lock conflict). If no service exists, the DHT cold-starts — network_ready will be false for 60–120 seconds.
+
+Install as a service: run 'a2ald service install' or see https://github.com/a2al/a2al/tree/main/deploy`,
+	})
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_identity_generate",

@@ -69,6 +69,29 @@ Key properties:
 
 `a2ald` is a *gateway*, not a *proxy*. It resolves addresses and establishes connections, then steps aside. Your application data flows directly between agents — `a2ald` is never in the data path after the connection is established.
 
+### Running as a persistent service
+
+For reliable daily use, install `a2ald` as a system service. It starts automatically on login, stays connected 24/7, and is immediately network-ready when any AI session starts — no 60–120 second cold-start per session.
+
+```bash
+a2ald service install          # register + start
+a2ald service status           # check running state
+a2ald service stop             # stop
+a2ald service start            # start
+a2ald service uninstall        # remove service registration
+```
+
+**Flags for `install`:**
+
+| Flag | Description |
+|------|-------------|
+| `-data-dir <path>` | Data directory to use (default: platform config dir). Baked in at install time — service and direct CLI always use the same directory. |
+| `-user` | No-admin install (Windows only): uses Task Scheduler instead of SCM. Service stops at logout; does not require an elevated prompt. |
+
+> **Windows note:** without `-user`, run the install command in an elevated (Admin) terminal for system-level SCM installation with automatic restart on failure. With `-user`, no elevation is needed but the service stops when you log out.
+
+If you prefer not to use the built-in CLI, platform-specific configuration files (systemd unit, launchd plist, Task Scheduler XML) are available in [`deploy/`](../deploy/).
+
 ### Delegated identity — the master key stays offline
 
 When you register an agent, A2AL generates two keys:

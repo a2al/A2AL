@@ -13,7 +13,6 @@ import (
 	"errors"
 	"net"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -752,6 +751,12 @@ func (d *Daemon) execStatus() map[string]any {
 	d.publishMetaMu.Lock()
 	nlp := d.nodeLastPublish
 	d.publishMetaMu.Unlock()
+
+	uptimeSec := int(time.Since(d.startedAt).Seconds())
+	dhtStats := d.h.Node().DebugStatsData()
+	dhtPeers := dhtStats.TotalPeers
+	networkReady := dhtPeers >= 3 && uptimeSec >= 30
+
 	out := map[string]any{
 		"node_aid":             d.nodeAddr.String(),
 		"auto_publish":         d.cfg.AutoPublish,
@@ -761,6 +766,10 @@ func (d *Daemon) execStatus() map[string]any {
 		"endpoint_ttl_s":       int(endpointRecordTTL),
 		"version":              version.Version,
 		"commit":               version.Commit,
+		"uptime_seconds":       uptimeSec,
+		"dht_peers":            dhtPeers,
+		"network_ready":        networkReady,
+		"persistent_service":   d.persistentService,
 	}
 	if !nlp.IsZero() {
 		out["node_last_publish_at"] = nlp.UTC().Format(time.RFC3339)
@@ -769,6 +778,12 @@ func (d *Daemon) execStatus() map[string]any {
 		out["node_last_publish_at"] = nil
 		out["node_next_republish_estimate"] = nil
 	}
+
+	// Merge update subsystem status fields.
+	for k, v := range d.upd.Status() {
+		out[k] = v
+	}
+
 	return out
 }
 
@@ -961,7 +976,57 @@ func (d *Daemon) execMailboxSend(ctx context.Context, localAidStr, recipientStr 
 	if e == nil {
 		return errNotFound
 	}
-	return d.h.SendMailboxForAgent(ctx, aid, recipient, msgType, body)
+
+	// Build the signed record once; try delivery in three layers.
+	sr, err := d.h.BuildMailboxSignedRecord(ctx, aid, recipient, msgType, body)
+	if err != nil {
+		return err
+	}
+	msgID := MsgIDFromRecord(sr)
+
+	// L1: existing live QUIC connection — zero-latency direct delivery.
+	if conn := d.connPool.getLive(aid, recipient); conn != nil {
+		if err := sendMailboxQuic(ctx, conn, msgID, sr); err == nil {
+			return nil
+		}
+	}
+
+	// L2: background ICE dial + concurrent delivery attempt.
+	// connPool.acquire uses context.WithoutCancel internally (singleflight semantics),
+	// so we must not block the caller on it. Instead we race it against L3:
+	//   - L3 (DHT STORE) fires immediately and provides the reliability guarantee.
+	//   - L2 goroutine dials ICE; on success it also delivers the same record.
+	//   - Receiver deduplicates by msg_id, so double-delivery is harmless.
+	//   - The established QUIC connection is cached in connPool for future L1 hits.
+	go func() {
+		er, _ := d.h.Resolve(context.Background(), recipient)
+		if er == nil || len(er.Signals) == 0 || !endpointFresh(er) {
+			return
+		}
+		warmCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		conn, _, err := d.connPool.acquire(warmCtx, aid, recipient, er, false)
+		if err == nil {
+			_ = sendMailboxQuic(warmCtx, conn, msgID, sr)
+		}
+	}()
+
+	// L3: DHT STORE — caller awaits this for the reliability guarantee.
+	return d.h.PublishMailboxRecord(ctx, recipient, sr)
+}
+
+// endpointFresh returns true when the EndpointRecord's Timestamp + TTL is in the future,
+// indicating the record was published recently enough to trust the recipient as online.
+func endpointFresh(er *protocol.EndpointRecord) bool {
+	if er == nil {
+		return false
+	}
+	expiry := int64(er.Timestamp) + int64(er.TTL)
+	// Also reject records that were published more than 30 minutes ago to avoid
+	// wasting time on ICE dial attempts to a stale endpoint.
+	const maxAge = 30 * 60
+	age := time.Now().Unix() - int64(er.Timestamp)
+	return age <= maxAge && expiry > time.Now().Unix()
 }
 
 func (d *Daemon) execMailboxPoll(ctx context.Context, aidStr string) ([]map[string]any, error) {
@@ -970,58 +1035,79 @@ func (d *Daemon) execMailboxPoll(ctx context.Context, aidStr string) ([]map[stri
 		return nil, errBadAID
 	}
 	d.regMu.RLock()
-	e := d.reg.Get(aid)
+	reg := d.reg.Get(aid)
 	d.regMu.RUnlock()
-	if e == nil {
+	if reg == nil {
 		return nil, errNotFound
 	}
-	msgs, err := d.h.PollMailboxForAgent(ctx, aid)
+
+	// Fetch raw SignedRecords from DHT so we can persist them in the store.
+	recs, err := d.h.FetchMailboxRawForAgent(ctx, aid)
 	if err != nil {
 		return nil, err
 	}
-	if d.beacon != nil && len(msgs) == 0 {
-		if recs, _ := d.beacon.FindRecords(ctx, a2al.NodeIDFromAddress(aid), protocol.RecTypeMailbox); len(recs) > 0 {
-			if extra, e2 := d.h.DecryptMailboxRecords(aid, recs); e2 == nil {
-				msgs = extra
+
+	// Beacon fallback: supplement when DHT returned nothing.
+	if d.beacon != nil && len(recs) == 0 {
+		if beaconRecs, _ := d.beacon.FindRecords(ctx, a2al.NodeIDFromAddress(aid), protocol.RecTypeMailbox); len(beaconRecs) > 0 {
+			now2 := time.Now()
+			for _, sr := range beaconRecs {
+				if protocol.VerifySignedRecord(sr, now2) == nil {
+					recs = append(recs, sr)
+				}
 			}
 		}
 	}
 
-	d.mailboxSeenMu.Lock()
-	if d.mailboxSeen == nil {
-		d.mailboxSeen = make(map[string]map[string]time.Time)
-	}
-	seen := d.mailboxSeen[aidStr]
-	if seen == nil {
-		seen = make(map[string]time.Time)
-		d.mailboxSeen[aidStr] = seen
-	}
 	now := time.Now()
-	const mailboxSeenTTL = 2 * time.Hour
-	for k, t := range seen {
-		if now.Sub(t) > mailboxSeenTTL {
-			delete(seen, k)
+	store := d.mboxStore
+
+	// Insert new records into store; publish event for genuinely new ones.
+	newCount := 0
+	for _, sr := range recs {
+		msgID := MsgIDFromRecord(sr)
+		ttlExpires := now.Unix() + int64(sr.TTL)
+		if store.Put(msgID, MailboxStoreEntry{
+			RecipientAID: aid,
+			Record:       sr,
+			ReceivedAt:   now.Unix(),
+			TTLExpires:   ttlExpires,
+		}) {
+			newCount++
 		}
 	}
-	out := make([]map[string]any, 0, len(msgs))
-	for _, m := range msgs {
-		key := mailboxMsgKey(m)
-		if _, already := seen[key]; already {
-			continue
-		}
-		seen[key] = now
-		out = append(out, map[string]any{
-			"sender":      m.Sender.String(),
-			"msg_type":    m.MsgType,
-			"body_base64": base64.StdEncoding.EncodeToString(m.Body),
+	if newCount > 0 && d.bus != nil {
+		d.bus.Publish(Event{
+			Type: "mailbox.received",
+			AID:  aid,
+			Data: map[string]any{"count": newCount},
 		})
 	}
-	d.mailboxSeenMu.Unlock()
-	return out, nil
-}
 
-func mailboxMsgKey(m protocol.MailboxMessage) string {
-	return hex.EncodeToString(m.Sender[:]) + ":" + strconv.FormatUint(m.Seq, 10)
+	// Decrypt and return unconsumed entries.
+	unconsumed, _ := store.GetUnconsumed(aid)
+	out := make([]map[string]any, 0, len(unconsumed))
+	for _, entry := range unconsumed {
+		msg, decErr := d.h.DecryptMailboxRecordFor(aid, entry.Record)
+		if decErr != nil {
+			continue
+		}
+		msgID := MsgIDFromRecord(entry.Record)
+		store.MarkConsumed(msgID)
+		out = append(out, map[string]any{
+			"sender":      msg.Sender.String(),
+			"msg_type":    msg.MsgType,
+			"body_base64": base64.StdEncoding.EncodeToString(msg.Body),
+		})
+	}
+
+	// Signal activity so the backoff timer resets — a poll proves the agent
+	// is online and likely to receive more messages soon.
+	if d.subMgr != nil {
+		d.subMgr.NotifyActivity(aid)
+	}
+
+	return out, nil
 }
 
 type topicRegisterReq struct {

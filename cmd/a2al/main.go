@@ -57,6 +57,8 @@ func main() {
 		cmdNote(cli, g, args)
 	case "config":
 		cmdConfig(cli, g, args)
+	case "update":
+		cmdUpdate(cli, g, args)
 	default:
 		fmt.Fprintf(os.Stderr, "a2al: unknown command %q (try a2al help)\n", cmd)
 		os.Exit(1)

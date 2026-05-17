@@ -56,7 +56,9 @@ func newTestDaemon(t *testing.T) *Daemon {
 		nodeAddr:         ks.Address(),
 		agentLastPublish: make(map[a2al.Address]time.Time),
 		heartbeatAt:      make(map[a2al.Address]time.Time),
-		mailboxSeen:      make(map[string]map[string]time.Time),
+		mboxStore:        newMailboxStore(filepath.Join(dir, "mailbox_store.cbor"), slog.New(slog.NewTextHandler(io.Discard, nil))),
+		mboxStoreStop:    make(chan struct{}),
+		bus:              NewEventBus(slog.New(slog.NewTextHandler(io.Discard, nil))),
 	}
 }
 

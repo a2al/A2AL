@@ -64,6 +64,10 @@ func (d *Daemon) routes() http.Handler {
 	mux.HandleFunc("POST /demo/start", d.handleDemoStart)
 	mux.HandleFunc("POST /demo/stop", d.handleDemoStop)
 	mux.HandleFunc("GET /sessions/{port}", d.handleGetSession)
+	mux.HandleFunc("GET /agents/{aid}/events", d.withAgentMiddleware(d.handleAgentEvents))
+	mux.HandleFunc("GET /events", d.handleGlobalEvents)
+	mux.HandleFunc("GET /update/status", d.handleUpdateStatus)
+	mux.HandleFunc("POST /update/apply", d.handleUpdateApply)
 
 	// Mount Web UI assets and the AID proxy outside withMiddleware:
 	// - Web UI HTML/JS/CSS contain no sensitive data; auth happens at the API call level.
@@ -1158,4 +1162,122 @@ func (d *Daemon) handleGetSession(w http.ResponseWriter, r *http.Request) {
 func mustParseAddress(s string) a2al.Address {
 	addr, _ := a2al.ParseAddress(s)
 	return addr
+}
+
+// handleAgentEvents streams SSE events for a specific agent AID.
+// Accepts optional ?types=mailbox.received,... query param to filter event types.
+func (d *Daemon) handleAgentEvents(w http.ResponseWriter, r *http.Request) {
+	aidStr := r.PathValue("aid")
+	aid, err := a2al.ParseAddress(aidStr)
+	if err != nil {
+		http.Error(w, `{"error":"bad aid"}`, http.StatusBadRequest)
+		return
+	}
+	types := parseTypesParam(r.URL.Query().Get("types"))
+	ch, cancel := d.bus.Subscribe(Filter{AID: aid, Types: types})
+	defer cancel()
+
+	if d.subMgr != nil {
+		d.subMgr.Acquire(aid)
+		defer d.subMgr.Release(aid)
+	}
+
+	serveSSE(w, r, ch)
+}
+
+// handleGlobalEvents streams SSE events for all agents (CLI-friendly, loopback-only in practice).
+// Accepts optional ?types=... query param to filter event types.
+func (d *Daemon) handleGlobalEvents(w http.ResponseWriter, r *http.Request) {
+	types := parseTypesParam(r.URL.Query().Get("types"))
+	ch, cancel := d.bus.Subscribe(Filter{Types: types})
+	defer cancel()
+	serveSSE(w, r, ch)
+}
+
+// serveSSE writes W3C SSE headers and streams events from ch until the client disconnects.
+func serveSSE(w http.ResponseWriter, r *http.Request, ch <-chan Event) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+
+	fl, ok := w.(http.Flusher)
+	if !ok {
+		return
+	}
+	fl.Flush()
+
+	enc := json.NewEncoder(w)
+	ctx := r.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case evt, open := <-ch:
+			if !open {
+				return
+			}
+			data, err := sseEventJSON(evt)
+			if err != nil {
+				continue
+			}
+			fmt.Fprintf(w, "event: %s\ndata: %s\n\n", evt.Type, data)
+			_ = enc
+			fl.Flush()
+		}
+	}
+}
+
+func sseEventJSON(evt Event) ([]byte, error) {
+	payload := map[string]any{
+		"type": evt.Type,
+		"at":   evt.At.UTC().Format(time.RFC3339),
+	}
+	if evt.AID != (a2al.Address{}) {
+		payload["aid"] = evt.AID.String()
+	}
+	if evt.Data != nil {
+		payload["data"] = evt.Data
+	}
+	return json.Marshal(payload)
+}
+
+func (d *Daemon) handleUpdateStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, d.upd.Status())
+}
+
+func (d *Daemon) handleUpdateApply(w http.ResponseWriter, r *http.Request) {
+	go func() {
+		// Use a background context: r.Context() is cancelled as soon as the
+		// 202 response is sent (which is nearly instant), aborting all HTTP
+		// calls inside TriggerNow before they complete.
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+		defer cancel()
+		if err := d.upd.TriggerNow(ctx); err != nil {
+			d.log.Warn("update apply: failed", "err", err)
+		}
+	}()
+	resp := map[string]any{"message": "update check initiated"}
+	if !d.persistentService {
+		resp["warning"] = "daemon is not running as a managed service; if the new binary crashes immediately, the node will not self-recover — manual restart may be required"
+	}
+	writeJSONStatus(w, http.StatusAccepted, resp)
+}
+
+// parseTypesParam splits a comma-separated event types string.
+// Returns nil (match all) for empty input.
+func parseTypesParam(s string) []string {
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	var out []string
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }

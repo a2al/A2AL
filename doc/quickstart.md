@@ -39,11 +39,32 @@ Extract and place both in your PATH.
 
 ## Start the daemon
 
+**Option A — Install as a persistent background service (recommended)**
+
+```bash
+a2ald service install   # registers and starts the service
+```
+
+The service starts automatically on login and stays connected 24/7. Network operations are near-instant with no warm-up wait.
+
+To manage the service later:
+
+```bash
+a2ald service status
+a2ald service stop
+a2ald service start
+a2ald service uninstall
+```
+
+> On Windows, run in an elevated (Admin) terminal for system-level install, or add `--user` to install via Task Scheduler without admin rights.
+
+**Option B — Run directly (one-off or transient use)**
+
 ```bash
 a2ald
 ```
 
-On first run, `a2ald` generates a node identity, joins the Tangled Network via public bootstrap nodes, and starts listening. No configuration needed.
+`a2ald` generates a node identity on first run, joins the Tangled Network, and starts listening. No configuration needed. Note: DHT bootstrap takes 60–120 seconds before network operations are ready.
 
 ## Open the Web UI
 

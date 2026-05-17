@@ -4,6 +4,7 @@
 package daemon
 
 import (
+	"bufio"
 	"context"
 	"crypto/ed25519"
 	"crypto/tls"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/a2al/a2al/host"
+	"github.com/a2al/a2al/protocol"
 	"github.com/quic-go/quic-go"
 )
 
@@ -132,10 +134,40 @@ func (d *Daemon) serveGatewayConn(ctx context.Context, ac *host.AgentConn) {
 		streamCount.Add(1)
 		go func() {
 			defer streamCount.Add(-1)
-			d.bridgeInboundStream(ac, str, reg.ServiceTCP)
+			d.dispatchInboundStream(ac, str, reg.ServiceTCP)
 		}()
 	}
 }
+
+// dispatchInboundStream peeks the first 4 bytes to detect the frame type, then
+// dispatches to the appropriate handler.  Unrecognised (or no) magic falls
+// through to bridgeInboundStream, preserving backward compatibility for all
+// existing stream types (fetch, connect, tunnel, plain TCP bridge).
+func (d *Daemon) dispatchInboundStream(ac *host.AgentConn, str quic.Stream, serviceTCP string) {
+	br := bufio.NewReaderSize(str, 4)
+	magic, err := br.Peek(4)
+	if err == nil && string(magic) == protocol.MagicMailboxFrame {
+		// Consume the magic bytes we peeked.
+		_, _ = br.Discard(4)
+		// peekStream satisfies io.ReadWriter: reads from the buffered reader,
+		// writes (ACK) directly to the underlying QUIC stream.
+		d.acceptMailboxFrame(ac, &peekStream{Reader: br, Stream: str})
+		_ = str.Close()
+		return
+	}
+	// Default: wrap the buffered reader back for the bridge path.
+	// Since we only peeked (not consumed), the bridge sees the full stream.
+	d.bridgeInboundStream(ac, &peekStream{Reader: br, Stream: str}, serviceTCP)
+}
+
+// peekStream wraps a bufio.Reader over a quic.Stream so that already-buffered
+// bytes are visible to the next Read call without changing the quic.Stream interface.
+type peekStream struct {
+	*bufio.Reader
+	quic.Stream
+}
+
+func (p *peekStream) Read(b []byte) (int, error) { return p.Reader.Read(b) }
 
 func (d *Daemon) bridgeInboundStream(ac *host.AgentConn, str quic.Stream, serviceTCP string) {
 	if serviceTCP == "" {

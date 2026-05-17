@@ -716,6 +716,14 @@ func (h *Host) SetBeaconStatsProvider(fn func() map[string]any) {
 	h.beaconStatsMu.Unlock()
 }
 
+// SetDHTPushHandler registers fn as the handler for incoming MsgDHTPush messages
+// (oneShot push from DHT nodes). fn(key, record) returns true when the record is
+// new, which causes the ACK to renew the subscription for future deliveries.
+// Works in both single-port (UDPMux) and dual-port modes.
+func (h *Host) SetDHTPushHandler(fn func(key a2al.NodeID, rec protocol.SignedRecord) bool) {
+	h.node.SetPushHandler(fn)
+}
+
 const extipCacheTTL = 5 * time.Minute
 
 // ensureExternalIP returns a cached or freshly probed external IP string.

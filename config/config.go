@@ -84,9 +84,22 @@ type Config struct {
 	// When true, relay (TURN) candidates are excluded unless the per-call API field
 	// override enables it. Default false (relay allowed).
 	DisableRelay bool `toml:"disable_relay" json:"disable_relay,omitempty"`
+
+	// Update controls the auto-update behaviour.
+	Update UpdateConfig `toml:"update" json:"update,omitempty"`
+}
+
+// UpdateConfig holds auto-update settings. Only Auto is user-facing;
+// all timing constants live in the updater package.
+type UpdateConfig struct {
+	// Auto enables background version checks and automatic binary replacement.
+	// Default true. Set false to disable automatic updates entirely; the
+	// "a2ald update" CLI command still works regardless of this setting.
+	Auto bool `toml:"auto" json:"auto"`
 }
 
 // Default returns a copy with zero values filled to spec defaults.
+// Update.Auto is true by default.
 func Default() Config {
 	return Config{
 		ListenAddr:       ":4121",
@@ -98,6 +111,7 @@ func Default() Config {
 		APIAddr:          "127.0.0.1:2121",
 		APIToken:         "",
 		KeyDir:           "",
+		Update:           UpdateConfig{Auto: true},
 		LogFormat:        "text",
 		LogLevel:         "info",
 		AutoPublish:      true,
