@@ -136,6 +136,13 @@ func (h *Hub) signalConnLoop(c *websocket.Conn) {
 		}
 		if fr.T == "reg" && fr.AID != "" {
 			h.registerAID(c, fr.AID)
+			// Send ack so the client knows registration has been processed.
+			// Unknown frame types are silently ignored by receivers that don't need it.
+			if ack, e := EncodeFrame(Frame{T: "ack"}); e == nil {
+				ackCtx, ackCancel := context.WithTimeout(ctx, 5*time.Second)
+				_ = c.Write(ackCtx, websocket.MessageBinary, ack)
+				ackCancel()
+			}
 		}
 	}
 }

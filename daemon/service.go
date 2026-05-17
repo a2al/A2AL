@@ -616,6 +616,11 @@ func (d *Daemon) execAgentProbe(ctx context.Context, aidStr string) (map[string]
 	return out, nil
 }
 
+// execAgentPublish republishes all public records for an agent (endpoint,
+// services, profile) to the DHT. The endpoint publish is synchronous and its
+// seq is returned; services and profile are published asynchronously in a
+// goroutine. This is the manual counterpart to tryRepublishAgent (30 min
+// auto-cycle) and the two should stay semantically equivalent.
 func (d *Daemon) execAgentPublish(ctx context.Context, aidStr string) (uint64, error) {
 	aid, err := a2al.ParseAddress(aidStr)
 	if err != nil {
@@ -638,12 +643,6 @@ func (d *Daemon) execAgentPublish(ctx context.Context, aidStr string) (uint64, e
 	if e == nil {
 		return 0, errNotFound
 	}
-	// Snapshot lastPublish before the endpoint publish so we can compare it
-	// after persist without reading our own just-written value.
-	d.publishMetaMu.Lock()
-	lastPub := d.agentLastPublish[aid]
-	d.publishMetaMu.Unlock()
-
 	// Warn when service_tcp is set but unreachable; still allow publish for agents with their own public URL.
 	if e.ServiceTCP != "" && !probeTCP(e.ServiceTCP, 2*time.Second) {
 		d.log.Warn("service_tcp unreachable at publish time; daemon gateway forwarding will not work", "aid", aid.String(), "service_tcp", e.ServiceTCP)
@@ -682,21 +681,15 @@ persist:
 		return 0, errPersist
 	}
 	d.recordAgentPublishTime(aid)
-	// Topic records share the same TTL as endpoint records (3600 s) and are
-	// normally renewed together in tryRepublishAgent every 30 min. When POST
-	// /publish is called but the last joint publish was more than republishPeriod
-	// ago — or never happened since daemon start (lastPub.IsZero(), e.g. after a
-	// restart) — topic records may be approaching TTL expiry. Use this endpoint
-	// refresh as an opportunity to renew them too. The check is a single O(1)
-	// in-memory map read; the renewal itself runs in a goroutine.
-	if len(e.Services) > 0 && (lastPub.IsZero() || time.Since(lastPub) > republishPeriod) {
-		snap := *e
-		go func() {
-			svcCtx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-			defer cancel()
-			d.republishAgentServices(svcCtx, &snap)
-		}()
-	}
+	// Always republish topic and profile records alongside the endpoint when
+	// the user explicitly triggers POST /publish. This ensures a manual refresh
+	// is a full cycle (endpoint + services + profile), matching tryRepublishAgent.
+	snap := *e
+	go func() {
+		svcCtx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+		defer cancel()
+		d.republishAgentServices(svcCtx, &snap)
+	}()
 	return nextSeq, nil
 }
 
@@ -984,11 +977,10 @@ func (d *Daemon) execMailboxSend(ctx context.Context, localAidStr, recipientStr 
 	}
 	msgID := MsgIDFromRecord(sr)
 
-	// L1: existing live QUIC connection — zero-latency direct delivery.
+	// L1: existing live QUIC connection — best-effort zero-latency delivery.
+	// L3 always runs regardless of L1 outcome to guarantee DHT persistence.
 	if conn := d.connPool.getLive(aid, recipient); conn != nil {
-		if err := sendMailboxQuic(ctx, conn, msgID, sr); err == nil {
-			return nil
-		}
+		_ = sendMailboxQuic(ctx, conn, msgID, sr)
 	}
 
 	// L2: background ICE dial + concurrent delivery attempt.

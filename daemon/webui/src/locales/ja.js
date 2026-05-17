@@ -383,4 +383,16 @@ export default {
   'demo.started': 'デモ能力が有効になりました。他のノードからこのデモエージェントを発見できます。',
   'demo.stopped': 'デモ能力を停止しました。',
   'demo.confirm_overwrite': '現在の Agent URL "{addr}" が上書きされます。停止時に元の値が復元されます。続けますか？',
+
+  'node.service.persistent':     'サービス',
+  'node.service.transient':      'スタンドアロン',
+  'node.service.persistent_tip': 'システムサービスとして動作中 — 起動時に自動開始、障害時に自動復旧',
+  'node.service.transient_tip':  'システムサービス未インストール — クリックして設定方法を確認',
+  'node.service.modal.title':    '⚠ システムサービスがインストールされていません',
+  'node.service.modal.body':
+    'a2ald はスタンドアロンプロセスとして動作しています。ターミナルを閉じるか端末を再起動すると、' +
+    'a2ald が停止してエージェントはオフラインになります。手動で a2ald を再起動するまで復旧しません。\n\n' +
+    'a2ald をシステムサービスとしてインストールすると、起動時に自動開始し、障害時にも自動復旧します：',
+  'node.service.modal.after':
+    '上記のコマンドをコピーして実行し、a2ald をシステムサービスとしてインストールしてください（推奨）。',
 };

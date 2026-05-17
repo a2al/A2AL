@@ -41,6 +41,14 @@ func TestHubTargetedICEPair(t *testing.T) {
 	if err := subWS.Write(ctx, websocket.MessageBinary, regFr); err != nil {
 		t.Fatal(err)
 	}
+	// Wait for ack so we know the hub has processed the reg before the caller connects.
+	_, ackData, err := subWS.Read(ctx)
+	if err != nil {
+		t.Fatal("read ack:", err)
+	}
+	if ack, _ := DecodeFrame(ackData); ack.T != "ack" {
+		t.Fatalf("expected ack frame, got %q", ack.T)
+	}
 
 	callerURL, err := AppendRoomToICEURL(base, room)
 	if err != nil {

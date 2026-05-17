@@ -88,6 +88,17 @@ async function refreshHeader() {
     add('Tangled', host.dht_addr || '—');
     add('QUIC', host.quic_addr || '—');
     add(t('node.peers'), String(stats.total_peers ?? 0));
+    // Service-mode badge
+    const badge = document.getElementById('svcBadge');
+    if (badge && status?.persistent_service !== undefined) {
+      const ps = status.persistent_service;
+      badge.className = ps ? 'badge b-green' : 'badge b-yellow';
+      badge.textContent = t(ps ? 'node.service.persistent' : 'node.service.transient');
+      badge.title = t(ps ? 'node.service.persistent_tip' : 'node.service.transient_tip');
+      badge.style.cursor = ps ? 'default' : 'pointer';
+      badge.onclick = ps ? null : () => openServiceModal();
+    }
+
     // Update footer version — build display string once, reuse on language switch.
     if (status?.version) {
       const commit = status.commit && status.commit !== 'unknown' ? ` (${status.commit.slice(0, 7)})` : '';
@@ -106,6 +117,29 @@ async function refreshHeader() {
 function updateNavActive() {
   document.querySelectorAll('.nav-tabs button[data-tab]').forEach((btn) => {
     btn.classList.toggle('active', btn.dataset.tab === tab);
+  });
+}
+
+/** Open the "install as a system service" guidance modal. */
+function openServiceModal() {
+  const cmd = 'a2ald service install';
+  const bodyLines = t('node.service.modal.body').split('\n');
+  const bodyHtml = bodyLines.map(l => l ? `<p style="margin:0 0 .6rem">${esc(l)}</p>` : '').join('');
+  openModal({
+    title: t('node.service.modal.title'),
+    body: `
+      ${bodyHtml}
+      <div style="position:relative;margin:.25rem 0 .75rem">
+        <pre class="mono" style="background:var(--surface2,#f1f5f9);padding:.6rem .9rem;border-radius:6px;font-size:.85rem;margin:0;overflow-x:auto">${esc(cmd)}</pre>
+        <button type="button" id="copySvcCmd" class="btn btn-ghost btn-sm"
+          style="position:absolute;top:50%;right:.4rem;transform:translateY(-50%)" title="${esc(t('common.copy'))}">⧉</button>
+      </div>
+      <p class="muted" style="font-size:.83rem;margin:0">${esc(t('node.service.modal.after'))}</p>`,
+    onMount(root) {
+      root.querySelector('#copySvcCmd').onclick = () => {
+        navigator.clipboard.writeText(cmd).then(() => toast(t('common.copied'), 'ok', 1200));
+      };
+    },
   });
 }
 
@@ -165,7 +199,7 @@ function renderShell() {
 
   app.innerHTML = `
     <header class="app-header">
-      <h1><span class="status-dot" id="statusDot"></span> a2ald · <span id="stLabel" class="muted">${esc(t('status.connecting'))}</span></h1>
+      <h1><span class="status-dot" id="statusDot"></span> a2ald · <span id="stLabel" class="muted">${esc(t('status.connecting'))}</span> <span id="svcBadge" style="cursor:default"></span></h1>
       <nav class="nav-tabs" id="navTabs"></nav>
       <div class="lang-btns" id="langBtns"></div>
       <button type="button" class="btn btn-ghost btn-sm" id="hdrPw" title="${esc(t('webui.access.title'))}">⚙</button>

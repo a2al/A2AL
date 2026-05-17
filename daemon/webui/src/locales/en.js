@@ -383,4 +383,16 @@ export default {
   'demo.started': 'Demo capability activated. A lightweight demo agent is now discoverable.',
   'demo.stopped': 'Demo capability deactivated.',
   'demo.confirm_overwrite': 'Current Agent URL "{addr}" will be overwritten. Original value will be restored on deactivation. Continue?',
+
+  'node.service.persistent':     'Service',
+  'node.service.transient':      'Standalone',
+  'node.service.persistent_tip': 'Running as a managed service — a2ald starts automatically on boot and restarts on failure',
+  'node.service.transient_tip':  'Not installed as a system service — click to learn how',
+  'node.service.modal.title':    '⚠ Not Installed as a System Service',
+  'node.service.modal.body':
+    'a2ald is running as a standalone process. If the terminal closes or the machine restarts, ' +
+    'a2ald will stop and agents will go offline — until a2ald is run again manually.\n\n' +
+    'Install a2ald as a system service so it starts on boot and recovers from failures automatically:',
+  'node.service.modal.after':
+    'Copy the command above and run it to install a2ald as a system service (recommended).',
 };

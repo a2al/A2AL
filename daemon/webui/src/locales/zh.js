@@ -383,4 +383,16 @@ export default {
   'demo.started': '演示能力已激活，其他节点现在可以发现并连接此演示智能体。',
   'demo.stopped': '演示能力已停用。',
   'demo.confirm_overwrite': '当前 Agent URL "{addr}" 将被覆盖，停用时将自动恢复原值。继续？',
+
+  'node.service.persistent':     '服务',
+  'node.service.transient':      '独立运行',
+  'node.service.persistent_tip': '已安装为系统服务 — 开机自启，故障自恢复',
+  'node.service.transient_tip':  '未安装为系统服务 — 点击查看安装方式',
+  'node.service.modal.title':    '⚠ 尚未安装为系统服务',
+  'node.service.modal.body':
+    'a2ald 当前以独立进程运行。终端关闭或设备重启后，a2ald 会停止，' +
+    'agent 将离线，需要手动再次运行 a2ald 才会恢复上线。\n\n' +
+    '将 a2ald 安装为系统服务，可实现开机自启和故障自恢复，无需手动干预：',
+  'node.service.modal.after':
+    '拷贝上述命令并运行，将 a2ald 安装为系统服务（推荐）',
 };

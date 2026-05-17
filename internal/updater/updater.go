@@ -124,7 +124,11 @@ func (u *Updater) TriggerNow(ctx context.Context) error {
 }
 
 // Status returns fields for a2al_status / GET /update/status.
+// Safe to call on a nil receiver (returns update_enabled:false).
 func (u *Updater) Status() map[string]any {
+	if u == nil {
+		return map[string]any{"update_enabled": false}
+	}
 	u.mu.Lock()
 	latest := u.latestVer
 	checked := u.lastCheckAt
