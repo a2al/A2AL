@@ -250,7 +250,7 @@ func main() {
 				fmt.Printf("Resolved → %d QUIC candidate(s), connecting...\n", len(er.Endpoints))
 			}
 			cctx, ccancel := context.WithTimeout(ctx, 30*time.Second)
-			conn, err := h.ConnectFromRecord(cctx, addr, er)
+			conn, _, err := h.ConnectFromRecord(cctx, addr, er)
 			ccancel()
 			if err != nil {
 				fmt.Println("connect failed:", err)
