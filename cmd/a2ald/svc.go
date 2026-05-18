@@ -33,6 +33,7 @@ func handleServiceCmd(args []string) {
 		printServiceUsage()
 		return
 	}
+
 	subcmd := args[0]
 
 	fs := flag.NewFlagSet("a2ald service "+subcmd, flag.ExitOnError)
@@ -56,7 +57,7 @@ func handleServiceCmd(args []string) {
 			os.Exit(1)
 		}
 	case "uninstall":
-		if err := svcUninstall(*userMode); err != nil {
+		if err := svcUninstall(exePath); err != nil {
 			fmt.Fprintln(os.Stderr, "a2ald service uninstall:", err)
 			os.Exit(1)
 		}
@@ -75,6 +76,11 @@ func handleServiceCmd(args []string) {
 			fmt.Fprintln(os.Stderr, "a2ald service status:", err)
 			os.Exit(1)
 		}
+	case "emit-script":
+		if err := svcEmitScript(fs.Arg(0)); err != nil {
+			fmt.Fprintln(os.Stderr, "a2ald service emit-script:", err)
+			os.Exit(1)
+		}
 	default:
 		fmt.Fprintf(os.Stderr, "a2ald: unknown service subcommand %q\n\n", subcmd)
 		printServiceUsage()
@@ -86,11 +92,12 @@ func printServiceUsage() {
 	fmt.Fprintf(os.Stderr, `Usage: a2ald service <command> [flags]
 
 Commands:
-  install    Register and start a2ald as a persistent background service
-  uninstall  Stop and remove the service registration
-  start      Start an installed service
-  stop       Stop a running service
-  status     Show service status
+  install      Register and start a2ald as a persistent background service
+  uninstall    Stop and remove the service registration
+  start        Start an installed service
+  stop         Stop a running service
+  status       Show service status
+  emit-script  Write install-service.ps1 to disk (Windows only)
 
 Flags (install only):
   -data-dir <path>   Data directory (default: %s)

@@ -46,6 +46,10 @@ archives:
     format_overrides:
       - goos: windows
         formats: [zip]
+    overrides:
+      - goos: windows
+        files:
+          - src: scripts/install-service.ps1
 
 nfpms:
   - id: a2al-pkg

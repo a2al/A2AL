@@ -90,9 +90,9 @@ type Daemon struct {
 
 	iceRegNotify chan struct{} // ICE /signal registration refresh (buffered)
 
-	demo         *demoManager   // built-in demo capability server (per-agent)
-	gatewayConns atomic.Int64  // active gateway QUIC conns (direct + ICE)
-	sessions     sync.Map      // int (daemon-side TCP source port) → *sessionInfo
+	demo         *demoManager // built-in demo capability server (per-agent)
+	gatewayConns atomic.Int64 // active gateway QUIC conns (direct + ICE)
+	sessions     sync.Map     // int (daemon-side TCP source port) → *sessionInfo
 
 	// connPool caches outbound Mode A data-plane QUIC connections for execFetch
 	// and execConnect / execTunnelOpen. Connections are established on demand
@@ -123,6 +123,10 @@ type Daemon struct {
 	rebootstrapMu          sync.Mutex
 	lastRebootstrapAt      time.Time
 	testMaybeRebootstrapFn func(context.Context) // if set, maybeRebootstrap calls this instead
+
+	// Endpoint publish/resolve overrides for tests (execAgentPublish stale-seq recovery).
+	testPublishEndpointForAgent func(ctx context.Context, agentAddr a2al.Address, seq uint64, ttl uint32) error
+	testResolveEndpoint         func(ctx context.Context, target a2al.Address) (*protocol.EndpointRecord, error)
 
 	beacon *beaconManager
 
@@ -259,10 +263,10 @@ func New(cfg Config) (*Daemon, error) {
 		mboxStoreStop:    make(chan struct{}),
 		bus:              NewEventBus(log),
 		// subMgr is initialised in Run() after mboxStore is ready.
-		iceRegNotify:     make(chan struct{}, 1),
-		netChangeNotify:  make(chan struct{}, 1),
-		beacon:           newBeaconManager(h.Node(), &nodeCfg, log),
-		demo:             newDemoManager(),
+		iceRegNotify:    make(chan struct{}, 1),
+		netChangeNotify: make(chan struct{}, 1),
+		beacon:          newBeaconManager(h.Node(), &nodeCfg, log),
+		demo:            newDemoManager(),
 	}
 	// connPool dial function: always uses ConnectFromRecordFor with the resolved
 	// local identity (nodeAddr is registered as an agent so this covers the default
