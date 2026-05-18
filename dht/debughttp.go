@@ -48,7 +48,15 @@ type DebugStats struct {
 func (n *Node) DebugStatsData() DebugStats {
 	peers := n.tabDebugPeers()
 	r1h, r24h, r7d := n.reachCounts()
-	est, conf := n.EstimatedNetworkSizeFiltered(time.Now().Add(-30 * time.Minute))
+	// Use no time cutoff so all verified routing-table entries contribute.
+	// The routing table self-cleans via LRU eviction, so any entry with a
+	// non-zero VerifiedAt has genuine direct-contact evidence.
+	// Floor the estimate at reach_7d: the observed node count over 7 days is
+	// a hard lower bound — the network cannot be smaller than what we've seen.
+	est, conf := n.EstimatedNetworkSizeFiltered(time.Time{})
+	if est < r7d {
+		est = r7d
+	}
 	return DebugStats{
 		RxPackets:             n.statsRx.Load(),
 		TxPackets:             n.statsTx.Load(),

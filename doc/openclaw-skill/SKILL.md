@@ -51,7 +51,7 @@ Tangled Network — regardless of NAT, firewalls, or dynamic IPs.
 }
 ```
 
-For service mode, install as a system service first — see https://github.com/a2al/a2al/tree/main/deploy — then use `"url": "http://127.0.0.1:2121/mcp/"` instead.
+For service mode, run `a2ald service install` and follow the prompts — see https://github.com/a2al/a2al/tree/main/deploy for platform-specific details — then use `"url": "http://127.0.0.1:2121/mcp/"` instead.
 
 ## Core Concepts
 

@@ -173,7 +173,7 @@ a2ald service install
 
 This registers `a2ald` as a background service and starts it immediately. On subsequent logins it starts automatically.
 
-> **Windows:** run in an elevated (Admin) terminal for system-level install with automatic restart on failure. Add `-user` to install via Task Scheduler without admin rights (stops at logout).
+> **Windows:** just run `a2ald service install` from any terminal. If admin rights are needed, an interactive menu appears: **[1] System Service** (UAC prompt; survives reboot, recommended) or **[2] Task Scheduler** (no elevation; stops at logout). Pass `-user` to skip the menu and install via Task Scheduler directly.
 
 To manage the service:
 

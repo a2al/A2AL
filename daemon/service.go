@@ -72,7 +72,7 @@ func (d *Daemon) execAgentExport(aidStr string) (map[string]any, error) {
 		return nil, errNotFound
 	}
 	return map[string]any{
-		"aid":                        e.AID.String(),
+		"aid":                         e.AID.String(),
 		"operational_private_key_hex": hex.EncodeToString(e.OpPriv),
 		"delegation_proof_hex":        hex.EncodeToString(e.DelegationCBOR),
 		"service_tcp":                 e.ServiceTCP,
@@ -647,18 +647,27 @@ func (d *Daemon) execAgentPublish(ctx context.Context, aidStr string) (uint64, e
 	if e.ServiceTCP != "" && !probeTCP(e.ServiceTCP, 2*time.Second) {
 		d.log.Warn("service_tcp unreachable at publish time; daemon gateway forwarding will not work", "aid", aid.String(), "service_tcp", e.ServiceTCP)
 	}
+	publishEP := d.h.PublishEndpointForAgent
+	resolveEP := d.h.Resolve
+	if d.testPublishEndpointForAgent != nil {
+		publishEP = d.testPublishEndpointForAgent
+	}
+	if d.testResolveEndpoint != nil {
+		resolveEP = d.testResolveEndpoint
+	}
+
 	nextSeq := e.Seq + 1
-	if err := d.h.PublishEndpointForAgent(ctx, aid, nextSeq, 3600); err != nil {
+	if err := publishEP(ctx, aid, nextSeq, 3600); err != nil {
 		// Stale record: DHT peers hold a higher seq (e.g. agent was deleted and
 		// re-imported, resetting local seq to 0). Resolve the current network seq
 		// and retry once at networkSeq+1 — symmetric to recoverSeqFromNetwork for
 		// the node AID.
 		if errors.Is(err, dht.ErrStaleRecord) {
-			if er, rerr := d.h.Resolve(ctx, aid); rerr == nil && er.Seq >= nextSeq {
+			if er, rerr := resolveEP(ctx, aid); rerr == nil && er.Seq >= nextSeq {
 				d.log.Info("agent seq recovery: network ahead, retrying",
 					"aid", aid.String(), "network_seq", er.Seq, "local_seq", e.Seq)
 				nextSeq = er.Seq + 1
-				if err2 := d.h.PublishEndpointForAgent(ctx, aid, nextSeq, 3600); err2 != nil {
+				if err2 := publishEP(ctx, aid, nextSeq, 3600); err2 != nil {
 					d.log.Warn("publish endpoint (retry)", "aid", aid.String(), "err", err2)
 					return 0, errPublish
 				}
@@ -713,11 +722,11 @@ func (d *Daemon) touchHeartbeat(aid a2al.Address) {
 		e := d.reg.Get(aid)
 		d.regMu.RUnlock()
 		if e != nil {
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-			defer cancel()
-			d.tryRepublishAgent(ctx, aid)
-		}()
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+				defer cancel()
+				d.tryRepublishAgent(ctx, aid)
+			}()
 		}
 	}
 }
@@ -1114,7 +1123,7 @@ type topicRegisterReq struct {
 
 type discoverReq struct {
 	Services []string                 `json:"services"`
-	Filter *protocol.DiscoverFilter `json:"filter,omitempty"`
+	Filter   *protocol.DiscoverFilter `json:"filter,omitempty"`
 }
 
 func topicEntryToMap(e protocol.TopicEntry) map[string]any {
@@ -1395,38 +1404,38 @@ func (d *Daemon) execResolveRecords(ctx context.Context, aidStr string, recType 
 }
 
 var (
-	errBadOpPubHex           = errors.New("bad operational_public_key_hex")
-	errEthPubOrSeedRequired  = errors.New("operational_public_key_hex or operational_private_key_seed_hex required")
-	errBadOpSeedHex          = errors.New("bad operational_private_key_seed_hex")
-	errEthOpKeyMissing       = errors.New("operational_private_key_hex or operational_private_key_seed_hex required")
-	errEthOpKeyAmbiguous     = errors.New("provide only one of operational_private_key_hex or operational_private_key_seed_hex")
-	errEthBadAgent           = errors.New("bad ethereum agent address")
-	errEthBadSignature       = errors.New("bad eth_signature_hex (want 65 bytes)")
-	errEthSigVerify          = errors.New("ethereum signature verification failed")
-	errEthBadPrivHex         = errors.New("bad ethereum_private_key_hex")
-	errEthProofBuild         = errors.New("ethereum proof build failed")
-	errParalismBadPrivHex    = errors.New("bad paralism_private_key_hex")
-	errBadDelegationHex      = errors.New("bad delegation_proof_hex")
-	errDelegationParse       = errors.New("delegation parse")
-	errBadOpKeyHex           = errors.New("bad operational_private_key_hex")
-	errDelegationVerify      = errors.New("delegation verify")
-	errAID                   = errors.New("aid")
-	errNodeAsAgent = errors.New("cannot register node identity as agent")
-	errPersist     = errors.New("persist failed")
-	errBadAID                = errors.New("bad aid")
-	errNotFound              = errors.New("not found")
-	errPublish               = errors.New("publish failed")
-	errDeleteNode            = errors.New("cannot delete node identity")
-	errResolve               = errors.New("resolve failed")
-	errListen                = errors.New("listen failed")
-	errConnectQUIC           = errors.New("quic connect failed")
-	errOpKeyMismatch         = errors.New("operational key mismatch")
-	errServicesRequired      = errors.New("services required")
-	errBadRecType            = errors.New("rec_type must be sovereign custom 0x02-0x0f")
-	errTTLRequired           = errors.New("ttl required")
-	errBadPayloadB64         = errors.New("invalid payload_base64")
-	errNoDelegation          = errors.New("delegation required")
-	errBadServiceTCP         = errors.New("service_tcp cannot contain a path — use host:port or https://host:port")
+	errBadOpPubHex          = errors.New("bad operational_public_key_hex")
+	errEthPubOrSeedRequired = errors.New("operational_public_key_hex or operational_private_key_seed_hex required")
+	errBadOpSeedHex         = errors.New("bad operational_private_key_seed_hex")
+	errEthOpKeyMissing      = errors.New("operational_private_key_hex or operational_private_key_seed_hex required")
+	errEthOpKeyAmbiguous    = errors.New("provide only one of operational_private_key_hex or operational_private_key_seed_hex")
+	errEthBadAgent          = errors.New("bad ethereum agent address")
+	errEthBadSignature      = errors.New("bad eth_signature_hex (want 65 bytes)")
+	errEthSigVerify         = errors.New("ethereum signature verification failed")
+	errEthBadPrivHex        = errors.New("bad ethereum_private_key_hex")
+	errEthProofBuild        = errors.New("ethereum proof build failed")
+	errParalismBadPrivHex   = errors.New("bad paralism_private_key_hex")
+	errBadDelegationHex     = errors.New("bad delegation_proof_hex")
+	errDelegationParse      = errors.New("delegation parse")
+	errBadOpKeyHex          = errors.New("bad operational_private_key_hex")
+	errDelegationVerify     = errors.New("delegation verify")
+	errAID                  = errors.New("aid")
+	errNodeAsAgent          = errors.New("cannot register node identity as agent")
+	errPersist              = errors.New("persist failed")
+	errBadAID               = errors.New("bad aid")
+	errNotFound             = errors.New("not found")
+	errPublish              = errors.New("publish failed")
+	errDeleteNode           = errors.New("cannot delete node identity")
+	errResolve              = errors.New("resolve failed")
+	errListen               = errors.New("listen failed")
+	errConnectQUIC          = errors.New("quic connect failed")
+	errOpKeyMismatch        = errors.New("operational key mismatch")
+	errServicesRequired     = errors.New("services required")
+	errBadRecType           = errors.New("rec_type must be sovereign custom 0x02-0x0f")
+	errTTLRequired          = errors.New("ttl required")
+	errBadPayloadB64        = errors.New("invalid payload_base64")
+	errNoDelegation         = errors.New("delegation required")
+	errBadServiceTCP        = errors.New("service_tcp cannot contain a path — use host:port or https://host:port")
 )
 
 // resolveNoRelay returns the effective noRelay flag for a connection request.

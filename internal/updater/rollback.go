@@ -16,6 +16,12 @@ import (
 	"github.com/a2al/a2al/internal/version"
 )
 
+// Hooks for CheckAndRollback (tests swap these to avoid renaming real binaries / exiting).
+var (
+	checkRollbackResolveExeFn = resolveExe
+	checkRollbackExitFn       = os.Exit
+)
+
 // CheckAndRollback must be called at the very start of main(), before
 // daemon.New() acquires the data-dir lock. It implements the startup-counter
 // rollback described in the design doc.
@@ -28,7 +34,7 @@ import (
 //  5. status != "pending"
 //
 // If attempts reaches 3 and .old is valid, the rollback is executed and
-// os.Exit(0) is called so the service manager restarts with the old binary.
+// checkRollbackExitFn(0) runs (production: os.Exit) so the service manager restarts with the old binary.
 func CheckAndRollback(dataDir string) {
 	state, err := ReadState(dataDir)
 	if err != nil || state == nil {
@@ -64,7 +70,7 @@ func CheckAndRollback(dataDir string) {
 	}
 
 	// Three failed attempts — initiate rollback.
-	exe, err := resolveExe()
+	exe, err := checkRollbackResolveExeFn()
 	if err != nil {
 		slog.Error("update rollback: cannot resolve executable path", "err", err)
 		markRollbackFailed(dataDir, state)
@@ -110,7 +116,7 @@ func CheckAndRollback(dataDir string) {
 
 	slog.Info("update rollback: restored previous version",
 		"from", state.NewVersion, "to", state.OldVersion)
-	os.Exit(0) // service manager will restart with the old binary
+	checkRollbackExitFn(0) // service manager will restart with the old binary
 }
 
 // RunSmokeTest validates config parsing, keys, and data-dir writeability

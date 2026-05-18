@@ -46,6 +46,11 @@ archives:
     format_overrides:
       - goos: windows
         formats: [zip]
+    files:
+      # Windows only: include install-service.ps1 in the zip archive.
+      # On other platforms the template resolves to "none*" which matches nothing
+      # and is silently skipped (goreleaser-documented pattern).
+      - src: '{{ if eq .Os "windows" }}scripts/install-service.ps1{{ else }}none*{{ end }}'
 
 nfpms:
   - id: a2al-pkg

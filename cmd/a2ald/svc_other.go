@@ -22,7 +22,7 @@ func svcInstall(_ string, _ string, _ bool) error {
 	return errors.New("not supported on this platform")
 }
 
-func svcUninstall(_ bool) error {
+func svcUninstall(_ string) error {
 	fmt.Println("a2ald: use your system's service manager to uninstall (e.g. systemctl disable --now a2ald).")
 	return nil
 }
@@ -35,6 +35,10 @@ func svcStart() error {
 func svcStop() error {
 	fmt.Println("a2ald: use your system's service manager (e.g. systemctl stop a2ald).")
 	return nil
+}
+
+func svcEmitScript(_ string) error {
+	return fmt.Errorf("emit-script is only available on Windows")
 }
 
 func svcStatus() error {

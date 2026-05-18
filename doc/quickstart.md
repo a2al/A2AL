@@ -56,7 +56,7 @@ a2ald service start
 a2ald service uninstall
 ```
 
-> On Windows, run in an elevated (Admin) terminal for system-level install, or add `--user` to install via Task Scheduler without admin rights.
+> **Windows:** just run `a2ald service install` — if admin rights are needed, an interactive menu appears with two options: **[1] System Service** (triggers a UAC prompt; survives reboot, recommended) or **[2] Task Scheduler** (no elevation; stops at logout). You can also pass `-user` directly to skip the menu and install via Task Scheduler.
 
 **Option B — Run directly (one-off or transient use)**
 

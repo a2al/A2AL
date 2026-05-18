@@ -828,9 +828,14 @@ func (n *Node) runRoutingMaintenance(ctx context.Context) {
 		if err != nil {
 			// Probe failure: undo failCount increment (same reasoning as pending).
 			n.recordProbeFailure(id)
-			n.tabMu.Lock()
-			n.table.Remove(id)
-			n.tabMu.Unlock()
+			// When network is suspected down, retain the node in the routing
+			// table so it is available for ObserveFromRouting once connectivity
+			// is restored. Normal removal resumes as soon as any RPC succeeds.
+			if !n.suspectOffline() {
+				n.tabMu.Lock()
+				n.table.Remove(id)
+				n.tabMu.Unlock()
+			}
 		}
 		// Success: PingIdentity → recordSuccess → UpdateVerifiedAt handled it.
 	}
@@ -998,6 +1003,16 @@ func (n *Node) probeRepNode(ctx context.Context, rk repKey, rs *repSet, e *repNo
 
 	// Failure path (UDP failure or punch-channel miss).
 	rs.mu.Lock()
+
+	// When network is suspected down, do not advance the repSet failure state
+	// machine: healthy replicas must not be evicted for a local outage.
+	// Schedule a fast retry so the probe fires again once connectivity returns.
+	if n.suspectOffline() {
+		e.nextProbeAt = time.Now().Add(probeInitDelay)
+		rs.mu.Unlock()
+		return
+	}
+
 	e.failCount++
 
 	switch {

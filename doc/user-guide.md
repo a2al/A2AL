@@ -88,7 +88,11 @@ a2ald service uninstall        # remove service registration
 | `-data-dir <path>` | Data directory to use (default: platform config dir). Baked in at install time — service and direct CLI always use the same directory. |
 | `-user` | No-admin install (Windows only): uses Task Scheduler instead of SCM. Service stops at logout; does not require an elevated prompt. |
 
-> **Windows note:** without `-user`, run the install command in an elevated (Admin) terminal for system-level SCM installation with automatic restart on failure. With `-user`, no elevation is needed but the service stops when you log out.
+> **Windows:** just run `a2ald service install` from any terminal. If admin rights are needed, an interactive menu appears:
+> - **[1] System Service** — triggers a UAC prompt; registered with SCM, survives reboot, recommended.
+> - **[2] Task Scheduler** — no elevation needed; stops when you log out.
+>
+> Pass `-user` directly to skip the menu and always install via Task Scheduler.
 
 If you prefer not to use the built-in CLI, platform-specific configuration files (systemd unit, launchd plist, Task Scheduler XML) are available in [`deploy/`](../deploy/).
 

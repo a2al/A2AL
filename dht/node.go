@@ -143,6 +143,12 @@ const badHealthThreshold = 2
 // probeInitDelay<<10 ≈ 8.5 h, which is effectively "give up for now".
 const maxBackoffShift = 10
 
+// offlineSuspectThreshold is the quiet period without any successful outbound
+// RPC after which the node suspects its own network connectivity is lost.
+// Three probe ticks (3 × probeTickInterval = 45 s) provides enough margin
+// to rule out a momentary lull while bounding damage from a real outage.
+const offlineSuspectThreshold = 45 * time.Second
+
 type peerHealthEntry struct {
 	lastSuccess   time.Time
 	lastFailure   time.Time
@@ -214,6 +220,15 @@ type Node struct {
 
 	healthMu sync.RWMutex
 	health   map[string]*peerHealthEntry // key: nodeIDKey(id)
+
+	// lastAnySuccessAt is the unix-nanosecond timestamp of the most recent
+	// successful outbound RPC (updated by recordSuccess). Zero means no
+	// success has been observed this session.
+	// Used by suspectOffline to distinguish a local network outage from
+	// genuine peer failures: if no success has been seen for
+	// offlineSuspectThreshold, failure recording is suppressed so that
+	// healthy peers are not penalised for our own connectivity loss.
+	lastAnySuccessAt atomic.Int64
 
 	// NAT probe: SendNATProbeReq registers a token → notify channel here;
 	// onNATProbeEcho delivers incoming echoes to the matching channel.
@@ -649,6 +664,7 @@ func (n *Node) lookupPeerID(addr net.Addr) (a2al.NodeID, bool) {
 func (n *Node) recordSuccess(id a2al.NodeID, rtt time.Duration) {
 	key := nodeIDKey(id)
 	now := time.Now()
+	n.lastAnySuccessAt.Store(now.UnixNano()) // clear offline-suspect state
 	n.healthMu.Lock()
 	e := n.health[key]
 	if e == nil {
@@ -674,6 +690,11 @@ func (n *Node) recordSuccess(id a2al.NodeID, rtt time.Duration) {
 // recordFailure increments the consecutive-failure counter and sets a global
 // exponential back-off on the peer.  All communication channels use the same
 // scale (probeInitDelay << shift) so the value remains a meaningful signal.
+//
+// When suspectOffline is true (no successful RPC for offlineSuspectThreshold),
+// failCount and nextRetryAt are suppressed: healthy peers must not be penalised
+// for a local network outage.  lastFailure and totalAttempts are still updated
+// so diagnostic counters remain accurate.
 func (n *Node) recordFailure(id a2al.NodeID) {
 	key := nodeIDKey(id)
 	n.healthMu.Lock()
@@ -683,8 +704,12 @@ func (n *Node) recordFailure(id a2al.NodeID) {
 		n.health[key] = e
 	}
 	e.lastFailure = time.Now()
-	e.failCount++
 	e.totalAttempts++
+	if n.suspectOffline() {
+		n.healthMu.Unlock()
+		return
+	}
+	e.failCount++
 	shift := e.failCount - 1
 	if shift > maxBackoffShift {
 		shift = maxBackoffShift
@@ -705,6 +730,21 @@ func (n *Node) PeerAllowContact(id a2al.NodeID) bool {
 		return true
 	}
 	return e.nextRetryAt.IsZero() || time.Now().After(e.nextRetryAt)
+}
+
+// suspectOffline reports whether the node suspects its own network connectivity
+// is lost. Returns true when at least one successful RPC has been observed
+// this session but no success has occurred for longer than offlineSuspectThreshold.
+//
+// When true, recordFailure suppresses failCount and nextRetryAt accumulation
+// so healthy peers are not penalised for a local outage. Any recordSuccess
+// call clears the condition immediately.
+func (n *Node) suspectOffline() bool {
+	last := n.lastAnySuccessAt.Load()
+	if last == 0 {
+		return false // never succeeded this session; new node, do not assume offline
+	}
+	return time.Since(time.Unix(0, last)) > offlineSuspectThreshold
 }
 
 // peerHealthForSort returns the lastFailure time and totalAttempts for a peer,
