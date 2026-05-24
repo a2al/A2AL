@@ -142,6 +142,8 @@ type Config struct {
 	// SeenPeersPath is forwarded to the DHT node for seenPeers persistence (spec §7.3).
 	// Empty disables persistence.
 	SeenPeersPath string
+	// LearnedPathFirst enables learned-path outbound selection in the DHT layer.
+	LearnedPathFirst bool
 	// ICENetworkTypes lists the ICE network types used for candidate gathering.
 	// Defaults to {ice.NetworkTypeUDP4, ice.NetworkTypeUDP6} (dual-stack) when
 	// nil or empty. ICE opens its own sockets independently of the main QUIC
@@ -227,10 +229,10 @@ type Host struct {
 	extip6Snap string    // IPv6 STUN result "ip:port"; empty = not resolved or unavailable
 	extip6Exp  time.Time // cache expiry
 
-	iceMu               sync.RWMutex
-	bootstrapHubURLs    []string // signal hub URLs from bootstrap/DNS (stable fallback)
+	iceMu                sync.RWMutex
+	bootstrapHubURLs     []string // signal hub URLs from bootstrap/DNS (stable fallback)
 	routingHubCandidates []string // signal hub URLs derived from routing table (refreshable)
-	activeSignalURLs    []string // currently connected hubs, maintained by ice_listener
+	activeSignalURLs     []string // currently connected hubs, maintained by ice_listener
 
 	signalStatsMu sync.RWMutex
 	signalStats   func() map[string]any
@@ -306,10 +308,11 @@ func New(cfg Config) (*Host, error) {
 		OnObservedAddr: func(reporter a2al.NodeID, wire []byte) {
 			sense.Record(reporter, wire)
 		},
-		RecordAuth:     recordAuthPolicy,
-		Logger:         cfg.Logger,
-		SeenPeersPath:  cfg.SeenPeersPath,
-		PunchTransport: punchPool,
+		RecordAuth:       recordAuthPolicy,
+		Logger:           cfg.Logger,
+		SeenPeersPath:    cfg.SeenPeersPath,
+		PunchTransport:   punchPool,
+		LearnedPathFirst: cfg.LearnedPathFirst,
 	}
 
 	// listenSocket creates a UDP socket according to the DisableIPv6 flag.
@@ -468,10 +471,10 @@ func (h *Host) RegisteredAgents() []a2al.Address {
 	return out
 }
 
-func (h *Host) Node() *dht.Node              { return h.node }
-func (h *Host) Sense() *natsense.Sense        { return h.sense }
-func (h *Host) Address() a2al.Address         { return h.addr }
-func (h *Host) DHTpunchPool() *DHTpunchPool   { return h.punchPool }
+func (h *Host) Node() *dht.Node             { return h.node }
+func (h *Host) Sense() *natsense.Sense      { return h.sense }
+func (h *Host) Address() a2al.Address       { return h.addr }
+func (h *Host) DHTpunchPool() *DHTpunchPool { return h.punchPool }
 
 func (h *Host) DHTLocalAddr() *net.UDPAddr {
 	return h.node.LocalAddr().(*net.UDPAddr)
@@ -666,6 +669,7 @@ func (h *Host) InvalidateNetworkCaches() {
 	h.extip6Mu.Unlock()
 	h.sense.ClearProbeResult()
 	h.sense.InvalidateObservations()
+	h.node.ClearReachabilityHints()
 }
 
 // selectNATProbeTargets returns up to n UDP addresses of routing-table peers

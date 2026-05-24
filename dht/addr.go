@@ -15,56 +15,137 @@ import (
 // After this period the ephemeral slot is treated as expired and ignored.
 const peerAddrEphemeralTTL = 5 * time.Minute
 
-// peerAddrs holds up to three candidate dial addresses for a remote peer.
+// addrRank orders address evidence strength. Higher rank must not be replaced by
+// a lower rank in the Live slot; Anchor is a separate slot for self-/operator-
+// declared endpoints and is never written from hearsay or ephemeral sources.
+type addrRank uint8
+
+const (
+	rankHearsay  addrRank = 2
+	rankVerified addrRank = 3
+)
+
+// familyAddrs holds dial candidates for one IP family (v4 or v6).
 //
-// stableV4/V6 are set whenever we receive a packet directly from that peer
-// on the respective family — they represent persistently reachable endpoints.
-// ephemeral is a hole-punch prflx address that is only valid for a limited
-// time after the punch completes; it is never included in FIND_NODE responses.
-//
-// The zero value is valid (no address known).
-type peerAddrs struct {
-	stableV4    *net.UDPAddr
-	stableV6    *net.UDPAddr
+// Anchor: long-lived advertised/infra address (endpoint quic://, DNS bootstrap).
+// Live: operational address from RPC success or hearsay; rank-guarded writes.
+// Ephemeral: short-lived ICE prflx (TTL-bounded); never overwrites Anchor/Live.
+type familyAddrs struct {
+	anchor      *net.UDPAddr
+	live        *net.UDPAddr
+	liveRank    addrRank
 	ephemeral   *net.UDPAddr
 	ephemeralAt time.Time
-	// fallback holds a non-UDP dial address (e.g. MemTransport in tests).
-	// When non-nil it is returned by preferred() without family selection.
-	fallback net.Addr
 }
 
-// preferred returns the best dial address available.
-// Priority: fallback (non-UDP) → stableV4 → stableV6 → ephemeral (within TTL).
-// Returns nil when no address is available.
-func (pa *peerAddrs) preferred() net.Addr {
-	if pa.fallback != nil {
-		return pa.fallback
+func (fa *familyAddrs) tryAnchor(addr *net.UDPAddr) bool {
+	if addr == nil {
+		return false
 	}
-	if pa.stableV4 != nil {
-		return pa.stableV4
+	fa.anchor = cloneUDPAddr(addr)
+	return true
+}
+
+func (fa *familyAddrs) tryLive(addr *net.UDPAddr, rank addrRank) bool {
+	if addr == nil || rank < rankHearsay {
+		return false
 	}
-	if pa.stableV6 != nil {
-		return pa.stableV6
+	if fa.live != nil && rank < fa.liveRank {
+		return false
 	}
-	if pa.ephemeral != nil && time.Since(pa.ephemeralAt) < peerAddrEphemeralTTL {
-		return pa.ephemeral
+	fa.live = cloneUDPAddr(addr)
+	fa.liveRank = rank
+	return true
+}
+
+func (fa *familyAddrs) tryEphemeral(addr *net.UDPAddr) {
+	if addr == nil {
+		return
+	}
+	fa.ephemeral = cloneUDPAddr(addr)
+	fa.ephemeralAt = time.Now()
+}
+
+// preferred returns the best dial address for this family: Anchor → Live → Ephemeral.
+func (fa *familyAddrs) preferred() *net.UDPAddr {
+	if fa.anchor != nil {
+		return fa.anchor
+	}
+	if fa.live != nil {
+		return fa.live
+	}
+	if fa.ephemeral != nil && time.Since(fa.ephemeralAt) < peerAddrEphemeralTTL {
+		return fa.ephemeral
 	}
 	return nil
 }
 
-// setStable writes addr into the family-matched stable slot.
-func (pa *peerAddrs) setStable(addr *net.UDPAddr) {
-	if addr.IP.To4() != nil {
-		pa.stableV4 = addr
-	} else {
-		pa.stableV6 = addr
+func (fa *familyAddrs) bestStable() *net.UDPAddr {
+	if fa.anchor != nil {
+		return fa.anchor
 	}
+	return fa.live
 }
 
-// setEphemeral records a hole-punch temporary address.
+// peerAddrs holds per-family dial addresses for a remote peer.
+type peerAddrs struct {
+	v4 familyAddrs
+	v6 familyAddrs
+	// fallback holds a non-UDP dial address (e.g. MemTransport in tests).
+	fallback net.Addr
+}
+
+func (pa *peerAddrs) familyFor(addr *net.UDPAddr) *familyAddrs {
+	if addr.IP.To4() != nil {
+		return &pa.v4
+	}
+	return &pa.v6
+}
+
+func (pa *peerAddrs) tryAnchor(addr *net.UDPAddr) bool {
+	if addr == nil {
+		return false
+	}
+	return pa.familyFor(addr).tryAnchor(addr)
+}
+
+func (pa *peerAddrs) tryLive(addr *net.UDPAddr, rank addrRank) bool {
+	if addr == nil {
+		return false
+	}
+	return pa.familyFor(addr).tryLive(addr, rank)
+}
+
+func (pa *peerAddrs) tryEphemeral(addr *net.UDPAddr) {
+	if addr == nil {
+		return
+	}
+	pa.familyFor(addr).tryEphemeral(addr)
+}
+
+// preferred returns the best dial address available.
+// Priority: fallback (non-UDP) → v4 family → v6 family.
+func (pa *peerAddrs) preferred() net.Addr {
+	if pa.fallback != nil {
+		return pa.fallback
+	}
+	if a := pa.v4.preferred(); a != nil {
+		return a
+	}
+	if a := pa.v6.preferred(); a != nil {
+		return a
+	}
+	return nil
+}
+
+// setStable writes addr into the Live slot at Verified rank (legacy/test helper).
+func (pa *peerAddrs) setStable(addr *net.UDPAddr) {
+	pa.tryLive(addr, rankVerified)
+}
+
+// setEphemeral records a hole-punch temporary address in the family ephemeral slot.
 func (pa *peerAddrs) setEphemeral(addr *net.UDPAddr) {
-	pa.ephemeral = addr
-	pa.ephemeralAt = time.Now()
+	pa.tryEphemeral(addr)
 }
 
 // ObservedAddr encodes remote IP:port for PONG / FIND_*_RESP (spec §7.6).

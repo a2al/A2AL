@@ -24,6 +24,9 @@ func TestDefault(t *testing.T) {
 	if c.LogFormat != "text" || c.LogLevel != "info" {
 		t.Fatalf("log defaults: format=%q level=%q", c.LogFormat, c.LogLevel)
 	}
+	if !c.LearnedPathFirst {
+		t.Fatal("LearnedPathFirst: want true by default")
+	}
 	if err := c.Validate(); err != nil {
 		t.Fatal(err)
 	}

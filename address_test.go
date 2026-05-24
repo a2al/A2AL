@@ -32,6 +32,16 @@ func TestNodeIDFromAddress_deterministic(t *testing.T) {
 	}
 }
 
+func TestNodeIDString_hex(t *testing.T) {
+	var id NodeID
+	id[0] = 0x3d
+	id[1] = 0x70
+	want := hex.EncodeToString(id[:])
+	if got := id.String(); got != want {
+		t.Fatalf("String() = %q, want %q", got, want)
+	}
+}
+
 func TestDistance_symmetric(t *testing.T) {
 	var a, b NodeID
 	for i := range a {

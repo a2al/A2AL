@@ -41,10 +41,10 @@ type Config struct {
 	// Default false: loopback callers (CLI, local agents, browser on 127.0.0.1) bypass
 	// token auth, since OS-level user isolation already protects the API. Set true on
 	// shared/multi-user hosts where the daemon should refuse anonymous local access.
-	RequireLocalToken bool `toml:"require_local_token" json:"require_local_token,omitempty"`
-	KeyDir           string   `toml:"key_dir" json:"key_dir"`
-	LogFormat        string   `toml:"log_format" json:"log_format"`
-	LogLevel         string   `toml:"log_level" json:"log_level"`
+	RequireLocalToken bool   `toml:"require_local_token" json:"require_local_token,omitempty"`
+	KeyDir            string `toml:"key_dir" json:"key_dir"`
+	LogFormat         string `toml:"log_format" json:"log_format"`
+	LogLevel          string `toml:"log_level" json:"log_level"`
 	// LogDebugComponents lists subsystem names whose DEBUG-level logs are emitted
 	// regardless of log_level. Useful for targeted diagnostics without enabling
 	// all DEBUG output. Recognized names: "ice", "punch", "natsense".
@@ -79,6 +79,11 @@ type Config struct {
 	// When non-empty, any bootstrap peer whose NodeID is not in this list is rejected.
 	// Applies to config-supplied and DNS-discovered bootstrap addresses.
 	BootstrapNodeIDs []string `toml:"bootstrap_node_ids" json:"bootstrap_node_ids,omitempty"`
+
+	// LearnedPathFirst enables learned-path outbound selection in the DHT layer
+	// (lastInbound, skipCold DeferICE). Default true; set false to fall back to
+	// legacy L0-only blind UDP for emergency rollback.
+	LearnedPathFirst bool `toml:"learned_path_first" json:"learned_path_first"`
 
 	// DisableRelay is the node-level default for relay usage on outbound connections.
 	// When true, relay (TURN) candidates are excluded unless the per-call API field
@@ -117,6 +122,7 @@ func Default() Config {
 		AutoPublish:      true,
 		OpenBrowser:      true,
 		SignalListenAddr: "",
+		LearnedPathFirst: true,
 	}
 }
 

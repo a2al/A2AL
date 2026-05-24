@@ -119,6 +119,10 @@ type Config struct {
 	// injection pattern as OnObservedAddr.
 	PunchTransport PunchTransport
 
+	// LearnedPathFirst enables learned-path outbound selection (lastInbound,
+	// skipCold DeferICE). Default false preserves legacy L0-only behaviour.
+	LearnedPathFirst bool
+
 	// PushHandler is called when this node receives a MsgDHTPush (oneShot delivery).
 	// Returns true if the record was new (daemon renews subscription via ACK).
 	// Optional; nil disables push reception (node still participates as a pusher).
@@ -160,6 +164,12 @@ type familyHealth struct {
 	// aggregation, preserving equivalence with the old single-family model for
 	// nodes that have only ever been contacted over one address family.
 	everUsed bool
+
+	// Inbound/outbound path hints (per address family).
+	skipColdUDP   bool       // prefer ICE/QUIC over cold stable UDP; not a hard ban
+	skipColdAt    time.Time  // when skipColdUDP was set
+	lastInbound   *net.UDPAddr
+	lastInboundAt time.Time
 }
 
 // familyFor returns a pointer to the family sub-struct corresponding to addr.
@@ -272,6 +282,13 @@ type Node struct {
 	// Nil when running in direct-UDP-only mode (default).
 	punch PunchTransport
 
+	// learnedPathFirst gates learned-path outbound selection (see sendplan.go).
+	learnedPathFirst atomic.Bool
+
+	// deliverPlanLogMu guards deliverPlanLogged (transition-only deliver plan debug).
+	deliverPlanLogMu sync.Mutex
+	deliverPlanLogged map[string]string // nodeIDKey(peer) → last logged plan signature
+
 	// pushMu guards pushHandler.
 	pushMu      sync.RWMutex
 	// pushHandler is called when this node receives a MsgDHTPush from a DHT node.
@@ -325,12 +342,14 @@ func NewNode(cfg Config) (*Node, error) {
 		natProbeEchoMap: make(map[string]*probeEchoEntry),
 		repSets:        make(map[repKey]*repSet),
 		replCh:         make(chan replTask, replChBuf),
-		renewInFlight:  make(map[repKey]struct{}),
-		onObservedAddr: cfg.OnObservedAddr,
+		renewInFlight:     make(map[repKey]struct{}),
+		deliverPlanLogged: make(map[string]string),
+		onObservedAddr:    cfg.OnObservedAddr,
 		auth:           cfg.RecordAuth,
 		punch:          cfg.PunchTransport,
 		pushHandler:    cfg.PushHandler,
 	}
+	n.learnedPathFirst.Store(cfg.LearnedPathFirst)
 	n.table = routing.NewTable(nid, nil)
 	if cfg.SeenPeersPath != "" {
 		n.seenPeersPath = cfg.SeenPeersPath
@@ -375,22 +394,29 @@ func (n *Node) recvLoop() {
 		case protocol.MsgPong, protocol.MsgFindValueResp, protocol.MsgFindNodeResp, protocol.MsgStoreResp,
 			protocol.MsgDHTPushACK:
 			continue
-		case protocol.MsgPing:
-			n.onPing(from, dec)
-		case protocol.MsgFindNode:
-			n.onFindNode(from, dec)
-		case protocol.MsgFindValue:
-			n.onFindValue(from, dec)
-		case protocol.MsgStore:
-			n.onStore(from, dec)
-		case protocol.MsgNATProbeReq:
-			n.onNATProbeReq(from, dec)
-		case protocol.MsgNATProbeEcho:
-			n.onNATProbeEcho(from, dec)
-		case protocol.MsgDHTPush:
-			n.onDHTPush(from, dec)
-		default:
 		}
+		n.dispatchIncoming(from, inboundChannelUDP, dec)
+	}
+}
+
+func (n *Node) dispatchIncoming(from net.Addr, ch inboundChannel, dec *protocol.DecodedMessage) {
+	n.inboundLearn(from, ch, dec)
+	switch dec.Header.MsgType {
+	case protocol.MsgPing:
+		n.onPing(from, ch, dec)
+	case protocol.MsgFindNode:
+		n.onFindNode(from, ch, dec)
+	case protocol.MsgFindValue:
+		n.onFindValue(from, ch, dec)
+	case protocol.MsgStore:
+		n.onStore(from, ch, dec)
+	case protocol.MsgNATProbeReq:
+		n.onNATProbeReq(from, ch, dec)
+	case protocol.MsgNATProbeEcho:
+		n.onNATProbeEcho(from, ch, dec)
+	case protocol.MsgDHTPush:
+		n.onDHTPush(from, dec)
+	default:
 	}
 }
 
@@ -416,21 +442,8 @@ func (n *Node) InjectReceived(data []byte, from net.Addr) {
 	case protocol.MsgPong, protocol.MsgFindValueResp, protocol.MsgFindNodeResp, protocol.MsgStoreResp,
 		protocol.MsgDHTPushACK:
 		return
-	case protocol.MsgPing:
-		n.onPing(from, dec)
-	case protocol.MsgFindNode:
-		n.onFindNode(from, dec)
-	case protocol.MsgFindValue:
-		n.onFindValue(from, dec)
-	case protocol.MsgStore:
-		n.onStore(from, dec)
-	case protocol.MsgNATProbeReq:
-		n.onNATProbeReq(from, dec)
-	case protocol.MsgNATProbeEcho:
-		n.onNATProbeEcho(from, dec)
-	case protocol.MsgDHTPush:
-		n.onDHTPush(from, dec)
 	}
+	n.dispatchIncoming(from, inboundChannelQUIC, dec)
 }
 
 func (n *Node) tryDeliver(dec *protocol.DecodedMessage) bool {
@@ -478,13 +491,13 @@ func (n *Node) lookupPeer(id a2al.NodeID) (net.Addr, bool) {
 // lookupPeerHealthAware returns the best dial address for id that is not
 // currently in back-off, selecting between v4 and v6 based on health state.
 //
-// Unlike lookupPeer (which blindly prefers stableV4), this function skips a
+// Unlike lookupPeer (which blindly prefers v4 anchor/live), this function skips a
 // family whose back-off window has not expired and tries the other family
 // instead.  Specifically:
-//   - If stableV4 is known and its back-off has expired (or it was never
-//     used), return stableV4.
-//   - Else if stableV6 is known and its back-off has expired (or it was
-//     never used), return stableV6.
+//   - If v4 anchor or live is known and its back-off has expired (or it was never
+//     used), return that address.
+//   - Else if v6 anchor or live is known and its back-off has expired (or it was
+//     never used), return that address.
 //   - If all known addresses are in back-off, return nil, false.
 //
 // An "unused" family (everUsed=false) counts as back-off expired — it means
@@ -508,44 +521,61 @@ func (n *Node) lookupPeerHealthAware(id a2al.NodeID) (net.Addr, bool) {
 	v4ok := e == nil || !e.v4.everUsed || e.v4.nextRetryAt.IsZero() || now.After(e.v4.nextRetryAt)
 	v6ok := e == nil || !e.v6.everUsed || e.v6.nextRetryAt.IsZero() || now.After(e.v6.nextRetryAt)
 
-	if pa.stableV4 != nil && v4ok {
-		return pa.stableV4, true
+	if pa.v4.bestStable() != nil && v4ok {
+		return pa.v4.bestStable(), true
 	}
-	if pa.stableV6 != nil && v6ok {
-		return pa.stableV6, true
+	if pa.v6.bestStable() != nil && v6ok {
+		return pa.v6.bestStable(), true
 	}
 	return nil, false
 }
 
-func (n *Node) remember(from net.Addr, dec *protocol.DecodedMessage) {
+// rememberLiveRank infers Live-slot rank from a stored endpoint declaration.
+// This trusts the peer's self-reported NatType; it is not proof of RPC success.
+// Stronger Verified evidence comes from outbound recordSuccess paths (Phase 2).
+func (n *Node) rememberLiveRank(id a2al.NodeID) addrRank {
+	recs := n.LocalStoreGet(id, protocol.RecTypeEndpoint)
+	for _, sr := range recs {
+		if er, err := protocol.ParseEndpointRecord(sr); err == nil {
+			if er.NatType < protocol.NATSymmetric {
+				return rankVerified
+			}
+			break
+		}
+	}
+	return rankHearsay
+}
+
+func (n *Node) remember(from net.Addr, ch inboundChannel, dec *protocol.DecodedMessage) {
 	id := a2al.NodeIDFromAddress(dec.SenderAddr)
+	liveRank := n.rememberLiveRank(id)
 	n.peerMu.Lock()
 	pa := n.peers[nodeIDKey(id)]
 	if pa == nil {
 		pa = &peerAddrs{}
 		n.peers[nodeIDKey(id)] = pa
 	}
-	if udp, ok := from.(*net.UDPAddr); ok {
-		pa.setStable(udp)
-	} else {
-		pa.fallback = from
+	// Mode B QUIC inject uses ICE RemoteAddr; do not treat it as a portable
+	// stable anchor (M6). HasConn is authoritative for outbound on that path.
+	if ch != inboundChannelQUIC {
+		if udp, ok := from.(*net.UDPAddr); ok {
+			pa.tryLive(udp, liveRank)
+		} else {
+			pa.fallback = from
+		}
 	}
 	n.peerMu.Unlock()
 	n.addrToID.Store(from.String(), id)
 	// Inbound message = direct-contact evidence; set VerifiedAt now.
-	n.tabAdd(nodeInfoFromMessage(dec, from), routing.EntryMeta{VerifiedAt: time.Now()})
+	n.tabAdd(nodeInfoFromMessage(dec, from), routing.EntryMeta{VerifiedAt: time.Now()}, from)
 }
 
 // tabAdd inserts or refreshes ni in the routing table.
 //
-// For direct-contact entries (meta.VerifiedAt != zero), the full LRU-eviction
-// path is used: if the bucket is full, the LRU node is PINGed; if it does not
-// respond, it is evicted and ni takes its slot.
-//
-// For hearsay entries (meta.VerifiedAt.IsZero()), the routing layer places ni
-// into the main bucket if there is space, or into the per-bucket pending list
-// if the bucket is full.  Hearsay nodes never trigger LRU eviction.
-func (n *Node) tabAdd(ni protocol.NodeInfo, meta routing.EntryMeta) {
+// directFrom is the transport address the inbound message arrived on. When it is
+// a *net.UDPAddr, endpoint records may also populate the peer Anchor dial slot;
+// non-UDP paths (e.g. MemTransport in tests) only upgrade the routing table.
+func (n *Node) tabAdd(ni protocol.NodeInfo, meta routing.EntryMeta, directFrom net.Addr) {
 	var nid a2al.NodeID
 	if len(ni.NodeID) != len(nid) {
 		return
@@ -593,6 +623,9 @@ func (n *Node) tabAdd(ni protocol.NodeInfo, meta routing.EntryMeta) {
 							ni.IP = append([]byte(nil), ua.IP.To16()...)
 						}
 						ni.Port = uint16(ua.Port)
+						if _, ok := directFrom.(*net.UDPAddr); ok {
+							n.BindPeerAnchor(nid, ua)
+						}
 					}
 				}
 				break
@@ -741,10 +774,9 @@ func (n *Node) lookupPeerID(addr net.Addr) (a2al.NodeID, bool) {
 	return v.(a2al.NodeID), true
 }
 
-// adaptNodeListForAsker rewrites each NodeInfo's IP:Port to prefer the
-// address family matching the asker's source address, using dual-slot data
-// from the peers map when available. When no dual-slot data exists the
-// routing-table address is kept unchanged, preserving full backward compat.
+// adaptNodeListForAsker rewrites each NodeInfo's IP:Port for FIND_* responses.
+// Priority per node (aligned with tabAdd endpoint upgrade): endpoint anchor
+// (NatType < Symmetric) → routing-table IP:Port → peers bestStable fallback.
 func (n *Node) adaptNodeListForAsker(nodes []protocol.NodeInfo, asker net.Addr) []protocol.NodeInfo {
 	askerUDP, ok := asker.(*net.UDPAddr)
 	if !ok {
@@ -763,33 +795,50 @@ func (n *Node) adaptNodeListForAsker(nodes []protocol.NodeInfo, asker net.Addr) 
 	return out
 }
 
-// adaptNodeInfoForAsker rewrites ni.IP/Port to the asker-family-preferred
-// address from the dual-slot peers map, if available. Falls back to the
-// routing-table address when no dual-slot entry exists.
+// adaptNodeInfoForAsker rewrites ni.IP/Port for propagation to asker.
 func (n *Node) adaptNodeInfoForAsker(ni protocol.NodeInfo, id a2al.NodeID, askerIsV4 bool) protocol.NodeInfo {
+	familyRef := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)}
+	if !askerIsV4 {
+		familyRef = &net.UDPAddr{IP: net.IPv6loopback}
+	}
+	for _, sr := range n.LocalStoreGet(id, protocol.RecTypeEndpoint) {
+		if er, err := protocol.ParseEndpointRecord(sr); err == nil {
+			if er.NatType < protocol.NATSymmetric {
+				if ua := firstEndpointAddrForFamily(&er, familyRef); ua != nil {
+					return nodeInfoWithUDPAddr(ni, ua)
+				}
+			}
+			break
+		}
+	}
+	if len(ni.IP) > 0 && ni.Port != 0 {
+		return ni
+	}
 	n.peerMu.Lock()
 	pa := n.peers[nodeIDKey(id)]
 	n.peerMu.Unlock()
 	if pa == nil {
-		return ni // no dual-slot data; keep routing-table address as-is
+		return ni
 	}
 	var addr *net.UDPAddr
 	if askerIsV4 {
-		if pa.stableV4 != nil {
-			addr = pa.stableV4
-		} else {
-			addr = pa.stableV6 // fallback to v6 if no v4
+		addr = pa.v4.bestStable()
+		if addr == nil {
+			addr = pa.v6.bestStable()
 		}
 	} else {
-		if pa.stableV6 != nil {
-			addr = pa.stableV6
-		} else {
-			addr = pa.stableV4 // fallback to v4 if no v6
+		addr = pa.v6.bestStable()
+		if addr == nil {
+			addr = pa.v4.bestStable()
 		}
 	}
 	if addr == nil {
-		return ni // neither stable slot populated; keep existing
+		return ni
 	}
+	return nodeInfoWithUDPAddr(ni, addr)
+}
+
+func nodeInfoWithUDPAddr(ni protocol.NodeInfo, addr *net.UDPAddr) protocol.NodeInfo {
 	result := ni
 	if ip4 := addr.IP.To4(); ip4 != nil {
 		result.IP = append([]byte(nil), ip4...)
@@ -819,10 +868,15 @@ func (n *Node) recordSuccess(id a2al.NodeID, addr net.Addr, rtt time.Duration) {
 	fh.failCount = 0
 	fh.nextRetryAt = time.Time{}
 	fh.lastSuccess = now
+	n.clearSkipColdUDP(fh)
 	if rtt > 0 {
 		fh.rtt = rtt
 	}
 	n.healthMu.Unlock()
+
+	if udp, ok := addr.(*net.UDPAddr); ok {
+		n.bindPeerLive(id, udp, rankVerified)
+	}
 
 	// Update the routing layer's freshness timestamp.  This covers the outbound
 	// RPC path; the inbound path (remember) is covered by tabAdd with VerifiedAt=now.
@@ -839,6 +893,10 @@ func (n *Node) recordSuccess(id a2al.NodeID, addr net.Addr, rtt time.Duration) {
 // for a local network outage.  lastFailure and totalAttempts are still updated
 // so diagnostic counters remain accurate.
 func (n *Node) recordFailure(id a2al.NodeID, addr net.Addr) {
+	// Endpoint lookup touches the store; never call it while holding healthMu.
+	profile := n.reachProfile(id)
+	hasSignal := n.lookupEndpointRecord(id) != nil
+
 	key := nodeIDKey(id)
 	n.healthMu.Lock()
 	e := n.health[key]
@@ -860,6 +918,10 @@ func (n *Node) recordFailure(id a2al.NodeID, addr net.Addr) {
 		shift = maxBackoffShift
 	}
 	fh.nextRetryAt = time.Now().Add(probeInitDelay << shift)
+	if hasSignal && profile.prefersICEOverColdUDP() {
+		fh.skipColdUDP = true
+		fh.skipColdAt = time.Now()
+	}
 	n.healthMu.Unlock()
 }
 
@@ -1103,7 +1165,7 @@ func (n *Node) EstimatedNetworkSizeFiltered(cutoff time.Time) (int, float64) {
 // (zero value if the source is unknown or it is a local routing-table seed).
 func (n *Node) absorbNodeInfo(ni protocol.NodeInfo, learnedFrom a2al.NodeID) {
 	meta := routing.EntryMeta{LearnedFrom: learnedFrom} // VerifiedAt zero = hearsay
-	n.tabAdd(ni, meta)
+	n.tabAdd(ni, meta, nil)
 	if ni.Port == 0 || (len(ni.IP) != 4 && len(ni.IP) != 16) {
 		return
 	}
@@ -1113,13 +1175,10 @@ func (n *Node) absorbNodeInfo(ni protocol.NodeInfo, learnedFrom a2al.NodeID) {
 	}
 	copy(id[:], ni.NodeID)
 	udp := &net.UDPAddr{IP: append([]byte(nil), ni.IP...), Port: int(ni.Port)}
-	n.BindPeerAddr(id, udp)
+	n.bindPeerLive(id, udp, rankHearsay)
 }
 
-// BindPeerAddr registers the transport dial address for a remote NodeID
-// (e.g. from ICE or MemTransport in tests). UDP addresses are stored in the
-// family-matched stable slot; non-UDP addresses use the fallback slot.
-func (n *Node) BindPeerAddr(id a2al.NodeID, addr net.Addr) {
+func (n *Node) bindPeerLive(id a2al.NodeID, addr net.Addr, rank addrRank) {
 	n.peerMu.Lock()
 	pa := n.peers[nodeIDKey(id)]
 	if pa == nil {
@@ -1127,7 +1186,30 @@ func (n *Node) BindPeerAddr(id a2al.NodeID, addr net.Addr) {
 		n.peers[nodeIDKey(id)] = pa
 	}
 	if udp, ok := addr.(*net.UDPAddr); ok {
-		pa.setStable(udp)
+		pa.tryLive(udp, rank)
+	} else {
+		pa.fallback = addr
+	}
+	n.peerMu.Unlock()
+	n.addrToID.Store(addr.String(), id)
+}
+
+// BindPeerAddr registers a Verified live dial address (RPC success, tests).
+func (n *Node) BindPeerAddr(id a2al.NodeID, addr net.Addr) {
+	n.bindPeerLive(id, addr, rankVerified)
+}
+
+// BindPeerAnchor registers a long-lived advertised/infra dial address.
+// Anchor is never overwritten by hearsay or ephemeral sources.
+func (n *Node) BindPeerAnchor(id a2al.NodeID, addr net.Addr) {
+	n.peerMu.Lock()
+	pa := n.peers[nodeIDKey(id)]
+	if pa == nil {
+		pa = &peerAddrs{}
+		n.peers[nodeIDKey(id)] = pa
+	}
+	if udp, ok := addr.(*net.UDPAddr); ok {
+		pa.tryAnchor(udp)
 	} else {
 		pa.fallback = addr
 	}
@@ -1159,6 +1241,40 @@ func (n *Node) SelfExtIPv6() net.IP {
 	n.selfExtMu.RLock()
 	defer n.selfExtMu.RUnlock()
 	return n.selfExtIPv6
+}
+
+// isSelfReflectedAddr reports whether addr is our own bound transport address
+// (NAT loopback / self-reflected UDP source).
+func (n *Node) isSelfReflectedAddr(addr net.Addr) bool {
+	if addr == nil {
+		return false
+	}
+	self := n.tr.LocalAddr()
+	if self == nil {
+		return false
+	}
+	su, ok1 := addr.(*net.UDPAddr)
+	sl, ok2 := self.(*net.UDPAddr)
+	if !ok1 || !ok2 {
+		return addr.String() == self.String()
+	}
+	return su.IP.Equal(sl.IP) && su.Port == sl.Port
+}
+
+// isUnusableControlPlaneReachAddr reports addresses that must not be used for
+// DHT control-plane reachability learning or outbound selection (hairpin NAT
+// reflection, self bind address). Does not apply to Mode A business paths.
+func (n *Node) isUnusableControlPlaneReachAddr(addr net.Addr) bool {
+	return n.isHairpinAddr(addr) || n.isSelfReflectedAddr(addr)
+}
+
+// isControlPlaneSelfExcitation reports inbound evidence that must not drive
+// lastInbound recording or ICE punch triggers on the DHT control plane.
+func (n *Node) isControlPlaneSelfExcitation(peerID a2al.NodeID, from net.Addr) bool {
+	if peerID == n.nid {
+		return true
+	}
+	return n.isUnusableControlPlaneReachAddr(from)
 }
 
 // isHairpinAddr returns true when addr shares our public IP but is not our own
@@ -1197,15 +1313,21 @@ func (n *Node) reply(from net.Addr, req *protocol.DecodedMessage, msgType uint8,
 		n.log.Warn("dht reply marshal failed", "msg_type", msgType, "to", from, "err", err)
 		return
 	}
-	if err := n.sendToOrFallback(n.ctx, from, raw); err != nil {
+	if err := n.deliverReply(from, req, raw); err != nil {
 		n.log.Warn("dht reply send failed", "msg_type", msgType, "to", from, "size", len(raw), "err", err)
 	} else {
 		n.statsTx.Add(1)
 	}
 }
 
-func (n *Node) onPing(from net.Addr, dec *protocol.DecodedMessage) {
-	n.remember(from, dec)
+func (n *Node) deliverReply(from net.Addr, req *protocol.DecodedMessage, raw []byte) error {
+	peerID := a2al.NodeIDFromAddress(req.SenderAddr)
+	_, err := n.deliver(n.ctx, peerID, from, raw)
+	return err
+}
+
+func (n *Node) onPing(from net.Addr, ch inboundChannel, dec *protocol.DecodedMessage) {
+	n.remember(from, ch, dec)
 	body := &protocol.BodyPong{
 		Address:      n.addr[:],
 		ObservedAddr: ObservedAddr(from),
@@ -1213,9 +1335,8 @@ func (n *Node) onPing(from net.Addr, dec *protocol.DecodedMessage) {
 	n.reply(from, dec, protocol.MsgPong, body)
 }
 
-func (n *Node) onFindNode(from net.Addr, dec *protocol.DecodedMessage) {
-	n.log.Debug("dht recv find_node", "from", from)
-	n.remember(from, dec)
+func (n *Node) onFindNode(from net.Addr, ch inboundChannel, dec *protocol.DecodedMessage) {
+	n.remember(from, ch, dec)
 	target := dec.Body.(*protocol.BodyFindNode).Target
 	var tid a2al.NodeID
 	copy(tid[:], target)
@@ -1233,9 +1354,8 @@ func (n *Node) onFindNode(from net.Addr, dec *protocol.DecodedMessage) {
 	n.reply(from, dec, protocol.MsgFindNodeResp, resp)
 }
 
-func (n *Node) onFindValue(from net.Addr, dec *protocol.DecodedMessage) {
-	n.log.Debug("dht recv find_value", "from", from)
-	n.remember(from, dec)
+func (n *Node) onFindValue(from net.Addr, ch inboundChannel, dec *protocol.DecodedMessage) {
+	n.remember(from, ch, dec)
 	body := dec.Body.(*protocol.BodyFindValue)
 	var tid a2al.NodeID
 	copy(tid[:], body.Target)
@@ -1296,8 +1416,8 @@ func (n *Node) onFindValue(from net.Addr, dec *protocol.DecodedMessage) {
 	}
 }
 
-func (n *Node) onStore(from net.Addr, dec *protocol.DecodedMessage) {
-	n.remember(from, dec)
+func (n *Node) onStore(from net.Addr, ch inboundChannel, dec *protocol.DecodedMessage) {
+	n.remember(from, ch, dec)
 	body := dec.Body.(*protocol.BodyStore)
 	var key a2al.NodeID
 	if len(body.Key) == len(key) {
@@ -1344,7 +1464,7 @@ func (n *Node) pushToSubscriber(key a2al.NodeID, rec protocol.SignedRecord, sub 
 	addr := sub.addr
 	hdr := protocol.Header{Version: protocol.ProtocolVersion, MsgType: protocol.MsgDHTPush}
 	body := &protocol.BodyDHTPush{Key: key[:], Record: rec}
-	dec, err := n.sendAndWait(ctx, &addr, hdr, body, protocol.MsgDHTPushACK)
+	dec, _, err := n.sendAndWait(ctx, &addr, hdr, body, protocol.MsgDHTPushACK)
 	if err != nil {
 		n.log.Debug("dht_push: failed", "dst", addr.String(), "err", err)
 		return
@@ -1396,8 +1516,8 @@ const natProbeEchoMax = 3
 // enforces source-IP consistency (anti-reflection), applies a per-source rate
 // limit, then sends a NATProbeEcho directly to that address.
 // Old nodes never reach here (VerifyAndDecode returns ErrUnknownMsgType for 0x09).
-func (n *Node) onNATProbeReq(from net.Addr, dec *protocol.DecodedMessage) {
-	n.remember(from, dec)
+func (n *Node) onNATProbeReq(from net.Addr, ch inboundChannel, dec *protocol.DecodedMessage) {
+	n.remember(from, ch, dec)
 	body := dec.Body.(*protocol.BodyNATProbeReq)
 
 	host, port, ok := protocol.ParseObservedUDP(body.ClaimedAddr)
@@ -1458,16 +1578,16 @@ func (n *Node) echoRateOK(srcIP string) bool {
 }
 
 // onNATProbeEcho receives an echo from a peer and notifies any waiter registered for the token.
-func (n *Node) onNATProbeEcho(from net.Addr, dec *protocol.DecodedMessage) {
-	n.remember(from, dec)
+func (n *Node) onNATProbeEcho(from net.Addr, inCh inboundChannel, dec *protocol.DecodedMessage) {
+	n.remember(from, inCh, dec)
 	body := dec.Body.(*protocol.BodyNATProbeEcho)
 	key := hex.EncodeToString(body.Token)
 	n.natProbeMu.Lock()
-	ch, ok := n.natProbeWait[key]
+	waitCh, ok := n.natProbeWait[key]
 	n.natProbeMu.Unlock()
 	if ok {
 		select {
-		case ch <- struct{}{}:
+		case waitCh <- struct{}{}:
 		default:
 		}
 	}
@@ -1531,25 +1651,29 @@ const (
 // 1200 (MaxPacketSize) - 138 (overhead) - 12 (safety margin) = 1050.
 const maxResponsePayload = 1050
 
-func (n *Node) sendAndWait(ctx context.Context, to net.Addr, hdr protocol.Header, body any, expect uint8) (*protocol.DecodedMessage, error) {
+func (n *Node) sendAndWait(ctx context.Context, to net.Addr, hdr protocol.Header, body any, expect uint8) (*protocol.DecodedMessage, deliverMeta, error) {
+	var lastMeta deliverMeta
 	for attempt := 0; attempt < rpcMaxAttempts; attempt++ {
 		if ctx.Err() != nil {
-			return nil, ctx.Err()
+			return nil, lastMeta, ctx.Err()
 		}
 		// Fresh TxID per attempt to avoid stale-response cross-matching.
 		hdr.TxID = make([]byte, 20)
 		if _, err := crand.Read(hdr.TxID); err != nil {
-			return nil, err
+			return nil, lastMeta, err
 		}
 		ch := n.registerWait(hdr.TxID, expect)
 		raw, err := protocol.MarshalSignedMessageKeyStore(hdr, body, n.ks, n.addr)
 		if err != nil {
 			n.unregisterWait(hdr.TxID)
-			return nil, err
+			return nil, lastMeta, err
 		}
-		if err := n.sendToOrFallback(ctx, to, raw); err != nil {
+		peerID, _ := n.lookupPeerID(to)
+		meta, err := n.deliver(ctx, peerID, to, raw)
+		lastMeta = meta
+		if err != nil {
 			n.unregisterWait(hdr.TxID)
-			return nil, err
+			return nil, lastMeta, err
 		}
 		n.statsTx.Add(1)
 
@@ -1558,50 +1682,39 @@ func (n *Node) sendAndWait(ctx context.Context, to net.Addr, hdr protocol.Header
 		case dec := <-ch:
 			aCancel()
 			n.statsRPC.Add(1)
-			return dec, nil
+			return dec, lastMeta, nil
 		case <-aCtx.Done():
 			n.unregisterWait(hdr.TxID)
 			aCancel()
 			if n.ctx.Err() != nil {
-				return nil, n.ctx.Err()
+				return nil, lastMeta, n.ctx.Err()
 			}
 			if ctx.Err() != nil {
-				return nil, ctx.Err()
+				return nil, lastMeta, ctx.Err()
 			}
 			n.log.Debug("dht rpc timeout, retrying", "to", to, "msg_type", hdr.MsgType, "attempt", attempt+1)
 			// per-attempt timeout; retry
 		case <-n.ctx.Done():
 			n.unregisterWait(hdr.TxID)
 			aCancel()
-			return nil, n.ctx.Err()
+			return nil, lastMeta, n.ctx.Err()
 		}
 	}
-	n.log.Warn("dht rpc failed after retries", "to", to, "msg_type", hdr.MsgType, "attempts", rpcMaxAttempts)
-	return nil, context.DeadlineExceeded
+	n.log.Warn("dht rpc failed after retries",
+		"to", to,
+		"msg_type", hdr.MsgType,
+		"attempts", rpcMaxAttempts,
+		"dial_addr", lastMeta.dialAddr,
+		"via_quic", lastMeta.viaQUIC,
+		"plan_reason", lastMeta.reason,
+	)
+	return nil, lastMeta, context.DeadlineExceeded
 }
 
-// sendToOrFallback delivers raw to the peer at addr.
-//
-// When a punch pool is configured and a punched QUIC connection is already
-// active for the peer, the message is delivered via that connection (Mode B,
-// control-plane QUIC). If the pool reports no active connection (ok=false) or
-// no pool is configured, the call falls back to the UDP transport. This makes
-// the send path transparent: callers never need to know which transport was
-// used, and behaviour is identical to the current pure-UDP path when the pool
-// is empty (Phase 2/3 stub always returns ok=false).
-//
-// NAT-probe paths (onNATProbeReq, SendNATProbeReq) deliberately bypass this
-// helper and call n.tr.Send directly because their purpose is to measure raw
-// UDP reachability, which would be defeated by routing through a QUIC stream.
+// sendToOrFallback delivers raw to the peer at addr via the L0 legacy path.
+// Tests and NAT-probe-adjacent callers use this directly; RPC paths go through deliver.
 func (n *Node) sendToOrFallback(ctx context.Context, to net.Addr, raw []byte) error {
-	if n.punch != nil {
-		if nid, ok := n.lookupPeerID(to); ok {
-			if sent, err := n.punch.SendTo(ctx, nid, raw); sent {
-				return err
-			}
-		}
-	}
-	return n.tr.Send(to, raw)
+	return n.sendToOrFallbackLegacy(ctx, to, raw)
 }
 
 func (n *Node) notifyObserved(reporter a2al.NodeID, wire []byte) {
@@ -1632,10 +1745,16 @@ func (n *Node) PingIdentity(ctx context.Context, peer net.Addr) (*PeerIdentity, 
 	hdr := protocol.Header{Version: protocol.ProtocolVersion, MsgType: protocol.MsgPing, TxID: tx}
 	body := &protocol.BodyPing{Address: n.addr[:]}
 	t0 := time.Now()
-	dec, err := n.sendAndWait(ctx, peer, hdr, body, protocol.MsgPong)
+	dec, meta, err := n.sendAndWait(ctx, peer, hdr, body, protocol.MsgPong)
 	if err != nil {
-		if id, ok := n.lookupPeerID(peer); ok {
-			n.recordFailure(id, peer)
+		if id, ok := n.lookupPeerID(peer); ok && !meta.viaQUIC {
+			// Penalise the address family actually used for the attempt (meta.dialAddr),
+			// not necessarily the caller's stable addr hint.
+			failAddr := meta.dialAddr
+			if failAddr == nil {
+				failAddr = peer
+			}
+			n.recordFailure(id, failAddr)
 		}
 		return nil, err
 	}
@@ -1645,10 +1764,10 @@ func (n *Node) PingIdentity(ctx context.Context, peer net.Addr) (*PeerIdentity, 
 	}
 	peerAddr := dec.SenderAddr
 	peerNID := a2al.NodeIDFromAddress(peerAddr)
-	n.recordSuccess(peerNID, peer, time.Since(t0))
+	n.recordSuccess(peerNID, successDialAddr(peer, meta), time.Since(t0))
 	ni := nodeInfoFromMessage(dec, peer)
 	n.BindPeerAddr(peerNID, peer)
-	n.tabAdd(ni, routing.EntryMeta{VerifiedAt: time.Now()})
+	n.tabAdd(ni, routing.EntryMeta{VerifiedAt: time.Now()}, peer)
 	var obs []byte
 	if len(pong.ObservedAddr) > 0 {
 		obs = append([]byte(nil), pong.ObservedAddr...)
@@ -1658,22 +1777,31 @@ func (n *Node) PingIdentity(ctx context.Context, peer net.Addr) (*PeerIdentity, 
 }
 
 // StoreAt sends STORE to peer. storeKey zero omits BodyStore.Key (receiver derives key from rec.Address).
-func (n *Node) StoreAt(ctx context.Context, peer net.Addr, storeKey a2al.NodeID, rec protocol.SignedRecord) (bool, error) {
+// On success peerID is the remote node's identity from the STORE response.
+func (n *Node) StoreAt(ctx context.Context, peer net.Addr, storeKey a2al.NodeID, rec protocol.SignedRecord) (stored bool, peerID a2al.NodeID, err error) {
 	body := &protocol.BodyStore{Record: rec}
 	if storeKey != (a2al.NodeID{}) {
 		body.Key = storeKey[:]
 	}
 	hdr := protocol.Header{Version: protocol.ProtocolVersion, MsgType: protocol.MsgStore}
 	t0 := time.Now()
-	dec, err := n.sendAndWait(ctx, peer, hdr, body, protocol.MsgStoreResp)
+	dec, meta, err := n.sendAndWait(ctx, peer, hdr, body, protocol.MsgStoreResp)
 	if err != nil {
-		if id, ok := n.lookupPeerID(peer); ok {
-			n.recordFailure(id, peer)
+		if id, ok := n.lookupPeerID(peer); ok && !meta.viaQUIC {
+			// Penalise the address family actually used for the attempt (meta.dialAddr),
+			// not necessarily the caller's stable addr hint.
+			failAddr := meta.dialAddr
+			if failAddr == nil {
+				failAddr = peer
+			}
+			n.recordFailure(id, failAddr)
 		}
-		return false, err
+		return false, a2al.NodeID{}, err
 	}
 	peerNID := a2al.NodeIDFromAddress(dec.SenderAddr)
-	n.recordSuccess(peerNID, peer, time.Since(t0))
+	dial := successDialAddr(peer, meta)
+	n.recordSuccess(peerNID, dial, time.Since(t0))
+	n.rememberStoreSuccess(peerNID, dial)
 	resp := dec.Body.(*protocol.BodyStoreResp)
 	switch {
 	case resp.AlreadyHad:
@@ -1683,7 +1811,17 @@ func (n *Node) StoreAt(ctx context.Context, peer net.Addr, storeKey a2al.NodeID,
 	case !resp.Stored && resp.Reason == protocol.StoreReasonRecordInvalid:
 		n.log.Debug("dht store: record invalid", "peer", peer, "key", hex.EncodeToString(storeKey[:4]))
 	}
-	return resp.Stored, nil
+	return resp.Stored, peerNID, nil
+}
+
+// rememberStoreSuccess registers dial→nodeID mapping after a successful outbound
+// STORE. Anchor binding is handled by tabAdd (UDP inbound) or explicit beacon paths;
+// do not write Anchor here from outbound dial evidence alone.
+func (n *Node) rememberStoreSuccess(id a2al.NodeID, dial net.Addr) {
+	if dial == nil {
+		return
+	}
+	n.addrToID.Store(dial.String(), id)
 }
 
 // FindNode asks peer for closest nodes to target NodeID.
@@ -1691,15 +1829,21 @@ func (n *Node) FindNode(ctx context.Context, peer net.Addr, target a2al.NodeID) 
 	hdr := protocol.Header{Version: protocol.ProtocolVersion, MsgType: protocol.MsgFindNode}
 	body := &protocol.BodyFindNode{Target: target[:]}
 	t0 := time.Now()
-	dec, err := n.sendAndWait(ctx, peer, hdr, body, protocol.MsgFindNodeResp)
+	dec, meta, err := n.sendAndWait(ctx, peer, hdr, body, protocol.MsgFindNodeResp)
 	if err != nil {
-		if id, ok := n.lookupPeerID(peer); ok {
-			n.recordFailure(id, peer)
+		if id, ok := n.lookupPeerID(peer); ok && !meta.viaQUIC {
+			// Penalise the address family actually used for the attempt (meta.dialAddr),
+			// not necessarily the caller's stable addr hint.
+			failAddr := meta.dialAddr
+			if failAddr == nil {
+				failAddr = peer
+			}
+			n.recordFailure(id, failAddr)
 		}
 		return nil, err
 	}
 	peerNID := a2al.NodeIDFromAddress(dec.SenderAddr)
-	n.recordSuccess(peerNID, peer, time.Since(t0))
+	n.recordSuccess(peerNID, successDialAddr(peer, meta), time.Since(t0))
 	br := dec.Body.(*protocol.BodyFindNodeResp)
 	n.notifyObserved(peerNID, br.ObservedAddr)
 	return br.Nodes, nil
@@ -1712,15 +1856,21 @@ func (n *Node) FindValueWithNodes(ctx context.Context, peer net.Addr, key a2al.N
 	hdr := protocol.Header{Version: protocol.ProtocolVersion, MsgType: protocol.MsgFindValue}
 	body := &protocol.BodyFindValue{Target: key[:], RecType: recType, OneShotSubscribe: subscribe}
 	t0 := time.Now()
-	dec, err := n.sendAndWait(ctx, peer, hdr, body, protocol.MsgFindValueResp)
+	dec, meta, err := n.sendAndWait(ctx, peer, hdr, body, protocol.MsgFindValueResp)
 	if err != nil {
-		if id, ok := n.lookupPeerID(peer); ok {
-			n.recordFailure(id, peer)
+		if id, ok := n.lookupPeerID(peer); ok && !meta.viaQUIC {
+			// Penalise the address family actually used for the attempt (meta.dialAddr),
+			// not necessarily the caller's stable addr hint.
+			failAddr := meta.dialAddr
+			if failAddr == nil {
+				failAddr = peer
+			}
+			n.recordFailure(id, failAddr)
 		}
 		return nil, nil, err
 	}
 	peerNID := a2al.NodeIDFromAddress(dec.SenderAddr)
-	n.recordSuccess(peerNID, peer, time.Since(t0))
+	n.recordSuccess(peerNID, successDialAddr(peer, meta), time.Since(t0))
 	br := dec.Body.(*protocol.BodyFindValueResp)
 	n.notifyObserved(peerNID, br.ObservedAddr)
 	var out []protocol.SignedRecord
@@ -1762,7 +1912,7 @@ func (n *Node) AddContact(addr net.Addr, ni protocol.NodeInfo) {
 	var peerID a2al.NodeID
 	copy(peerID[:], ni.NodeID)
 	n.BindPeerAddr(peerID, addr)
-	n.tabAdd(ni, routing.EntryMeta{VerifiedAt: time.Now()})
+	n.tabAdd(ni, routing.EntryMeta{VerifiedAt: time.Now()}, addr)
 }
 
 // LocalAddr returns the underlying transport address.
@@ -1806,19 +1956,7 @@ func (n *Node) BootstrapCandidateAddrs(max int) []net.Addr {
 			continue
 		}
 		var udp *net.UDPAddr
-		n.peerMu.Lock()
-		pa := n.peers[nodeIDKey(id)]
-		n.peerMu.Unlock()
-		if pa != nil {
-			if a := pa.preferred(); a != nil {
-				if u, ok := a.(*net.UDPAddr); ok && u.Port != 0 {
-					udp = u
-				}
-			}
-		}
-		if udp == nil && (len(ni.IP) == 4 || len(ni.IP) == 16) && ni.Port != 0 {
-			udp = &net.UDPAddr{IP: append([]byte(nil), ni.IP...), Port: int(ni.Port)}
-		}
+		udp = n.bootstrapDialAddr(id, ni)
 		if udp == nil {
 			continue
 		}

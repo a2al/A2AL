@@ -5,6 +5,7 @@ package a2al
 
 import (
 	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"math/bits"
 	"strings"
@@ -33,6 +34,11 @@ func NodeIDFromAddress(addr Address) NodeID {
 	b[0] = addr[0]
 	copy(b[1:], addr[1:])
 	return sha256.Sum256(b[:])
+}
+
+// String returns the canonical hex representation for logs and display.
+func (id NodeID) String() string {
+	return hex.EncodeToString(id[:])
 }
 
 // Distance is the XOR metric d(A,B) = NodeID_A ⊕ NodeID_B (spec §3.3).
