@@ -128,6 +128,13 @@ func (p *DHTpunchPool) Punch(nodeID a2al.NodeID, er *protocol.EndpointRecord, pr
 		}
 		return
 	}
+	if er.Address == p.h.addr {
+		p.log.Debug("dht punch: skipped self endpoint", "node", nodeID)
+		if n := p.node(); n != nil {
+			n.OnPunchComplete(nodeID, a2al.Address{}, nil, false, false, dht.PunchFailOther)
+		}
+		return
+	}
 
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), punchDialTimeout)
@@ -160,6 +167,10 @@ func (p *DHTpunchPool) Punch(nodeID a2al.NodeID, er *protocol.EndpointRecord, pr
 func (p *DHTpunchPool) HandleIncomingPunch(ctx context.Context, callerNodeID a2al.NodeID, callerLogicalAddr a2al.Address, signalBase, room string) {
 	if p.h == nil {
 		p.log.Warn("dht punch accept: pool not bound to host")
+		return
+	}
+	if callerLogicalAddr == p.h.addr {
+		p.log.Debug("dht punch accept: skipped self caller", "caller", callerLogicalAddr)
 		return
 	}
 

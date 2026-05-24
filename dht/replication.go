@@ -24,8 +24,9 @@ const (
 	probeInitDelay    = 30 * time.Second // Unknown node: initial probe interval
 	probeMaxDelay     = 1 * time.Hour    // Good node: ceiling; in practice StoreAt (every 30 min) contacts the node first
 	probeBadDelay     = 30 * time.Minute // Bad node: grace window before eviction
-	probeTickInterval = 15 * time.Second // health probe loop wake-up interval
-	replChBuf         = 64              // replication task channel buffer
+	probeTickInterval  = 15 * time.Second // health probe loop wake-up interval
+	replChBuf          = 64               // replication task channel buffer
+	gapFillPunchBudget = 2                // max new ICE attempts per gap-fill cycle
 )
 
 // repKey uniquely identifies one (storeKey, publisher) replication unit.
@@ -151,10 +152,7 @@ func (n *Node) replMaintainer(ctx context.Context) {
 	}
 }
 
-// processReplTask fills any gap in a repSet (|nodes| < N_rep) by selecting
-// candidates from the routing table and performing staggered StoreAt RPCs.
-// Used for refill after bad-node removal (过程三) and for new-record seeding
-// (before renewBackground has run FindNode).
+// processReplTask fills gaps in direct and punched replication tracks.
 func (n *Node) processReplTask(ctx context.Context, task replTask) {
 	rs := n.getOrCreateRepSet(task.rk)
 
@@ -170,37 +168,23 @@ func (n *Node) processReplTask(ctx context.Context, task replTask) {
 	for k := range rs.nodes {
 		existing[k] = struct{}{}
 	}
-	need := nRep - len(rs.nodes)
 	rs.mu.Unlock()
 
-	if len(rec.Address) == 0 || need <= 0 {
+	if len(rec.Address) == 0 {
+		return
+	}
+	directNeed, punchedNeed, total := repSetTrackNeeds(rs)
+	if total >= repHardCap || (directNeed <= 0 && punchedNeed <= 0) {
 		return
 	}
 
-	candidates := n.tabNearestHealthy(task.rk.storeKey, repHardCap)
-	var filtered []protocol.NodeInfo
-	for _, ni := range candidates {
-		k := infoKey(ni)
-		if k == "" {
-			continue
-		}
-		if _, inSet := existing[k]; inSet {
-			continue
-		}
-		var id a2al.NodeID
-		copy(id[:], ni.NodeID)
-		if !n.PeerAllowContact(id) {
-			continue
-		}
-		filtered = append(filtered, ni)
+	directPool := n.tabNearestHealthy(task.rk.storeKey, repHardCap)
+	xorPool := n.tabNearest(task.rk.storeKey, repHardCap)
+	direct, nat := n.pickGapFillPeers(task.rk.storeKey, rs, directPool, xorPool, existing)
+	if len(direct) > 0 {
+		n.storeAndRecord(ctx, direct, task.rk, rec, rs)
 	}
-	if len(filtered) > need {
-		filtered = filtered[:need]
-	}
-	if len(filtered) == 0 {
-		return
-	}
-	n.storeAndRecord(ctx, filtered, task.rk, rec, rs)
+	n.gapFillStoreNAT(ctx, task.rk, rec, rs, nat)
 }
 
 // scheduleReplicate kicks off async replication for a record that was just
@@ -282,7 +266,7 @@ func (n *Node) renewBackground(rk repKey, rs *repSet) {
 		var fnErr error
 		found, fnErr = q.FindNode(ctx, rk.storeKey)
 		if fnErr != nil || ctx.Err() != nil {
-			found = n.tabNearestHealthy(rk.storeKey, repHardCap)
+			found = nil
 		}
 	}
 
@@ -350,75 +334,27 @@ func (n *Node) renewBackground(rk repKey, rs *repSet) {
 		rs.mu.Unlock()
 	}
 
-	// Build the newPeers candidate list from FindNode results.
-	//
-	// When the repSet is already at N_rep we still want topology refresh: try
-	// nodes that are XOR-closer than the current farthest repSet member.  This
-	// preserves the strategy invariant (store at the N_rep XOR-closest reachable
-	// nodes) without exhausting the full FindNode list indiscriminately.
-	//
-	// In both cases we skip known-Bad peers to avoid wasting 2 s timeouts on
-	// nodes the health system has already flagged as unreachable.
-	rs.mu.Lock()
-	currentSize := len(rs.nodes)
-	// Compute the farthest XOR distance currently in the repSet (used when full).
-	var farthestDist a2al.NodeID
-	hasFarthest := false
-	if currentSize >= nRep {
-		for _, e := range rs.nodes {
-			d := xorNodeID(e.nodeID, rk.storeKey)
-			if !hasFarthest || xorGT(d, farthestDist) {
-				farthestDist = d
-				hasFarthest = true
-			}
-		}
+	// Gap-fill new peers via dual-track plan (direct + punched XOR-near NAT).
+	directPool := n.tabNearestHealthy(rk.storeKey, repHardCap)
+	xorPool := n.tabNearest(rk.storeKey, repHardCap)
+	if len(found) > 0 {
+		xorPool = found
 	}
-	availableSlots := repHardCap - currentSize
-	rs.mu.Unlock()
-
-	if len(found) > 0 && availableSlots > 0 {
-		var newPeers []protocol.NodeInfo
-		for _, ni := range found {
-			k := infoKey(ni)
-			if k == "" {
-				continue
-			}
-			if _, inSet := existing[k]; inSet {
-				continue // already a confirmed replica
-			}
-		var id a2al.NodeID
-		copy(id[:], ni.NodeID)
-		if !n.PeerAllowContact(id) {
-			continue
-		}
-			if hasFarthest {
-				// repSet is full: only try peers closer than our farthest member.
-				d := xorNodeID(id, rk.storeKey)
-				if !xorGT(farthestDist, d) {
-					// d >= farthestDist: this peer is not closer; skip.
-					continue
-				}
-			}
-			newPeers = append(newPeers, ni)
-		}
-		// Respect the hard cap on total attempts.
-		if len(newPeers) > availableSlots {
-			newPeers = newPeers[:availableSlots]
-		}
-		if len(newPeers) > 0 {
-			n.storeAndRecord(ctx, newPeers, rk, rec, rs)
-		}
+	direct, nat := n.pickGapFillPeers(rk.storeKey, rs, directPool, xorPool, existing)
+	if len(direct) > 0 {
+		n.storeAndRecord(ctx, direct, rk, rec, rs)
 	}
+	n.gapFillStoreNAT(ctx, rk, rec, rs, nat)
 
-	// If still below N_rep after all attempts, queue a processReplTask refill.
-	// processReplTask uses tabNearestHealthy which may surface candidates not
-	// returned by FindNode (e.g. recently-discovered Good peers).
+	// If either track is still short, queue 过程二 refill (may surface candidates
+	// from routing-table updates not yet visible to this renewBackground run).
+	directNeed, punchedNeed, _ := repSetTrackNeeds(rs)
+	if directNeed > 0 || punchedNeed > 0 {
+		n.enqueueReplication(rk, protocol.SignedRecord{})
+	}
 	rs.mu.Lock()
 	finalSize := len(rs.nodes)
 	rs.mu.Unlock()
-	if nRep-finalSize > 0 {
-		n.enqueueReplication(rk, protocol.SignedRecord{})
-	}
 	n.log.Debug("replication status",
 		"key", fmt.Sprintf("%x", rk.storeKey[:4]),
 		"replicas", finalSize,
@@ -474,8 +410,15 @@ func (n *Node) storeAndRecord(ctx context.Context, peers []protocol.NodeInfo, rk
 			continue
 		}
 
+		if n.learnedPathFirst.Load() {
+			n.maybeWaitRepSetPunch(ctx, id, rs, addr)
+			if planAddr := n.outboundPlan(id, addr).addr; planAddr != nil {
+				addr = planAddr
+			}
+		}
+
 		pctx, cancel := context.WithTimeout(ctx, queryPeerTimeout)
-		stored, err := n.StoreAt(pctx, addr, rk.storeKey, rec)
+		stored, _, err := n.StoreAt(pctx, addr, rk.storeKey, rec)
 		cancel()
 		if err != nil {
 			n.log.Debug("replication StoreAt failed", "peer", addr, "err", err)
@@ -549,7 +492,154 @@ func (n *Node) storeAndRecord(ctx context.Context, peers []protocol.NodeInfo, rk
 			}
 			tabNI.Port = uint16(ua.Port)
 		}
-		n.tabAdd(tabNI, routing.EntryMeta{VerifiedAt: time.Now()})
+		n.tabAdd(tabNI, routing.EntryMeta{VerifiedAt: time.Now()}, addr)
+	}
+}
+
+// repSetTrackNeeds returns remaining direct and punched slots (each targets nRep).
+func repSetTrackNeeds(rs *repSet) (directNeed, punchedNeed, total int) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	var direct, punched int
+	for _, e := range rs.nodes {
+		if e.isPunched {
+			punched++
+		} else {
+			direct++
+		}
+	}
+	total = len(rs.nodes)
+	if n := nRep - direct; n > 0 {
+		directNeed = n
+	}
+	if n := nRep - punched; n > 0 {
+		punchedNeed = n
+	}
+	return directNeed, punchedNeed, total
+}
+
+// pickGapFillPeers splits gap-fill candidates into direct and NAT (signal) tracks.
+// Direct: reachability first, no XOR gate. NAT: XOR-near from xorPool, signal required.
+func (n *Node) pickGapFillPeers(storeKey a2al.NodeID, rs *repSet, directPool, xorPool []protocol.NodeInfo, existing map[string]struct{}) (direct, nat []protocol.NodeInfo) {
+	directNeed, punchedNeed, total := repSetTrackNeeds(rs)
+	if total >= repHardCap || (directNeed <= 0 && punchedNeed <= 0) {
+		return nil, nil
+	}
+
+	// Compute the farthest XOR distance in the existing repSet. Used as a gate for
+	// the NAT track: only XOR-closer candidates are worth punching through to.
+	var xorFarthest a2al.NodeID
+	hasXorFarthest := false
+	rs.mu.Lock()
+	for _, e := range rs.nodes {
+		d := xorNodeID(e.nodeID, storeKey)
+		if !hasXorFarthest || xorGT(d, xorFarthest) {
+			xorFarthest = d
+			hasXorFarthest = true
+		}
+	}
+	rs.mu.Unlock()
+
+	for _, ni := range directPool {
+		if directNeed <= 0 {
+			break
+		}
+		k := infoKey(ni)
+		if k == "" {
+			continue
+		}
+		if _, ok := existing[k]; ok {
+			continue
+		}
+		var id a2al.NodeID
+		if len(ni.NodeID) != len(id) {
+			continue
+		}
+		copy(id[:], ni.NodeID)
+		if id == n.nid || !n.PeerAllowContact(id) {
+			continue
+		}
+		if n.reachProfile(id).prefersICEOverColdUDP() {
+			continue
+		}
+		direct = append(direct, ni)
+		directNeed--
+	}
+
+	punchBudget := gapFillPunchBudget
+	for _, ni := range xorPool {
+		if punchedNeed <= 0 {
+			break
+		}
+		k := infoKey(ni)
+		if k == "" {
+			continue
+		}
+		if _, ok := existing[k]; ok {
+			continue
+		}
+		var id a2al.NodeID
+		if len(ni.NodeID) != len(id) {
+			continue
+		}
+		copy(id[:], ni.NodeID)
+		if id == n.nid {
+			continue
+		}
+		if n.lookupEndpointRecord(id) == nil || n.reachProfile(id).prefersUDPAnchor() {
+			continue
+		}
+		if hasXorFarthest {
+			d := xorNodeID(id, storeKey)
+			if !xorGT(xorFarthest, d) {
+				continue
+			}
+		}
+		hasConn := n.punch != nil && n.punch.HasConn(id)
+		if !hasConn {
+			if punchBudget <= 0 {
+				continue
+			}
+			punchBudget--
+		}
+		nat = append(nat, ni)
+		punchedNeed--
+	}
+	return direct, nat
+}
+
+// gapFillStoreNAT punch-waits then reuses storeAndRecord per NAT candidate.
+func (n *Node) gapFillStoreNAT(ctx context.Context, rk repKey, rec protocol.SignedRecord, rs *repSet, peers []protocol.NodeInfo) {
+	if n.punch == nil || len(peers) == 0 {
+		return
+	}
+	for i, ni := range peers {
+		if ctx.Err() != nil {
+			return
+		}
+		if i > 0 {
+			t := time.NewTimer(storeStagger)
+			select {
+			case <-t.C:
+			case <-ctx.Done():
+				t.Stop()
+				return
+			}
+		}
+		var id a2al.NodeID
+		if len(ni.NodeID) != len(id) {
+			continue
+		}
+		copy(id[:], ni.NodeID)
+		if !n.punch.HasConn(id) {
+			if er := n.lookupEndpointRecord(id); er != nil {
+				n.triggerPunchWithOptions(id, er, PunchPriorityHigh, true)
+			}
+			if !waitForHasConn(ctx, func() bool { return n.punch.HasConn(id) }, repSetPunchWait) {
+				continue
+			}
+		}
+		n.storeAndRecord(ctx, []protocol.NodeInfo{ni}, rk, rec, rs)
 	}
 }
 
@@ -944,8 +1034,11 @@ func (n *Node) probeRepNode(ctx context.Context, rk repKey, rs *repSet, e *repNo
 		punchAttempted bool
 	)
 	if n.punch != nil {
-		if er := n.lookupEndpointRecord(e.nodeID); er != nil {
+		profile := n.reachProfile(e.nodeID)
+		er := n.lookupEndpointRecord(e.nodeID)
+		if er != nil && profile.prefersICEOverColdUDP() {
 			if n.punch.HasConn(e.nodeID) {
+				n.log.Debug("replication probe: ice conn ok", "nodeID", e.nodeID, "profile", profile)
 				// Active punch channel: treat as a successful probe.
 				rs.mu.Lock()
 				e.failCount = 0
@@ -959,9 +1052,10 @@ func (n *Node) probeRepNode(ctx context.Context, rk repKey, rs *repSet, e *repNo
 				rs.mu.Unlock()
 				return
 			}
-			// No active channel: trigger ICE redialing and count this round as
+			// NAT/ICE-dependent peer: trigger ICE redialing and count this round as
 			// a miss so the state machine advances (dead peers get evicted).
 			n.triggerPunch(e.nodeID, er, PunchPriorityHigh)
+			n.log.Debug("replication probe: ice redial", "nodeID", e.nodeID, "profile", profile)
 			probeSkip = true
 			punchAttempted = true
 		}
@@ -973,8 +1067,25 @@ func (n *Node) probeRepNode(ctx context.Context, rk repKey, rs *repSet, e *repNo
 	)
 	if !probeSkip {
 		var ok bool
-		probeAddr, ok = n.lookupPeer(e.nodeID)
+		profile := n.reachProfile(e.nodeID)
+		if profile.prefersUDPAnchor() {
+			v6 := false
+			if a, has := n.lookupPeerHealthAware(e.nodeID); has {
+				if isV6, ok2 := addrIsV6(a); ok2 {
+					v6 = isV6
+				}
+			}
+			probeAddr = n.publicStableDialAddr(e.nodeID, v6)
+			ok = probeAddr != nil
+		}
 		if !ok {
+			probeAddr, ok = n.lookupPeerHealthAware(e.nodeID)
+		}
+		if !ok {
+			probeAddr, ok = n.lookupPeer(e.nodeID)
+		}
+		if !ok {
+			n.log.Debug("replication probe: no dial addr", "nodeID", e.nodeID, "profile", profile)
 			// Address unknown: count as a miss and retry soon.
 			rs.mu.Lock()
 			e.failCount++
@@ -984,6 +1095,7 @@ func (n *Node) probeRepNode(ctx context.Context, rk repKey, rs *repSet, e *repNo
 		}
 
 		pctx, cancel := context.WithTimeout(ctx, queryPeerTimeout)
+		n.log.Debug("replication probe: ping", "nodeID", e.nodeID, "profile", profile, "addr", probeAddr, "ice_skip", probeSkip)
 		_, err = n.PingIdentity(pctx, probeAddr)
 		cancel()
 

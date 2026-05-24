@@ -409,6 +409,12 @@ func (d *Daemon) readICELoopFor(ctx context.Context, conn *websocket.Conn, base 
 		if localAgent == d.nodeAddr {
 			// Mode B: caller is another DHT node punching this node's control plane.
 			// Hand off to DHTpunchPool without an agent-route handshake.
+			if callerAID == d.nodeAddr {
+				d.log.Debug("ice incoming: skipped self caller on control plane",
+					"component", "ice", "base", base, "room", room[:8])
+				seen.release(room)
+				continue
+			}
 			callerNodeID := a2al.NodeIDFromAddress(callerAID)
 			go func() {
 				defer seen.release(room)

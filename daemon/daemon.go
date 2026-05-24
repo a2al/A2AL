@@ -242,6 +242,7 @@ func New(cfg Config) (*Daemon, error) {
 		ICEPublishTurns:  nodeCfg.ICEPublishTurns,
 		Logger:           log,
 		SeenPeersPath:    filepath.Join(cfg.DataDir, "seen_peers.dat"),
+		LearnedPathFirst: nodeCfg.LearnedPathFirst,
 	})
 	if err != nil {
 		return nil, err

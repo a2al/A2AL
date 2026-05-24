@@ -155,7 +155,7 @@ func TestFakePunchTransport_Punch_routingExchange(t *testing.T) {
 		IP:      []byte{10, 0, 1, 3},
 		Port:    9103,
 	}
-	nodeB.tabAdd(nodeC_ni, routing.EntryMeta{VerifiedAt: time.Now()})
+	nodeB.tabAdd(nodeC_ni, routing.EntryMeta{VerifiedAt: time.Now()}, nil)
 
 	// Also register both peers' addresses in the opposite node so
 	// sendToOrFallback can resolve NodeIDs from addresses (needed for the

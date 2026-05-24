@@ -6,6 +6,7 @@ package dht
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"net"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -171,5 +172,101 @@ func TestTriggerPunch_deduplication(t *testing.T) {
 
 	if atomic.LoadInt32(&mock.punchCalls) != 1 {
 		t.Errorf("Punch call count = %d, want 1 (dedup should prevent second call)", mock.punchCalls)
+	}
+}
+
+func TestTriggerPunchSkipsSelfNodeID(t *testing.T) {
+	netw := transport.NewMemNetwork()
+	tr, _ := netw.NewTransport("trig-self-nid")
+	defer tr.Close()
+
+	mock := &mockPunch{}
+	ks := newMemKS(t)
+	node, err := NewNode(Config{Transport: tr, Keystore: ks, PunchTransport: mock})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, peerID, sr := makeSignedEndpointRecord(t, "wss://signal.example.com")
+	if err := node.LocalStorePut(peerID, sr); err != nil {
+		t.Fatalf("LocalStorePut: %v", err)
+	}
+	er := node.lookupEndpointRecord(peerID)
+	if er == nil {
+		t.Fatal("pre-condition: lookupEndpointRecord should return non-nil")
+	}
+
+	node.triggerPunch(node.nid, er, PunchPriorityHigh)
+
+	if atomic.LoadInt32(&mock.punchCalls) != 0 {
+		t.Errorf("Punch call count = %d, want 0 for self nodeID", mock.punchCalls)
+	}
+}
+
+func TestTriggerPunchSkipsSelfEndpoint(t *testing.T) {
+	mock := &mockPunch{}
+	node := newHealthTestNode(t)
+	node.punch = mock
+
+	var peerID a2al.NodeID
+	peerID[0] = 0xAB
+	er := &protocol.EndpointRecord{
+		Address: node.addr,
+		Signal:  "wss://signal.example.com",
+	}
+	node.triggerPunch(peerID, er, PunchPriorityHigh)
+
+	if atomic.LoadInt32(&mock.punchCalls) != 0 {
+		t.Errorf("Punch call count = %d, want 0 for self endpoint address", mock.punchCalls)
+	}
+}
+
+func TestOnPunchCompleteRejectsHairpinSuccess(t *testing.T) {
+	n := newHealthTestNode(t)
+	n.SetSelfExtIP(net.IPv4(47, 74, 189, 180))
+
+	var peerID a2al.NodeID
+	peerID[0] = 0xCC
+	peerAddr, _, _ := makeSignedEndpointRecord(t, "wss://signal.example.com")
+	hairpin := &net.UDPAddr{IP: net.IPv4(47, 74, 189, 180), Port: 65090}
+
+	n.OnPunchComplete(peerID, peerAddr, hairpin, true, true, PunchFailNone)
+
+	if _, ok := n.lookupPeer(peerID); ok {
+		t.Fatal("hairpin punch success must not register peer address")
+	}
+}
+
+func TestOnPunchCompleteRejectsSelfLogicalAddr(t *testing.T) {
+	n := newHealthTestNode(t)
+
+	var peerID a2al.NodeID
+	peerID[0] = 0xDD
+	peerUDP := addrV4(55106)
+
+	n.OnPunchComplete(peerID, n.addr, peerUDP, true, true, PunchFailNone)
+
+	if _, ok := n.lookupPeer(peerID); ok {
+		t.Fatal("self logical address must not be admitted on punch complete")
+	}
+}
+
+func TestIsControlPlaneSelfExcitation(t *testing.T) {
+	n := newHealthTestNode(t)
+	n.SetSelfExtIP(net.IPv4(47, 74, 189, 180))
+
+	var peerID a2al.NodeID
+	peerID[0] = 0xEE
+	loopback := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 4122}
+	hairpin := &net.UDPAddr{IP: net.IPv4(47, 74, 189, 180), Port: 65090}
+
+	if !n.isControlPlaneSelfExcitation(n.nid, loopback) {
+		t.Fatal("self nodeID must be self excitation")
+	}
+	if !n.isControlPlaneSelfExcitation(peerID, hairpin) {
+		t.Fatal("hairpin from must be self excitation")
+	}
+	if n.isControlPlaneSelfExcitation(peerID, loopback) {
+		t.Fatal("loopback sibling from must not be self excitation")
 	}
 }

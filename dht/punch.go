@@ -66,16 +66,20 @@ const punchMinBackoff = 5 * time.Minute
 //   - PunchTransport is not configured (n.punch == nil)
 //   - An active Mode B connection already exists (HasConn)
 //   - A punch is already in flight for this peer (isPunching == true)
-//   - The peer's backoff is below punchMinBackoff (§14: anti-jitter gate)
+//   - The peer's backoff is below punchMinBackoff (§14: anti-jitter gate),
+//     unless bypassBackoff is true (repSet / skipCold paths)
 //
 // Otherwise it sets isPunching = true and calls PunchTransport.Punch, which
 // enqueues the attempt in the host-layer scheduler (non-blocking).
-//
-// Callers: 过程二 (replication maintainer), 过程三 (health probe),
-// query engine. All callers provide an *EndpointRecord obtained from the
-// local store; triggerPunch does not fetch records itself.
 func (n *Node) triggerPunch(nodeID a2al.NodeID, er *protocol.EndpointRecord, priority int) {
+	n.triggerPunchWithOptions(nodeID, er, priority, false)
+}
+
+func (n *Node) triggerPunchWithOptions(nodeID a2al.NodeID, er *protocol.EndpointRecord, priority int, bypassBackoff bool) {
 	if n.punch == nil {
+		return
+	}
+	if nodeID == n.nid || (er != nil && er.Address == n.addr) {
 		return
 	}
 	// Already have a live punched connection — no need to re-punch.
@@ -97,7 +101,7 @@ func (n *Node) triggerPunch(nodeID a2al.NodeID, er *protocol.EndpointRecord, pri
 	// ICE is worthwhile. Inactive families (everUsed=false) are excluded so that
 	// a v4-only peer's v6 slot (always zero) doesn't suppress the gate check —
 	// preserving the same semantics as the old single-family model.
-	if h != nil {
+	if h != nil && !bypassBackoff {
 		v4Block := h.v4.everUsed && !h.v4.nextRetryAt.IsZero() && time.Until(h.v4.nextRetryAt) < punchMinBackoff
 		v6Block := h.v6.everUsed && !h.v6.nextRetryAt.IsZero() && time.Until(h.v6.nextRetryAt) < punchMinBackoff
 		v4Active := h.v4.everUsed
@@ -179,6 +183,11 @@ func (n *Node) OnPunchComplete(nodeID a2al.NodeID, peerLogicalAddr a2al.Address,
 		return
 	}
 
+	if nodeID == n.nid || peerLogicalAddr == n.addr || n.isUnusableControlPlaneReachAddr(peerNetAddr) {
+		n.log.Debug("punch complete: failed", "node", nodeID, "reason", PunchFailOther)
+		return
+	}
+
 	// Build NodeInfo for routing table admission. Address is required by
 	// nodeInfoCheck so the entry can appear in FIND_NODE responses.
 	ni := protocol.NodeInfo{
@@ -220,7 +229,7 @@ func (n *Node) OnPunchComplete(nodeID a2al.NodeID, peerLogicalAddr a2al.Address,
 				}
 			}
 		}
-		n.tabAdd(ni, meta)
+		n.tabAdd(ni, meta, peerNetAddr)
 		n.log.Debug("punch complete: reclassified as direct node", "node", nodeID)
 	} else {
 		// Normal punch: admit to the routing table's punched zone (spare slots only).
@@ -233,7 +242,7 @@ func (n *Node) OnPunchComplete(nodeID a2al.NodeID, peerLogicalAddr a2al.Address,
 	// Register the peer address so DHT send functions can route to this peer.
 	// sendToOrFallback consults PunchTransport.SendTo first; this registration
 	// ensures the UDP fallback also has a candidate address.
-	// isDirect → stable slot; prflx punch → ephemeral slot (TTL-bounded).
+	// isDirect → Live Verified slot; prflx punch → ephemeral slot (TTL-bounded).
 	n.peerMu.Lock()
 	pa := n.peers[key]
 	if pa == nil {
@@ -242,9 +251,9 @@ func (n *Node) OnPunchComplete(nodeID a2al.NodeID, peerLogicalAddr a2al.Address,
 	}
 	if udp, ok := peerNetAddr.(*net.UDPAddr); ok {
 		if isDirect {
-			pa.setStable(udp)
+			pa.tryLive(udp, rankVerified)
 		} else {
-			pa.setEphemeral(udp)
+			pa.tryEphemeral(udp)
 		}
 	} else {
 		pa.fallback = peerNetAddr

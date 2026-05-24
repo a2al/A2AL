@@ -308,7 +308,10 @@ func (q *Query) runIterQuery(
 	doRPC := func(ni protocol.NodeInfo, track int) {
 		var id a2al.NodeID
 		copy(id[:], ni.NodeID)
-		addr, ok := n.lookupPeer(id)
+		addr, ok := n.lookupPeerHealthAware(id)
+		if !ok {
+			addr, ok = n.lookupPeer(id)
+		}
 		if !ok {
 			resultCh <- slotRes{track: track}
 			return

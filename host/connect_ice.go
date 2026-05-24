@@ -751,6 +751,9 @@ func (h *Host) connectViaICEForDHT(ctx context.Context, er *protocol.EndpointRec
 	if len(signalURLs) == 0 {
 		return nil, nil, false, errors.New("a2al/host: no signal url in record")
 	}
+	if er.Address == h.addr {
+		return nil, nil, false, errors.New("a2al/host: cannot punch self on control plane")
+	}
 
 	nodeCert, certErr := h.defaultAgentCert()
 	if certErr != nil {

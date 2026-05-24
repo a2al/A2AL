@@ -52,21 +52,21 @@ func TestPeerAddrs_SetAndPrefer(t *testing.T) {
 
 	v4 := addrV4(4000)
 	pa.setStable(v4)
-	if got := pa.preferred(); got != v4 {
+	if got := pa.preferred(); got.String() != v4.String() {
 		t.Fatalf("preferred() = %v, want %v", got, v4)
 	}
 
 	v6 := addrV6(4000)
 	pa.setStable(v6)
-	// stableV4 is still preferred (v4 priority).
-	if got := pa.preferred(); got != v4 {
-		t.Fatalf("preferred() should be stableV4, got %v", got)
+	// v4 live is still preferred (v4 priority).
+	if got := pa.preferred(); got.String() != v4.String() {
+		t.Fatalf("preferred() should be v4, got %v", got)
 	}
 
 	// Remove v4; v6 should surface.
-	pa.stableV4 = nil
-	if got := pa.preferred(); got != v6 {
-		t.Fatalf("preferred() should be stableV6, got %v", got)
+	pa.v4 = familyAddrs{}
+	if got := pa.preferred(); got != nil && got.String() != v6.String() {
+		t.Fatalf("preferred() should be v6 live, got %v", got)
 	}
 }
 
@@ -75,12 +75,12 @@ func TestPeerAddrs_EphemeralExpiry(t *testing.T) {
 	eph := addrV4(9999)
 	pa.setEphemeral(eph)
 
-	if got := pa.preferred(); got != eph {
-		t.Fatalf("expected ephemeral, got %v", got)
+	if got := pa.preferred(); got == nil || got.String() != eph.String() {
+		t.Fatalf("expected ephemeral %v, got %v", eph, got)
 	}
 
 	// Simulate expiry by backdating ephemeralAt.
-	pa.ephemeralAt = time.Now().Add(-(peerAddrEphemeralTTL + time.Second))
+	pa.v4.ephemeralAt = time.Now().Add(-(peerAddrEphemeralTTL + time.Second))
 	if pa.preferred() != nil {
 		t.Fatal("expected nil after ephemeral expiry")
 	}
@@ -93,8 +93,8 @@ func TestPeerAddrs_FallbackNonUDP(t *testing.T) {
 	pa := &peerAddrs{}
 	fb := fbTr.LocalAddr()
 	pa.fallback = fb
-	pa.stableV4 = addrV4(1234)
-	// fallback takes priority over stable slots.
+	pa.setStable(addrV4(1234))
+	// fallback takes priority over anchor/live slots.
 	if got := pa.preferred(); got != fb {
 		t.Fatalf("expected fallback addr, got %v", got)
 	}

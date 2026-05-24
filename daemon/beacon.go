@@ -183,9 +183,21 @@ func (b *beaconManager) StoreAll(ctx context.Context, keys []a2al.NodeID) {
 				go func() {
 					sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 					defer cancel()
-					if _, err := b.node.StoreAt(sctx, a, k, r); err != nil {
-						b.log.Debug("aux-dht store", "addr", a, "err", err)
+					stored, peerID, err := b.node.StoreAt(sctx, a, k, r)
+					if err != nil {
+						b.log.Debug("aux-dht store failed", "addr", a, "key", hex.EncodeToString(k[:4]), "err", err)
+						return
 					}
+					if !stored {
+						b.log.Debug("aux-dht store rejected", "addr", a, "key", hex.EncodeToString(k[:4]))
+						return
+					}
+					if peerID != (a2al.NodeID{}) {
+						if ua, ok := a.(*net.UDPAddr); ok {
+							b.node.BindPeerAnchor(peerID, ua)
+						}
+					}
+					b.log.Debug("aux-dht store ok", "addr", a, "peer", peerID, "key", hex.EncodeToString(k[:4]))
 				}()
 				b.storeSent.Add(1)
 			}

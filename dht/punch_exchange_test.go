@@ -63,7 +63,7 @@ func TestExchangeAfterPunch(t *testing.T) {
 		Port:    9003,
 	}
 	// Add nodeC to nodeB as a directly-verified contact.
-	nodeB.tabAdd(nodeC_ni, routing.EntryMeta{VerifiedAt: time.Now()})
+	nodeB.tabAdd(nodeC_ni, routing.EntryMeta{VerifiedAt: time.Now()}, nil)
 
 	// Wire nodeA → nodeB for lookup (simulates the punch result).
 	nodeA.BindPeerAddr(a2al.NodeIDFromAddress(ksB.addr), trB.LocalAddr())
@@ -124,7 +124,7 @@ func TestExchangeAfterPunch_badNodeFiltered(t *testing.T) {
 		IP:      []byte{10, 0, 0, 4},
 		Port:    9004,
 	}
-	nodeB.tabAdd(nodeD_ni, routing.EntryMeta{VerifiedAt: time.Now()})
+	nodeB.tabAdd(nodeD_ni, routing.EntryMeta{VerifiedAt: time.Now()}, nil)
 
 	// Pre-mark nodeD as Bad on nodeA — it should be filtered during absorption.
 	nodeDNetAddr := &net.UDPAddr{IP: []byte{10, 0, 0, 4}, Port: 9004}
