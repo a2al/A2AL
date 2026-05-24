@@ -5,10 +5,67 @@ package dht
 
 import (
 	"net"
+	"time"
 
 	"github.com/a2al/a2al"
 	"github.com/a2al/a2al/protocol"
 )
+
+// peerAddrEphemeralTTL is the validity window for hole-punch derived addresses.
+// After this period the ephemeral slot is treated as expired and ignored.
+const peerAddrEphemeralTTL = 5 * time.Minute
+
+// peerAddrs holds up to three candidate dial addresses for a remote peer.
+//
+// stableV4/V6 are set whenever we receive a packet directly from that peer
+// on the respective family — they represent persistently reachable endpoints.
+// ephemeral is a hole-punch prflx address that is only valid for a limited
+// time after the punch completes; it is never included in FIND_NODE responses.
+//
+// The zero value is valid (no address known).
+type peerAddrs struct {
+	stableV4    *net.UDPAddr
+	stableV6    *net.UDPAddr
+	ephemeral   *net.UDPAddr
+	ephemeralAt time.Time
+	// fallback holds a non-UDP dial address (e.g. MemTransport in tests).
+	// When non-nil it is returned by preferred() without family selection.
+	fallback net.Addr
+}
+
+// preferred returns the best dial address available.
+// Priority: fallback (non-UDP) → stableV4 → stableV6 → ephemeral (within TTL).
+// Returns nil when no address is available.
+func (pa *peerAddrs) preferred() net.Addr {
+	if pa.fallback != nil {
+		return pa.fallback
+	}
+	if pa.stableV4 != nil {
+		return pa.stableV4
+	}
+	if pa.stableV6 != nil {
+		return pa.stableV6
+	}
+	if pa.ephemeral != nil && time.Since(pa.ephemeralAt) < peerAddrEphemeralTTL {
+		return pa.ephemeral
+	}
+	return nil
+}
+
+// setStable writes addr into the family-matched stable slot.
+func (pa *peerAddrs) setStable(addr *net.UDPAddr) {
+	if addr.IP.To4() != nil {
+		pa.stableV4 = addr
+	} else {
+		pa.stableV6 = addr
+	}
+}
+
+// setEphemeral records a hole-punch temporary address.
+func (pa *peerAddrs) setEphemeral(addr *net.UDPAddr) {
+	pa.ephemeral = addr
+	pa.ephemeralAt = time.Now()
+}
 
 // ObservedAddr encodes remote IP:port for PONG / FIND_*_RESP (spec §7.6).
 func ObservedAddr(from net.Addr) []byte {

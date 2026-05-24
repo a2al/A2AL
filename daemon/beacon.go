@@ -75,12 +75,17 @@ func (b *beaconManager) start(ctx context.Context, agentKeysFn func() []a2al.Nod
 	}()
 }
 
-// trySelfIdentify checks whether this node's public IP appears in addrs.
-// If so, enables the high-capacity local store path (same behavior as the operator
-// high-capacity role in config).
+// trySelfIdentify checks whether this node's public IP (v4 or v6) appears in
+// the well-known beacon address list. If so, enables the high-capacity local
+// store path (same behaviour as the operator high-capacity role in config).
+//
+// Hairpin detection and beacon self-identify are intentionally separate
+// concerns: SetSelfExtIP covers v4 hairpin detection (NAT peers); this
+// function covers beacon self-identify for both v4 and v6 GUA nodes.
 func (b *beaconManager) trySelfIdentify(addrs []net.Addr) {
-	selfIP := b.node.SelfExtIP()
-	if selfIP == nil {
+	selfIPv4 := b.node.SelfExtIP()
+	selfIPv6 := b.node.SelfExtIPv6()
+	if selfIPv4 == nil && selfIPv6 == nil {
 		return
 	}
 	for _, a := range addrs {
@@ -88,7 +93,9 @@ func (b *beaconManager) trySelfIdentify(addrs []net.Addr) {
 		if !ok {
 			continue
 		}
-		if selfIP.Equal(udp.IP) {
+		match := (selfIPv4 != nil && selfIPv4.Equal(udp.IP)) ||
+			(selfIPv6 != nil && selfIPv6.Equal(udp.IP))
+		if match {
 			b.active.Store(true)
 			b.node.SetMaxStoreKeys(beaconMaxStoreKeys)
 			b.node.SetPassiveRouting(true)
@@ -122,15 +129,17 @@ func (b *beaconManager) Addrs() []net.Addr {
 // extra random state, and naturally spreads load when the top-ranked address is
 // consistently responsive.
 func (b *beaconManager) shuffledAddrs() []net.Addr {
-	selfIP := b.node.SelfExtIP()
+	selfIPv4 := b.node.SelfExtIP()
+	selfIPv6 := b.node.SelfExtIPv6()
 	b.mu.RLock()
 	raw := b.addrs
 	b.mu.RUnlock()
 
 	var known, unknown []net.Addr
 	for _, a := range raw {
-		if selfIP != nil {
-			if udp, ok := a.(*net.UDPAddr); ok && selfIP.Equal(udp.IP) {
+		if udp, ok := a.(*net.UDPAddr); ok {
+			if (selfIPv4 != nil && selfIPv4.Equal(udp.IP)) ||
+				(selfIPv6 != nil && selfIPv6.Equal(udp.IP)) {
 				continue
 			}
 		}

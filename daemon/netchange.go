@@ -165,25 +165,43 @@ func (d *Daemon) currentNetworkFingerprint() string {
 		}
 		b.WriteByte(';')
 	}
-	if ip := daemonOutboundIP(); ip != nil {
+	// Include both outbound IPs in fingerprint so v6 topology changes are detected.
+	// v4 key kept as "out=" for backward compatibility; v6 appended as "out6=".
+	v4out, v6out := daemonOutboundIP()
+	if v4out != nil {
 		b.WriteString("out=")
-		b.WriteString(ip.String())
+		b.WriteString(v4out.String())
+	}
+	if v6out != nil {
+		b.WriteString("out6=")
+		b.WriteString(v6out.String())
 	}
 	sum := sha256.Sum256([]byte(b.String()))
 	return hex.EncodeToString(sum[:])
 }
 
-func daemonOutboundIP() net.IP {
-	conn, err := net.Dial("udp4", "8.8.8.8:80")
-	if err != nil {
-		return nil
+// daemonOutboundIP returns the preferred IPv4 and IPv6 outbound addresses.
+// Neither probe sends actual packets; we connect a UDP socket to a public
+// address and read the local address the OS selected.
+// Returns nil fields when the respective address family is unavailable.
+func daemonOutboundIP() (v4, v6 net.IP) {
+	if conn, err := net.Dial("udp4", "8.8.8.8:80"); err == nil {
+		defer conn.Close()
+		if ua, ok := conn.LocalAddr().(*net.UDPAddr); ok {
+			v4 = ua.IP
+		}
 	}
-	defer conn.Close()
-	ua, ok := conn.LocalAddr().(*net.UDPAddr)
-	if !ok {
-		return nil
+	if conn, err := net.Dial("udp6", "[2001:4860:4860::8888]:80"); err == nil {
+		defer conn.Close()
+		if ua, ok := conn.LocalAddr().(*net.UDPAddr); ok {
+			ip := ua.IP
+			// Discard link-local and loopback; only GUA/ULA signals topology.
+			if !ip.IsLinkLocalUnicast() && !ip.IsLoopback() {
+				v6 = ip
+			}
+		}
 	}
-	return ua.IP
+	return
 }
 
 func (d *Daemon) inFlapModeLocked(now time.Time) bool {

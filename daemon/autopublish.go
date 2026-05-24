@@ -506,6 +506,9 @@ func (d *Daemon) autoPublishMainLoop(ctx context.Context) {
 				pCtx, cancel2 := context.WithTimeout(ctx, 20*time.Second)
 				d.h.RunNATProbe(pCtx)
 				cancel2()
+				// Refresh routing hub candidates after NAT probe; cheap in-memory
+				// scan. Only overwrites if no explicit config is set.
+				d.h.SetRoutingHubCandidates(d.h.DeriveRoutingHubURLs(maxSignalCandidates))
 			}()
 		}
 	}

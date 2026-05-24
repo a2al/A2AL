@@ -149,17 +149,31 @@ const maxBackoffShift = 10
 // to rule out a momentary lull while bounding damage from a real outage.
 const offlineSuspectThreshold = 45 * time.Second
 
+// familyHealth tracks reachability statistics for a single IP family (v4 or v6).
+type familyHealth struct {
+	failCount   int           // consecutive failures; reset to 0 on success
+	rtt         time.Duration // last successful RTT
+	nextRetryAt time.Time     // exponential backoff expiry; zero = contact freely
+	lastSuccess time.Time     // most recent success on this family; zero = never
+	// everUsed is set when at least one RPC has been attempted on this family
+	// (success or failure). Inactive families do not contribute to PeerHealthOf
+	// aggregation, preserving equivalence with the old single-family model for
+	// nodes that have only ever been contacted over one address family.
+	everUsed bool
+}
+
+// familyFor returns a pointer to the family sub-struct corresponding to addr.
+// Non-UDP addresses (e.g. MemTransport in tests) map to v4 by convention.
+func (e *peerHealthEntry) familyFor(addr net.Addr) *familyHealth {
+	if udp, ok := addr.(*net.UDPAddr); ok && udp.IP.To4() == nil {
+		return &e.v6
+	}
+	return &e.v4
+}
+
 type peerHealthEntry struct {
-	lastSuccess   time.Time
-	lastFailure   time.Time
-	failCount     int           // consecutive failures; reset to 0 on success
-	totalAttempts int           // lifetime RPC attempts (success + failure); never reset
-	rtt           time.Duration // last successful RTT; reserved for future RTT-based sorting
-	// nextRetryAt is the earliest time any channel may contact this peer.
-	// Zero means "contact freely".  Set by recordFailure (exponential back-off),
-	// cleared by recordSuccess.  Probes are allowed to halve the remaining
-	// duration via recordProbeFailure instead of growing it.
-	nextRetryAt time.Time
+	lastFailure   time.Time // most recent failure, any family; used by peerHealthForSort
+	totalAttempts int       // lifetime RPC attempts, all families; never reset
 
 	// isPunching indicates that an ICE hole-punch attempt is currently in
 	// flight for this peer. While true the peer is excluded from all query
@@ -168,6 +182,9 @@ type peerHealthEntry struct {
 	// (success or failure). Populated by Phase 2 (punch scheduler); zero
 	// value (false) preserves existing behaviour until then.
 	isPunching bool
+
+	v4 familyHealth // IPv4 address family health
+	v6 familyHealth // IPv6 address family health
 }
 
 // Node is a single DHT participant (routing + local store + wire handler).
@@ -186,7 +203,7 @@ type Node struct {
 	wait   map[string]*waitEntry
 
 	peerMu sync.Mutex
-	peers  map[string]net.Addr
+	peers  map[string]*peerAddrs
 
 	addrToID sync.Map // addr.String() → a2al.NodeID (reverse of peers map)
 
@@ -198,8 +215,9 @@ type Node struct {
 	onObservedAddr func(reporter a2al.NodeID, wire []byte)
 	auth           RecordAuthFunc // nil → no check
 
-	selfExtMu sync.RWMutex
-	selfExtIP net.IP // our own public IP (set by host after STUN/HTTP probe)
+	selfExtMu   sync.RWMutex
+	selfExtIP   net.IP // our own public IPv4 (set by host after STUN/HTTP probe)
+	selfExtIPv6 net.IP // our own public IPv6 GUA (set by host after STUN/HTTP probe)
 
 	statsRx  atomic.Uint64
 	statsTx  atomic.Uint64
@@ -301,7 +319,7 @@ func NewNode(cfg Config) (*Node, error) {
 		cancel:         cancel,
 		log:            logger,
 		wait:            make(map[string]*waitEntry),
-		peers:           make(map[string]net.Addr),
+		peers:           make(map[string]*peerAddrs),
 		health:          make(map[string]*peerHealthEntry),
 		natProbeWait:    make(map[string]chan struct{}),
 		natProbeEchoMap: make(map[string]*probeEchoEntry),
@@ -449,14 +467,69 @@ func (n *Node) unregisterWait(txID []byte) {
 func (n *Node) lookupPeer(id a2al.NodeID) (net.Addr, bool) {
 	n.peerMu.Lock()
 	defer n.peerMu.Unlock()
-	a, ok := n.peers[nodeIDKey(id)]
-	return a, ok
+	pa := n.peers[nodeIDKey(id)]
+	if pa == nil {
+		return nil, false
+	}
+	a := pa.preferred()
+	return a, a != nil
+}
+
+// lookupPeerHealthAware returns the best dial address for id that is not
+// currently in back-off, selecting between v4 and v6 based on health state.
+//
+// Unlike lookupPeer (which blindly prefers stableV4), this function skips a
+// family whose back-off window has not expired and tries the other family
+// instead.  Specifically:
+//   - If stableV4 is known and its back-off has expired (or it was never
+//     used), return stableV4.
+//   - Else if stableV6 is known and its back-off has expired (or it was
+//     never used), return stableV6.
+//   - If all known addresses are in back-off, return nil, false.
+//
+// An "unused" family (everUsed=false) counts as back-off expired — it means
+// we have no history for that path and should try it freely.
+//
+// ephemeral (hole-punch) addresses are not considered here; they are handled
+// by the ICE punch path, not the replication store path.
+func (n *Node) lookupPeerHealthAware(id a2al.NodeID) (net.Addr, bool) {
+	n.peerMu.Lock()
+	pa := n.peers[nodeIDKey(id)]
+	n.peerMu.Unlock()
+	if pa == nil {
+		return nil, false
+	}
+
+	n.healthMu.RLock()
+	e := n.health[nodeIDKey(id)]
+	n.healthMu.RUnlock()
+
+	now := time.Now()
+	v4ok := e == nil || !e.v4.everUsed || e.v4.nextRetryAt.IsZero() || now.After(e.v4.nextRetryAt)
+	v6ok := e == nil || !e.v6.everUsed || e.v6.nextRetryAt.IsZero() || now.After(e.v6.nextRetryAt)
+
+	if pa.stableV4 != nil && v4ok {
+		return pa.stableV4, true
+	}
+	if pa.stableV6 != nil && v6ok {
+		return pa.stableV6, true
+	}
+	return nil, false
 }
 
 func (n *Node) remember(from net.Addr, dec *protocol.DecodedMessage) {
 	id := a2al.NodeIDFromAddress(dec.SenderAddr)
 	n.peerMu.Lock()
-	n.peers[nodeIDKey(id)] = from
+	pa := n.peers[nodeIDKey(id)]
+	if pa == nil {
+		pa = &peerAddrs{}
+		n.peers[nodeIDKey(id)] = pa
+	}
+	if udp, ok := from.(*net.UDPAddr); ok {
+		pa.setStable(udp)
+	} else {
+		pa.fallback = from
+	}
 	n.peerMu.Unlock()
 	n.addrToID.Store(from.String(), id)
 	// Inbound message = direct-contact evidence; set VerifiedAt now.
@@ -496,15 +569,24 @@ func (n *Node) tabAdd(ni protocol.NodeInfo, meta routing.EntryMeta) {
 
 	// Direct-contact path: existing manual LRU-eviction logic.
 	//
-	// If the peer self-advertises a stable quic:// address (non-symmetric NAT or
-	// public) and the caller supplied an ephemeral address (e.g. from ICE), prefer
-	// the advertised one so the routing table always points to the persistent port.
+	// If the peer self-advertises a stable quic:// address and the caller
+	// supplied an ephemeral address (e.g. from ICE), prefer the advertised one
+	// so the routing table always points to the persistent port.
+	//
+	// NATType gate: NATUnknown, NATFullCone, NATRestricted, and NATPortRestricted
+	// all publish a stable v4 port (EIM mapping), so their advertised address is a
+	// reliable routing anchor. NATSymmetric allocates a different external port per
+	// destination and must NOT override an ephemeral address that was actually used —
+	// the published port is unlikely to match the port the NAT will use next time.
+	//
+	// Use family-aware lookup to avoid replacing ni.IP with a different-family address.
 	if len(ni.IP) > 0 {
 		recs := n.LocalStoreGet(nid, protocol.RecTypeEndpoint)
 		for _, sr := range recs {
 			if er, err := protocol.ParseEndpointRecord(sr); err == nil {
 				if er.NatType < protocol.NATSymmetric {
-					if ua := firstEndpointAddr(&er); ua != nil {
+					ref := &net.UDPAddr{IP: net.IP(ni.IP)}
+					if ua := firstEndpointAddrForFamily(&er, ref); ua != nil {
 						if ip4 := ua.IP.To4(); ip4 != nil {
 							ni.IP = append([]byte(nil), ip4...)
 						} else {
@@ -647,7 +729,7 @@ func (n *Node) PeerRTT(addr net.Addr) time.Duration {
 	if e == nil {
 		return 0
 	}
-	return e.rtt
+	return e.familyFor(addr).rtt
 }
 
 // lookupPeerID returns the NodeID associated with addr, if known.
@@ -659,9 +741,69 @@ func (n *Node) lookupPeerID(addr net.Addr) (a2al.NodeID, bool) {
 	return v.(a2al.NodeID), true
 }
 
-// recordSuccess marks the peer as healthy: resets failCount, clears backoff,
-// updates RTT, and refreshes the routing table VerifiedAt timestamp.
-func (n *Node) recordSuccess(id a2al.NodeID, rtt time.Duration) {
+// adaptNodeListForAsker rewrites each NodeInfo's IP:Port to prefer the
+// address family matching the asker's source address, using dual-slot data
+// from the peers map when available. When no dual-slot data exists the
+// routing-table address is kept unchanged, preserving full backward compat.
+func (n *Node) adaptNodeListForAsker(nodes []protocol.NodeInfo, asker net.Addr) []protocol.NodeInfo {
+	askerUDP, ok := asker.(*net.UDPAddr)
+	if !ok {
+		return nodes // non-UDP asker: adaptation not possible
+	}
+	askerIsV4 := askerUDP.IP.To4() != nil
+	out := make([]protocol.NodeInfo, 0, len(nodes))
+	for _, ni := range nodes {
+		var id a2al.NodeID
+		if len(ni.NodeID) == len(id) {
+			copy(id[:], ni.NodeID)
+			ni = n.adaptNodeInfoForAsker(ni, id, askerIsV4)
+		}
+		out = append(out, ni)
+	}
+	return out
+}
+
+// adaptNodeInfoForAsker rewrites ni.IP/Port to the asker-family-preferred
+// address from the dual-slot peers map, if available. Falls back to the
+// routing-table address when no dual-slot entry exists.
+func (n *Node) adaptNodeInfoForAsker(ni protocol.NodeInfo, id a2al.NodeID, askerIsV4 bool) protocol.NodeInfo {
+	n.peerMu.Lock()
+	pa := n.peers[nodeIDKey(id)]
+	n.peerMu.Unlock()
+	if pa == nil {
+		return ni // no dual-slot data; keep routing-table address as-is
+	}
+	var addr *net.UDPAddr
+	if askerIsV4 {
+		if pa.stableV4 != nil {
+			addr = pa.stableV4
+		} else {
+			addr = pa.stableV6 // fallback to v6 if no v4
+		}
+	} else {
+		if pa.stableV6 != nil {
+			addr = pa.stableV6
+		} else {
+			addr = pa.stableV4 // fallback to v4 if no v6
+		}
+	}
+	if addr == nil {
+		return ni // neither stable slot populated; keep existing
+	}
+	result := ni
+	if ip4 := addr.IP.To4(); ip4 != nil {
+		result.IP = append([]byte(nil), ip4...)
+	} else {
+		result.IP = append([]byte(nil), addr.IP.To16()...)
+	}
+	result.Port = uint16(addr.Port)
+	return result
+}
+
+// recordSuccess marks the peer's address family as healthy: resets that
+// family's failCount, clears its backoff, and updates RTT.
+// Also refreshes the routing table VerifiedAt timestamp.
+func (n *Node) recordSuccess(id a2al.NodeID, addr net.Addr, rtt time.Duration) {
 	key := nodeIDKey(id)
 	now := time.Now()
 	n.lastAnySuccessAt.Store(now.UnixNano()) // clear offline-suspect state
@@ -671,12 +813,14 @@ func (n *Node) recordSuccess(id a2al.NodeID, rtt time.Duration) {
 		e = &peerHealthEntry{}
 		n.health[key] = e
 	}
-	e.lastSuccess = now
-	e.failCount = 0
 	e.totalAttempts++
-	e.nextRetryAt = time.Time{}
+	fh := e.familyFor(addr)
+	fh.everUsed = true
+	fh.failCount = 0
+	fh.nextRetryAt = time.Time{}
+	fh.lastSuccess = now
 	if rtt > 0 {
-		e.rtt = rtt
+		fh.rtt = rtt
 	}
 	n.healthMu.Unlock()
 
@@ -687,15 +831,14 @@ func (n *Node) recordSuccess(id a2al.NodeID, rtt time.Duration) {
 	n.tabMu.Unlock()
 }
 
-// recordFailure increments the consecutive-failure counter and sets a global
-// exponential back-off on the peer.  All communication channels use the same
-// scale (probeInitDelay << shift) so the value remains a meaningful signal.
+// recordFailure increments the consecutive-failure counter for the address
+// family used by addr, and sets an exponential back-off on that family.
 //
 // When suspectOffline is true (no successful RPC for offlineSuspectThreshold),
 // failCount and nextRetryAt are suppressed: healthy peers must not be penalised
 // for a local network outage.  lastFailure and totalAttempts are still updated
 // so diagnostic counters remain accurate.
-func (n *Node) recordFailure(id a2al.NodeID) {
+func (n *Node) recordFailure(id a2al.NodeID, addr net.Addr) {
 	key := nodeIDKey(id)
 	n.healthMu.Lock()
 	e := n.health[key]
@@ -709,19 +852,20 @@ func (n *Node) recordFailure(id a2al.NodeID) {
 		n.healthMu.Unlock()
 		return
 	}
-	e.failCount++
-	shift := e.failCount - 1
+	fh := e.familyFor(addr)
+	fh.everUsed = true
+	fh.failCount++
+	shift := fh.failCount - 1
 	if shift > maxBackoffShift {
 		shift = maxBackoffShift
 	}
-	e.nextRetryAt = time.Now().Add(probeInitDelay << shift)
+	fh.nextRetryAt = time.Now().Add(probeInitDelay << shift)
 	n.healthMu.Unlock()
 }
 
-// PeerAllowContact returns true if the global back-off for this peer has
-// expired (or was never set).  Callers decide whether their own tolerance
-// permits contacting a peer whose back-off is still active; this gate
-// reflects the shared signal across all communication channels.
+// PeerAllowContact returns true if at least one address family's back-off for
+// this peer has expired (or was never set). Contact is permitted when any
+// family is available — callers use whichever family succeeds.
 func (n *Node) PeerAllowContact(id a2al.NodeID) bool {
 	n.healthMu.RLock()
 	e := n.health[nodeIDKey(id)]
@@ -729,7 +873,10 @@ func (n *Node) PeerAllowContact(id a2al.NodeID) bool {
 	if e == nil {
 		return true
 	}
-	return e.nextRetryAt.IsZero() || time.Now().After(e.nextRetryAt)
+	now := time.Now()
+	v4ok := e.v4.nextRetryAt.IsZero() || now.After(e.v4.nextRetryAt)
+	v6ok := e.v6.nextRetryAt.IsZero() || now.After(e.v6.nextRetryAt)
+	return v4ok || v6ok
 }
 
 // suspectOffline reports whether the node suspects its own network connectivity
@@ -761,45 +908,59 @@ func (n *Node) peerHealthForSort(id a2al.NodeID) (lastFailure time.Time, totalAt
 }
 
 // recordProbeFailure is called by healthProbeLoop after a dedicated PING
-// fails.  A health probe is not a "real" contact attempt — its sole purpose
-// is to check liveness, not to transfer data — so its failure should not
-// carry the same weight as a failed StoreAt or FindNode.
+// fails on addr.  A health probe is not a "real" contact attempt — its sole
+// purpose is to check liveness — so its failure should not carry the same
+// weight as a failed StoreAt or FindNode.
 //
-// We therefore undo the failCount increment that PingIdentity's internal
+// We undo the familyHealth.failCount increment that PingIdentity's internal
 // recordFailure applied (net effect on failCount: zero) and halve the
-// remaining back-off instead of growing it.  This ensures that probe
-// failures cannot push a peer into PeerHealthBad on their own: only genuine
-// communication failures from data-plane RPCs accumulate failCount.
-//
-// A node that recently succeeded in StoreAt is thereby protected from being
-// misclassified as bad due to transient UDP probe losses, even in sparse
-// networks where probes fire more frequently.
-func (n *Node) recordProbeFailure(id a2al.NodeID) {
+// remaining back-off instead of growing it, for the family matching addr.
+func (n *Node) recordProbeFailure(id a2al.NodeID, addr net.Addr) {
 	n.healthMu.Lock()
 	defer n.healthMu.Unlock()
 	e := n.health[nodeIDKey(id)]
 	if e == nil {
 		return
 	}
+	fh := e.familyFor(addr)
 	// Undo the failCount++ that PingIdentity's sendAndWait applied.
-	// Probes are health-checks, not data-plane RPCs; their failures must not
-	// accumulate toward the PeerHealthBad threshold.
-	if e.failCount > 0 {
-		e.failCount--
+	if fh.failCount > 0 {
+		fh.failCount--
 	}
-	// Halve the remaining back-off window instead of growing it, so a
-	// temporarily unreachable peer returns to the retry pool sooner.
-	if !e.nextRetryAt.IsZero() {
-		remaining := time.Until(e.nextRetryAt)
+	// Halve the remaining back-off window instead of growing it.
+	if !fh.nextRetryAt.IsZero() {
+		remaining := time.Until(fh.nextRetryAt)
 		if remaining <= 0 {
-			e.nextRetryAt = time.Time{}
+			fh.nextRetryAt = time.Time{}
 		} else {
-			e.nextRetryAt = time.Now().Add(remaining / 2)
+			fh.nextRetryAt = time.Now().Add(remaining / 2)
 		}
 	}
 }
 
-// PeerHealthOf returns the observed health state for the given peer.
+// familyHealthState classifies the health state of a single family sub-entry.
+// Returns PeerHealthUnknown when the family has never been used (everUsed=false),
+// which prevents inactive families from biasing the aggregate result.
+func familyHealthState(fh *familyHealth) PeerHealthState {
+	if !fh.everUsed {
+		return PeerHealthUnknown // sentinel: inactive family
+	}
+	if fh.failCount >= badHealthThreshold {
+		return PeerHealthBad
+	}
+	if !fh.lastSuccess.IsZero() {
+		return PeerHealthGood
+	}
+	return PeerHealthUnknown
+}
+
+// PeerHealthOf returns the aggregate health state across both address families.
+//
+// Aggregation rules (designed to preserve exact backward-compatibility for
+// single-family v4-only nodes during the migration period):
+//   - Any active family Good  → PeerHealthGood
+//   - All active families Bad → PeerHealthBad
+//   - No active family at all → PeerHealthUnknown
 func (n *Node) PeerHealthOf(id a2al.NodeID) PeerHealthState {
 	n.healthMu.RLock()
 	e := n.health[nodeIDKey(id)]
@@ -807,13 +968,25 @@ func (n *Node) PeerHealthOf(id a2al.NodeID) PeerHealthState {
 	if e == nil {
 		return PeerHealthUnknown
 	}
-	if e.failCount >= badHealthThreshold {
-		return PeerHealthBad
-	}
-	if !e.lastSuccess.IsZero() {
+	v4s := familyHealthState(&e.v4)
+	v6s := familyHealthState(&e.v6)
+
+	// Any Good → Good.
+	if v4s == PeerHealthGood || v6s == PeerHealthGood {
 		return PeerHealthGood
 	}
-	return PeerHealthUnknown
+	// Collect active (ever-used) families.
+	if !e.v4.everUsed && !e.v6.everUsed {
+		return PeerHealthUnknown
+	}
+	// All active families must be Bad to declare the peer Bad.
+	if e.v4.everUsed && v4s != PeerHealthBad {
+		return PeerHealthUnknown
+	}
+	if e.v6.everUsed && v6s != PeerHealthBad {
+		return PeerHealthUnknown
+	}
+	return PeerHealthBad
 }
 
 // IsPunching reports whether an ICE hole-punch attempt is currently in flight
@@ -943,21 +1116,49 @@ func (n *Node) absorbNodeInfo(ni protocol.NodeInfo, learnedFrom a2al.NodeID) {
 	n.BindPeerAddr(id, udp)
 }
 
-// BindPeerAddr registers the transport dial address for a remote NodeID (e.g. MemTransport name lookup in tests).
+// BindPeerAddr registers the transport dial address for a remote NodeID
+// (e.g. from ICE or MemTransport in tests). UDP addresses are stored in the
+// family-matched stable slot; non-UDP addresses use the fallback slot.
 func (n *Node) BindPeerAddr(id a2al.NodeID, addr net.Addr) {
 	n.peerMu.Lock()
-	n.peers[nodeIDKey(id)] = addr
+	pa := n.peers[nodeIDKey(id)]
+	if pa == nil {
+		pa = &peerAddrs{}
+		n.peers[nodeIDKey(id)] = pa
+	}
+	if udp, ok := addr.(*net.UDPAddr); ok {
+		pa.setStable(udp)
+	} else {
+		pa.fallback = addr
+	}
 	n.peerMu.Unlock()
 	n.addrToID.Store(addr.String(), id)
 }
 
-// SetSelfExtIP records our own public IP (from STUN/HTTP probe). Used to detect
+// SetSelfExtIP records our own public IPv4 (from STUN/HTTP probe). Used to detect
 // NAT hairpin peers: nodes behind the same NAT share the same public IP and
 // typically cannot reach each other via that IP (router hairpinning not supported).
 func (n *Node) SetSelfExtIP(ip net.IP) {
 	n.selfExtMu.Lock()
 	n.selfExtIP = ip
 	n.selfExtMu.Unlock()
+}
+
+// SetSelfExtIPv6 records our own public IPv6 GUA (from STUN/HTTP probe).
+// Unlike the v4 counterpart this is not used for hairpin detection (v6 GUA
+// nodes are directly reachable); it is used to self-identify when the node's
+// v6 address appears in the well-known DNS list.
+func (n *Node) SetSelfExtIPv6(ip net.IP) {
+	n.selfExtMu.Lock()
+	n.selfExtIPv6 = ip
+	n.selfExtMu.Unlock()
+}
+
+// SelfExtIPv6 returns the node's public IPv6 GUA set via SetSelfExtIPv6.
+func (n *Node) SelfExtIPv6() net.IP {
+	n.selfExtMu.RLock()
+	defer n.selfExtMu.RUnlock()
+	return n.selfExtIPv6
 }
 
 // isHairpinAddr returns true when addr shares our public IP but is not our own
@@ -1019,7 +1220,7 @@ func (n *Node) onFindNode(from net.Addr, dec *protocol.DecodedMessage) {
 	var tid a2al.NodeID
 	copy(tid[:], target)
 	resp := &protocol.BodyFindNodeResp{
-		Nodes:        n.tabNearestVerified(tid, routing.K),
+		Nodes:        n.adaptNodeListForAsker(n.tabNearestVerified(tid, routing.K), from),
 		ObservedAddr: ObservedAddr(from),
 	}
 	for len(resp.Nodes) > 1 {
@@ -1042,7 +1243,7 @@ func (n *Node) onFindValue(from net.Addr, dec *protocol.DecodedMessage) {
 	records := n.store.GetAll(tid, body.RecType, now)
 	best := n.store.Get(tid, now)
 	resp := &protocol.BodyFindValueResp{
-		Nodes:        n.tabNearestVerified(tid, routing.K),
+		Nodes:        n.adaptNodeListForAsker(n.tabNearestVerified(tid, routing.K), from),
 		ObservedAddr: ObservedAddr(from),
 		Records:      records,
 	}
@@ -1216,8 +1417,14 @@ func (n *Node) onNATProbeReq(from net.Addr, dec *protocol.DecodedMessage) {
 		return
 	}
 
-	// Per-source-IP rate limit.
-	if !n.echoRateOK(fromUDP.IP.String()) {
+	// Per-source-IP rate limit. Normalize the key so that an IPv4-mapped IPv6
+	// address (::ffff:x.x.x.x) and its plain IPv4 form share the same bucket,
+	// preventing a dual-stack sender from doubling its echo budget.
+	rateKey := fromUDP.IP.String()
+	if v4 := fromUDP.IP.To4(); v4 != nil {
+		rateKey = v4.String()
+	}
+	if !n.echoRateOK(rateKey) {
 		return
 	}
 
@@ -1428,7 +1635,7 @@ func (n *Node) PingIdentity(ctx context.Context, peer net.Addr) (*PeerIdentity, 
 	dec, err := n.sendAndWait(ctx, peer, hdr, body, protocol.MsgPong)
 	if err != nil {
 		if id, ok := n.lookupPeerID(peer); ok {
-			n.recordFailure(id)
+			n.recordFailure(id, peer)
 		}
 		return nil, err
 	}
@@ -1438,7 +1645,7 @@ func (n *Node) PingIdentity(ctx context.Context, peer net.Addr) (*PeerIdentity, 
 	}
 	peerAddr := dec.SenderAddr
 	peerNID := a2al.NodeIDFromAddress(peerAddr)
-	n.recordSuccess(peerNID, time.Since(t0))
+	n.recordSuccess(peerNID, peer, time.Since(t0))
 	ni := nodeInfoFromMessage(dec, peer)
 	n.BindPeerAddr(peerNID, peer)
 	n.tabAdd(ni, routing.EntryMeta{VerifiedAt: time.Now()})
@@ -1461,12 +1668,12 @@ func (n *Node) StoreAt(ctx context.Context, peer net.Addr, storeKey a2al.NodeID,
 	dec, err := n.sendAndWait(ctx, peer, hdr, body, protocol.MsgStoreResp)
 	if err != nil {
 		if id, ok := n.lookupPeerID(peer); ok {
-			n.recordFailure(id)
+			n.recordFailure(id, peer)
 		}
 		return false, err
 	}
 	peerNID := a2al.NodeIDFromAddress(dec.SenderAddr)
-	n.recordSuccess(peerNID, time.Since(t0))
+	n.recordSuccess(peerNID, peer, time.Since(t0))
 	resp := dec.Body.(*protocol.BodyStoreResp)
 	switch {
 	case resp.AlreadyHad:
@@ -1487,12 +1694,12 @@ func (n *Node) FindNode(ctx context.Context, peer net.Addr, target a2al.NodeID) 
 	dec, err := n.sendAndWait(ctx, peer, hdr, body, protocol.MsgFindNodeResp)
 	if err != nil {
 		if id, ok := n.lookupPeerID(peer); ok {
-			n.recordFailure(id)
+			n.recordFailure(id, peer)
 		}
 		return nil, err
 	}
 	peerNID := a2al.NodeIDFromAddress(dec.SenderAddr)
-	n.recordSuccess(peerNID, time.Since(t0))
+	n.recordSuccess(peerNID, peer, time.Since(t0))
 	br := dec.Body.(*protocol.BodyFindNodeResp)
 	n.notifyObserved(peerNID, br.ObservedAddr)
 	return br.Nodes, nil
@@ -1508,12 +1715,12 @@ func (n *Node) FindValueWithNodes(ctx context.Context, peer net.Addr, key a2al.N
 	dec, err := n.sendAndWait(ctx, peer, hdr, body, protocol.MsgFindValueResp)
 	if err != nil {
 		if id, ok := n.lookupPeerID(peer); ok {
-			n.recordFailure(id)
+			n.recordFailure(id, peer)
 		}
 		return nil, nil, err
 	}
 	peerNID := a2al.NodeIDFromAddress(dec.SenderAddr)
-	n.recordSuccess(peerNID, time.Since(t0))
+	n.recordSuccess(peerNID, peer, time.Since(t0))
 	br := dec.Body.(*protocol.BodyFindValueResp)
 	n.notifyObserved(peerNID, br.ObservedAddr)
 	var out []protocol.SignedRecord
@@ -1554,9 +1761,7 @@ func (n *Node) FindValue(ctx context.Context, peer net.Addr, key a2al.NodeID) (*
 func (n *Node) AddContact(addr net.Addr, ni protocol.NodeInfo) {
 	var peerID a2al.NodeID
 	copy(peerID[:], ni.NodeID)
-	n.peerMu.Lock()
-	n.peers[nodeIDKey(peerID)] = addr
-	n.peerMu.Unlock()
+	n.BindPeerAddr(peerID, addr)
 	n.tabAdd(ni, routing.EntryMeta{VerifiedAt: time.Now()})
 }
 
@@ -1602,13 +1807,16 @@ func (n *Node) BootstrapCandidateAddrs(max int) []net.Addr {
 		}
 		var udp *net.UDPAddr
 		n.peerMu.Lock()
-		a, ok := n.peers[nodeIDKey(id)]
+		pa := n.peers[nodeIDKey(id)]
 		n.peerMu.Unlock()
-		if ok {
-			if u, ok := a.(*net.UDPAddr); ok && u.Port != 0 {
-				udp = u
+		if pa != nil {
+			if a := pa.preferred(); a != nil {
+				if u, ok := a.(*net.UDPAddr); ok && u.Port != 0 {
+					udp = u
+				}
 			}
-		} else if (len(ni.IP) == 4 || len(ni.IP) == 16) && ni.Port != 0 {
+		}
+		if udp == nil && (len(ni.IP) == 4 || len(ni.IP) == 16) && ni.Port != 0 {
 			udp = &net.UDPAddr{IP: append([]byte(nil), ni.IP...), Port: int(ni.Port)}
 		}
 		if udp == nil {

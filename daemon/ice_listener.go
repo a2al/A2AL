@@ -420,14 +420,16 @@ func (d *Daemon) readICELoopFor(ctx context.Context, conn *websocket.Conn, base 
 		}
 
 		go func() {
-			// Release the dedup entry when Accept finishes (success or failure)
-			// so that a subsequent session for the same peer pair is never blocked.
-			defer seen.release(room)
 			actx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 			d.log.Debug("ice accept: start", "component", "ice",
 				"local", localAgent.String(), "remote", callerAID.String(), "hub", base)
 			ac, err := d.h.AcceptICEViaSignal(actx, localAgent, callerAID, base)
 			cancel() // handshake established (or failed); no longer need startup timeout context.
+			// Release the dedup entry as soon as the ICE/QUIC handshake phase is
+			// complete (success or failure). The dedup's purpose is to prevent
+			// parallel ICE negotiations for the same room; it must not block a
+			// retry while serveGatewayConn is running (which may last hours).
+			seen.release(room)
 			if err != nil {
 				d.log.Debug("ice accept: failed", "component", "ice",
 					"err", err, "local", localAgent.String(), "remote", callerAID.String())

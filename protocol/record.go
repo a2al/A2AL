@@ -39,11 +39,42 @@ const (
 )
 
 // NAT types for EndpointPayload (spec §7.6).
+//
+// These are published capability hints, not strict RFC 3489/5780 NAT topology
+// labels. Each value answers two questions a connecting peer needs to know:
+//
+//  1. Can you accept cold inbound v4 UDP from an arbitrary peer?
+//  2. Is your published v4 address a stable routing anchor?
+//
+// Consumers (Connect path, routing table) act solely on these two properties;
+// any further distinction is not meaningful at the protocol level.
 const (
+	// NATUnknown: reachability not yet determined.
+	// Connecting peers should attempt direct v4 optimistically while
+	// preparing an ICE fallback if a Signal URL is present.
+	// Published when active probe has not completed or evidence is insufficient.
 	NATUnknown uint8 = iota
+
+	// NATFullCone: tested — any peer can initiate cold inbound UDP on v4.
+	// Published address and port are stable. Direct dial should succeed.
+	// (Covers public WAN bind, full-cone NAT, and cloud NAT with EIF.)
 	NATFullCone
+
+	// NATRestricted: tested — cold inbound v4 from arbitrary peers fails.
+	// The NAT mapping is endpoint-independent (EIM): port is stable, so the
+	// published address is a reliable routing anchor. Peers must use ICE or
+	// hole-punch to connect.
 	NATRestricted
+
+	// NATPortRestricted: same capability semantics as NATRestricted.
+	// Cold inbound v4 fails; port is stable; routing anchor is valid.
+	// Treated identically to NATRestricted by all consumers.
 	NATPortRestricted
+
+	// NATSymmetric: tested — cold inbound v4 fails AND the NAT allocates a
+	// different external port per destination (EIM broken). The published v4
+	// address is not a stable routing anchor. Peers must use ICE; port-spray
+	// may improve punch success when the remote's outbound port is predictable.
 	NATSymmetric
 )
 

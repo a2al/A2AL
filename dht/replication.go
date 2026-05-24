@@ -454,13 +454,19 @@ func (n *Node) storeAndRecord(ctx context.Context, peers []protocol.NodeInfo, rk
 		if id == n.nid {
 			continue
 		}
-		// Global back-off gate: skip peers whose retry window has not expired.
+		// Global back-off gate: quick-reject when all address families are in
+		// back-off.  lookupPeerHealthAware below enforces the same constraint
+		// at the address level, but this check avoids the extra lock
+		// acquisitions for peers that are clearly blocked.
 		// StoreAt will call recordFailure/recordSuccess internally, so health
 		// state is always updated regardless of the outcome.
 		if !n.PeerAllowContact(id) {
 			continue
 		}
-		addr, ok := n.lookupPeer(id)
+		// Select the dial address that is not in back-off.  If v4 is in
+		// back-off, this returns stableV6 (if known); if neither family is
+		// available, it returns false and we skip the peer.
+		addr, ok := n.lookupPeerHealthAware(id)
 		if !ok {
 			continue
 		}
@@ -774,7 +780,7 @@ func (n *Node) runRoutingMaintenance(ctx context.Context) {
 			// Probe failure: undo the failCount++ that PingIdentity's recordFailure
 			// applied.  Pending nodes have no prior communication history; their
 			// failure must not push them into PeerHealthBad.
-			n.recordProbeFailure(id)
+			n.recordProbeFailure(id, addr)
 			n.tabMu.Lock()
 			n.table.MarkPendingFailed(id)
 			n.tabMu.Unlock()
@@ -827,7 +833,7 @@ func (n *Node) runRoutingMaintenance(ctx context.Context) {
 		cancel()
 		if err != nil {
 			// Probe failure: undo failCount increment (same reasoning as pending).
-			n.recordProbeFailure(id)
+			n.recordProbeFailure(id, addr)
 			// When network is suspected down, retain the node in the routing
 			// table so it is available for ObserveFromRouting once connectivity
 			// is restored. Normal removal resumes as soon as any RPC succeeds.
@@ -961,9 +967,13 @@ func (n *Node) probeRepNode(ctx context.Context, rk repKey, rs *repSet, e *repNo
 		}
 	}
 
-	var err error
+	var (
+		err       error
+		probeAddr net.Addr
+	)
 	if !probeSkip {
-		addr, ok := n.lookupPeer(e.nodeID)
+		var ok bool
+		probeAddr, ok = n.lookupPeer(e.nodeID)
 		if !ok {
 			// Address unknown: count as a miss and retry soon.
 			rs.mu.Lock()
@@ -974,7 +984,7 @@ func (n *Node) probeRepNode(ctx context.Context, rk repKey, rs *repSet, e *repNo
 		}
 
 		pctx, cancel := context.WithTimeout(ctx, queryPeerTimeout)
-		_, err = n.PingIdentity(pctx, addr)
+		_, err = n.PingIdentity(pctx, probeAddr)
 		cancel()
 
 		if err != nil {
@@ -982,7 +992,7 @@ func (n *Node) probeRepNode(ctx context.Context, rk repKey, rs *repSet, e *repNo
 			// extended).  Since this is a dedicated health probe — not a "real"
 			// communication — undo the increment and halve the remaining back-off
 			// instead of growing it, giving the node a chance to recover.
-			n.recordProbeFailure(e.nodeID)
+			n.recordProbeFailure(e.nodeID, probeAddr)
 		}
 	}
 

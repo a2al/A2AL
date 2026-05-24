@@ -245,8 +245,9 @@ func (d *Daemon) maybeRebootstrap(ctx context.Context) {
 
 	if bootstrapDHT(ctx, d.h, d.cfg, d.dataDir, d.log, d.beacon) {
 		if urls := deriveSignalURLs(d.cfg, d.log); len(urls) > 0 {
-			d.h.SetDerivedICESignalURLs(urls)
+			d.h.SetBootstrapHubURLs(urls)
 		}
+		d.h.SetRoutingHubCandidates(d.h.DeriveRoutingHubURLs(maxSignalCandidates))
 		d.log.Info("bootstrap recovery succeeded")
 		// Trigger a cascade so observe/probe/publish run with the newly joined
 		// peers. guard tick picks this up within guardTickPeriod (5 s).

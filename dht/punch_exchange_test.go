@@ -4,6 +4,7 @@
 package dht
 
 import (
+	"net"
 	"testing"
 	"time"
 
@@ -126,8 +127,9 @@ func TestExchangeAfterPunch_badNodeFiltered(t *testing.T) {
 	nodeB.tabAdd(nodeD_ni, routing.EntryMeta{VerifiedAt: time.Now()})
 
 	// Pre-mark nodeD as Bad on nodeA — it should be filtered during absorption.
+	nodeDNetAddr := &net.UDPAddr{IP: []byte{10, 0, 0, 4}, Port: 9004}
 	for i := 0; i < badHealthThreshold; i++ {
-		nodeA.recordFailure(nodeDID)
+		nodeA.recordFailure(nodeDID, nodeDNetAddr)
 	}
 	if nodeA.PeerHealthOf(nodeDID) != PeerHealthBad {
 		t.Fatal("pre-condition: nodeDID should be Bad on nodeA")

@@ -62,8 +62,8 @@ type Config struct {
 	// ICEPublishTurns is deprecated; new nodes do not publish turns[] to the DHT.
 	ICEPublishTurns []string `toml:"ice_publish_turns" json:"ice_publish_turns"`
 	// SignalListenAddr is the TCP listen address for the embedded ICE signaling hub.
-	// Empty or "off" disables the hub (default). Only enable on bootstrap/infrastructure nodes.
-	// E.g. ":4121" shares the DHT port over TCP.
+	// Empty string (default) uses the same port as listen_addr; "off" explicitly disables.
+	// E.g. ":4121" or "0.0.0.0:4121" for explicit override.
 	SignalListenAddr string `toml:"signal_listen_addr" json:"signal_listen_addr"`
 	// AutoPublish controls whether the daemon publishes the node identity to the DHT
 	// on startup and on a schedule (default true). When false, the node stays off the DHT
@@ -116,7 +116,7 @@ func Default() Config {
 		LogLevel:         "info",
 		AutoPublish:      true,
 		OpenBrowser:      true,
-		SignalListenAddr: "off",
+		SignalListenAddr: "",
 	}
 }
 

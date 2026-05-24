@@ -426,9 +426,11 @@ func (d *Daemon) Run(ctx context.Context, mcpStdio bool) error {
 	// bootstrap completes, which is correct behaviour.
 	go func() {
 		if urls := runBootstrapChain(netCtx, d.h, d.cfg, d.dataDir, d.log, d.beacon); len(urls) > 0 {
-			d.h.SetDerivedICESignalURLs(urls)
+			d.h.SetBootstrapHubURLs(urls)
 		}
 		d.h.RunNATProbe(netCtx) // active NAT classification after bootstrap
+		// Populate routing-table hub candidates after NAT probe so NATFullCone is known.
+		d.h.SetRoutingHubCandidates(d.h.DeriveRoutingHubURLs(maxSignalCandidates))
 		// Start signal pool before initial publish so hubs can connect during
 		// the endpoint probe window (~1–2 s), reducing startup double-publishes.
 		go d.runICEListener(netCtx)

@@ -88,11 +88,23 @@ func (n *Node) triggerPunch(nodeID a2al.NodeID, er *protocol.EndpointRecord, pri
 	h := n.health[key]
 
 	// §14 anti-jitter gate: only punch when the peer has been bad long enough.
-	// Peers with a small backoff are likely suffering a transient UDP outage;
-	// ICE should not be wasted on them.  Zero nextRetryAt (never contacted or
-	// recently recovered) also passes through so that unknown peers can be tried.
-	if h != nil && !h.nextRetryAt.IsZero() {
-		if time.Until(h.nextRetryAt) < punchMinBackoff {
+	// Peers with a small active backoff are likely suffering a transient UDP
+	// outage; ICE should not be wasted on them. Zero nextRetryAt (never
+	// contacted or recently recovered) always passes through.
+	//
+	// With dual-family health: skip punch only when ALL active families have a
+	// small-but-nonzero backoff. If any active family has a large/zero backoff,
+	// ICE is worthwhile. Inactive families (everUsed=false) are excluded so that
+	// a v4-only peer's v6 slot (always zero) doesn't suppress the gate check —
+	// preserving the same semantics as the old single-family model.
+	if h != nil {
+		v4Block := h.v4.everUsed && !h.v4.nextRetryAt.IsZero() && time.Until(h.v4.nextRetryAt) < punchMinBackoff
+		v6Block := h.v6.everUsed && !h.v6.nextRetryAt.IsZero() && time.Until(h.v6.nextRetryAt) < punchMinBackoff
+		v4Active := h.v4.everUsed
+		v6Active := h.v6.everUsed
+		// Block only when all active families have small backoffs.
+		blocked := (!v4Active || v4Block) && (!v6Active || v6Block) && (v4Active || v6Active)
+		if blocked {
 			n.healthMu.Unlock()
 			return
 		}
@@ -144,11 +156,16 @@ func (n *Node) OnPunchComplete(nodeID a2al.NodeID, peerLogicalAddr a2al.Address,
 		h.isPunching = false
 		if !success && failReason == PunchFailNoAgent {
 			// Remote has no ICE callee registered — it is offline or does not
-			// support hole-punching. Advance failCount past the bad threshold so
-			// the health probe (过程三) will not waste RTTs on this peer until it
-			// reappears with a fresh endpoint record.
-			if h.failCount < badHealthThreshold {
-				h.failCount = badHealthThreshold
+			// support hole-punching. Advance both families' failCount past the
+			// bad threshold (ICE is family-agnostic: noagent means the peer is
+			// entirely offline, not just on one family).
+			if h.v4.failCount < badHealthThreshold {
+				h.v4.failCount = badHealthThreshold
+				h.v4.everUsed = true
+			}
+			if h.v6.failCount < badHealthThreshold {
+				h.v6.failCount = badHealthThreshold
+				h.v6.everUsed = true
 			}
 			n.log.Debug("punch complete: noagent, peer marked bad", "node", nodeID)
 		}
@@ -184,18 +201,23 @@ func (n *Node) OnPunchComplete(nodeID a2al.NodeID, peerLogicalAddr a2al.Address,
 		// Phase 8: remote is directly reachable — admit as standard direct node.
 		// Prefer the peer's self-advertised stable address over the ephemeral ICE
 		// pair port: public nodes may bind a different local port for ICE sessions.
-		recs := n.LocalStoreGet(nodeID, protocol.RecTypeEndpoint)
-		for _, sr := range recs {
-			if er, err := protocol.ParseEndpointRecord(sr); err == nil {
-				if ua := firstEndpointAddr(&er); ua != nil {
-					if ip4 := ua.IP.To4(); ip4 != nil {
-						ni.IP = append([]byte(nil), ip4...)
-					} else {
-						ni.IP = append([]byte(nil), ua.IP.To16()...)
+		// Only consider endpoints whose IP family matches the winning ICE path;
+		// taking a v6 endpoint for a v4 ICE path (or vice-versa) would write an
+		// unreachable address into the routing table.
+		if peer, ok := peerNetAddr.(*net.UDPAddr); ok {
+			recs := n.LocalStoreGet(nodeID, protocol.RecTypeEndpoint)
+			for _, sr := range recs {
+				if er, err := protocol.ParseEndpointRecord(sr); err == nil {
+					if ua := firstEndpointAddrForFamily(&er, peer); ua != nil {
+						if ip4 := ua.IP.To4(); ip4 != nil {
+							ni.IP = append([]byte(nil), ip4...)
+						} else {
+							ni.IP = append([]byte(nil), ua.IP.To16()...)
+						}
+						ni.Port = uint16(ua.Port)
 					}
-					ni.Port = uint16(ua.Port)
+					break
 				}
-				break
 			}
 		}
 		n.tabAdd(ni, meta)
@@ -211,8 +233,22 @@ func (n *Node) OnPunchComplete(nodeID a2al.NodeID, peerLogicalAddr a2al.Address,
 	// Register the peer address so DHT send functions can route to this peer.
 	// sendToOrFallback consults PunchTransport.SendTo first; this registration
 	// ensures the UDP fallback also has a candidate address.
+	// isDirect → stable slot; prflx punch → ephemeral slot (TTL-bounded).
 	n.peerMu.Lock()
-	n.peers[key] = peerNetAddr
+	pa := n.peers[key]
+	if pa == nil {
+		pa = &peerAddrs{}
+		n.peers[key] = pa
+	}
+	if udp, ok := peerNetAddr.(*net.UDPAddr); ok {
+		if isDirect {
+			pa.setStable(udp)
+		} else {
+			pa.setEphemeral(udp)
+		}
+	} else {
+		pa.fallback = peerNetAddr
+	}
 	n.peerMu.Unlock()
 	n.addrToID.Store(peerNetAddr.String(), nodeID)
 
@@ -227,6 +263,26 @@ func firstEndpointAddr(er *protocol.EndpointRecord) *net.UDPAddr {
 		if len(e) > 7 && e[:7] == "quic://" {
 			if a, err := net.ResolveUDPAddr("udp", e[7:]); err == nil {
 				return a
+			}
+		}
+	}
+	return nil
+}
+
+// firstEndpointAddrForFamily returns the first quic:// endpoint whose IP
+// family matches peer, or nil. Used when upgrading an ICE ephemeral address to
+// the peer's stable self-advertised address: taking an endpoint with the wrong
+// family would write an unreachable address into the routing table.
+func firstEndpointAddrForFamily(er *protocol.EndpointRecord, peer *net.UDPAddr) *net.UDPAddr {
+	wantV4 := peer.IP.To4() != nil
+	for _, e := range er.Endpoints {
+		if len(e) > 7 && e[:7] == "quic://" {
+			ua, err := net.ResolveUDPAddr("udp", e[7:])
+			if err != nil {
+				continue
+			}
+			if (ua.IP.To4() != nil) == wantV4 {
+				return ua
 			}
 		}
 	}

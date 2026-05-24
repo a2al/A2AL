@@ -100,9 +100,11 @@ ice_turn_urls = [
 # (callee-pays relay addresses are exchanged via trickle ICE, not stored in DHT)
 ice_publish_turns = []
 
-# Embedded ICE signaling hub TCP listen address; empty or "off" disables (default).
-# Enable only on bootstrap/infrastructure nodes when needed, e.g. ":4121".
-signal_listen_addr = "off"
+# Embedded ICE signaling hub TCP listen address.
+# Empty string (default): automatically uses the same port as listen_addr over TCP.
+# "off": explicitly disable the hub.
+# Explicit form (e.g. ":4121", "0.0.0.0:4121"): override port/bind address.
+signal_listen_addr = ""
 
 # Periodically publish this node's AID to the DHT (can be toggled via PATCH /config without restart).
 auto_publish = true
