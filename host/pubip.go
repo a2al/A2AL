@@ -16,7 +16,9 @@ import (
 	"time"
 )
 
-// STUN servers queried for external IP:port (RFC 5389 Binding Request).
+// stunServers are queried for the external UDP mapping using STUN Binding Requests
+// (RFC 5389). All entries have both A and AAAA records, so the same list is used
+// for IPv4 probes (network="udp4") and IPv6 probes (network="udp6").
 var stunServers = []string{
 	"stun.l.google.com:19302",
 	"stun1.l.google.com:19302",
@@ -32,13 +34,20 @@ var httpIPServices = []string{
 
 const stunMagicCookie = uint32(0x2112A442)
 
-// probeSTUN tries all STUN servers in parallel and returns the first successful
-// external (ip, port) pair. Returns nil ip if all fail.
-//
-// Currently queries IPv4 STUN only. TODO(ipv6): add a parallel probeSTUNv6 that
-// calls stunQuery with network="udp6" and a v6 STUN server list once dual-stack
-// socket support is in place (Layer 1 of the IPv6 support plan).
+// probeSTUN queries all STUN servers in parallel over IPv4 and returns the
+// first successful external (ip, port) pair. Returns nil ip if all fail.
 func probeSTUN(ctx context.Context) (net.IP, uint16) {
+	return probeSTUNNetwork(ctx, "udp4")
+}
+
+// probeSTUNv6 queries all STUN servers in parallel over IPv6 and returns the
+// first successful external (ip, port) pair. Returns nil ip if IPv6 is
+// unavailable or all servers fail. Safe to call on IPv4-only hosts.
+func probeSTUNv6(ctx context.Context) (net.IP, uint16) {
+	return probeSTUNNetwork(ctx, "udp6")
+}
+
+func probeSTUNNetwork(ctx context.Context, network string) (net.IP, uint16) {
 	type result struct {
 		ip   net.IP
 		port uint16
@@ -47,7 +56,7 @@ func probeSTUN(ctx context.Context) (net.IP, uint16) {
 	for _, srv := range stunServers {
 		srv := srv
 		go func() {
-			ip, port, err := stunQuery(ctx, "udp4", srv)
+			ip, port, err := stunQuery(ctx, network, srv)
 			if err != nil {
 				ch <- result{}
 				return
@@ -56,8 +65,7 @@ func probeSTUN(ctx context.Context) (net.IP, uint16) {
 		}()
 	}
 	for range stunServers {
-		r := <-ch
-		if r.ip != nil {
+		if r := <-ch; r.ip != nil {
 			return r.ip, r.port
 		}
 	}
@@ -66,10 +74,8 @@ func probeSTUN(ctx context.Context) (net.IP, uint16) {
 
 // stunQuery sends a single RFC 5389 Binding Request to serverAddr using the
 // given network ("udp4" or "udp6") and parses the XOR-MAPPED-ADDRESS (or
-// MAPPED-ADDRESS) attribute from the response.
-//
-// Passing "udp6" and a v6-capable STUN server will return the IPv6 mapped
-// address once dual-stack socket support is enabled (Layer 1).
+// MAPPED-ADDRESS) attribute from the response. Both address families are
+// supported; pass "udp6" for IPv6 STUN probes.
 func stunQuery(ctx context.Context, network, serverAddr string) (net.IP, uint16, error) {
 	raddr, err := net.ResolveUDPAddr(network, serverAddr)
 	if err != nil {
@@ -140,19 +146,15 @@ func parseSTUNResponse(buf, txID []byte) (net.IP, uint16, error) {
 		val := attrs[4 : 4+attrLen]
 
 		switch attrType {
-		case 0x0020: // XOR-MAPPED-ADDRESS (preferred)
-			if len(val) >= 8 && val[1] == 0x01 { // IPv4 family
-				port := binary.BigEndian.Uint16(val[2:4]) ^ uint16(stunMagicCookie>>16)
-				rawIP := binary.BigEndian.Uint32(val[4:8]) ^ stunMagicCookie
-				ip := make(net.IP, 4)
-				binary.BigEndian.PutUint32(ip, rawIP)
+		case 0x0020: // XOR-MAPPED-ADDRESS (preferred, RFC 5389 §15.2)
+			ip, port, ok := decodeXORMappedAddr(val, txID)
+			if ok {
 				return ip, port, nil
 			}
-		case 0x0001: // MAPPED-ADDRESS (fallback)
-			if len(val) >= 8 && val[1] == 0x01 {
-				fallbackPort = binary.BigEndian.Uint16(val[2:4])
-				fallbackIP = make(net.IP, 4)
-				copy(fallbackIP, val[4:8])
+		case 0x0001: // MAPPED-ADDRESS (fallback, RFC 5389 §15.1)
+			ip, port, ok := decodeMappedAddr(val)
+			if ok {
+				fallbackIP, fallbackPort = ip, port
 			}
 		}
 		// Advance past attribute, 4-byte aligned.
@@ -163,6 +165,65 @@ func parseSTUNResponse(buf, txID []byte) (net.IP, uint16, error) {
 		return fallbackIP, fallbackPort, nil
 	}
 	return nil, 0, errors.New("stun: no mapped address in response")
+}
+
+// decodeXORMappedAddr parses the value bytes of a STUN XOR-MAPPED-ADDRESS
+// attribute (RFC 5389 §15.2) for both IPv4 (family 0x01) and IPv6 (family 0x02).
+// txID is the 12-byte transaction ID from the STUN message header.
+func decodeXORMappedAddr(val, txID []byte) (ip net.IP, port uint16, ok bool) {
+	if len(val) < 4 {
+		return
+	}
+	port = binary.BigEndian.Uint16(val[2:4]) ^ uint16(stunMagicCookie>>16)
+	switch val[1] {
+	case 0x01: // IPv4
+		if len(val) < 8 {
+			return
+		}
+		rawIP := binary.BigEndian.Uint32(val[4:8]) ^ stunMagicCookie
+		ip = make(net.IP, 4)
+		binary.BigEndian.PutUint32(ip, rawIP)
+		ok = true
+	case 0x02: // IPv6 — XOR with stunMagicCookie || txID (RFC 5389 §15.2)
+		if len(val) < 20 || len(txID) < 12 {
+			return
+		}
+		ip = make(net.IP, 16)
+		xorKey := [16]byte{}
+		binary.BigEndian.PutUint32(xorKey[:4], stunMagicCookie)
+		copy(xorKey[4:], txID)
+		for i := range ip {
+			ip[i] = val[4+i] ^ xorKey[i]
+		}
+		ok = true
+	}
+	return
+}
+
+// decodeMappedAddr parses the value bytes of a STUN MAPPED-ADDRESS attribute
+// (RFC 5389 §15.1) for both IPv4 and IPv6. No XOR.
+func decodeMappedAddr(val []byte) (ip net.IP, port uint16, ok bool) {
+	if len(val) < 4 {
+		return
+	}
+	port = binary.BigEndian.Uint16(val[2:4])
+	switch val[1] {
+	case 0x01: // IPv4
+		if len(val) < 8 {
+			return
+		}
+		ip = make(net.IP, 4)
+		copy(ip, val[4:8])
+		ok = true
+	case 0x02: // IPv6
+		if len(val) < 20 {
+			return
+		}
+		ip = make(net.IP, 16)
+		copy(ip, val[4:20])
+		ok = true
+	}
+	return
 }
 
 // httpPublicIP queries HTTP IP services in parallel and returns the first

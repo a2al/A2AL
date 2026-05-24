@@ -39,6 +39,7 @@ import (
 	"github.com/a2al/a2al/natmap"
 	"github.com/a2al/a2al/natsense"
 	"github.com/a2al/a2al/protocol"
+	"github.com/a2al/a2al/signaling"
 	"github.com/a2al/a2al/transport"
 )
 
@@ -88,25 +89,33 @@ type TURNServer struct {
 
 // Config wires DHT + QUIC.
 //
-// IPv6 note: currently Host binds udp4 sockets only. The Transport interface,
-// protocol wire format (NodeInfo.IP 4/16 bytes, observed_addr 6/18 bytes), and
-// endpoint URL model ("quic://[v6]:port") are all IPv6-ready. Dual-stack
-// requires changing listenUDP4 in New() — either "udp" dual-stack or separate
-// v4+v6 listeners — and adding v6 candidate collection in candidates.go.
-// No interface or data-model changes are expected.
+// IPv6 note: Host binds dual-stack sockets by default (transport.ListenDualUDP).
+// The Transport interface, protocol wire format (NodeInfo.IP 4/16 bytes,
+// observed_addr 6/18 bytes), and endpoint URL model ("quic://[v6]:port") are
+// all IPv6-ready. Set Config.DisableIPv6 = true to force IPv4-only sockets.
+// v6 candidate collection (candidates.go ③④) is the next step (Layer 1 M3).
 type Config struct {
 	KeyStore crypto.KeyStore
 	// ListenAddr is the DHT UDP bind address, e.g. ":5001".
-	// Currently resolved as udp4; dual-stack (udp / "[::]:port") is planned.
+	// Wildcard addresses (":port", "0.0.0.0:port") are promoted to dual-stack
+	// ([::]:port on Unix; udp4+udp6 on Windows). Explicit IPv4 addresses
+	// (e.g. "1.2.3.4:5001") bind an IPv4-only socket, preserving existing
+	// RunNATProbe and candidate-collection behaviour for those deployments.
+	// Override with DisableIPv6 = true to force IPv4-only for all addresses.
 	ListenAddr string
 	// QUICListenAddr, if non-empty, is a separate UDP bind for QUIC.
-	// Same udp4 constraint as ListenAddr.
+	// Same dual-stack rules as ListenAddr apply.
 	QUICListenAddr   string
 	PrivateKey       ed25519.PrivateKey
 	MinObservedPeers int
 	FallbackHost     string
 	// DisableUPnP skips IGD port mapping for the QUIC UDP port (Phase 2b).
 	DisableUPnP bool
+
+	// DisableIPv6, when true, forces all sockets to IPv4-only (udp4).
+	// Use as an emergency escape hatch if dual-stack causes problems on a
+	// specific platform or network environment. Default: false (dual-stack).
+	DisableIPv6 bool
 
 	// ICESignalURL is the primary WebSocket base URL for ICE signaling (single URL, backward compat).
 	// Superseded by ICESignalURLs when that field is non-empty.
@@ -134,9 +143,10 @@ type Config struct {
 	// Empty disables persistence.
 	SeenPeersPath string
 	// ICENetworkTypes lists the ICE network types used for candidate gathering.
-	// Defaults to {ice.NetworkTypeUDP4} (IPv4-only) when nil or empty.
-	// To enable IPv6 ICE, set to {ice.NetworkTypeUDP4, ice.NetworkTypeUDP6} after
-	// dual-stack socket support is implemented (Layer 1 of the IPv6 support plan).
+	// Defaults to {ice.NetworkTypeUDP4, ice.NetworkTypeUDP6} (dual-stack) when
+	// nil or empty. ICE opens its own sockets independently of the main QUIC
+	// socket, so IPv6 ICE candidates are collected even on IPv4-only QUIC
+	// bindings. Set to {ice.NetworkTypeUDP4} to restrict to IPv4 ICE only.
 	ICENetworkTypes []ice.NetworkType
 }
 
@@ -213,9 +223,14 @@ type Host struct {
 	extipSnap string    // "ip:port" (STUN) or "ip" (HTTP); empty = not yet resolved
 	extipExp  time.Time // cache expiry
 
-	iceMu              sync.RWMutex
-	derivedICESignals  []string // candidate signal hub URLs from bootstrap
-	activeSignalURLs   []string // currently connected hubs, maintained by ice_listener
+	extip6Mu   sync.Mutex
+	extip6Snap string    // IPv6 STUN result "ip:port"; empty = not resolved or unavailable
+	extip6Exp  time.Time // cache expiry
+
+	iceMu               sync.RWMutex
+	bootstrapHubURLs    []string // signal hub URLs from bootstrap/DNS (stable fallback)
+	routingHubCandidates []string // signal hub URLs derived from routing table (refreshable)
+	activeSignalURLs    []string // currently connected hubs, maintained by ice_listener
 
 	signalStatsMu sync.RWMutex
 	signalStats   func() map[string]any
@@ -224,6 +239,11 @@ type Host struct {
 	beaconStats   func() map[string]any
 
 	natProbeMu sync.Mutex // guards RunNATProbe (only one probe at a time)
+
+	// Local IP-family capability, determined once at Host creation.
+	// Used by dialTargets to skip addresses the local stack cannot reach.
+	hasV4 bool
+	hasV6 bool
 
 	punchPool *DHTpunchPool
 
@@ -266,8 +286,8 @@ func New(cfg Config) (*Host, error) {
 	}
 	sense := natsense.NewSense(min)
 
-	// ICE gathers its own sockets independently of the main 4121 QUIC socket,
-	// so IPv6 ICE works even though the main socket is udp4-only.
+	// ICE gathers its own sockets independently of the main QUIC socket (now
+	// dual-stack via transport.ListenDualUDP). Both families are active by default.
 	if len(cfg.ICENetworkTypes) == 0 {
 		cfg.ICENetworkTypes = []ice.NetworkType{ice.NetworkTypeUDP4, ice.NetworkTypeUDP6}
 	}
@@ -292,12 +312,22 @@ func New(cfg Config) (*Host, error) {
 		PunchTransport: punchPool,
 	}
 
+	// listenSocket creates a UDP socket according to the DisableIPv6 flag.
+	// DisableIPv6=false (default): dual-stack via transport.ListenDualUDP.
+	// DisableIPv6=true: IPv4-only fallback via listenUDP4.
+	listenSocket := func(addr string) (net.PacketConn, error) {
+		if cfg.DisableIPv6 {
+			return listenUDP4(addr)
+		}
+		return transport.ListenDualUDP(addr)
+	}
+
 	var node *dht.Node
 	var mux *transport.UDPMux
 	var qt *quic.Transport
 
 	if cfg.QUICListenAddr == "" {
-		conn, err := listenUDP4(cfg.ListenAddr)
+		conn, err := listenSocket(cfg.ListenAddr)
 		if err != nil {
 			return nil, err
 		}
@@ -311,11 +341,11 @@ func New(cfg Config) (*Host, error) {
 		}
 		qt = &quic.Transport{Conn: mux.QUICPacketConn()}
 	} else {
-		dConn, err := listenUDP4(cfg.ListenAddr)
+		dConn, err := listenSocket(cfg.ListenAddr)
 		if err != nil {
 			return nil, err
 		}
-		qConn, err := listenUDP4(cfg.QUICListenAddr)
+		qConn, err := listenSocket(cfg.QUICListenAddr)
 		if err != nil {
 			_ = dConn.Close()
 			return nil, err
@@ -345,6 +375,8 @@ func New(cfg Config) (*Host, error) {
 		node:      node,
 		sense:     sense,
 		quicTr:    qt,
+		hasV4:     outboundIPv4() != nil,
+		hasV6:     !cfg.DisableIPv6 && outboundIPv6() != nil,
 		punchPool: punchPool,
 		agents: map[a2al.Address]*agentEntry{
 			myAddr: {addr: myAddr, priv: priv, cert: defaultCert},
@@ -482,30 +514,44 @@ func (h *Host) ObserveFromRouting(ctx context.Context, n int) int {
 	return len(seeds)
 }
 
-// RunNATProbe performs an AutoNAT-style active reachability test to classify NAT type.
-// At most one probe runs at a time (TryLock); concurrent callers return immediately.
+// RunNATProbe performs an AutoNAT-style active reachability test for both IP
+// families. At most one probe runs at a time (TryLock); concurrent callers
+// return immediately.
 //
-// Classification logic:
+// IPv4 classification:
 //
-//	QUIC bind IP is public WAN              → sense.RecordBindPublic(true); return (no probe needed)
-//	probe echo received from ≥1 candidate   → sense.RecordProbeResult(true)  [Full Cone / cloud NAT]
-//	no echo despite known external address  → sense.RecordProbeResult(false) [Restricted]
+//	QUIC bind IP is a public v4 WAN address   → sense.RecordV4BindPublic(true); skip echo probe
+//	echo received from ≥1 v4 candidate        → sense.RecordV4ProbeResult(true)
+//	no echo despite known v4 external address → sense.RecordV4ProbeResult(false)
+//
+// IPv6 classification:
+//
+//	no GUA interface address                  → sense.RecordV6GUABind(false); v6 probe skipped
+//	GUA present; echo from ≥1 v6 candidate   → sense.RecordV6ProbeResult(true)
+//	GUA present; no echo                      → sense.RecordV6ProbeResult(false)
 func (h *Host) RunNATProbe(ctx context.Context) {
 	if !h.natProbeMu.TryLock() {
 		return // another probe is already running
 	}
 	defer h.natProbeMu.Unlock()
 
-	// ① Detect public bind.
-	if qa := h.QUICLocalAddr(); qa != nil && isPlausibleWANIP(qa.IP) {
-		h.sense.RecordBindPublic(true)
-		h.log.Debug("nat probe: public bind", "ip", qa.IP)
+	h.runNATProbeV4(ctx)
+	h.runNATProbeV6(ctx)
+}
+
+// runNATProbeV4 runs the IPv4 track of RunNATProbe.
+func (h *Host) runNATProbeV4(ctx context.Context) {
+	// ① Detect public v4 bind. QUICLocalAddr is typically [::] on dual-stack
+	// hosts, so this branch fires only on hosts with a routable v4 bind address.
+	if qa := h.QUICLocalAddr(); qa != nil && qa.IP.To4() != nil && isPlausibleWANIP(qa.IP) {
+		h.sense.RecordV4BindPublic(true)
+		h.log.Debug("nat probe v4: public bind", "ip", qa.IP)
 		return // directly reachable; no inbound echo probe needed
 	}
-	h.sense.RecordBindPublic(false)
+	h.sense.RecordV4BindPublic(false)
 
-	// ② Get claimed external address: natsense consensus preferred, STUN as fallback.
-	claimedWire, ok := h.sense.TrustedWire()
+	// ② Claimed external v4 address: natsense consensus preferred, STUN fallback.
+	claimedWire, ok := h.sense.TrustedWireV4()
 	if !ok {
 		sctx, cancel := context.WithTimeout(ctx, 4*time.Second)
 		stunIP, stunPort := probeSTUN(sctx)
@@ -517,14 +563,14 @@ func (h *Host) RunNATProbe(ctx context.Context) {
 		}
 	}
 	if len(claimedWire) == 0 {
-		h.log.Debug("nat probe: no claimed external address; skipping")
-		return // cannot probe without knowing external address
+		h.log.Debug("nat probe v4: no claimed external address; skipping")
+		return
 	}
 
-	// ③ Select up to 3 candidates with public WAN IPs from the routing table.
+	// ③ Select up to 3 v4 candidates from the routing table.
 	candidates := h.selectNATProbeTargets(3)
 	if len(candidates) == 0 {
-		h.log.Debug("nat probe: no public-IP candidates in routing table; skipping")
+		h.log.Debug("nat probe v4: no public-IP candidates in routing table; skipping")
 		return
 	}
 
@@ -546,8 +592,65 @@ func (h *Host) RunNATProbe(ctx context.Context) {
 			reachable = true
 		}
 	}
-	h.sense.RecordProbeResult(reachable)
-	h.log.Debug("nat probe done", "reachable", reachable, "candidates", len(candidates))
+	h.sense.RecordV4ProbeResult(reachable)
+	h.log.Debug("nat probe v4 done", "reachable", reachable, "candidates", len(candidates))
+}
+
+// runNATProbeV6 runs the IPv6 track of RunNATProbe.
+// It is a no-op on IPv4-only hosts (no GUA interface address).
+func (h *Host) runNATProbeV6(ctx context.Context) {
+	// ① Detect GUA IPv6 interface address via an outbound route probe.
+	v6IP := outboundIPv6()
+	hasGUA := v6IP != nil && isPlausibleWANIP(v6IP)
+	h.sense.RecordV6GUABind(hasGUA)
+	if !hasGUA {
+		return // IPv4-only (or v6 unreachable); v6 track is a no-op
+	}
+
+	// ② Claimed external v6 address: natsense consensus preferred, STUN fallback.
+	claimedWire, ok := h.sense.TrustedWireV6()
+	if !ok {
+		sctx, cancel := context.WithTimeout(ctx, 4*time.Second)
+		stunIP, stunPort := probeSTUNv6(sctx)
+		cancel()
+		if stunIP != nil && isPlausibleWANIP(stunIP) {
+			if b, err := protocol.FormatObservedUDP(stunIP, stunPort); err == nil {
+				claimedWire = b
+			}
+		}
+	}
+	if len(claimedWire) == 0 {
+		h.log.Debug("nat probe v6: no claimed external address; skipping")
+		return
+	}
+
+	// ③ Select up to 3 v6 GUA candidates from the routing table.
+	candidates := h.selectNATProbeTargetsV6(3)
+	if len(candidates) == 0 {
+		h.log.Debug("nat probe v6: no GUA-v6 candidates in routing table; skipping")
+		return
+	}
+
+	// ④ Probe concurrently; ≥1 successful echo → directly reachable v6.
+	type result struct{ ok bool }
+	results := make(chan result, len(candidates))
+	for _, addr := range candidates {
+		addr := addr
+		go func() {
+			pCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			ok, _ := h.node.SendNATProbeReq(pCtx, addr, claimedWire)
+			results <- result{ok}
+		}()
+	}
+	var reachable bool
+	for range candidates {
+		if r := <-results; r.ok {
+			reachable = true
+		}
+	}
+	h.sense.RecordV6ProbeResult(reachable)
+	h.log.Debug("nat probe v6 done", "reachable", reachable, "candidates", len(candidates))
 }
 
 // InvalidateNetworkCaches clears short-lived external-network caches so
@@ -557,17 +660,41 @@ func (h *Host) InvalidateNetworkCaches() {
 	h.extipSnap = ""
 	h.extipExp = time.Time{}
 	h.extipMu.Unlock()
+	h.extip6Mu.Lock()
+	h.extip6Snap = ""
+	h.extip6Exp = time.Time{}
+	h.extip6Mu.Unlock()
 	h.sense.ClearProbeResult()
 	h.sense.InvalidateObservations()
 }
 
-// selectNATProbeTargets returns up to n UDP addresses of routing-table peers with public WAN IPs.
+// selectNATProbeTargets returns up to n UDP addresses of routing-table peers
+// with public WAN IPv4 addresses. IPv6 addresses are excluded so that the v4
+// probe track sends its claimed v4 wire address only to v4 reachable peers.
 func (h *Host) selectNATProbeTargets(n int) []net.Addr {
 	all := h.node.BootstrapCandidateAddrs(n * 5)
 	var out []net.Addr
 	for _, a := range all {
 		udp, ok := a.(*net.UDPAddr)
-		if !ok || !isPlausibleWANIP(udp.IP) {
+		if !ok || udp.IP.To4() == nil || !isPlausibleWANIP(udp.IP) {
+			continue
+		}
+		out = append(out, a)
+		if len(out) >= n {
+			break
+		}
+	}
+	return out
+}
+
+// selectNATProbeTargetsV6 returns up to n UDP addresses of routing-table peers
+// with public WAN IPv6 (GUA) addresses for the v6 probe track.
+func (h *Host) selectNATProbeTargetsV6(n int) []net.Addr {
+	all := h.node.BootstrapCandidateAddrs(n * 5)
+	var out []net.Addr
+	for _, a := range all {
+		udp, ok := a.(*net.UDPAddr)
+		if !ok || udp.IP.To4() != nil || !isPlausibleWANIP(udp.IP) {
 			continue
 		}
 		out = append(out, a)
@@ -584,15 +711,21 @@ func (h *Host) BuildEndpointPayload(ctx context.Context) (protocol.EndpointPaylo
 	t0 := time.Now()
 	upCh := make(chan string, 1)
 	extCh := make(chan string, 1)
+	ext6Ch := make(chan string, 1)
 	go func() { upCh <- h.ensureUPnP(ctx) }()
 	go func() { extCh <- h.ensureExternalIP(ctx) }()
+	go func() { ext6Ch <- h.ensureExternalIPv6(ctx) }()
 	up := <-upCh
 	ext := <-extCh
+	ext6 := <-ext6Ch
 	if elapsed := time.Since(t0).Truncate(time.Millisecond); elapsed > 0 {
-		h.log.Debug("endpoint probe done", "elapsed", elapsed, "ext_ip", ext, "upnp", up)
+		h.log.Debug("endpoint probe done", "elapsed", elapsed, "ext_ip_v4", ext, "ext_ip_v6", ext6, "upnp", up)
 	}
 
-	// Keep the DHT node informed of our public IP so it can detect NAT hairpin peers.
+	// Inform the DHT node of our public IPv4 so it can detect NAT hairpin peers
+	// (nodes behind the same NAT share the same public IP).  IPv6 GUA nodes are
+	// directly reachable without hairpinning, so v6 hairpin detection is
+	// intentionally skipped. The v6 IP is stored separately for well-known-node self-identify.
 	if ext != "" {
 		ipStr := ext
 		if host, _, err := net.SplitHostPort(ext); err == nil {
@@ -602,8 +735,17 @@ func (h *Host) BuildEndpointPayload(ctx context.Context) (protocol.EndpointPaylo
 			h.node.SetSelfExtIP(ip)
 		}
 	}
+	if ext6 != "" {
+		ipStr := ext6
+		if host, _, err := net.SplitHostPort(ext6); err == nil {
+			ipStr = host
+		}
+		if ip := net.ParseIP(ipStr); ip != nil {
+			h.node.SetSelfExtIPv6(ip)
+		}
+	}
 
-	eps, err := h.orderedQUICEndpointStrings(ext, up)
+	eps, err := h.orderedQUICEndpointStrings(ext, ext6, up) // ext=IPv4, ext6=IPv6, up=UPnP
 	if err != nil {
 		return protocol.EndpointPayload{}, err
 	}
@@ -618,7 +760,7 @@ func (h *Host) BuildEndpointPayload(ctx context.Context) (protocol.EndpointPaylo
 	}
 	return protocol.EndpointPayload{
 		Endpoints: eps,
-		NatType:   h.sense.InferNATType(),
+		NatType:   h.sense.PublishNatType(),
 		Signal:    signal,
 		Signals:   signals,
 	}, nil
@@ -626,7 +768,8 @@ func (h *Host) BuildEndpointPayload(ctx context.Context) (protocol.EndpointPaylo
 
 // effectiveICESignalURLs returns the ordered candidate list for ice_listener to
 // attempt connections to. Priority: ICESignalURLs config > ICESignalURL config >
-// bootstrap-derived candidates. This list drives WHICH hubs to try, not what to publish.
+// routing-derived candidates > bootstrap-derived candidates.
+// This list drives WHICH hubs to try, not what to publish.
 func (h *Host) effectiveICESignalURLs() []string {
 	h.iceMu.RLock()
 	defer h.iceMu.RUnlock()
@@ -636,7 +779,22 @@ func (h *Host) effectiveICESignalURLs() []string {
 	if h.cfg.ICESignalURL != "" {
 		return []string{h.cfg.ICESignalURL}
 	}
-	return h.derivedICESignals
+	// Merge routing candidates (preferred) and bootstrap URLs (fallback), dedup.
+	seen := make(map[string]struct{})
+	out := make([]string, 0, len(h.routingHubCandidates)+len(h.bootstrapHubURLs))
+	for _, u := range h.routingHubCandidates {
+		if _, ok := seen[u]; !ok {
+			seen[u] = struct{}{}
+			out = append(out, u)
+		}
+	}
+	for _, u := range h.bootstrapHubURLs {
+		if _, ok := seen[u]; !ok {
+			seen[u] = struct{}{}
+			out = append(out, u)
+		}
+	}
+	return out
 }
 
 // publishSignalURLs returns the signal hub URLs to include in endpoint records.
@@ -667,8 +825,9 @@ func (h *Host) effectiveICESignalBase() string {
 	return ""
 }
 
-// EffectiveICESignalBase returns the primary ICE signaling WebSocket base URL
-// published in endpoint records: explicit config overrides bootstrap-derived value.
+// EffectiveICESignalBase returns the first hub URL from the effective candidate
+// list (config > routing-derived > bootstrap-derived). Used by callers that need
+// a single hub URL for an outbound ICE session.
 func (h *Host) EffectiveICESignalBase() string {
 	return h.effectiveICESignalBase()
 }
@@ -680,15 +839,57 @@ func (h *Host) EffectiveICESignalURLs() []string {
 	return h.effectiveICESignalURLs()
 }
 
-// SetDerivedICESignalURLs sets bootstrap-derived signal hub candidates.
+// SetBootstrapHubURLs sets signal hub URLs derived from bootstrap/DNS infrastructure.
+// These serve as a stable fallback when routing-table candidates are unavailable.
 // Explicit config (ICESignalURLs / ICESignalURL) always wins and is not overwritten.
-func (h *Host) SetDerivedICESignalURLs(urls []string) {
+func (h *Host) SetBootstrapHubURLs(urls []string) {
 	h.iceMu.Lock()
 	defer h.iceMu.Unlock()
 	if len(h.cfg.ICESignalURLs) > 0 || h.cfg.ICESignalURL != "" {
 		return
 	}
-	h.derivedICESignals = urls
+	h.bootstrapHubURLs = urls
+}
+
+// SetRoutingHubCandidates sets signal hub candidates derived from the routing table.
+// These are preferred over bootstrap URLs and are refreshed periodically.
+// Explicit config (ICESignalURLs / ICESignalURL) always wins and is not overwritten.
+func (h *Host) SetRoutingHubCandidates(urls []string) {
+	h.iceMu.Lock()
+	defer h.iceMu.Unlock()
+	if len(h.cfg.ICESignalURLs) > 0 || h.cfg.ICESignalURL != "" {
+		return
+	}
+	h.routingHubCandidates = urls
+}
+
+// RoutingHubCandidates returns the current routing-table-derived hub candidate list.
+func (h *Host) RoutingHubCandidates() []string {
+	h.iceMu.RLock()
+	defer h.iceMu.RUnlock()
+	out := make([]string, len(h.routingHubCandidates))
+	copy(out, h.routingHubCandidates)
+	return out
+}
+
+// DeriveRoutingHubURLs derives signal hub ws:// URLs from the DHT routing table,
+// selecting peers with high inbound TCP reachability (NATFullCone or v6 GUA).
+// Returns up to max candidates with bucket-index diversity.
+func (h *Host) DeriveRoutingHubURLs(max int) []string {
+	addrs := h.node.PublicHubCandidates(max)
+	out := make([]string, 0, len(addrs))
+	for _, a := range addrs {
+		udp, ok := a.(*net.UDPAddr)
+		if !ok || udp.Port == 0 {
+			continue
+		}
+		u, err := signaling.DeriveSignalBaseFromHostPort(udp.String())
+		if err != nil {
+			continue
+		}
+		out = append(out, u)
+	}
+	return out
 }
 
 // SetActiveSignalURLs records the set of signal hub URLs with live connections.
@@ -762,6 +963,39 @@ func (h *Host) ensureExternalIP(ctx context.Context) string {
 		h.extipExp = time.Now().Add(extipCacheTTL)
 		h.extipMu.Unlock()
 	}
+	return snap
+}
+
+// ensureExternalIPv6 returns a cached or freshly probed IPv6 external address
+// (from STUN, "ip:port" format). Returns "" on v6-only machines without a
+// global unicast address, or when dual-stack is disabled.
+func (h *Host) ensureExternalIPv6(ctx context.Context) string {
+	if h.cfg.DisableIPv6 {
+		return ""
+	}
+	h.extip6Mu.Lock()
+	// Use expiry-only check so negative results (snap=="") are also served from
+	// cache — prevents repeated STUN probes on IPv4-only machines.
+	if !h.extip6Exp.IsZero() && time.Now().Before(h.extip6Exp) {
+		snap := h.extip6Snap
+		h.extip6Mu.Unlock()
+		return snap
+	}
+	h.extip6Mu.Unlock()
+
+	sctx, scancel := context.WithTimeout(ctx, 3*time.Second)
+	stunIP, stunPort := probeSTUNv6(sctx)
+	scancel()
+
+	var snap string
+	if stunIP != nil && isPlausibleWANIP(stunIP) {
+		snap = net.JoinHostPort(stunIP.String(), strconv.Itoa(int(stunPort)))
+	}
+
+	h.extip6Mu.Lock()
+	h.extip6Snap = snap // cache negative result too (avoids repeated probes on v4-only machines)
+	h.extip6Exp = time.Now().Add(extipCacheTTL)
+	h.extip6Mu.Unlock()
 	return snap
 }
 
@@ -1181,22 +1415,29 @@ func outboundIPv4() net.IP {
 }
 
 // outboundIPv6 returns the preferred IPv6 outbound address without sending any
-// packets. Currently returns nil; will be implemented in Layer 1 of the IPv6
-// support plan alongside dual-stack socket setup.
-//
-// TODO(ipv6): implement as net.Dial("udp6", "2001:4860:4860::8888:80") once
-// the DHT/QUIC socket supports IPv6.
+// packets, by connecting a UDP socket to a public IPv6 address and reading the
+// local address the OS assigned. Returns nil if the host has no IPv6
+// connectivity (ENETUNREACH) or no global unicast outbound route.
 func outboundIPv6() net.IP {
-	return nil
+	conn, err := net.Dial("udp6", "[2001:4860:4860::8888]:80")
+	if err != nil {
+		return nil
+	}
+	defer conn.Close()
+	ip := conn.LocalAddr().(*net.UDPAddr).IP
+	// Discard link-local and loopback — we want only GUA / ULA.
+	if ip.IsLinkLocalUnicast() || ip.IsLoopback() {
+		return nil
+	}
+	return ip
 }
 
-// listenUDP4 resolves addr as IPv4 UDP and opens a socket.
+// listenUDP4 resolves addr as IPv4 UDP and opens an IPv4-only socket.
 //
-// All DHT and QUIC sockets currently bind to IPv4 only.
-// TODO(ipv6): to enable dual-stack or IPv6-only, change "udp4" to "udp" (dual-stack
-// on Linux/macOS) or implement separate v4/v6 listeners here (required on Windows,
-// where net.ListenUDP("udp", ...) does not auto-bind IPv6). See Layer 1 in the IPv6
-// support design plan.
+// This is the DisableIPv6=true fallback path. Under normal operation New()
+// uses transport.ListenDualUDP instead, which binds a dual-stack socket on
+// Linux/macOS and an IPv4+IPv6 socket pair on Windows. listenUDP4 is kept as
+// an emergency escape hatch for deployments where dual-stack causes problems.
 func listenUDP4(addr string) (*net.UDPConn, error) {
 	a, err := net.ResolveUDPAddr("udp4", addr)
 	if err != nil {

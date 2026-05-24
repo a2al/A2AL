@@ -24,8 +24,16 @@ const (
 // (0x40) set per RFC 9000 §17. A2AL DHT messages are CBOR maps whose first byte
 // falls in 0xa0-0xbf, where bit 6 is always clear. Checking `data[0]&0x40 != 0`
 // is therefore a reliable, stateless discriminator — no peer tracking needed.
+//
+// The underlying conn is a net.PacketConn, which may be:
+//   - *net.UDPConn (IPv4-only, or dual-stack on Unix via [::]:port)
+//   - *dualPacketConn (Windows: udp4 + udp6 fan-in; see listen_dual_windows.go)
+//
+// All source addresses are normalised by normalizeUDPAddr in readLoop so that
+// v4-mapped IPv6 addresses (::ffff:x.x.x.x) are always unwrapped to pure IPv4
+// before reaching DHT or QUIC code.
 type UDPMux struct {
-	conn *net.UDPConn
+	conn net.PacketConn
 
 	dhtIn chan pkt
 	qIn   chan pkt
@@ -57,7 +65,8 @@ type pkt struct {
 }
 
 // NewUDPMux wraps an existing UDP listener. Call StartReadLoop before use.
-func NewUDPMux(conn *net.UDPConn) *UDPMux {
+// conn may be a *net.UDPConn or a *dualPacketConn (Windows dual-stack).
+func NewUDPMux(conn net.PacketConn) *UDPMux {
 	return &UDPMux{
 		conn:     conn,
 		dhtIn:    make(chan pkt, muxChanDepth),
@@ -87,6 +96,9 @@ func (m *UDPMux) readLoop() {
 		if n == 0 {
 			continue
 		}
+		// Unwrap IPv4-mapped addresses (::ffff:x.x.x.x) produced by dual-stack
+		// sockets so all upstream code always sees plain IPv4 or IPv6 addresses.
+		addr = normalizeUDPAddr(addr)
 		// UDP echo probe: magic 0x00 0xEC — echo verbatim + accumulate stats.
 		// First byte 0x00 is outside both the QUIC range (0x40 bit set) and the
 		// CBOR map range (0xa0-0xbf), so there is no collision with real traffic.
@@ -224,10 +236,30 @@ func (c *muxQUICConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 	return c.m.conn.WriteTo(b, addr)
 }
 
-func (c *muxQUICConn) Close() error            { return nil }
-func (c *muxQUICConn) LocalAddr() net.Addr     { return c.m.conn.LocalAddr() }
-func (c *muxQUICConn) SetReadBuffer(n int) error  { return c.m.conn.SetReadBuffer(n) }
-func (c *muxQUICConn) SetWriteBuffer(n int) error { return c.m.conn.SetWriteBuffer(n) }
+func (c *muxQUICConn) Close() error        { return nil }
+func (c *muxQUICConn) LocalAddr() net.Addr { return c.m.conn.LocalAddr() }
+
+// udpBufferSetter is satisfied by *net.UDPConn and dualPacketConn but not by
+// the generic net.PacketConn interface. We type-assert rather than requiring
+// the interface, so that mock/mem transports don't need to implement it.
+type udpBufferSetter interface {
+	SetReadBuffer(n int) error
+	SetWriteBuffer(n int) error
+}
+
+func (c *muxQUICConn) SetReadBuffer(n int) error {
+	if bs, ok := c.m.conn.(udpBufferSetter); ok {
+		return bs.SetReadBuffer(n)
+	}
+	return nil
+}
+
+func (c *muxQUICConn) SetWriteBuffer(n int) error {
+	if bs, ok := c.m.conn.(udpBufferSetter); ok {
+		return bs.SetWriteBuffer(n)
+	}
+	return nil
+}
 
 func (c *muxQUICConn) SetDeadline(t time.Time) error {
 	_ = c.SetReadDeadline(t)

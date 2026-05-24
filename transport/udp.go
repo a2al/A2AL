@@ -6,8 +6,10 @@ package transport
 import "net"
 
 // UDPTransport wraps a UDP socket with a max read size (spec §3.7).
+// conn is a net.PacketConn so that both *net.UDPConn (IPv4-only) and
+// dualPacketConn (Windows dual-stack) can be used without code changes.
 type UDPTransport struct {
-	conn *net.UDPConn
+	conn net.PacketConn
 }
 
 // ListenUDP listens on laddr (e.g. "udp4", ":0") and returns a UDPTransport.
@@ -24,7 +26,7 @@ func ListenUDP(network, laddr string) (*UDPTransport, error) {
 }
 
 // NewUDPTransport wraps an existing UDP connection.
-func NewUDPTransport(c *net.UDPConn) *UDPTransport {
+func NewUDPTransport(c net.PacketConn) *UDPTransport {
 	return &UDPTransport{conn: c}
 }
 
@@ -48,7 +50,9 @@ func (t *UDPTransport) Receive() ([]byte, net.Addr, error) {
 	}
 	out := make([]byte, n)
 	copy(out, buf[:n])
-	return out, addr, nil
+	// Unwrap IPv4-mapped IPv6 addresses (::ffff:x.x.x.x) produced by dual-stack
+	// sockets, so DHT and other consumers always see plain IPv4 source addresses.
+	return out, normalizeUDPAddr(addr), nil
 }
 
 func (t *UDPTransport) Close() error {

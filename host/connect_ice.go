@@ -436,7 +436,20 @@ func (h *Host) acceptICEToQUIC(ctx context.Context, wsURL string, cert tls.Certi
 		iqc, acceptErr := ln.Accept(raceCtx)
 		_ = ln.Close()
 		if acceptErr != nil {
-			_ = tr.Close()
+			// Close the transport in a goroutine with a hard deadline so that
+			// a stuck pion/ice internal goroutine (e.g. during a
+			// Connected↔Disconnected oscillation) cannot block pathEnd
+			// delivery and keep incomingDedup locked indefinitely.
+			go func() {
+				done := make(chan struct{})
+				go func() { _ = tr.Close(); close(done) }()
+				select {
+				case <-done:
+				case <-time.After(5 * time.Second):
+					_ = sess.iceConn.Close() // force-unblock tr.Close
+					<-done
+				}
+			}()
 			ch <- connResult{pathEnd: true, err: acceptErr}
 			return
 		}

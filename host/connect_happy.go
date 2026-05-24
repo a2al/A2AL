@@ -31,18 +31,12 @@ const DefaultConnectStagger = 250 * time.Millisecond
 // HandshakeIdleTimeout (10 s) + ICE setup.
 const DefaultICEStagger = 2 * time.Second
 
-// shouldSkipDirect reports whether the direct QUIC/UDP dial should be skipped
-// for an endpoint record. Direct dialing is skipped when the peer's NAT type
-// makes a cold UDP connection essentially impossible and an ICE signal URL is
-// available to negotiate a punched path instead.
+// shouldSkipDirect reports whether direct QUIC/UDP dial should be skipped for
+// an endpoint record, treating the record as a whole (record-level check).
 //
-// Skipped NAT types (with signal required):
-//   - NATRestricted: address-restricted cone — inbound UDP blocked without prior outbound
-//   - NATPortRestricted: port-restricted cone — same, plus port must match
-//   - NATSymmetric: each outbound mapping uses a unique port, prediction impossible
-//
-// NATUnknown and NATFullCone are left for direct-dial first; ICE is attempted
-// only if the direct dial fails.
+// Deprecated: prefer filterDirectTargets which evaluates each candidate
+// individually and preserves IPv6 GUA candidates even when the peer's v4 NAT
+// type mandates skipping.
 func shouldSkipDirect(er *protocol.EndpointRecord) bool {
 	if er == nil || er.Signal == "" {
 		return false
@@ -52,6 +46,75 @@ func shouldSkipDirect(er *protocol.EndpointRecord) bool {
 		return true
 	}
 	return false
+}
+
+// filterDirectTargets returns the subset of addrs that can be dialled directly
+// without first requiring ICE negotiation.
+//
+// Decision logic follows the published NatType semantics (see protocol.NAT*):
+//
+//   - NATUnknown / NATFullCone: reachability unconfirmed or confirmed OK →
+//     keep all v4 candidates; peer should attempt direct dial.
+//   - NATRestricted / NATPortRestricted / NATSymmetric: peer has confirmed that
+//     cold inbound v4 UDP fails → skip v4 candidates when an ICE Signal URL is
+//     available as a fallback. Without a Signal URL we must try direct anyway.
+//   - IPv6 GUA addresses are always kept regardless of the peer's v4 NAT type,
+//     because GUA addresses are globally routable and have no inbound restriction.
+func filterDirectTargets(addrs []*net.UDPAddr, er *protocol.EndpointRecord) []*net.UDPAddr {
+	if er == nil || er.Signal == "" {
+		// No ICE fallback available; must try all candidates directly.
+		return addrs
+	}
+	var skipV4 bool
+	switch er.NatType {
+	case protocol.NATRestricted, protocol.NATPortRestricted, protocol.NATSymmetric:
+		skipV4 = true
+	}
+	if !skipV4 {
+		return addrs // NAT type is benign; all candidates are fine
+	}
+	var out []*net.UDPAddr
+	for _, a := range addrs {
+		if a.IP.To4() == nil {
+			// IPv6 GUA — directly reachable regardless of the peer's v4 NAT type.
+			out = append(out, a)
+		}
+		// IPv4 under NAT type that blocks cold inbound UDP — skip.
+	}
+	return out
+}
+
+// dialTargets is the internal variant of QUICDialTargets that additionally
+// filters candidates by the host's local IP-family capability (hasV4/hasV6).
+// v4-only hosts silently skip v6 addresses and vice versa; both-capable hosts
+// receive the full list unchanged. Falls back to the full list when only one
+// family has entries, ensuring connectivity is never silently discarded.
+func (h *Host) dialTargets(er *protocol.EndpointRecord) ([]*net.UDPAddr, error) {
+	all, err := QUICDialTargets(er)
+	if err != nil {
+		return nil, err
+	}
+	if h.hasV4 && h.hasV6 {
+		return all, nil
+	}
+	var out []*net.UDPAddr
+	for _, a := range all {
+		isV6 := a.IP.To4() == nil
+		if isV6 && !h.hasV6 {
+			continue
+		}
+		if !isV6 && !h.hasV4 {
+			continue
+		}
+		out = append(out, a)
+	}
+	if len(out) == 0 {
+		// No address matched our capability; fall back to full list so we
+		// never silently drop all candidates (edge case: capability detection
+		// returned false but the OS can actually reach the address family).
+		return all, nil
+	}
+	return out, nil
 }
 
 // QUICDialTargets returns ordered, deduplicated UDP addresses from quic:// / udp:// entries.
@@ -105,26 +168,28 @@ func (h *Host) ConnectFromRecord(ctx context.Context, expectRemote a2al.Address,
 		}
 	}()
 
-	targets, terr := QUICDialTargets(er)
+	targets, terr := h.dialTargets(er)
 	natType := protocol.NATUnknown
 	hasSignal := false
 	if er != nil {
 		natType = er.NatType
 		hasSignal = er.Signal != ""
 	}
-	skipDirect := shouldSkipDirect(er)
+	// Per-candidate filter: v6 GUA candidates remain even when v4 NAT type would
+	// otherwise mandate ICE-only.
+	directTargets := filterDirectTargets(targets, er)
 	h.log.Debug("connect path decision",
 		"remote_aid", expectRemote.String(),
 		"nat_type", natType,
 		"has_signal", hasSignal,
 		"quic_targets", len(targets),
-		"skip_direct", skipDirect,
+		"direct_targets", len(directTargets),
 	)
-	if !skipDirect && len(targets) > 0 && hasSignal {
-		return h.connectRace(ctx, cert, h.addr, expectRemote, targets, er, false)
+	if len(directTargets) > 0 && hasSignal {
+		return h.connectRace(ctx, cert, h.addr, expectRemote, directTargets, er, false)
 	}
-	if !skipDirect && len(targets) > 0 {
-		conn, err := h.connectHappy(ctx, cert, expectRemote, targets, DefaultConnectStagger)
+	if len(directTargets) > 0 {
+		conn, err := h.connectHappy(ctx, cert, expectRemote, directTargets, DefaultConnectStagger)
 		return conn, false, err
 	}
 	if hasSignal {
@@ -154,27 +219,27 @@ func (h *Host) ConnectFromRecordFor(ctx context.Context, localAgent, expectRemot
 		}
 	}()
 
-	targets, terr := QUICDialTargets(er)
+	targets, terr := h.dialTargets(er)
 	natType := protocol.NATUnknown
 	hasSignal := false
 	if er != nil {
 		natType = er.NatType
 		hasSignal = er.Signal != ""
 	}
-	skipDirect := shouldSkipDirect(er)
+	directTargets := filterDirectTargets(targets, er)
 	h.log.Debug("connect path decision",
 		"local_aid", localAgent.String(),
 		"remote_aid", expectRemote.String(),
 		"nat_type", natType,
 		"has_signal", hasSignal,
 		"quic_targets", len(targets),
-		"skip_direct", skipDirect,
+		"direct_targets", len(directTargets),
 	)
-	if !skipDirect && len(targets) > 0 && hasSignal {
-		return h.connectRace(ctx, ag.cert, localAgent, expectRemote, targets, er, opts.DisableRelay)
+	if len(directTargets) > 0 && hasSignal {
+		return h.connectRace(ctx, ag.cert, localAgent, expectRemote, directTargets, er, opts.DisableRelay)
 	}
-	if !skipDirect && len(targets) > 0 {
-		conn, err := h.connectHappy(ctx, ag.cert, expectRemote, targets, DefaultConnectStagger)
+	if len(directTargets) > 0 {
+		conn, err := h.connectHappy(ctx, ag.cert, expectRemote, directTargets, DefaultConnectStagger)
 		return conn, false, err
 	}
 	if hasSignal {

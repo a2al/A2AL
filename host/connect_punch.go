@@ -70,9 +70,9 @@ const (
 // (port 4121) for use in the punch-init/ack handshake.
 //
 // Sources (all that apply are returned, deduplicated):
-//  1. natsense TrustedUDP consensus — the NAT-mapped external port of the
-//     4121 socket as observed by DHT peers. May reflect a Symmetric mapping
-//     useless to other peers, so it's offered alongside other candidates.
+//  1. natsense TrustedUDPAll consensus — all NAT-mapped external addresses (v4
+//     and v6) observed by DHT peers. May reflect a Symmetric mapping useless
+//     to other peers, so it is offered alongside other candidates.
 //  2. UPnP-mapped address — when active, this is a static port-forward that
 //     ANY peer can reach regardless of our outbound NAT behavior. Critical
 //     for Symmetric NAT nodes that otherwise cannot accept inbound from peers.
@@ -95,10 +95,16 @@ func (h *Host) punchLocalAddrs() []string {
 		out = append(out, s)
 	}
 
-	// ① natsense observed external port for the QUIC socket.
-	if host, natPort, ok := h.sense.TrustedUDP(); ok && net.ParseIP(host) != nil {
-		port := int(natPort)
-		if port == 0 {
+	// ① natsense observed external addresses (v4 + v6) for the QUIC socket.
+	// TrustedUDPAll returns all address families that have reached consensus
+	// threshold, so dual-stack nodes advertise both addresses to the peer.
+	for _, addrStr := range h.sense.TrustedUDPAll() {
+		host, portStr, err := net.SplitHostPort(addrStr)
+		if err != nil || net.ParseIP(host) == nil {
+			continue
+		}
+		port, err := strconv.Atoi(portStr)
+		if err != nil || port == 0 {
 			port = localPort
 		}
 		add(net.JoinHostPort(host, strconv.Itoa(port)))
@@ -130,10 +136,30 @@ func (h *Host) punchLocalAddrs() []string {
 	return out
 }
 
+// firstV4SrflxAddr returns the first IPv4 address string from addrs, or "".
+// Used to locate the v4 spray base when the remote's srflx list may contain
+// both v4 and v6 entries.
+func firstV4SrflxAddr(addrs []string) string {
+	for _, s := range addrs {
+		h, _, err := net.SplitHostPort(s)
+		if err != nil {
+			continue
+		}
+		if ip := net.ParseIP(h); ip != nil && ip.To4() != nil {
+			return s
+		}
+	}
+	return ""
+}
+
 // expandSymmetricPunch returns the primary srflx address plus its ±spread port
 // neighbours (same IP). The primary address is always first. Used when the
 // remote is a Symmetric NAT to probe the likely actual outgoing port it will
 // use when its NAT creates a fresh mapping toward us.
+//
+// This deliberately uses "udp4": port-spray is only meaningful against v4
+// Symmetric NAT, which remaps outbound ports. IPv6 GUA addresses have stable
+// ports and never need port prediction.
 func expandSymmetricPunch(primary string, spread int) []string {
 	base, err := net.ResolveUDPAddr("udp4", primary)
 	if err != nil || base == nil {
@@ -240,15 +266,34 @@ func (h *Host) punchDial(
 
 	// Detect remote Symmetric NAT via self-reported NAT type.
 	// When remote has Symmetric NAT, each outbound mapping uses a unique port;
-	// spray around the reported srflx to increase the chance of hitting the
+	// spray around the reported v4 srflx to increase the chance of hitting the
 	// actual port the remote's NAT allocates when firing back at us.
+	//
+	// Spray is v4-only: IPv6 GUA addresses never remap outbound ports and must
+	// not be used as spray base. When the remote publishes dual-stack srflx
+	// addresses, find the first v4 entry explicitly (the list order is
+	// non-deterministic when derived from TrustedUDPAll). Any v6 addresses are
+	// appended as-is to fireTargets so they are still attempted.
 	fireTargets := remoteSrflxes
 	if remoteNat == natsense.NATSymmetric && len(remoteSrflxes) > 0 {
-		fireTargets = expandSymmetricPunch(remoteSrflxes[0], punchSymmetricSpread)
-		h.log.Debug("punch: remote symmetric NAT, spraying ports",
-			"component", "punch", "controlling", controlling,
-			"base", remoteSrflxes[0], "spread", punchSymmetricSpread,
-			"n_targets", len(fireTargets))
+		v4Base := firstV4SrflxAddr(remoteSrflxes)
+		if v4Base != "" {
+			fireTargets = expandSymmetricPunch(v4Base, punchSymmetricSpread)
+			// Keep any v6 srflx addresses: they don't need spray.
+			for _, s := range remoteSrflxes {
+				if h, _, err := net.SplitHostPort(s); err == nil {
+					if ip := net.ParseIP(h); ip != nil && ip.To4() == nil {
+						fireTargets = append(fireTargets, s)
+					}
+				}
+			}
+			h.log.Debug("punch: remote symmetric NAT, spraying ports",
+				"component", "punch", "controlling", controlling,
+				"base", v4Base, "spread", punchSymmetricSpread,
+				"n_targets", len(fireTargets))
+		}
+		// If remote advertises only v6 srflx (v6-only peer reporting Symmetric,
+		// which is unlikely but handled gracefully), fireTargets stays as-is.
 	}
 
 	// Register for incoming connections from expectRemote via h.qListen.
@@ -357,7 +402,9 @@ func (h *Host) punchDial(
 				sendersWG.Add(1)
 				go func() {
 					defer sendersWG.Done()
-					addr, rErr := net.ResolveUDPAddr("udp4", srflxStr)
+					// Use "udp" (not "udp4") so that v6 srflx targets from
+				// dual-stack peers can also be resolved and dialled.
+				addr, rErr := net.ResolveUDPAddr("udp", srflxStr)
 					if rErr != nil {
 						return
 					}
