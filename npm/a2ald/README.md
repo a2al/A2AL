@@ -4,6 +4,29 @@ npm distribution of the **A2AL daemon** (`a2ald`): decentralized agent networkin
 
 The main package pulls in the correct **platform binary** via optional dependencies (`@a2al/a2ald-*`). Install once; the right binary is selected for Linux, macOS, or Windows (x64/arm64 where applicable).
 
+## MCP integration
+
+Lets AI agents find and connect to other agents directly—no central server, registry, or pre-configured endpoint required.
+
+Add to your MCP client config (Cursor, Claude Desktop, Windsurf, Cline, etc.):
+
+```json
+{
+  "mcpServers": {
+    "a2al": {
+      "command": "a2ald",
+      "args": ["--mcp-stdio"]
+    }
+  }
+}
+```
+
+If `a2ald` is not on PATH, use `npx -y a2ald --mcp-stdio` or an absolute path to the binary. For daily use, install as a service and connect via `"url": "http://127.0.0.1:2121/mcp/"`.
+
+Always call `a2al_status` first and wait for `network_ready: true` before network operations.
+
+Install guide: [doc/llms-install.md](https://github.com/a2al/a2al/blob/main/doc/llms-install.md) · Full setup: [doc/mcp-setup.md](https://github.com/a2al/a2al/blob/main/doc/mcp-setup.md)
+
 ## Install
 
 ```bash

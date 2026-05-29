@@ -28,10 +28,12 @@ on:
 # - v*-test: dry-run behavior via snapshot build
 # - v*: build + GitHub Release, and optionally auto-publish packages when
 #   repository variable AUTO_PUBLISH_PACKAGES_ON_TAG=true
+#
+# MCP Registry publish is a separate workflow: publish-mcp-registry.yml
+# Run it manually (workflow_dispatch) after npm is live.
 
 permissions:
   contents: write
-  id-token: write
 
 jobs:
   test:

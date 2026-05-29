@@ -1,6 +1,7 @@
 {
   "name": "a2ald",
   "version": "0.0.0",
+  "mcpName": "io.github.a2al/a2ald",
   "description": "A2AL daemon — decentralized agent networking (local REST+MCP including fetch/tunnel endpoints)",
   "license": "MPL-2.0",
   "homepage": "https://a2al.org",

@@ -1,0 +1,21 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.a2al/a2ald",
+  "title": "A2AL Daemon",
+  "description": "Makes any AI agent globally reachable and discoverable—no cloud, domain, or port forwarding needed.",
+  "repository": {
+    "url": "https://github.com/a2al/a2al",
+    "source": "github"
+  },
+  "version": "0.0.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "a2ald",
+      "version": "0.0.0",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}

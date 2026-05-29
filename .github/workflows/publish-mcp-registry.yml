@@ -1,0 +1,81 @@
+name: publish-mcp-registry
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Version tag to publish, e.g. v0.2.7 (npm a2ald@VERSION must already be live)'
+        required: true
+        type: string
+        default: 'v'
+
+# Independent MCP Registry publish — not part of the binary/npm/PyPI release pipeline.
+# Run manually after npm is live; no auto-trigger to avoid OIDC timeout and npm propagation races.
+#
+# Prerequisites:
+#   - a2ald@VERSION already published to npm (includes mcpName in package.json)
+#   - server.json present in the tagged commit
+#
+# Does NOT build binaries or publish npm/PyPI.
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve ref
+        id: meta
+        run: |
+          REF="${{ inputs.ref }}"
+          if [[ ! "$REF" =~ ^v[0-9] ]] || [[ "$REF" == *"-test" ]]; then
+            echo "Expected a release tag like v0.2.7 (not *-test), got: $REF"
+            exit 1
+          fi
+          VERSION="${REF#v}"
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.meta.outputs.ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Verify npm package is live
+        run: |
+          VERSION="${{ steps.meta.outputs.version }}"
+          if ! npm view "a2ald@${VERSION}" version >/dev/null 2>&1; then
+            echo "ERROR: a2ald@${VERSION} not found on npm."
+            echo "Publish npm first (release.yml release-publish mode), then re-run this workflow."
+            exit 1
+          fi
+          echo "Confirmed: a2ald@${VERSION} is live on npm."
+
+      - name: Set server.json version
+        run: |
+          VERSION="${{ steps.meta.outputs.version }}"
+          node -e "
+            const fs = require('fs');
+            const p = JSON.parse(fs.readFileSync('server.json', 'utf8'));
+            p.version = '${VERSION}';
+            if (p.packages && p.packages[0]) p.packages[0].version = '${VERSION}';
+            fs.writeFileSync('server.json', JSON.stringify(p, null, 2) + '\n');
+          "
+
+      - name: Install mcp-publisher
+        run: |
+          curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" \
+            | tar xz mcp-publisher
+          chmod +x mcp-publisher
+
+      - name: Authenticate to MCP Registry
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish to MCP Registry
+        run: ./mcp-publisher publish
