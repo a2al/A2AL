@@ -327,8 +327,10 @@ func (h *Host) connectHappy(ctx context.Context, localCert tls.Certificate, expe
 	}
 
 	type dialRes struct {
-		c   quic.Connection
-		err error
+		c           quic.Connection
+		err         error
+		addr        *net.UDPAddr // address that was dialled
+		wasCanceled bool         // true when failure was caused by gctx cancellation
 	}
 	gctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -353,7 +355,11 @@ func (h *Host) connectHappy(ctx context.Context, localCert tls.Certificate, expe
 				return
 			}
 			c, err := h.dialAndAgentRoute(gctx, localCert, expectRemote, addr)
-			resCh <- dialRes{c, err}
+			// wasCanceled is true when the failure is directly caused by context
+			// cancellation (a sibling dial already won).  We use errors.Is rather
+			// than inspecting gctx.Err() because the cancel signal and the dial
+			// error are independent events; checking the error itself is precise.
+			resCh <- dialRes{c: c, err: err, addr: addr, wasCanceled: errors.Is(err, context.Canceled)}
 		}()
 	}
 	go func() {
@@ -374,6 +380,16 @@ func (h *Host) connectHappy(ctx context.Context, localCert tls.Certificate, expe
 			continue
 		}
 		if r.err != nil {
+			// Report genuine transport failures to the DHT health subsystem so it
+			// can revoke the fresh-live preference and update backoff state.
+			// Two cases must be excluded:
+			//   wasCanceled: context.Canceled means a sibling dial already won.
+			//   controlStreamError: the QUIC handshake succeeded — the path is
+			//     reachable; the failure is application-level, not transport-level.
+			var csErr *controlStreamError
+			if !r.wasCanceled && !errors.As(r.err, &csErr) {
+				h.node.NotePeerDialFailure(a2al.NodeIDFromAddress(expectRemote), r.addr)
+			}
 			errs = append(errs, r.err)
 		}
 	}

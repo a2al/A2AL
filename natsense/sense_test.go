@@ -39,8 +39,33 @@ func TestSense_requiresThreeByDefault(t *testing.T) {
 	r1[0] = 1
 	wire, _ := protocol.FormatObservedUDP(net.ParseIP("10.0.0.1"), 1)
 	s.Record(r1, wire)
+	// Adaptive threshold: with only 1 distinct reporter, effectiveMin drops to 1
+	// so the cold-start node can still form a consensus and publish an endpoint.
+	if _, _, ok := s.TrustedUDP(); !ok {
+		t.Fatal("expected cold-start consensus: adaptive threshold should allow 1 reporter")
+	}
+}
+
+// TestSense_configuredMinEnforcedWithSufficientPeers verifies that when the
+// node has seen at least min distinct reporters, the configured threshold is
+// applied and addresses with fewer votes are not trusted.
+func TestSense_configuredMinEnforcedWithSufficientPeers(t *testing.T) {
+	s := NewSense(3) // min=3
+	var r1, r2, r3 a2al.NodeID
+	r1[0], r2[0], r3[0] = 1, 2, 3
+	wireA, _ := protocol.FormatObservedUDP(net.ParseIP("10.0.0.1"), 1001)
+	wireB, _ := protocol.FormatObservedUDP(net.ParseIP("10.0.0.2"), 2001)
+	// 3 distinct reporters established (effectiveMin = 3).
+	s.Record(r1, wireA)
+	s.Record(r2, wireB) // different address — 1 vote each; neither reaches 3
+	s.Record(r3, wireA) // wireA has 2 votes, wireB has 1 — still below min=3
 	if _, _, ok := s.TrustedUDP(); ok {
-		t.Fatal("expected no trusted with single reporter and min=3")
+		t.Fatal("with 3 reporters and no address reaching min=3, expected no trusted entry")
+	}
+	// Add a third vote for wireA → reaches configured threshold.
+	s.Record(r2, wireA)
+	if _, _, ok := s.TrustedUDP(); !ok {
+		t.Fatal("expected consensus after 3 reporters agree on same address")
 	}
 }
 
@@ -153,6 +178,54 @@ func TestInferNATType_v6VotesNotCountedAsSymmetric(t *testing.T) {
 	}
 }
 
+// TestInferNATType_multiHomedNotSymmetric verifies that a multi-homed host with
+// two different public IPv4 addresses (one per NIC) is NOT classified as
+// Symmetric NAT, even when the two addresses happen to use different ports.
+// Symmetric detection must only fire when ≥2 ports are observed on the *same*
+// public IP.
+func TestInferNATType_multiHomedNotSymmetric(t *testing.T) {
+	s := NewSense(2)
+	var r1, r2, r3, r4 a2al.NodeID
+	r1[0], r2[0], r3[0], r4[0] = 1, 2, 3, 4
+
+	// NIC 1: peers see 203.0.113.1:4121
+	p1, _ := protocol.FormatObservedUDP(net.ParseIP("203.0.113.1"), 4121)
+	s.Record(r1, p1)
+	s.Record(r2, p1)
+
+	// NIC 2: peers see 198.51.100.2:1029  (different public IP, different port)
+	p2, _ := protocol.FormatObservedUDP(net.ParseIP("198.51.100.2"), 1029)
+	s.Record(r3, p2)
+	s.Record(r4, p2)
+
+	got := s.InferNATType()
+	if got == NATSymmetric {
+		t.Fatalf("multi-homed host with two distinct public IPs should not be classified as Symmetric, got %d", got)
+	}
+}
+
+// TestInferNATType_sameIPMultiPortIsSymmetric verifies that ≥2 well-supported
+// ports under the *same* public IP are still correctly detected as Symmetric.
+func TestInferNATType_sameIPMultiPortIsSymmetric(t *testing.T) {
+	s := NewSense(2)
+	var r1, r2, r3, r4 a2al.NodeID
+	r1[0], r2[0], r3[0], r4[0] = 1, 2, 3, 4
+
+	// Same public IP, two different ports — true Symmetric NAT.
+	p1, _ := protocol.FormatObservedUDP(net.ParseIP("203.0.113.5"), 51000)
+	s.Record(r1, p1)
+	s.Record(r2, p1)
+
+	p2, _ := protocol.FormatObservedUDP(net.ParseIP("203.0.113.5"), 52000)
+	s.Record(r3, p2)
+	s.Record(r4, p2)
+
+	got := s.InferNATType()
+	if got != NATSymmetric {
+		t.Fatalf("same public IP with two distinct well-supported ports: want NATSymmetric, got %d", got)
+	}
+}
+
 // TestInferV6Reach covers the v6 reachability state machine.
 func TestInferV6Reach(t *testing.T) {
 	s := NewSense(1)
@@ -243,10 +316,6 @@ func TestTrustedUDPAll_returnsBothFamilies(t *testing.T) {
 	v6wire, _ := protocol.FormatObservedUDP(net.ParseIP("2001:db8::1"), 6001)
 	s.Record(r2, v6wire)
 
-	// Entry that does NOT reach consensus (need 2 reporters but only r3 reports it)
-	s2 := NewSense(2)
-	s2.Record(r3, v4wire) // only 1 reporter, below min=2 → not trusted
-
 	all := s.TrustedUDPAll()
 	if len(all) != 2 {
 		t.Fatalf("TrustedUDPAll: got %d entries, want 2: %v", len(all), all)
@@ -267,10 +336,18 @@ func TestTrustedUDPAll_returnsBothFamilies(t *testing.T) {
 		t.Errorf("missing IPv6 entry in TrustedUDPAll: %v", all)
 	}
 
-	// Below-threshold entry should not appear.
-	none := s2.TrustedUDPAll()
-	if len(none) != 0 {
-		t.Errorf("expected no entries with single reporter and min=2, got %v", none)
+	// Below-threshold entry: s2 has min=2 with 3 distinct reporters, so
+	// effectiveMin stays at 2. Only r3 reports v4wire → 1 vote < 2, not trusted.
+	s2 := NewSense(2)
+	otherWire, _ := protocol.FormatObservedUDP(net.ParseIP("198.51.100.7"), 8001)
+	s2.Record(r1, otherWire) // r1 and r2 agree on otherWire (2 votes → trusted)
+	s2.Record(r2, otherWire)
+	s2.Record(r3, v4wire) // only r3 reports v4wire — below min=2
+	all2 := s2.TrustedUDPAll()
+	for _, a := range all2 {
+		if a == "203.0.113.5:5001" {
+			t.Errorf("below-threshold v4wire should not appear in TrustedUDPAll: %v", all2)
+		}
 	}
 }
 
@@ -301,5 +378,43 @@ func TestInvalidateObservationsClearsTrustedState(t *testing.T) {
 	s.InvalidateObservations()
 	if _, _, ok := s.TrustedUDP(); ok {
 		t.Fatal("expected no trusted udp after invalidate")
+	}
+}
+
+// TestHasMultiPortEvidence_multiHomedFalse verifies that two NICs with different
+// public IPs, each observed on one port, do NOT trigger HasMultiPortEvidence.
+func TestHasMultiPortEvidence_multiHomedFalse(t *testing.T) {
+	s := NewSense(1)
+	var r1, r2 a2al.NodeID
+	r1[0], r2[0] = 1, 2
+
+	// NIC 1: 203.0.113.1:4121
+	p1, _ := protocol.FormatObservedUDP(net.ParseIP("203.0.113.1"), 4121)
+	s.Record(r1, p1)
+
+	// NIC 2: 198.51.100.2:1029  (different public IP)
+	p2, _ := protocol.FormatObservedUDP(net.ParseIP("198.51.100.2"), 1029)
+	s.Record(r2, p2)
+
+	if s.HasMultiPortEvidence() {
+		t.Error("multi-homed host with one port per NIC should NOT trigger HasMultiPortEvidence")
+	}
+}
+
+// TestHasMultiPortEvidence_sameIPTrue verifies that the same public IP observed
+// on two different ports does trigger HasMultiPortEvidence (real Symmetric NAT).
+func TestHasMultiPortEvidence_sameIPTrue(t *testing.T) {
+	s := NewSense(1)
+	var r1, r2 a2al.NodeID
+	r1[0], r2[0] = 1, 2
+
+	p1, _ := protocol.FormatObservedUDP(net.ParseIP("203.0.113.5"), 51000)
+	s.Record(r1, p1)
+
+	p2, _ := protocol.FormatObservedUDP(net.ParseIP("203.0.113.5"), 52000)
+	s.Record(r2, p2)
+
+	if !s.HasMultiPortEvidence() {
+		t.Error("same public IP with two ports should trigger HasMultiPortEvidence")
 	}
 }

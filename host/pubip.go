@@ -13,7 +13,10 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/a2al/a2al/transport"
 )
 
 // stunServers are queried for the external UDP mapping using STUN Binding Requests
@@ -23,6 +26,160 @@ var stunServers = []string{
 	"stun.l.google.com:19302",
 	"stun1.l.google.com:19302",
 	"stun.cloudflare.com:3478",
+}
+
+// ---------------------------------------------------------------------------
+// Same-socket STUN: probe the shared DHT/QUIC UDP socket instead of an
+// ephemeral temporary socket. This makes the returned port directly useful
+// because NAT maps ports per (local-socket, remote-addr) pair.
+// ---------------------------------------------------------------------------
+
+// stunPendingEntry holds the reply channel for one in-flight STUN binding request.
+type stunPendingEntry struct {
+	ch    chan stunResult
+	txID  [12]byte
+}
+
+type stunResult struct {
+	ip   net.IP
+	port uint16
+}
+
+// muxSTUNProber sends STUN Binding Requests on a UDPMux (shared socket) and
+// routes the responses back via a SetPacketFilter hook.
+type muxSTUNProber struct {
+	mux     *transport.UDPMux
+	mu      sync.Mutex
+	pending map[[12]byte]chan stunResult
+}
+
+func newMuxSTUNProber(mux *transport.UDPMux) *muxSTUNProber {
+	p := &muxSTUNProber{
+		mux:     mux,
+		pending: make(map[[12]byte]chan stunResult),
+	}
+	mux.SetPacketFilter(p.intercept)
+	return p
+}
+
+// intercept is installed as the UDPMux packet filter.  It checks whether the
+// incoming packet looks like a STUN message (magic cookie present).
+//
+// Any valid STUN packet is consumed here to prevent spurious noise reaching the
+// DHT decoder.  If the transaction ID matches a pending probe request the result
+// is forwarded to the waiting goroutine; otherwise the packet is silently dropped
+// (it may be a stale response or an unsolicited STUN message from a remote).
+func (p *muxSTUNProber) intercept(data []byte, _ net.Addr) bool {
+	// STUN packets: top two bits of first byte are 00, magic cookie at offset 4.
+	if len(data) < 20 {
+		return false
+	}
+	if data[0]&0xC0 != 0x00 {
+		return false
+	}
+	if binary.BigEndian.Uint32(data[4:8]) != stunMagicCookie {
+		return false
+	}
+	// Valid STUN packet — always consume so the DHT decoder never sees it.
+	// Extract transaction ID (bytes 8–20) and route to any pending probe.
+	var txID [12]byte
+	copy(txID[:], data[8:20])
+
+	p.mu.Lock()
+	ch, ok := p.pending[txID]
+	if ok {
+		delete(p.pending, txID)
+	}
+	p.mu.Unlock()
+
+	if !ok {
+		// No matching probe; packet is silently discarded.
+		return true
+	}
+
+	ip, port, err := parseSTUNResponse(data, txID[:])
+	if err != nil {
+		ch <- stunResult{}
+	} else {
+		ch <- stunResult{ip: ip, port: port}
+	}
+	return true
+}
+
+// Probe sends a STUN Binding Request to serverAddr on the shared socket and
+// waits for the response.  network must be "udp4" or "udp6".
+func (p *muxSTUNProber) Probe(ctx context.Context, network, serverAddr string) (net.IP, uint16, error) {
+	raddr, err := net.ResolveUDPAddr(network, serverAddr)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	var txID [12]byte
+	if _, err := rand.Read(txID[:]); err != nil {
+		return nil, 0, err
+	}
+
+	// Build STUN Binding Request.
+	req := make([]byte, 20)
+	req[0], req[1] = 0x00, 0x01
+	binary.BigEndian.PutUint32(req[4:], stunMagicCookie)
+	copy(req[8:], txID[:])
+
+	ch := make(chan stunResult, 1)
+	p.mu.Lock()
+	p.pending[txID] = ch
+	p.mu.Unlock()
+
+	if err := p.mux.SendPacket(req, raddr); err != nil {
+		p.mu.Lock()
+		delete(p.pending, txID)
+		p.mu.Unlock()
+		return nil, 0, err
+	}
+
+	select {
+	case <-ctx.Done():
+		p.mu.Lock()
+		delete(p.pending, txID)
+		p.mu.Unlock()
+		return nil, 0, ctx.Err()
+	case r := <-ch:
+		if r.ip == nil {
+			return nil, 0, errors.New("stun: invalid response")
+		}
+		return r.ip, r.port, nil
+	}
+}
+
+// probeSTUNViaMux queries all STUN servers in parallel on the shared socket
+// and returns the first successful (ip, port) pair.  Falls back to probeSTUN
+// (ephemeral socket) when prober is nil.
+func probeSTUNViaMux(ctx context.Context, prober *muxSTUNProber, network string) (net.IP, uint16) {
+	if prober == nil {
+		return probeSTUNNetwork(ctx, network)
+	}
+	type result struct {
+		ip   net.IP
+		port uint16
+	}
+	ch := make(chan result, len(stunServers))
+	for _, srv := range stunServers {
+		srv := srv
+		go func() {
+			ip, port, err := prober.Probe(ctx, network, srv)
+			if err != nil {
+				ch <- result{}
+				return
+			}
+			ch <- result{ip, port}
+		}()
+	}
+	for range stunServers {
+		if r := <-ch; r.ip != nil {
+			return r.ip, r.port
+		}
+	}
+	return nil, 0
 }
 
 // httpIPServices are queried as fallback when STUN is unavailable.

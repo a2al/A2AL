@@ -57,6 +57,14 @@ type UDPMux struct {
 	echoAddr     net.Addr
 	echoCount    int
 	echoBuckets  [4]int // ≤200 B, ≤500 B, ≤900 B, >900 B
+
+	// filterHook is an optional hook called for every incoming packet before
+	// DHT/QUIC routing.  If it returns true the packet is consumed and routing
+	// is skipped.  The slice passed to the hook is only valid for the duration
+	// of the call; the hook must copy if it needs to retain the data.
+	// Set via SetPacketFilter; nil means no filter (default).
+	filterMu   sync.RWMutex
+	filterHook func(data []byte, from net.Addr) (consumed bool)
 }
 
 type pkt struct {
@@ -78,6 +86,25 @@ func NewUDPMux(conn net.PacketConn) *UDPMux {
 func (m *UDPMux) StartReadLoop() {
 	m.wg.Add(1)
 	go m.readLoop()
+}
+
+// SetPacketFilter registers an optional hook that is called for every incoming
+// packet before DHT/QUIC routing.  If the hook returns true, the packet is
+// considered consumed and normal routing is skipped.  Passing nil clears the
+// hook.  Safe to call at any time; the hook is invoked with only buf[:n] of
+// the shared read buffer — the hook must copy if it needs to retain the data.
+func (m *UDPMux) SetPacketFilter(f func(data []byte, from net.Addr) (consumed bool)) {
+	m.filterMu.Lock()
+	m.filterHook = f
+	m.filterMu.Unlock()
+}
+
+// SendPacket writes data to addr on the underlying shared UDP socket.
+// Used by protocols (e.g. STUN) that need to send on the same fd as DHT/QUIC
+// and receive replies via a SetPacketFilter hook.
+func (m *UDPMux) SendPacket(data []byte, addr net.Addr) error {
+	_, err := m.conn.WriteTo(data, addr)
+	return err
 }
 
 func (m *UDPMux) readLoop() {
@@ -106,6 +133,16 @@ func (m *UDPMux) readLoop() {
 			m.conn.WriteTo(buf[:n], addr)
 			m.recordEcho(addr, n)
 			continue
+		}
+		// Optional filter hook (e.g. STUN response interception).  The hook
+		// receives a read-only view of the raw packet and must not retain it.
+		// Called before DHT/QUIC routing so it can intercept protocol traffic
+		// that shares neither the QUIC Fixed Bit (0x40) nor the CBOR map range.
+		m.filterMu.RLock()
+		fh := m.filterHook
+		m.filterMu.RUnlock()
+		if fh != nil && fh(buf[:n], addr) {
+			continue // consumed by filter
 		}
 		data := make([]byte, n)
 		copy(data, buf[:n])

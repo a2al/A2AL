@@ -212,16 +212,21 @@ func (s *Sense) InvalidateObservations() {
 	s.mu.Unlock()
 }
 
-// HasMultiPortEvidence reports whether ≥2 distinct external IPv4 ports have been
-// observed in the live (non-expired) vote window. Used to overrule probe-based
-// FullCone classification when there is any indication of port-varying
-// (Symmetric) NAT behavior. Only v4 entries are considered; v6 GUA ports
-// are stable by nature and must not contribute to this signal.
+// HasMultiPortEvidence reports whether any single public IPv4 address has been
+// observed with ≥2 distinct ports in the live (non-expired) vote window. Used
+// to overrule probe-based FullCone classification when there is live evidence
+// that a single NAT device is assigning different external ports per destination
+// (Symmetric NAT behavior).
+//
+// Ports are only compared within the same public IP: a multi-homed host whose
+// two NICs have different public IPs will each show one stable port and must
+// NOT be treated as Symmetric. v6 GUA ports are also excluded.
 func (s *Sense) HasMultiPortEvidence() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cutoff := time.Now().Add(-voteTTL)
-	ports := make(map[uint16]struct{})
+	// ipPorts: public-IP → set of observed ports
+	ipPorts := make(map[string]map[uint16]struct{})
 	for key, m := range s.votes {
 		alive := false
 		for _, v := range m {
@@ -245,8 +250,13 @@ func (s *Sense) HasMultiPortEvidence() bool {
 		if err != nil {
 			continue
 		}
-		ports[uint16(p)] = struct{}{}
-		if len(ports) > 1 {
+		pm := ipPorts[host]
+		if pm == nil {
+			pm = make(map[uint16]struct{})
+			ipPorts[host] = pm
+		}
+		pm[uint16(p)] = struct{}{}
+		if len(pm) > 1 {
 			return true
 		}
 	}
@@ -286,14 +296,43 @@ func liveVotes(m map[nodeIDKey]vote, cutoff time.Time) int {
 	return n
 }
 
+// effectiveMin returns the consensus threshold to use for this evaluation.
+// When fewer distinct live reporters have been seen than the configured minimum
+// (cold-start: small bootstrap set), the threshold is lowered to the actual
+// reporter count so the node can still form a consensus and publish an endpoint.
+// Once the node has seen at least s.min distinct reporters the original threshold
+// is restored. Must be called with s.mu held.
+func (s *Sense) effectiveMin(cutoff time.Time) int {
+	if s.min <= 1 {
+		return s.min
+	}
+	var seen int
+	reporters := make(map[nodeIDKey]struct{})
+	for _, m := range s.votes {
+		for rid, v := range m {
+			if v.at.After(cutoff) {
+				if _, ok := reporters[rid]; !ok {
+					reporters[rid] = struct{}{}
+					seen++
+				}
+			}
+		}
+	}
+	if seen > 0 && seen < s.min {
+		return seen
+	}
+	return s.min
+}
+
 // TrustedUDP returns host and port if some observed key has >= min distinct
 // reporters whose votes are younger than voteTTL.
 func (s *Sense) TrustedUDP() (host string, port uint16, ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cutoff := time.Now().Add(-voteTTL)
+	min := s.effectiveMin(cutoff)
 	for key, reps := range s.votes {
-		if liveVotes(reps, cutoff) < s.min {
+		if liveVotes(reps, cutoff) < min {
 			continue
 		}
 		h, ps, err := net.SplitHostPort(key)
@@ -317,9 +356,10 @@ func (s *Sense) TrustedUDPAll() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cutoff := time.Now().Add(-voteTTL)
+	min := s.effectiveMin(cutoff)
 	var out []string
 	for key, reps := range s.votes {
-		if liveVotes(reps, cutoff) >= s.min {
+		if liveVotes(reps, cutoff) >= min {
 			out = append(out, key)
 		}
 	}
@@ -351,8 +391,9 @@ func (s *Sense) TrustedWireV4() ([]byte, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cutoff := time.Now().Add(-voteTTL)
+	min := s.effectiveMin(cutoff)
 	for key, reps := range s.votes {
-		if liveVotes(reps, cutoff) < s.min {
+		if liveVotes(reps, cutoff) < min {
 			continue
 		}
 		h, ps, err := net.SplitHostPort(key)
@@ -382,8 +423,9 @@ func (s *Sense) TrustedWireV6() ([]byte, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cutoff := time.Now().Add(-voteTTL)
+	min := s.effectiveMin(cutoff)
 	for key, reps := range s.votes {
-		if liveVotes(reps, cutoff) < s.min {
+		if liveVotes(reps, cutoff) < min {
 			continue
 		}
 		h, ps, err := net.SplitHostPort(key)
@@ -407,6 +449,109 @@ func (s *Sense) TrustedWireV6() ([]byte, bool) {
 	return nil, false
 }
 
+// symDetectResult is returned by detectSymmetricV4.
+type symDetectResult struct {
+	isSymmetric    bool
+	supportedPorts int
+	total          int
+	// portsByHost collects "host:port(reporters)" strings for debug logging.
+	portsByHost []string
+}
+
+// detectSymmetricV4 scans live v4 votes and returns whether this node appears
+// to be behind a Symmetric NAT.
+//
+// Symmetric NAT is characterised by the NAT device assigning a *different*
+// external port depending on the *destination*.  The tell-tale sign is that
+// multiple remote peers observe our v4 source address as the same IP but
+// *different* ports — all from the same egress interface.
+//
+// Multi-homed hosts (multiple WAN interfaces / public IPs) must NOT be
+// misclassified: if peer A sees 203.0.113.1:4121 and peer B sees
+// 198.51.100.2:1029, those are two different public IPs, each with one port —
+// not a single NAT device varying its mapping.  The fix is to group votes by
+// public IP first, then look for ≥2 well-supported ports *within the same IP*.
+//
+// v6 votes are excluded: GUA ports are stable and must not bias this check.
+//
+// Must be called with s.mu held.
+func (s *Sense) detectSymmetricV4(cutoff time.Time) symDetectResult {
+	minPerPort := 2
+	if s.min <= 1 {
+		minPerPort = 1
+	}
+
+	// hostPortReporters: public-IP → port → set-of-reporters
+	type portMap = map[uint16]map[nodeIDKey]struct{}
+	hostPortReporters := make(map[string]portMap)
+	total := 0
+
+	for key, m := range s.votes {
+		host, ps, err := net.SplitHostPort(key)
+		if err != nil {
+			continue
+		}
+		// v4 only — v6 GUA ports are stable and irrelevant.
+		if ip := net.ParseIP(host); ip == nil || ip.To4() == nil {
+			continue
+		}
+		reporters := make(map[nodeIDKey]struct{})
+		for rid, v := range m {
+			if v.at.After(cutoff) {
+				reporters[rid] = struct{}{}
+			}
+		}
+		if len(reporters) == 0 {
+			continue
+		}
+		total += len(reporters)
+
+		p64, err := strconv.ParseUint(ps, 10, 16)
+		if err != nil {
+			continue
+		}
+		p := uint16(p64)
+
+		pm := hostPortReporters[host]
+		if pm == nil {
+			pm = make(portMap)
+			hostPortReporters[host] = pm
+		}
+		dst := pm[p]
+		if dst == nil {
+			dst = make(map[nodeIDKey]struct{})
+			pm[p] = dst
+		}
+		for rid := range reporters {
+			dst[rid] = struct{}{}
+		}
+	}
+
+	// For each public IP, count how many ports have sufficient independent
+	// reporters.  Symmetric NAT requires ≥2 such ports under the *same* IP.
+	maxSupported := 0
+	var debugParts []string
+	for host, pm := range hostPortReporters {
+		supported := 0
+		for p, reps := range pm {
+			if len(reps) >= minPerPort {
+				supported++
+				debugParts = append(debugParts, fmt.Sprintf("%s:%d(%d)", host, p, len(reps)))
+			}
+		}
+		if supported > maxSupported {
+			maxSupported = supported
+		}
+	}
+
+	return symDetectResult{
+		isSymmetric:    maxSupported >= 2,
+		supportedPorts: maxSupported,
+		total:          total,
+		portsByHost:    debugParts,
+	}
+}
+
 // InferNATType returns the best NAT classification for local operational use
 // (punch strategy, session signalling). It is intentionally conservative:
 // when the active probe has not yet run it returns NATRestricted so that
@@ -419,8 +564,9 @@ func (s *Sense) TrustedWireV6() ([]byte, bool) {
 // Decision flow:
 //
 //  1. Public bind (QUIC socket on a WAN IPv4)  → NATFullCone.
-//  2. Symmetric mapping: ≥2 well-supported v4 observed ports → NATSymmetric.
-//     (v6 votes are excluded: GUA ports are stable and must not bias this check.)
+//  2. Symmetric mapping: ≥2 well-supported ports under the same public IPv4 →
+//     NATSymmetric.  Ports across different public IPs (multi-homed host) are
+//     NOT counted together; that would be a false positive.
 //  3. Insufficient passive evidence             → NATUnknown.
 //  4. Active probe result (RecordV4ProbeResult):
 //     reachable=true  → NATFullCone  (any peer can initiate; Full Cone or cloud NAT)
@@ -435,69 +581,19 @@ func (s *Sense) InferNATType() uint8 {
 		return NATFullCone
 	}
 
-	// ② Passive mapping stability: count live votes per port bucket, v4 only.
+	// ② Passive mapping stability: symmetric detection, v4 only, grouped by IP.
 	cutoff := time.Now().Add(-voteTTL)
-	total := 0
-	portReporters := make(map[uint16]map[nodeIDKey]struct{})
-	for key, m := range s.votes {
-		host, ps, err := net.SplitHostPort(key)
-		if err != nil {
-			continue
-		}
-		// Exclude v6 entries: GUA has a stable port equal to the local bind port,
-		// which would spuriously create a second "well-supported port" bucket and
-		// misclassify dual-stack nodes as Symmetric.
-		if ip := net.ParseIP(host); ip == nil || ip.To4() == nil {
-			continue
-		}
-		reporters := make(map[nodeIDKey]struct{})
-		for rid, v := range m {
-			if v.at.After(cutoff) {
-				reporters[rid] = struct{}{}
-			}
-		}
-		if len(reporters) == 0 {
-			continue
-		}
-		total += len(reporters)
-		p64, err := strconv.ParseUint(ps, 10, 16)
-		if err != nil {
-			continue
-		}
-		p := uint16(p64)
-		dst := portReporters[p]
-		if dst == nil {
-			dst = make(map[nodeIDKey]struct{})
-			portReporters[p] = dst
-		}
-		for rid := range reporters {
-			dst[rid] = struct{}{}
-		}
-	}
-
-	// Require each port bucket to have ≥2 independent reporters (1 in test mode).
-	minPerPort := 2
-	if s.min <= 1 {
-		minPerPort = 1
-	}
-	supportedPorts := 0
-	for _, reps := range portReporters {
-		if len(reps) >= minPerPort {
-			supportedPorts++
-		}
-	}
-	if supportedPorts >= 2 {
-		ports := make([]string, 0, len(portReporters))
-		for p := range portReporters {
-			ports = append(ports, fmt.Sprintf("%d(%d)", p, len(portReporters[p])))
-		}
+	effMin := s.effectiveMin(cutoff)
+	sym := s.detectSymmetricV4(cutoff)
+	if sym.isSymmetric {
 		slog.Debug("nat: symmetric detected", "component", "natsense",
-			"supported_ports", supportedPorts, "ports", ports, "total_reporters", total)
-		return NATSymmetric // different ports per destination → symmetric mapping
+			"supported_ports", sym.supportedPorts, "ports", sym.portsByHost,
+			"total_reporters", sym.total)
+		return NATSymmetric
 	}
 
 	// ③ Not enough passive evidence to proceed.
-	if total < s.min {
+	if sym.total < effMin {
 		return NATUnknown
 	}
 
@@ -536,58 +632,16 @@ func (s *Sense) PublishNatType() uint8 {
 		return NATFullCone
 	}
 
-	// ② Symmetric mapping (same detection as InferNATType).
+	// ② Symmetric mapping (same detection as InferNATType, grouped by IP).
 	cutoff := time.Now().Add(-voteTTL)
-	total := 0
-	portReporters := make(map[uint16]map[nodeIDKey]struct{})
-	for key, m := range s.votes {
-		host, ps, err := net.SplitHostPort(key)
-		if err != nil {
-			continue
-		}
-		if ip := net.ParseIP(host); ip == nil || ip.To4() == nil {
-			continue
-		}
-		reporters := make(map[nodeIDKey]struct{})
-		for rid, v := range m {
-			if v.at.After(cutoff) {
-				reporters[rid] = struct{}{}
-			}
-		}
-		if len(reporters) == 0 {
-			continue
-		}
-		total += len(reporters)
-		p64, err := strconv.ParseUint(ps, 10, 16)
-		if err != nil {
-			continue
-		}
-		p := uint16(p64)
-		dst := portReporters[p]
-		if dst == nil {
-			dst = make(map[nodeIDKey]struct{})
-			portReporters[p] = dst
-		}
-		for rid := range reporters {
-			dst[rid] = struct{}{}
-		}
-	}
-	minPerPort := 2
-	if s.min <= 1 {
-		minPerPort = 1
-	}
-	supportedPorts := 0
-	for _, reps := range portReporters {
-		if len(reps) >= minPerPort {
-			supportedPorts++
-		}
-	}
-	if supportedPorts >= 2 {
+	effMin := s.effectiveMin(cutoff)
+	sym := s.detectSymmetricV4(cutoff)
+	if sym.isSymmetric {
 		return NATSymmetric
 	}
 
 	// ③ Insufficient passive evidence.
-	if total < s.min {
+	if sym.total < effMin {
 		return NATUnknown
 	}
 
