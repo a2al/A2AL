@@ -104,6 +104,10 @@ func (s *signalSlotState) release(url string) {
 }
 
 // flush snapshots the active set and pushes it to the host for DHT publishing.
+// When the active set becomes non-empty it also:
+//   - notifies the signal-ready gate so a pending forcePublishNodeOnce can proceed;
+//   - triggers an immediate node republish if a prior publish had no Signal URLs
+//     (pendingSignalRepublish flag set by the gate timeout path).
 func (s *signalSlotState) flush() {
 	s.mu.Lock()
 	urls := make([]string, 0, len(s.act))
@@ -113,6 +117,27 @@ func (s *signalSlotState) flush() {
 	s.mu.Unlock()
 	slices.Sort(urls)
 	s.d.h.SetActiveSignalURLs(urls)
+	if len(urls) == 0 {
+		return
+	}
+	// Unblock any goroutine waiting in the signal-ready gate.
+	select {
+	case s.d.signalReady <- struct{}{}:
+	default:
+	}
+	// If a prior publish had no Signal URLs, republish now so the record
+	// includes the freshly connected hub addresses.
+	if s.d.cfg.AutoPublish && s.d.pendingSignalRepublish.CompareAndSwap(true, false) {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+			defer cancel()
+			if err := s.d.publishNodeOnce(ctx); err != nil {
+				// Restore the flag so the next flush retries.
+				s.d.pendingSignalRepublish.Store(true)
+				s.d.log.Debug("signal-ready republish", "err", err)
+			}
+		}()
+	}
 }
 
 // iceKeepaliveInterval is how often the daemon re-sends reg frames on an idle

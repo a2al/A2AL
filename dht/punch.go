@@ -26,16 +26,20 @@ import (
 )
 
 // lookupEndpointRecord returns the most recent endpoint record for nodeID that
-// contains a non-empty signal URL, fetched from the local store cache.
+// contains at least one signal URL, fetched from the local store cache.
 //
 // Returns nil when:
 //   - No endpoint record for nodeID is cached locally.
-//   - The cached record has no signal URL (direct-only server nodes).
+//   - The cached record has no signal URL in either Signal (legacy) or
+//     Signals (multi-center list) — i.e. a direct-only server node.
 //
-// Called by the punch trigger sites (Phase 6).  The lookup is intentionally
-// best-effort: the local store only contains records that were previously
-// fetched by Resolve or received via incoming DHT traffic.  Missing records
-// simply skip the punch trigger; routing correctness is unaffected.
+// Signal compatibility: new nodes publish URLs in er.Signals (key 5);
+// older nodes only populate er.Signal (key 3).  Both are accepted so that
+// NAT punch works regardless of which field the remote node uses.
+//
+// Called by punch trigger sites and the replication gap-fill NAT track.
+// The lookup is intentionally best-effort: missing records simply skip the
+// punch trigger; routing correctness is unaffected.
 func (n *Node) lookupEndpointRecord(nodeID a2al.NodeID) *protocol.EndpointRecord {
 	recs := n.LocalStoreGet(nodeID, protocol.RecTypeEndpoint)
 	for _, sr := range recs {
@@ -43,7 +47,7 @@ func (n *Node) lookupEndpointRecord(nodeID a2al.NodeID) *protocol.EndpointRecord
 		if err != nil {
 			continue
 		}
-		if er.Signal == "" {
+		if er.Signal == "" && len(er.Signals) == 0 {
 			continue
 		}
 		return &er

@@ -90,6 +90,15 @@ type Daemon struct {
 
 	iceRegNotify chan struct{} // ICE /signal registration refresh (buffered)
 
+	// signalReady receives a token whenever ≥1 Signal hub transitions from
+	// disconnected to connected. Used by forcePublishNodeOnce to gate the
+	// publish until live Signal URLs are available. Capacity 1; non-blocking.
+	signalReady chan struct{}
+	// pendingSignalRepublish is set when a publish completed without any live
+	// Signal URLs (gate timed out). flush() clears it and triggers a republish
+	// as soon as a hub connects.
+	pendingSignalRepublish atomic.Bool
+
 	demo         *demoManager // built-in demo capability server (per-agent)
 	gatewayConns atomic.Int64 // active gateway QUIC conns (direct + ICE)
 	sessions     sync.Map     // int (daemon-side TCP source port) → *sessionInfo
@@ -119,6 +128,10 @@ type Daemon struct {
 	testNowFn            func() time.Time
 	testGuardRepublishFn func(context.Context)
 	testGuardCascadeFn   func(context.Context)
+
+	// forcePublishMu prevents concurrent forcePublishNodeOnce calls from
+	// racing on nodePublishSeq. Callers TryLock and skip if already running.
+	forcePublishMu sync.Mutex
 
 	rebootstrapMu          sync.Mutex
 	lastRebootstrapAt      time.Time
@@ -266,6 +279,7 @@ func New(cfg Config) (*Daemon, error) {
 		// subMgr is initialised in Run() after mboxStore is ready.
 		iceRegNotify:    make(chan struct{}, 1),
 		netChangeNotify: make(chan struct{}, 1),
+		signalReady:     make(chan struct{}, 1),
 		beacon:          newBeaconManager(h.Node(), &nodeCfg, log),
 		demo:            newDemoManager(),
 	}

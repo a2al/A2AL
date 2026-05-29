@@ -43,6 +43,34 @@ func makeSignedEndpointRecord(t *testing.T, signalURL string) (a2al.Address, a2a
 	return addr, nid, sr
 }
 
+// makeSignedEndpointRecordSignalsOnly creates a record where Signal is empty but
+// Signals contains at least one URL — the "multi-center only" case introduced
+// in Phase 9.  This exercises the P1 fix in lookupEndpointRecord.
+func makeSignedEndpointRecordSignalsOnly(t *testing.T, signals []string) (a2al.Address, a2al.NodeID, protocol.SignedRecord) {
+	t.Helper()
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr, err := acrypto.AddressFromPublicKey(pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nid := a2al.NodeIDFromAddress(addr)
+	ep := protocol.EndpointPayload{
+		Endpoints: []string{"quic://10.0.0.2:4242"},
+		NatType:   protocol.NATRestricted,
+		// Signal intentionally left empty; only Signals is populated.
+		Signals: signals,
+	}
+	now := time.Now()
+	sr, err := protocol.SignEndpointRecord(priv, addr, ep, 1, uint64(now.Unix()), 3600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return addr, nid, sr
+}
+
 // TestLookupEndpointRecord_hit verifies that a record with a signal URL is returned.
 func TestLookupEndpointRecord_hit(t *testing.T) {
 	netw := transport.NewMemNetwork()
@@ -110,6 +138,41 @@ func TestLookupEndpointRecord_noSignal(t *testing.T) {
 	er := node.lookupEndpointRecord(peerID)
 	if er != nil {
 		t.Error("expected nil for record without signal URL")
+	}
+}
+
+// TestLookupEndpointRecord_signalsOnly verifies that a record with Signal=""
+// but a non-empty Signals list is recognised as having a usable signal URL
+// (P1 fix: lookupEndpointRecord now checks er.Signals in addition to er.Signal).
+func TestLookupEndpointRecord_signalsOnly(t *testing.T) {
+	netw := transport.NewMemNetwork()
+	tr, _ := netw.NewTransport("trig-siglist")
+	defer tr.Close()
+
+	ks := newMemKS(t)
+	node, err := NewNode(Config{Transport: tr, Keystore: ks})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	signalURLs := []string{"wss://sig1.example.com", "wss://sig2.example.com"}
+	_, peerID, sr := makeSignedEndpointRecordSignalsOnly(t, signalURLs)
+	if err := node.LocalStorePut(peerID, sr); err != nil {
+		t.Fatalf("LocalStorePut: %v", err)
+	}
+
+	er := node.lookupEndpointRecord(peerID)
+	if er == nil {
+		t.Fatal("expected non-nil EndpointRecord for peer with Signals-only list (P1 regression)")
+	}
+	if er.Signal != "" {
+		t.Errorf("Signal should be empty for signals-only record, got %q", er.Signal)
+	}
+	if len(er.Signals) != len(signalURLs) {
+		t.Fatalf("expected %d Signals entries, got %d", len(signalURLs), len(er.Signals))
+	}
+	if er.Signals[0] != signalURLs[0] {
+		t.Errorf("Signals[0] = %q, want %q", er.Signals[0], signalURLs[0])
 	}
 }
 

@@ -97,6 +97,53 @@ func TestBindPeerAnchorSurvivesHearsayAbsorb(t *testing.T) {
 	}
 }
 
+// TestAddrAuthority_FreshVerifiedLiveBeatsAnchor verifies the core "my observation
+// > peer claim" rule: a freshly-verified live address is preferred over anchor.
+func TestAddrAuthority_FreshVerifiedLiveBeatsAnchor(t *testing.T) {
+	pa := &peerAddrs{}
+	anchor := addrV4(4121)
+	live := addrV4(57691)
+
+	pa.tryAnchor(anchor)
+	pa.tryLive(live, rankVerified) // liveAt = now
+
+	if got := pa.preferred(); got.String() != live.String() {
+		t.Fatalf("preferred = %v, want fresh verified live %v", got, live)
+	}
+}
+
+// TestAddrAuthority_ExpiredVerifiedLiveFallsBackToAnchor checks that once the
+// fresh window elapses the anchor reasserts without any other action.
+func TestAddrAuthority_ExpiredVerifiedLiveFallsBackToAnchor(t *testing.T) {
+	pa := &peerAddrs{}
+	anchor := addrV4(4121)
+	live := addrV4(57691)
+
+	pa.tryAnchor(anchor)
+	pa.tryLive(live, rankVerified)
+	// Back-date liveAt beyond the freshness window.
+	pa.v4.liveAt = time.Now().Add(-(liveVerifiedFreshWindow + time.Second))
+
+	if got := pa.preferred(); got.String() != anchor.String() {
+		t.Fatalf("preferred = %v, want anchor %v after live expired", got, anchor)
+	}
+}
+
+// TestAddrAuthority_HearsayLiveNeverBeatsAnchor confirms that even a very
+// recent hearsay live cannot displace anchor — only rankVerified may.
+func TestAddrAuthority_HearsayLiveNeverBeatsAnchor(t *testing.T) {
+	pa := &peerAddrs{}
+	anchor := addrV4(4121)
+	hearsay := addrV4(57691)
+
+	pa.tryAnchor(anchor)
+	pa.tryLive(hearsay, rankHearsay) // liveAt is still set, but rank is too low
+
+	if got := pa.preferred(); got.String() != anchor.String() {
+		t.Fatalf("preferred = %v, want anchor %v; hearsay must not beat anchor", got, anchor)
+	}
+}
+
 func TestTabAdd_NonUDPDirectFrom_DoesNotWriteAnchor(t *testing.T) {
 	n := newHealthTestNode(t)
 	_, peerID, sr := makeSignedEndpointRecord(t, "wss://signal.example.com")

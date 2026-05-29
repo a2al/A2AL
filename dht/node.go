@@ -294,6 +294,27 @@ type Node struct {
 	// pushHandler is called when this node receives a MsgDHTPush from a DHT node.
 	// Returns true if the message was new (causing the sender to renew its oneShot subscription).
 	pushHandler func(key a2al.NodeID, rec protocol.SignedRecord) bool
+
+	// recoveryNotify receives a token when recordSuccess detects the first
+	// successful RPC after a suspectOffline period (long disconnect → reconnect).
+	// Capacity 1; the sender is non-blocking so it never blocks the RPC hot path.
+	recoveryNotify chan struct{}
+
+	// epPrefetchNegMu guards epPrefetchNeg.
+	epPrefetchNegMu sync.RWMutex
+	// epPrefetchNeg suppresses redundant FindRecords calls for nodes whose
+	// endpoint record was not found or whose lookup recently failed.
+	//
+	// Two tiers:
+	//   ErrNoMatchingRecords (confirmed absent): retryAt = now+probeBadDelay,
+	//     failCount set high so subsequent failures keep the 30-min interval.
+	//   Network / timeout error (transient):     exponential backoff starting
+	//     at probeInitDelay (30 s), doubling each failure, capped at
+	//     probeBadDelay (30 min).
+	//
+	// The entry is deleted whenever an endpoint record for the same nodeID is
+	// written to the local store by any code path (see clearEpPrefetchNeg).
+	epPrefetchNeg map[string]epPrefetchNegEntry // nodeIDKey(id) → entry
 }
 
 type waitEntry struct {
@@ -343,11 +364,13 @@ func NewNode(cfg Config) (*Node, error) {
 		repSets:        make(map[repKey]*repSet),
 		replCh:         make(chan replTask, replChBuf),
 		renewInFlight:     make(map[repKey]struct{}),
+		epPrefetchNeg:  make(map[string]epPrefetchNegEntry),
 		deliverPlanLogged: make(map[string]string),
 		onObservedAddr:    cfg.OnObservedAddr,
 		auth:           cfg.RecordAuth,
 		punch:          cfg.PunchTransport,
 		pushHandler:    cfg.PushHandler,
+		recoveryNotify: make(chan struct{}, 1),
 	}
 	n.learnedPathFirst.Store(cfg.LearnedPathFirst)
 	n.table = routing.NewTable(nid, nil)
@@ -855,6 +878,14 @@ func nodeInfoWithUDPAddr(ni protocol.NodeInfo, addr *net.UDPAddr) protocol.NodeI
 func (n *Node) recordSuccess(id a2al.NodeID, addr net.Addr, rtt time.Duration) {
 	key := nodeIDKey(id)
 	now := time.Now()
+	// Detect recovery: first success after a suspected-offline period.
+	// Must be checked before clearing lastAnySuccessAt.
+	if n.suspectOffline() {
+		select {
+		case n.recoveryNotify <- struct{}{}:
+		default:
+		}
+	}
 	n.lastAnySuccessAt.Store(now.UnixNano()) // clear offline-suspect state
 	n.healthMu.Lock()
 	e := n.health[key]
@@ -922,7 +953,29 @@ func (n *Node) recordFailure(id a2al.NodeID, addr net.Addr) {
 		fh.skipColdUDP = true
 		fh.skipColdAt = time.Now()
 	}
+	turnedBad := fh.failCount >= badHealthThreshold
 	n.healthMu.Unlock()
+
+	if turnedBad {
+		// The family just turned Bad: revoke the fresh-live preference so that
+		// preferred() falls back to anchor immediately instead of waiting out
+		// liveVerifiedFreshWindow.  This keeps the "my observation" advantage
+		// accurate — once the observed path is confirmed dead, the peer's
+		// advertised anchor should reassert.
+		//
+		// peerMu is acquired AFTER healthMu is released to respect the global
+		// lock order (lookupPeerHealthAware takes peerMu before healthMu).
+		n.peerMu.Lock()
+		if pa := n.peers[key]; pa != nil {
+			if udp, ok := addr.(*net.UDPAddr); ok && udp != nil {
+				pa.familyFor(udp).liveAt = time.Time{}
+			} else {
+				// Non-UDP addr defaults to v4 (same convention as familyHealth).
+				pa.v4.liveAt = time.Time{}
+			}
+		}
+		n.peerMu.Unlock()
+	}
 }
 
 // PeerAllowContact returns true if at least one address family's back-off for
@@ -954,6 +1007,36 @@ func (n *Node) suspectOffline() bool {
 		return false // never succeeded this session; new node, do not assume offline
 	}
 	return time.Since(time.Unix(0, last)) > offlineSuspectThreshold
+}
+
+// RecoveryNotify returns the channel that receives a token whenever the node
+// recovers from a suspected-offline period (first successful RPC after
+// ≥ offlineSuspectThreshold without any success). The channel has capacity 1;
+// the caller should consume tokens promptly to avoid missing events.
+func (n *Node) RecoveryNotify() <-chan struct{} {
+	return n.recoveryNotify
+}
+
+// RelaxHealthThrottle caps the nextRetryAt of all known peers to at most
+// now+cap. Peers whose backoff expires sooner, or who have no backoff, are
+// unaffected. failCount is intentionally preserved so the exponential-backoff
+// schedule is not fully discarded, only shortened.
+//
+// Call this after a confirmed network recovery to let probe and replication
+// loops reach throttled peers within cap, rather than waiting out potentially
+// long backlogs accumulated during the outage.
+func (n *Node) RelaxHealthThrottle(dur time.Duration) {
+	deadline := time.Now().Add(dur)
+	n.healthMu.Lock()
+	for _, e := range n.health {
+		if !e.v4.nextRetryAt.IsZero() && e.v4.nextRetryAt.After(deadline) {
+			e.v4.nextRetryAt = deadline
+		}
+		if !e.v6.nextRetryAt.IsZero() && e.v6.nextRetryAt.After(deadline) {
+			e.v6.nextRetryAt = deadline
+		}
+	}
+	n.healthMu.Unlock()
 }
 
 // peerHealthForSort returns the lastFailure time and totalAttempts for a peer,
@@ -1194,9 +1277,33 @@ func (n *Node) bindPeerLive(id a2al.NodeID, addr net.Addr, rank addrRank) {
 	n.addrToID.Store(addr.String(), id)
 }
 
-// BindPeerAddr registers a Verified live dial address (RPC success, tests).
+// BindPeerAddr registers a Verified live dial address.
+// Deprecated: prefer NotePeerDialSuccess which additionally updates health counters.
+// Retained for test helpers and internal callers that do not have RTT information.
 func (n *Node) BindPeerAddr(id a2al.NodeID, addr net.Addr) {
 	n.bindPeerLive(id, addr, rankVerified)
+}
+
+// NotePeerDialSuccess records a verified direct connection (e.g. QUIC handshake)
+// to addr from the upper-layer transport.  It updates both the live address slot
+// and the health counters — equivalent in effect to a successful DHT RPC, allowing
+// a peer that was in Bad state to recover without waiting for a UDP round-trip.
+//
+// addr should be the actual remote address observed on the connection
+// (e.g. conn.RemoteAddr()), which may differ from the dialled address due to NAT.
+// rtt is the round-trip time of the handshake; pass 0 if unknown.
+func (n *Node) NotePeerDialSuccess(id a2al.NodeID, addr net.Addr, rtt time.Duration) {
+	n.recordSuccess(id, addr, rtt)
+}
+
+// NotePeerDialFailure records a failed direct connection attempt to addr.
+// It is a hint to the health subsystem that this address is not currently
+// reachable via the upper-layer transport.
+//
+// Callers MUST only invoke this for genuine transport failures, not for context
+// cancellations caused by a competing dial winning (happy eyeballs).
+func (n *Node) NotePeerDialFailure(id a2al.NodeID, addr net.Addr) {
+	n.recordFailure(id, addr)
 }
 
 // BindPeerAnchor registers a long-lived advertised/infra dial address.
@@ -2044,12 +2151,38 @@ func (n *Node) LocalStoreInvalidate(key a2al.NodeID, recType uint8) {
 	n.store.Invalidate(key, recType)
 }
 
+// epPrefetchNegEntry is the value stored in epPrefetchNeg.
+type epPrefetchNegEntry struct {
+	retryAt   time.Time
+	failCount int
+}
+
+// clearEpPrefetchNeg removes the negative-cache entry for nodeID if present.
+// Called whenever an endpoint record for nodeID is written to the local store,
+// so that nodes suppressed by a prior transient lookup failure are unblocked.
+func (n *Node) clearEpPrefetchNeg(nodeID a2al.NodeID) {
+	key := nodeIDKey(nodeID)
+	n.epPrefetchNegMu.Lock()
+	delete(n.epPrefetchNeg, key)
+	n.epPrefetchNegMu.Unlock()
+}
+
 // LocalStorePut writes rec into the local store without triggering replication.
 // Use this to seed records received via an out-of-band channel (e.g. QUIC
 // control plane AgentInfo push) so that subsequent AggregateRecords queries
 // return the fresh data immediately.
+//
+// If rec is an endpoint record, any negative-cache entry for the same nodeID
+// is cleared so that the replication gap-fill NAT track can use the new signal
+// URL immediately rather than waiting for the suppression window to expire.
 func (n *Node) LocalStorePut(storeKey a2al.NodeID, rec protocol.SignedRecord) error {
-	return n.store.Put(storeKey, rec, time.Now())
+	if err := n.store.Put(storeKey, rec, time.Now()); err != nil {
+		return err
+	}
+	if rec.RecType == protocol.RecTypeEndpoint {
+		n.clearEpPrefetchNeg(storeKey)
+	}
+	return nil
 }
 
 // Close stops the node, closes the transport, and waits for the receive loop to exit.

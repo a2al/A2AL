@@ -237,6 +237,62 @@ func nodeIDFromBytes(b []byte) (id [32]byte) {
 	return id
 }
 
+// TestRecordFailure_ClearsLiveAtOnBad tests the full "peer-face cache
+// lifecycle" when a peer migrates:
+//
+//  1. Set anchor + fresh verified live → preferred() returns live (observation wins).
+//  2. recordFailure badHealthThreshold times → family turns Bad, liveAt is cleared.
+//     preferred() should revert to anchor.
+//  3. BindPeerAddr with a new live address → liveAt is refreshed.
+//     preferred() should return the new live again.
+func TestRecordFailure_ClearsLiveAtOnBad(t *testing.T) {
+	n := newHealthTestNode(t)
+
+	var peerID [32]byte
+	peerID[0] = 0xFE
+	id := nodeIDFromBytes(peerID[:])
+
+	anchor := addrV4(4121)
+	live1 := addrV4(55001)
+	live2 := addrV4(55002)
+
+	// Step 1: bind anchor and fresh verified live.
+	n.BindPeerAnchor(id, anchor)
+	n.BindPeerAddr(id, live1)
+
+	got, ok := n.lookupPeer(id)
+	if !ok || got.String() != live1.String() {
+		t.Fatalf("step1: preferred = %v (ok=%v), want fresh live %v", got, ok, live1)
+	}
+
+	// Step 2: record enough failures to turn the family Bad.
+	for i := 0; i < badHealthThreshold; i++ {
+		n.recordFailure(id, live1)
+	}
+	got, ok = n.lookupPeer(id)
+	if !ok || got.String() != anchor.String() {
+		t.Fatalf("step2: after Bad, preferred = %v (ok=%v), want anchor %v", got, ok, anchor)
+	}
+
+	// Verify liveAt was actually zeroed.
+	n.peerMu.Lock()
+	pa := n.peers[nodeIDKey(id)]
+	n.peerMu.Unlock()
+	if pa == nil {
+		t.Fatal("step2: peerAddrs unexpectedly nil")
+	}
+	if !pa.v4.liveAt.IsZero() {
+		t.Fatalf("step2: liveAt should be zero after Bad, got %v", pa.v4.liveAt)
+	}
+
+	// Step 3: new successful connection to updated address restores observation priority.
+	n.BindPeerAddr(id, live2)
+	got, ok = n.lookupPeer(id)
+	if !ok || got.String() != live2.String() {
+		t.Fatalf("step3: after rebind, preferred = %v (ok=%v), want new live %v", got, ok, live2)
+	}
+}
+
 // TestSelfExtIPv6 verifies that SetSelfExtIPv6 / SelfExtIPv6 store and
 // retrieve the IPv6 GUA independently of the v4 selfExtIP field.
 func TestSelfExtIPv6(t *testing.T) {

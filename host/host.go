@@ -202,6 +202,11 @@ type Host struct {
 	quicTr  *quic.Transport
 	qListen *quic.Listener
 
+	// stunProber sends STUN Binding Requests on the shared DHT/QUIC socket
+	// (UDPMux) so the reflected port is the real NAT-mapped QUIC port.
+	// Nil in split-port mode (cfg.QUICListenAddr != "") until Item 5 is done.
+	stunProber *muxSTUNProber
+
 	agentsMu sync.RWMutex
 	agents   map[a2al.Address]*agentEntry
 
@@ -343,6 +348,8 @@ func New(cfg Config) (*Host, error) {
 			return nil, err
 		}
 		qt = &quic.Transport{Conn: mux.QUICPacketConn()}
+		// stunProber is initialised after Host is constructed (see below) so
+		// it can be stored on h. The field is set immediately after h is built.
 	} else {
 		dConn, err := listenSocket(cfg.ListenAddr)
 		if err != nil {
@@ -387,6 +394,11 @@ func New(cfg Config) (*Host, error) {
 	}
 	h.iceCache.init()
 	punchPool.bind(h)
+	// Initialise same-socket STUN prober when DHT and QUIC share one socket.
+	// In split-port mode (QUICListenAddr != "") mux is nil; prober stays nil.
+	if mux != nil {
+		h.stunProber = newMuxSTUNProber(mux)
+	}
 
 	srvTLS := quicServerTLSWithSNI(defaultCert, h.certForSNI)
 	qListen, err := qt.Listen(srvTLS, defaultQUICConfig())
@@ -557,7 +569,7 @@ func (h *Host) runNATProbeV4(ctx context.Context) {
 	claimedWire, ok := h.sense.TrustedWireV4()
 	if !ok {
 		sctx, cancel := context.WithTimeout(ctx, 4*time.Second)
-		stunIP, stunPort := probeSTUN(sctx)
+		stunIP, stunPort := probeSTUNViaMux(sctx, h.stunProber, "udp4")
 		cancel()
 		if stunIP != nil && isPlausibleWANIP(stunIP) {
 			if b, err := protocol.FormatObservedUDP(stunIP, stunPort); err == nil {
@@ -614,7 +626,7 @@ func (h *Host) runNATProbeV6(ctx context.Context) {
 	claimedWire, ok := h.sense.TrustedWireV6()
 	if !ok {
 		sctx, cancel := context.WithTimeout(ctx, 4*time.Second)
-		stunIP, stunPort := probeSTUNv6(sctx)
+		stunIP, stunPort := probeSTUNViaMux(sctx, h.stunProber, "udp6")
 		cancel()
 		if stunIP != nil && isPlausibleWANIP(stunIP) {
 			if b, err := protocol.FormatObservedUDP(stunIP, stunPort); err == nil {
@@ -905,6 +917,19 @@ func (h *Host) SetActiveSignalURLs(urls []string) {
 	h.iceMu.Unlock()
 }
 
+// ActiveSignalURLs returns a snapshot of the currently connected signal hub
+// URLs. Returns nil when no hub is connected.
+func (h *Host) ActiveSignalURLs() []string {
+	h.iceMu.RLock()
+	defer h.iceMu.RUnlock()
+	if len(h.activeSignalURLs) == 0 {
+		return nil
+	}
+	out := make([]string, len(h.activeSignalURLs))
+	copy(out, h.activeSignalURLs)
+	return out
+}
+
 // SetSignalStatsProvider merges hub stats into GET /debug/stats under "signal".
 func (h *Host) SetSignalStatsProvider(f func() map[string]any) {
 	h.signalStatsMu.Lock()
@@ -943,9 +968,10 @@ func (h *Host) ensureExternalIP(ctx context.Context) string {
 	}
 	h.extipMu.Unlock()
 
-	// STUN probe: 3-second budget.
+	// STUN probe: prefer same-socket prober (port reflects true QUIC NAT mapping);
+	// fall back to ephemeral-socket probe when prober is unavailable (split-port mode).
 	sctx, scancel := context.WithTimeout(ctx, 3*time.Second)
-	stunIP, stunPort := probeSTUN(sctx)
+	stunIP, stunPort := probeSTUNViaMux(sctx, h.stunProber, "udp4")
 	scancel()
 
 	var snap string
@@ -988,7 +1014,7 @@ func (h *Host) ensureExternalIPv6(ctx context.Context) string {
 	h.extip6Mu.Unlock()
 
 	sctx, scancel := context.WithTimeout(ctx, 3*time.Second)
-	stunIP, stunPort := probeSTUNv6(sctx)
+	stunIP, stunPort := probeSTUNViaMux(sctx, h.stunProber, "udp6")
 	scancel()
 
 	var snap string
@@ -1195,19 +1221,37 @@ func (h *Host) doDialerControlStream(ctx context.Context, conn quic.Connection, 
 	return nil
 }
 
+// controlStreamError wraps a failure that occurred after the QUIC+TLS handshake
+// succeeded but during Stream 0 control exchange.  The network path itself was
+// reachable; callers (e.g. connectHappy) must not report this as a transport
+// failure to the DHT health subsystem.
+type controlStreamError struct{ cause error }
+
+func (e *controlStreamError) Error() string { return e.cause.Error() }
+func (e *controlStreamError) Unwrap() error { return e.cause }
+
 func (h *Host) dialAndAgentRoute(ctx context.Context, localCert tls.Certificate, expectRemote a2al.Address, udpAddr *net.UDPAddr) (quic.Connection, error) {
 	cliTLS, err := quicClientTLSWithCert(localCert, expectRemote)
 	if err != nil {
 		return nil, err
 	}
 	h.log.Debug("quic dial", "src", h.quicTr.Conn.LocalAddr(), "dst", udpAddr, "remote_aid", expectRemote)
+	t0 := time.Now()
 	conn, err := h.quicTr.Dial(ctx, udpAddr, cliTLS, defaultQUICConfig())
 	if err != nil {
 		return nil, err
 	}
+	// Capture RTT immediately after the QUIC+TLS handshake, before opening
+	// Stream 0, so the value reflects network latency only.
+	handshakeRTT := time.Since(t0)
 	if err := h.doDialerControlStream(ctx, conn, expectRemote); err != nil {
 		_ = conn.CloseWithError(1, "control stream failed")
-		return nil, err
+		return nil, &controlStreamError{cause: err}
+	}
+	// Notify the DHT health subsystem of the verified outbound connection.
+	// conn.RemoteAddr() is the actual NAT-mapped address.
+	if udpRemote, ok := conn.RemoteAddr().(*net.UDPAddr); ok && udpRemote != nil {
+		h.node.NotePeerDialSuccess(a2al.NodeIDFromAddress(expectRemote), udpRemote, handshakeRTT)
 	}
 	return conn, nil
 }
@@ -1240,6 +1284,11 @@ func (h *Host) Accept(ctx context.Context) (*AgentConn, error) {
 		state := conn.ConnectionState().TLS
 		if remote, rErr := peerAddrFromTLSState(state); rErr == nil {
 			if v, ok := h.punchExpect.Load(remote); ok {
+			// Notify the DHT subsystem of the confirmed punch path so health
+			// counters are updated alongside the peer-face address cache.
+			if udpRemote, ok2 := conn.RemoteAddr().(*net.UDPAddr); ok2 && udpRemote != nil {
+				h.node.NotePeerDialSuccess(a2al.NodeIDFromAddress(remote), udpRemote, 0)
+			}
 				ch := v.(chan quic.Connection)
 				select {
 				case ch <- conn:
@@ -1278,6 +1327,16 @@ func (h *Host) agentConnFromQUIC(ctx context.Context, conn quic.Connection, fall
 			if ok {
 				ac.Local = addr
 			}
+		}
+	}
+
+	// Notify the DHT subsystem of the verified inbound connection.
+	// ac.Remote is populated from the TLS certificate; conn.RemoteAddr() is the
+	// actual source address observed by the OS.  rtt=0 because we have no
+	// handshake timing on the acceptor side.
+	if ac.Remote != (a2al.Address{}) {
+		if udpRemote, ok := conn.RemoteAddr().(*net.UDPAddr); ok && udpRemote != nil {
+			h.node.NotePeerDialSuccess(a2al.NodeIDFromAddress(ac.Remote), udpRemote, 0)
 		}
 	}
 	return ac, nil

@@ -30,19 +30,46 @@ const (
 	nodePublishMinGap = 30 * time.Second
 	// nodePostPublishQuiet suppresses immediate re-triggers right after a publish.
 	nodePostPublishQuiet = 30 * time.Second
+
+	// netSleepWakeThreshold: if a netWatchPeriod tick arrives more than this
+	// late, the process was likely suspended (sleep/hibernate).  We treat it
+	// as an unconditional network-change event so endpoint records and health
+	// throttles are refreshed immediately on wake.
+	// 3× netWatchPeriod gives a comfortable margin over normal scheduler jitter.
+	netSleepWakeThreshold = 30 * time.Second
 )
 
 func (d *Daemon) runNetworkMonitor(ctx context.Context) {
 	t := time.NewTicker(netWatchPeriod)
 	defer t.Stop()
+	lastTick := time.Now()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
+		case now := <-t.C:
+			if now.Sub(lastTick) > netSleepWakeThreshold {
+				d.log.Info("sleep/wake detected, triggering cascade",
+					"gap", now.Sub(lastTick).Truncate(time.Second))
+				d.onSleepWakeDetected(ctx)
+			}
+			lastTick = now
 			d.pollNetworkFingerprint()
 		}
 	}
+}
+
+// onSleepWakeDetected handles a sleep/wake event inferred from a large clock
+// gap between ticker ticks. It resets the fingerprint baseline so the next
+// poll re-evaluates the current network topology from scratch, and immediately
+// triggers a cascade without waiting for the normal debounce window.
+func (d *Daemon) onSleepWakeDetected(ctx context.Context) {
+	d.netMu.Lock()
+	d.netStableFP = "" // force re-baseline on next pollNetworkFingerprint
+	d.netPendingFP = ""
+	d.netPendingAt = time.Time{}
+	d.netMu.Unlock()
+	d.startCascadeAsync(ctx)
 }
 
 func (d *Daemon) pollNetworkFingerprint() {
@@ -271,9 +298,11 @@ func (d *Daemon) handleNetworkChangeCascade(ctx context.Context) {
 	d.h.RunNATProbe(probeCtx)
 	probeCancel()
 
-	pubCtx, pubCancel := context.WithTimeout(ctx, 100*time.Second)
-	d.maybeRepublishNodeOnEndpointChange(pubCtx)
-	pubCancel()
+	// Force-publish unconditionally: the cached endpoint fingerprint may be
+	// stale after a network change, and Signal hubs need time to reconnect.
+	// forcePublishNodeOnce also relaxes peer health throttles and gates on
+	// Signal readiness so the published record includes live hub URLs.
+	d.forcePublishNodeOnce(ctx)
 
 	d.log.Info("network change handled",
 		"observed_peers", observed,

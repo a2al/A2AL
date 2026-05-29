@@ -22,12 +22,25 @@ import (
 )
 
 const (
-	endpointRecordTTL    = uint32(3600)
-	republishPeriod      = time.Duration(endpointRecordTTL/2) * time.Second // 30m
-	endpointWatchPeriod  = 60 * time.Second
-	heartbeatTTL         = time.Duration(endpointRecordTTL) * time.Second
-	guardTickPeriod      = 5 * time.Second
+	endpointRecordTTL     = uint32(3600)
+	republishPeriod       = time.Duration(endpointRecordTTL/2) * time.Second // 30m
+	endpointWatchPeriod   = 60 * time.Second
+	heartbeatTTL          = time.Duration(endpointRecordTTL) * time.Second
+	guardTickPeriod       = 5 * time.Second
 	anchorKeepalivePeriod = 20 * time.Second // keep NAT bindings alive; feeds observed-addr back to natsense
+
+	// signalReadyTimeout is how long forcePublishNodeOnce waits for at least
+	// one Signal hub to connect before publishing without Signal URLs.
+	// Normal hub registration completes well within this window; the timeout
+	// is a safety valve for slow or unreachable hubs.
+	signalReadyTimeout = 15 * time.Second
+
+	// healthRelaxCap is the maximum remaining backoff applied to all peers
+	// during RelaxHealthThrottle. Peers with longer pending backoffs are
+	// brought forward to now+cap so probes resume quickly after recovery.
+	// 30 s matches two probe-tick intervals (2×15 s), giving the replication
+	// loop a short but fair retry window without flooding the network.
+	healthRelaxCap = 30 * time.Second
 )
 
 type nodePublishDisk struct {
@@ -221,6 +234,79 @@ func (d *Daemon) maybeRepublishNodeOnEndpointChange(ctx context.Context) {
 	for _, e := range agents {
 		d.tryRepublishAgent(ctx, e.AID)
 	}
+}
+
+// forcePublishNodeOnce publishes the node identity unconditionally, bypassing
+// the endpoint-fingerprint gate used by maybeRepublishNodeOnEndpointChange.
+// Used after confirmed network changes where the published record must be
+// refreshed regardless of whether the local endpoint appears to have changed.
+//
+// Before publishing it relaxes per-peer health throttles so recovery probes
+// can reach previously-throttled peers within healthRelaxCap.  For NAT nodes
+// it also waits up to signalReadyTimeout for a Signal hub to connect, so the
+// published record includes live Signal URLs.  If no hub connects in time the
+// publish proceeds and pendingSignalRepublish is set; flush() will republish
+// once a hub comes online.
+func (d *Daemon) forcePublishNodeOnce(ctx context.Context) {
+	if !d.cfg.AutoPublish {
+		d.netMu.Lock()
+		d.deferredEndpointEval = false
+		d.netMu.Unlock()
+		return
+	}
+
+	// Prevent concurrent force-publish calls from racing on nodePublishSeq.
+	// If a force publish is already in flight, the record will be fresh by the
+	// time it finishes; no need for a second one to immediately follow.
+	if !d.forcePublishMu.TryLock() {
+		return
+	}
+	defer d.forcePublishMu.Unlock()
+
+	// During rapid network flapping, suppress the publish: a cascade will
+	// fire once the topology stabilises, at which point we publish with the
+	// correct stable address.
+	d.netMu.Lock()
+	if d.inFlapModeLocked(d.now()) {
+		d.deferredEndpointEval = true
+		d.netMu.Unlock()
+		d.log.Debug("force node publish suppressed: flapping")
+		return
+	}
+	d.netMu.Unlock()
+
+	// Relax peer backoffs so probe and replication loops reach throttled peers
+	// quickly rather than waiting out long per-peer exponential-backoff windows.
+	d.h.Node().RelaxHealthThrottle(healthRelaxCap)
+
+	// Signal-ready gate: if ICE is configured but no hub is connected yet,
+	// wait briefly so the published record includes live Signal URLs.
+	if len(d.h.EffectiveICESignalURLs()) > 0 && len(d.h.ActiveSignalURLs()) == 0 {
+		t := time.NewTimer(signalReadyTimeout)
+		defer t.Stop()
+		select {
+		case <-d.signalReady:
+			// Hub connected; proceed with fresh Signal URLs.
+		case <-t.C:
+			// No hub within timeout; publish now and let flush() republish later.
+			d.pendingSignalRepublish.Store(true)
+		case <-ctx.Done():
+			return
+		}
+	}
+
+	pubCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	defer cancel()
+	if err := d.publishNodeOnce(pubCtx); err != nil {
+		d.log.Debug("force node republish", "err", err)
+		d.netMu.Lock()
+		d.deferredEndpointEval = true
+		d.netMu.Unlock()
+		return
+	}
+	d.netMu.Lock()
+	d.deferredEndpointEval = false
+	d.netMu.Unlock()
 }
 
 func (d *Daemon) tryRepublishAgent(ctx context.Context, aid a2al.Address) {
@@ -482,6 +568,8 @@ func (d *Daemon) autoPublishMainLoop(ctx context.Context) {
 	anchor := time.NewTicker(anchorKeepalivePeriod)
 	defer anchor.Stop()
 
+	recoveryNotify := d.h.Node().RecoveryNotify()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -509,6 +597,21 @@ func (d *Daemon) autoPublishMainLoop(ctx context.Context) {
 				// Refresh routing hub candidates after NAT probe; cheap in-memory
 				// scan. Only overwrites if no explicit config is set.
 				d.h.SetRoutingHubCandidates(d.h.DeriveRoutingHubURLs(maxSignalCandidates))
+			}()
+		case <-recoveryNotify:
+			// First successful RPC after a long outage: force-publish so
+			// peers get a fresh record with current endpoint / Signal URLs,
+			// then push updated records for all registered agents.
+			go func() {
+				rCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
+				defer cancel()
+				d.forcePublishNodeOnce(rCtx)
+				d.regMu.RLock()
+				agents := d.reg.List()
+				d.regMu.RUnlock()
+				for _, e := range agents {
+					d.tryRepublishAgent(rCtx, e.AID)
+				}
 			}()
 		}
 	}

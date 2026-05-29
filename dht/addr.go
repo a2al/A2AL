@@ -15,6 +15,12 @@ import (
 // After this period the ephemeral slot is treated as expired and ignored.
 const peerAddrEphemeralTTL = 5 * time.Minute
 
+// liveVerifiedFreshWindow is how long a freshly verified live address (written
+// by a successful QUIC handshake or punch) takes priority over the peer's
+// long-lived anchor (advertised endpoint).  Within this window "my observation"
+// beats "their claim"; outside it the anchor is the safer choice.
+const liveVerifiedFreshWindow = 5 * time.Minute
+
 // addrRank orders address evidence strength. Higher rank must not be replaced by
 // a lower rank in the Live slot; Anchor is a separate slot for self-/operator-
 // declared endpoints and is never written from hearsay or ephemeral sources.
@@ -30,10 +36,16 @@ const (
 // Anchor: long-lived advertised/infra address (endpoint quic://, DNS bootstrap).
 // Live: operational address from RPC success or hearsay; rank-guarded writes.
 // Ephemeral: short-lived ICE prflx (TTL-bounded); never overwrites Anchor/Live.
+//
+// Freshness: when live is written at rankVerified (e.g. from a successful QUIC
+// handshake) liveAt is updated.  preferred() treats a fresh verified live as
+// higher priority than anchor — "my recent observation" beats "their claim".
+// Once liveVerifiedFreshWindow elapses the anchor is preferred again.
 type familyAddrs struct {
 	anchor      *net.UDPAddr
 	live        *net.UDPAddr
 	liveRank    addrRank
+	liveAt      time.Time // last time live was written; zero if never
 	ephemeral   *net.UDPAddr
 	ephemeralAt time.Time
 }
@@ -55,6 +67,7 @@ func (fa *familyAddrs) tryLive(addr *net.UDPAddr, rank addrRank) bool {
 	}
 	fa.live = cloneUDPAddr(addr)
 	fa.liveRank = rank
+	fa.liveAt = time.Now()
 	return true
 }
 
@@ -66,8 +79,21 @@ func (fa *familyAddrs) tryEphemeral(addr *net.UDPAddr) {
 	fa.ephemeralAt = time.Now()
 }
 
-// preferred returns the best dial address for this family: Anchor → Live → Ephemeral.
+// preferred returns the best dial address for this family.
+//
+// Priority order:
+//  1. Fresh verified live  – a QUIC-handshake-confirmed address within
+//     liveVerifiedFreshWindow; "my observation" beats the peer's published claim.
+//  2. Anchor               – long-lived advertised endpoint; once live ages out
+//     this is the stable fallback.
+//  3. Stale live           – hearsay or expired-verified; still better than nothing.
+//  4. Ephemeral            – hole-punch address within peerAddrEphemeralTTL.
 func (fa *familyAddrs) preferred() *net.UDPAddr {
+	// Fresh verified live takes priority over anchor.
+	if fa.live != nil && fa.liveRank >= rankVerified && !fa.liveAt.IsZero() &&
+		time.Since(fa.liveAt) < liveVerifiedFreshWindow {
+		return fa.live
+	}
 	if fa.anchor != nil {
 		return fa.anchor
 	}

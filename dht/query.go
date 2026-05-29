@@ -583,6 +583,10 @@ func mergeAggregate(into map[string]protocol.SignedRecord, recs []protocol.Signe
 // Local store is checked first; if a valid cached record exists the network is
 // not queried.  The cache is transparently invalidated by the host layer when a
 // subsequent connection attempt using the cached data fails.
+//
+// Network-discovered records are written into the local store so that
+// subsequent lookupEndpointRecord calls (e.g. from the replication NAT track)
+// can find them without another round-trip.
 func (q *Query) FindRecords(ctx context.Context, target a2al.NodeID, recType uint8) ([]protocol.SignedRecord, error) {
 	if q.n == nil {
 		return nil, errors.New("dht: nil node")
@@ -594,6 +598,11 @@ func (q *Query) FindRecords(ctx context.Context, target a2al.NodeID, recType uin
 		}
 	}
 	recs, _, err := q.runIterQuery(ctx, target, true, recType, 1)
+	if err == nil {
+		for _, rec := range recs {
+			_ = q.n.LocalStorePut(target, rec)
+		}
+	}
 	return recs, err
 }
 

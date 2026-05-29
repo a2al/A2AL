@@ -6,6 +6,7 @@ package dht
 import (
 	"context"
 	crand "crypto/rand"
+	"errors"
 	"fmt"
 	"net"
 	"sort"
@@ -27,6 +28,12 @@ const (
 	probeTickInterval  = 15 * time.Second // health probe loop wake-up interval
 	replChBuf          = 64               // replication task channel buffer
 	gapFillPunchBudget = 2                // max new ICE attempts per gap-fill cycle
+
+	// epPrefetchFailCountCap is the maximum failCount stored in epPrefetchNegEntry.
+	// probeInitDelay << epPrefetchFailCountCap must exceed probeBadDelay so the
+	// exponential back-off always hits the cap branch before integer shift overflow.
+	// 30s << 7 = 3840s ≈ 64 min > probeBadDelay (30 min). ✓
+	epPrefetchFailCountCap = 7
 )
 
 // repKey uniquely identifies one (storeKey, publisher) replication unit.
@@ -180,6 +187,10 @@ func (n *Node) processReplTask(ctx context.Context, task replTask) {
 
 	directPool := n.tabNearestHealthy(task.rk.storeKey, repHardCap)
 	xorPool := n.tabNearest(task.rk.storeKey, repHardCap)
+	// Proactively fetch endpoint records for NAT candidates that are not yet
+	// cached locally (same as in renewBackground).
+	xorFar, hasXorFar := xorFarthestInRepSet(rs)
+	n.prefetchNATEndpoints(ctx, task.rk.storeKey, hasXorFar, xorFar, xorPool)
 	direct, nat := n.pickGapFillPeers(task.rk.storeKey, rs, directPool, xorPool, existing)
 	if len(direct) > 0 {
 		n.storeAndRecord(ctx, direct, task.rk, rec, rs)
@@ -340,6 +351,11 @@ func (n *Node) renewBackground(rk repKey, rs *repSet) {
 	if len(found) > 0 {
 		xorPool = found
 	}
+	// Proactively fetch endpoint records for NAT candidates that are not yet
+	// cached locally.  Without their signal URLs, pickGapFillPeers would skip
+	// them; this ensures the NAT track can actually be populated this cycle.
+	xorFar, hasXorFar := xorFarthestInRepSet(rs)
+	n.prefetchNATEndpoints(ctx, rk.storeKey, hasXorFar, xorFar, xorPool)
 	direct, nat := n.pickGapFillPeers(rk.storeKey, rs, directPool, xorPool, existing)
 	if len(direct) > 0 {
 		n.storeAndRecord(ctx, direct, rk, rec, rs)
@@ -526,8 +542,11 @@ func (n *Node) pickGapFillPeers(storeKey a2al.NodeID, rs *repSet, directPool, xo
 		return nil, nil
 	}
 
-	// Compute the farthest XOR distance in the existing repSet. Used as a gate for
-	// the NAT track: only XOR-closer candidates are worth punching through to.
+	// Compute the farthest XOR distance in the existing repSet. Used as a gate
+	// for the NAT track: only XOR-closer candidates are worth punching to.
+	// NOTE: xorFarthestInRepSet performs the same computation for the prefetch
+	// path.  The two are intentionally kept separate so pickGapFillPeers remains
+	// self-contained; if this gate logic ever changes, update both sites.
 	var xorFarthest a2al.NodeID
 	hasXorFarthest := false
 	rs.mu.Lock()
@@ -761,6 +780,9 @@ func (n *Node) runHealthProbes(ctx context.Context) {
 	n.repMu.RUnlock()
 
 	now := time.Now()
+	// One RPC per nodeID per heartbeat: the same replica may appear in
+	// multiple repSets (different storeKey/publisher pairs).
+	probeCache := make(map[string]repProbeExecOutcome)
 	for _, rk := range keys {
 		if ctx.Err() != nil {
 			return
@@ -784,7 +806,7 @@ func (n *Node) runHealthProbes(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
-			n.probeRepNode(ctx, rk, rs, e)
+			n.probeRepNode(ctx, rk, rs, e, probeCache)
 		}
 	}
 
@@ -1009,7 +1031,19 @@ func randomIDInBucket(self a2al.NodeID, bi int) a2al.NodeID {
 	return id
 }
 
+// repProbeExecOutcome is the node-level result of one replication health probe
+// RPC. Shared across repSets within a single runHealthProbes heartbeat.
+type repProbeExecOutcome struct {
+	iceConnOK      bool
+	noAddr         bool
+	probeSkip      bool
+	punchAttempted bool
+	err            error
+}
+
 // probeRepNode probes one replica node with PING, updating its probe schedule.
+// probeCache deduplicates RPCs when the same nodeID is due in multiple repSets
+// during one heartbeat.
 //
 // State machine (Fix 2):
 //   Unknown/recovering:  failCount < badHealthThreshold → fast retry at probeInitDelay
@@ -1021,94 +1055,86 @@ func randomIDInBucket(self a2al.NodeID, bi int) a2al.NodeID {
 //
 // Fix 7: rs.mu is always released before calling enqueueReplication to avoid
 // holding the lock while touching the channel.
-func (n *Node) probeRepNode(ctx context.Context, rk repKey, rs *repSet, e *repNodeEntry) {
+func (n *Node) probeRepNode(ctx context.Context, rk repKey, rs *repSet, e *repNodeEntry, probeCache map[string]repProbeExecOutcome) {
+	key := nodeIDKey(e.nodeID)
+	out, ok := probeCache[key]
+	if !ok {
+		out = n.execRepProbe(ctx, e.nodeID)
+		probeCache[key] = out
+	}
+	n.applyRepProbeOutcome(ctx, rk, rs, e, out)
+}
+
+// execRepProbe performs the node-level RPC for one replication health probe.
+func (n *Node) execRepProbe(ctx context.Context, id a2al.NodeID) repProbeExecOutcome {
+	var out repProbeExecOutcome
+
 	// For ICE-capable NAT peers (signal URL present), consult the punch channel
 	// before attempting a UDP probe — stale NAT-mapped ports always time out.
-	//
-	// probeSkip=true  → no probe RPC was sent; failure path still runs so the
-	//                   grace+evict state machine advances normally.
-	// punchAttempted  → triggerPunch already called; skip redundant Low-priority
-	//                   re-trigger in the badHealthThreshold case.
-	var (
-		probeSkip      bool
-		punchAttempted bool
-	)
 	if n.punch != nil {
-		profile := n.reachProfile(e.nodeID)
-		er := n.lookupEndpointRecord(e.nodeID)
+		profile := n.reachProfile(id)
+		er := n.lookupEndpointRecord(id)
 		if er != nil && profile.prefersICEOverColdUDP() {
-			if n.punch.HasConn(e.nodeID) {
-				n.log.Debug("replication probe: ice conn ok", "nodeID", e.nodeID, "profile", profile)
-				// Active punch channel: treat as a successful probe.
-				rs.mu.Lock()
-				e.failCount = 0
-				e.badSince = time.Time{}
-				next := e.nextProbeDelay * 2
-				if next == 0 || next > probeMaxDelay {
-					next = probeMaxDelay
-				}
-				e.nextProbeDelay = next
-				e.nextProbeAt = time.Now().Add(next)
-				rs.mu.Unlock()
-				return
+			if n.punch.HasConn(id) {
+				n.log.Debug("replication probe: ice conn ok", "nodeID", id, "profile", profile)
+				out.iceConnOK = true
+				return out
 			}
 			// NAT/ICE-dependent peer: trigger ICE redialing and count this round as
 			// a miss so the state machine advances (dead peers get evicted).
-			n.triggerPunch(e.nodeID, er, PunchPriorityHigh)
-			n.log.Debug("replication probe: ice redial", "nodeID", e.nodeID, "profile", profile)
-			probeSkip = true
-			punchAttempted = true
+			n.triggerPunch(id, er, PunchPriorityHigh)
+			n.log.Debug("replication probe: ice redial", "nodeID", id, "profile", profile)
+			out.probeSkip = true
+			out.punchAttempted = true
+			return out
 		}
 	}
 
+	profile := n.reachProfile(id)
 	var (
-		err       error
 		probeAddr net.Addr
+		ok        bool
 	)
-	if !probeSkip {
-		var ok bool
-		profile := n.reachProfile(e.nodeID)
-		if profile.prefersUDPAnchor() {
-			v6 := false
-			if a, has := n.lookupPeerHealthAware(e.nodeID); has {
-				if isV6, ok2 := addrIsV6(a); ok2 {
-					v6 = isV6
-				}
+	if profile.prefersUDPAnchor() {
+		v6 := false
+		if a, has := n.lookupPeerHealthAware(id); has {
+			if isV6, ok2 := addrIsV6(a); ok2 {
+				v6 = isV6
 			}
-			probeAddr = n.publicStableDialAddr(e.nodeID, v6)
-			ok = probeAddr != nil
 		}
-		if !ok {
-			probeAddr, ok = n.lookupPeerHealthAware(e.nodeID)
-		}
-		if !ok {
-			probeAddr, ok = n.lookupPeer(e.nodeID)
-		}
-		if !ok {
-			n.log.Debug("replication probe: no dial addr", "nodeID", e.nodeID, "profile", profile)
-			// Address unknown: count as a miss and retry soon.
-			rs.mu.Lock()
-			e.failCount++
-			e.nextProbeAt = time.Now().Add(probeInitDelay)
-			rs.mu.Unlock()
-			return
-		}
-
-		pctx, cancel := context.WithTimeout(ctx, queryPeerTimeout)
-		n.log.Debug("replication probe: ping", "nodeID", e.nodeID, "profile", profile, "addr", probeAddr, "ice_skip", probeSkip)
-		_, err = n.PingIdentity(pctx, probeAddr)
-		cancel()
-
-		if err != nil {
-			// PingIdentity called recordFailure internally (penalty++, backoff
-			// extended).  Since this is a dedicated health probe — not a "real"
-			// communication — undo the increment and halve the remaining back-off
-			// instead of growing it, giving the node a chance to recover.
-			n.recordProbeFailure(e.nodeID, probeAddr)
-		}
+		probeAddr = n.publicStableDialAddr(id, v6)
+		ok = probeAddr != nil
+	}
+	if !ok {
+		probeAddr, ok = n.lookupPeerHealthAware(id)
+	}
+	if !ok {
+		probeAddr, ok = n.lookupPeer(id)
+	}
+	if !ok {
+		n.log.Debug("replication probe: no dial addr", "nodeID", id, "profile", profile)
+		out.noAddr = true
+		return out
 	}
 
-	if !probeSkip && err == nil {
+	pctx, cancel := context.WithTimeout(ctx, queryPeerTimeout)
+	n.log.Debug("replication probe: ping", "nodeID", id, "profile", profile, "addr", probeAddr, "ice_skip", out.probeSkip)
+	_, err := n.PingIdentity(pctx, probeAddr)
+	cancel()
+	if err != nil {
+		// PingIdentity called recordFailure internally (penalty++, backoff
+		// extended).  Since this is a dedicated health probe — not a "real"
+		// communication — undo the increment and halve the remaining back-off
+		// instead of growing it, giving the node a chance to recover.
+		n.recordProbeFailure(id, probeAddr)
+	}
+	out.err = err
+	return out
+}
+
+// applyRepProbeOutcome updates one repSet entry from a shared probe result.
+func (n *Node) applyRepProbeOutcome(ctx context.Context, rk repKey, rs *repSet, e *repNodeEntry, out repProbeExecOutcome) {
+	if out.iceConnOK || (!out.probeSkip && !out.noAddr && out.err == nil) {
 		// Success: advance the exponential back-off, clear bad state.
 		rs.mu.Lock()
 		e.failCount = 0
@@ -1119,6 +1145,14 @@ func (n *Node) probeRepNode(ctx context.Context, rk repKey, rs *repSet, e *repNo
 		}
 		e.nextProbeDelay = next
 		e.nextProbeAt = time.Now().Add(next)
+		rs.mu.Unlock()
+		return
+	}
+
+	if out.noAddr {
+		rs.mu.Lock()
+		e.failCount++
+		e.nextProbeAt = time.Now().Add(probeInitDelay)
 		rs.mu.Unlock()
 		return
 	}
@@ -1157,7 +1191,7 @@ func (n *Node) probeRepNode(ctx context.Context, rk repKey, rs *repSet, e *repNo
 		// Phase 6 (过程三, Low priority): UDP has confirmed unreachable; try ICE.
 		// Skip if already triggered above (triggerPunch deduplicates anyway, but
 		// avoid the lock overhead).
-		if !punchAttempted {
+		if !out.punchAttempted {
 			if er := n.lookupEndpointRecord(e.nodeID); er != nil {
 				n.triggerPunch(e.nodeID, er, PunchPriorityLow)
 			}
@@ -1170,7 +1204,193 @@ func (n *Node) probeRepNode(ctx context.Context, rk repKey, rs *repSet, e *repNo
 	}
 }
 
+// prefetchNATEndpoints fetches and caches endpoint records for candidates in
+// xorPool that lack a locally-cached signal URL but are not known-public.
+//
+// Problem: pickGapFillPeers skips NAT candidates when lookupEndpointRecord
+// returns nil — it cannot punch to a node with no signal URL.  Nodes may
+// appear in xorPool (from FindNode traversal or tabNearest) without their
+// endpoint records having been cached locally, especially if we have never
+// called Resolve or connected to them.  Such nodes are classified ReachUnknown
+// (no local evidence) and would never pass prefersICEOverColdUDP() even though
+// they are prime candidates: they may be NAT-behind nodes whose records simply
+// haven't been fetched yet.
+//
+// Filter logic (applied before any network query):
+//
+//  1. Skip known-public peers (prefersUDPAnchor) — they use UDP anchors, not ICE.
+//  2. Skip nodes whose any cached endpoint record is already present
+//     (lookupEndpointRecordAny != nil): either a signal URL was found on a
+//     prior fetch (lookupEndpointRecord will return it), or we already know
+//     there is no signal URL — either way another FindRecords adds nothing.
+//  3. XOR gate: skip candidates that are farther than the current farthest
+//     replica (same gate used by pickGapFillPeers).  Even if we retrieved
+//     their endpoint record they would still be filtered out by the picker.
+//  4. Negative cache (epPrefetchNeg): skip nodes whose recent FindRecords
+//     failed, with two suppression tiers:
+//       - ErrNoMatchingRecords (confirmed absent): probeBadDelay (30 min).
+//         The network was queried and truly has no endpoint record; retrying
+//         sooner is wasteful.
+//       - Other error (timeout, network hiccup): exponential back-off from
+//         probeInitDelay (30 s), doubling each consecutive failure, capped at
+//         probeBadDelay.  A single transient failure retries within ~60 s;
+//         persistent failures converge to the same 30-min window.
+//     Entries are invalidated immediately when an endpoint record for the same
+//     nodeID is written to the local store via any path (LocalStorePut), so a
+//     node discovered through Resolve, Connect, or a push cannot remain
+//     suppressed even if it was previously neg-cached.
+//     Note: jobs not dispatched due to the overall fctx timeout are NOT
+//     neg-cached — they were never attempted, so no inference can be drawn.
+//
+// On success FindRecords (P0 fix) writes results into the local store so that
+// the immediately-following pickGapFillPeers call can find them.
+//
+// Concurrency is bounded to gapFillPunchBudget×2 goroutines.
+func (n *Node) prefetchNATEndpoints(ctx context.Context, storeKey a2al.NodeID, hasXorFarthest bool, xorFarthest a2al.NodeID, candidates []protocol.NodeInfo) {
+	type work struct{ id a2al.NodeID }
+	now := time.Now()
+	var jobs []work
+	for _, ni := range candidates {
+		var id a2al.NodeID
+		if len(ni.NodeID) != len(id) {
+			continue
+		}
+		copy(id[:], ni.NodeID)
+		if id == n.nid {
+			continue
+		}
+		// Filter 1: known-public peers use stable UDP anchors; ICE is not needed.
+		if n.reachProfile(id).prefersUDPAnchor() {
+			continue
+		}
+		// Filter 2: XOR gate — mirrors the same condition in pickGapFillPeers.
+		// A node farther than our current farthest replica would not be selected
+		// by the picker even if we retrieved its endpoint record.
+		// Applied before the store and neg-cache lookups (both of which acquire
+		// locks) because this check is a free computation.
+		if hasXorFarthest {
+			d := xorNodeID(id, storeKey)
+			if !xorGT(xorFarthest, d) {
+				continue
+			}
+		}
+		// Filter 3: any cached endpoint record means we already fetched and stored
+		// the result (with or without a signal URL); no need to query again.
+		if n.lookupEndpointRecordAny(id) != nil {
+			continue
+		}
+		// Filter 4: negative cache — skip recently-failed lookups.
+		n.epPrefetchNegMu.RLock()
+		negEntry, neg := n.epPrefetchNeg[nodeIDKey(id)]
+		n.epPrefetchNegMu.RUnlock()
+		if neg && now.Before(negEntry.retryAt) {
+			continue
+		}
+		jobs = append(jobs, work{id: id})
+	}
+	if len(jobs) == 0 {
+		return
+	}
+
+	fctx, cancel := context.WithTimeout(ctx, natEndpointFetchTimeout)
+	defer cancel()
+
+	sem := make(chan struct{}, gapFillPunchBudget*2)
+	var wg sync.WaitGroup
+	for _, j := range jobs {
+		select {
+		case sem <- struct{}{}:
+		case <-fctx.Done():
+			// Remaining jobs were not dispatched due to the overall prefetch
+			// timeout.  We do NOT write neg-cache entries for them: a timeout
+			// reflects local budget pressure, not a confirmed absence of an
+			// endpoint record on the network.  The next gap-fill cycle will
+			// retry them normally.
+			return
+		}
+		wg.Add(1)
+		go func(nodeID a2al.NodeID) {
+			defer func() {
+				<-sem
+				wg.Done()
+			}()
+			q := NewQuery(n)
+			_, err := q.FindRecords(fctx, nodeID, protocol.RecTypeEndpoint)
+			if err == nil {
+				return
+			}
+			key := nodeIDKey(nodeID)
+			writeNow := time.Now()
+
+			n.epPrefetchNegMu.Lock()
+			existing := n.epPrefetchNeg[key]
+
+			var retryAt time.Time
+			var nextFailCount int
+			if errors.Is(err, ErrNoMatchingRecords) {
+				// Confirmed absent: the iterative query traversed the network and
+				// found no endpoint record.  Jump straight to the maximum suppression
+				// window; pin failCount at cap so any subsequent transient failure
+				// also stays at probeBadDelay without risking shift overflow.
+				retryAt = writeNow.Add(probeBadDelay)
+				nextFailCount = epPrefetchFailCountCap
+			} else {
+				// Transient failure (timeout, network error): exponential back-off
+				// starting at probeInitDelay, doubling each failure, capped at
+				// probeBadDelay.  After epPrefetchFailCountCap consecutive failures
+				// the interval reaches probeBadDelay and stays there — same
+				// long-term behaviour as before, but with faster recovery after a
+				// single network hiccup.
+				//
+				// failCount is read from the zero-value entry on first failure
+				// (nextFailCount = 0+1 = 1 → 60 s), which is intentional.
+				nextFailCount = existing.failCount + 1
+				if nextFailCount > epPrefetchFailCountCap {
+					nextFailCount = epPrefetchFailCountCap
+				}
+				delay := probeInitDelay << nextFailCount
+				if delay > probeBadDelay {
+					delay = probeBadDelay
+				}
+				retryAt = writeNow.Add(delay)
+			}
+			n.epPrefetchNeg[key] = epPrefetchNegEntry{retryAt: retryAt, failCount: nextFailCount}
+
+			// Evict expired entries to bound map growth over long sessions.
+			for k, e := range n.epPrefetchNeg {
+				if writeNow.After(e.retryAt) {
+					delete(n.epPrefetchNeg, k)
+				}
+			}
+			n.epPrefetchNegMu.Unlock()
+		}(j.id)
+	}
+	wg.Wait()
+}
+
+// natEndpointFetchTimeout is the wall-clock budget for a prefetchNATEndpoints
+// call.  Each FindRecords can take up to queryPeerTimeout per hop; 5 s gives
+// one full iterative query round-trip time with a small margin.
+const natEndpointFetchTimeout = 5 * time.Second
+
 // ─── XOR distance helpers ────────────────────────────────────────────────────
+
+// xorFarthestInRepSet returns the XOR distance (relative to rs.storeKey) of
+// the farthest node currently in rs.  Used by prefetchNATEndpoints to apply
+// the same XOR gate as pickGapFillPeers: there is no point fetching the
+// endpoint record of a node that is farther than every existing replica.
+func xorFarthestInRepSet(rs *repSet) (far a2al.NodeID, ok bool) {
+	rs.mu.Lock()
+	for _, e := range rs.nodes {
+		d := xorNodeID(e.nodeID, rs.storeKey)
+		if !ok || xorGT(d, far) {
+			far = d
+			ok = true
+		}
+	}
+	rs.mu.Unlock()
+	return
+}
 
 func xorNodeID(a, b a2al.NodeID) a2al.NodeID {
 	var d a2al.NodeID
