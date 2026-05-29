@@ -100,24 +100,35 @@ func (n *Node) exchangeAfterPunch(nodeID a2al.NodeID, peerAddr net.Addr) {
 }
 
 // triggerStoreAfterPunch enqueues a replication task for every locally-owned
-// record (repSet) that has fewer than nRep confirmed remote replicas.
+// record (repSet) that has room in at least one replication track.
 //
-// After a successful punch the punched node is already in the routing table.
-// processReplTask (run asynchronously by the replication maintainer) will
-// discover it via tabNearestHealthy and send STORE if it is XOR-close enough.
+// §8.2 dual-set: the direct track and the punched (XOR-near) track each target
+// nRep replicas independently.  A repSet with 4 direct + 4 punched members
+// (total = nRep) has nRep-4 = 4 open slots in each track — it clearly needs
+// more replicas.  Using the total count (nRep - len(rs.nodes)) would compute 0
+// for such a repSet and skip it entirely, preventing evicted-then-recovered
+// nodes (e.g. a public peer that was temporarily offline) from rejoining.
 //
-// This is a best-effort optimisation: repSets that are already full will be
-// re-evaluated on the next regular renewBackground cycle, not immediately.
+// After a successful punch the punched node is in the routing table (marked
+// direct or punched depending on isDirect).  processReplTask, run
+// asynchronously by the replication maintainer, will discover it via
+// tabNearestHealthy/tabNearest and send STORE if it qualifies.
 func (n *Node) triggerStoreAfterPunch() {
 	n.repMu.Lock()
 	defer n.repMu.Unlock()
 	for rk, rs := range n.repSets {
 		rs.mu.Lock()
 		hasRec := len(rs.rec.Address) > 0
-		need := nRep - len(rs.nodes)
+		var directCount, punchedCount int
+		for _, e := range rs.nodes {
+			if e.isPunched {
+				punchedCount++
+			} else {
+				directCount++
+			}
+		}
 		rs.mu.Unlock()
-		if hasRec && need > 0 {
-			// Zero SignedRecord signals processReplTask to use the existing record.
+		if hasRec && (directCount < nRep || punchedCount < nRep) {
 			n.enqueueReplication(rk, protocol.SignedRecord{})
 		}
 	}

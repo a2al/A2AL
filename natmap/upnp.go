@@ -22,6 +22,10 @@ import (
 
 const upnpDescription = "a2al-quic"
 
+// maxPortTry is the number of consecutive external ports tried when the preferred
+// port is already mapped to a different internal host (same-LAN conflict).
+const maxPortTry = 10
+
 // MapUDPPort asks the LAN IGD to forward UDP externalPort -> internalClient:internalPort
 // using the same port number on the WAN side (required for predictable QUIC URLs).
 // Returns cleanup (DeletePortMapping). Errors if no gateway or mapping is rejected.
@@ -72,27 +76,29 @@ func mapWANIP1(ctx context.Context, client *internetgateway1.WANIPConnection1, i
 		return "", 0, nil, fmt.Errorf("natmap: bad external IP %q", extIP)
 	}
 
-	extPort := uint16(internalPort)
-	err = client.AddPortMappingCtx(ctx,
-		"",
-		extPort,
-		"UDP",
-		uint16(internalPort),
-		internalClient,
-		true,
-		upnpDescription,
-		3600,
-	)
-	if err != nil {
-		return "", 0, nil, err
-	}
+	for try := 0; try < maxPortTry; try++ {
+		extPort := uint16(internalPort + try)
 
-	cleanup := func() {
-		cctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-		_ = client.DeletePortMappingCtx(cctx, "", extPort, "UDP")
+		// Check whether this external port is already claimed by a different internal host.
+		_, existingClient, enabled, _, _, qerr := client.GetSpecificPortMappingEntryCtx(ctx, "", extPort, "UDP")
+		if qerr == nil && enabled && existingClient != internalClient {
+			continue // Conflict: another LAN host owns this external port; try the next one.
+		}
+
+		if merr := client.AddPortMappingCtx(ctx, "", extPort, "UDP",
+			uint16(internalPort), internalClient, true, upnpDescription, 3600); merr != nil {
+			continue // Rare race or transient error; try the next port.
+		}
+
+		ep := extPort // capture for closure
+		cleanup := func() {
+			cctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			_ = client.DeletePortMappingCtx(cctx, "", ep, "UDP")
+		}
+		return extIP, int(extPort), cleanup, nil
 	}
-	return extIP, int(extPort), cleanup, nil
+	return "", 0, nil, fmt.Errorf("natmap: no free external port in [%d, %d)", internalPort, internalPort+maxPortTry)
 }
 
 func mapWANPPP1(ctx context.Context, client *internetgateway1.WANPPPConnection1, internalPort int, internalClient string) (string, int, func(), error) {
@@ -104,27 +110,29 @@ func mapWANPPP1(ctx context.Context, client *internetgateway1.WANPPPConnection1,
 		return "", 0, nil, fmt.Errorf("natmap: bad external IP %q", extIP)
 	}
 
-	extPort := uint16(internalPort)
-	err = client.AddPortMappingCtx(ctx,
-		"",
-		extPort,
-		"UDP",
-		uint16(internalPort),
-		internalClient,
-		true,
-		upnpDescription,
-		3600,
-	)
-	if err != nil {
-		return "", 0, nil, err
-	}
+	for try := 0; try < maxPortTry; try++ {
+		extPort := uint16(internalPort + try)
 
-	cleanup := func() {
-		cctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-		_ = client.DeletePortMappingCtx(cctx, "", extPort, "UDP")
+		// Check whether this external port is already claimed by a different internal host.
+		_, existingClient, enabled, _, _, qerr := client.GetSpecificPortMappingEntryCtx(ctx, "", extPort, "UDP")
+		if qerr == nil && enabled && existingClient != internalClient {
+			continue // Conflict: another LAN host owns this external port; try the next one.
+		}
+
+		if merr := client.AddPortMappingCtx(ctx, "", extPort, "UDP",
+			uint16(internalPort), internalClient, true, upnpDescription, 3600); merr != nil {
+			continue // Rare race or transient error; try the next port.
+		}
+
+		ep := extPort // capture for closure
+		cleanup := func() {
+			cctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			_ = client.DeletePortMappingCtx(cctx, "", ep, "UDP")
+		}
+		return extIP, int(extPort), cleanup, nil
 	}
-	return extIP, int(extPort), cleanup, nil
+	return "", 0, nil, fmt.Errorf("natmap: no free external port in [%d, %d)", internalPort, internalPort+maxPortTry)
 }
 
 // LocalIPv4ForUPnP returns an IPv4 address suitable as IGD "internal client"

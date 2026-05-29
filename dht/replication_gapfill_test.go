@@ -84,3 +84,57 @@ func TestPickGapFillPeers_punchBudget(t *testing.T) {
 		t.Fatalf("nat=%d, want %d", len(nat), gapFillPunchBudget)
 	}
 }
+
+// TestPickGapFillPeers_qualityDisplacement verifies that when the direct track
+// is full (directNeed=0) but punched members exist, one direct candidate that
+// is XOR-closer than the farthest punched member is included for quality
+// displacement.  This covers re-admission of a node that was evicted and later
+// recovered as a directly-reachable peer.
+func TestPickGapFillPeers_qualityDisplacement(t *testing.T) {
+	netw := transport.NewMemNetwork()
+	tr, _ := netw.NewTransport("gapfill-quality")
+	defer tr.Close()
+	n := newTestNode(t, tr, &mockPunch{})
+	n.Start()
+	defer n.Close()
+
+	var key a2al.NodeID // zero key
+
+	// Fill the direct track to capacity: nRep direct nodes at distances 50..57.
+	rs := makeRepSet(key)
+	rs.storeKey = key
+	for i := 0; i < nRep; i++ {
+		var id a2al.NodeID
+		id[31] = byte(50 + i)
+		rs.nodes[nodeIDKey(id)] = &repNodeEntry{nodeID: id, isPunched: false}
+	}
+	// Add 2 punched members at distances 100 and 101 (farther than all direct nodes).
+	var p1, p2 a2al.NodeID
+	p1[31] = 100
+	p2[31] = 101
+	rs.nodes[nodeIDKey(p1)] = &repNodeEntry{nodeID: p1, isPunched: true}
+	rs.nodes[nodeIDKey(p2)] = &repNodeEntry{nodeID: p2, isPunched: true}
+
+	// Quality candidate: NodeID at XOR distance 1 from key (closer than punched
+	// nodes at 100/101).  Bind an anchor so reachProfile returns ReachPublic
+	// (prefersICEOverColdUDP = false) — simulating a reclassified-as-direct node.
+	var closeID a2al.NodeID
+	closeID[31] = 1
+	n.BindPeerAnchor(closeID, &net.UDPAddr{IP: net.IPv4(10, 0, 0, 3), Port: 4121})
+	qualityNI := protocol.NodeInfo{NodeID: append([]byte(nil), closeID[:]...)}
+
+	existing := make(map[string]struct{})
+	for k := range rs.nodes {
+		existing[k] = struct{}{}
+	}
+
+	direct, _ := n.pickGapFillPeers(key, rs,
+		[]protocol.NodeInfo{qualityNI}, // directPool: only the quality candidate
+		nil,                            // xorPool: not testing NAT track here
+		existing,
+	)
+
+	if len(direct) != 1 {
+		t.Fatalf("direct=%d, want 1 (quality-displacement candidate should be included when XOR-closer than worst punched member)", len(direct))
+	}
+}

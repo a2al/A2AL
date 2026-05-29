@@ -542,25 +542,37 @@ func (n *Node) pickGapFillPeers(storeKey a2al.NodeID, rs *repSet, directPool, xo
 		return nil, nil
 	}
 
-	// Compute the farthest XOR distance in the existing repSet. Used as a gate
-	// for the NAT track: only XOR-closer candidates are worth punching to.
+	// Single pass: compute both the overall farthest XOR distance (NAT-track gate)
+	// and the farthest punched member's distance (quality-displacement gate).
+	//
+	// NAT gate: only XOR-closer candidates are worth punching to.
 	// NOTE: xorFarthestInRepSet performs the same computation for the prefetch
 	// path.  The two are intentionally kept separate so pickGapFillPeers remains
 	// self-contained; if this gate logic ever changes, update both sites.
-	var xorFarthest a2al.NodeID
-	hasXorFarthest := false
+	//
+	// Quality-displacement: when the direct track is at capacity (directNeed=0)
+	// but punched members exist, one direct candidate that is XOR-closer than
+	// the farthest punched member is admitted.  rebalanceRepSets then recomputes
+	// global XOR-set and direct-set membership and evicts the global-worst entry
+	// (not necessarily that specific punched node).  This enables a recovered
+	// direct node to re-enter the repSet without waiting for the next TTL renewal.
+	var xorFarthest, xorFarthestPunched a2al.NodeID
+	hasXorFarthest, hasXorFarthestPunched := false, false
 	rs.mu.Lock()
 	for _, e := range rs.nodes {
 		d := xorNodeID(e.nodeID, storeKey)
 		if !hasXorFarthest || xorGT(d, xorFarthest) {
-			xorFarthest = d
-			hasXorFarthest = true
+			xorFarthest, hasXorFarthest = d, true
+		}
+		if e.isPunched && (!hasXorFarthestPunched || xorGT(d, xorFarthestPunched)) {
+			xorFarthestPunched, hasXorFarthestPunched = d, true
 		}
 	}
 	rs.mu.Unlock()
+	qualitySlotUsed := false
 
 	for _, ni := range directPool {
-		if directNeed <= 0 {
+		if directNeed <= 0 && (!hasXorFarthestPunched || qualitySlotUsed) {
 			break
 		}
 		k := infoKey(ni)
@@ -581,8 +593,16 @@ func (n *Node) pickGapFillPeers(storeKey a2al.NodeID, rs *repSet, directPool, xo
 		if n.reachProfile(id).prefersICEOverColdUDP() {
 			continue
 		}
-		direct = append(direct, ni)
-		directNeed--
+		if directNeed > 0 {
+			direct = append(direct, ni)
+			directNeed--
+		} else if hasXorFarthestPunched && !qualitySlotUsed {
+			d := xorNodeID(id, storeKey)
+			if xorGT(xorFarthestPunched, d) {
+				direct = append(direct, ni)
+				qualitySlotUsed = true
+			}
+		}
 	}
 
 	punchBudget := gapFillPunchBudget
@@ -815,150 +835,34 @@ func (n *Node) runHealthProbes(ctx context.Context) {
 }
 
 // Per-cycle resource limits for the routing maintenance loop.
-// The loop fires every probeTickInterval (15 s); these caps bound the total
-// PING time per cycle to roughly:
-//   max = (maintPendingPerCycle + maintStalePerCycle) × 3 s = 45 s
-// In practice most PINGs complete in < 100 ms (LAN/good-WAN), so a typical
-// cycle finishes well within the 15 s tick.  Nodes not probed this cycle
-// remain in pending/main and will be re-evaluated next cycle.
 const (
-	maintPendingPerCycle = 5  // max pending-list PINGs per heartbeat
-	maintStalePerCycle   = 10 // max stale-unverified main-bucket PINGs per heartbeat
-	maintRefillPerCycle  = 2  // max FindNode refill queries launched per heartbeat
+	maintRefillPerCycle = 2 // max FindNode refill queries launched per heartbeat
 
-	// stalePunchBucketThreshold is the minimum bucket index (CPL) at which a
-	// stale-probe failure triggers ICE instead of (or in addition to) immediate
-	// removal.  Bucket ≥ 3 means the peer occupies ≤ 1/16 of the key space and
-	// is hard to replace; the ICE cost is justified by the routing value.
-	stalePunchBucketThreshold = 3
+	// hearsayProbeBucketThreshold is the minimum bucket index (CPL) at which a
+	// newly absorbed hearsay node gets a single opportunistic PING.
+	// Bucket ≥ 3 means the peer occupies ≤ 1/16 of the key space and is
+	// routing-critical; one probe attempt is worthwhile to promote it quickly.
+	hearsayProbeBucketThreshold = 3
 )
 
 // runRoutingMaintenance performs one pass of routing table upkeep:
-//  1. PINGs a capped batch of pending-list nodes; promotes successful ones.
-//  2. PINGs a capped batch of stale unverified main-bucket nodes; removes failures.
-//  3. Launches at most maintRefillPerCycle background FindNode queries for
-//     under-filled buckets, prioritising higher-CPL (closer-to-self) buckets.
+// Launches at most maintRefillPerCycle background FindNode queries for
+// under-filled buckets, prioritising higher-CPL (closer-to-self) buckets.
+//
+// Hearsay nodes are verified lazily: they gain VerifiedAt only through
+// natural RPC traffic (StoreAt, FindNode responses) or the opportunistic
+// single-probe fired by absorbNodeInfo for XOR-close nodes.
 //
 // Called by runHealthProbes every probeTickInterval (15 s).
-// All three steps are strictly rate-limited to prevent blocking repSet probing
-// and to avoid sending a FindNode storm during startup or after large network churn.
 func (n *Node) runRoutingMaintenance(ctx context.Context) {
 	now := time.Now()
 	freshCutoff := now.Add(-verifiedFreshWindow)
-	staleCutoff := now.Add(-verifiedFreshWindow) // same threshold: 30 min unverified → probe
 
 	n.tabMu.Lock()
-	work := n.table.CollectMaintenanceWork(now, freshCutoff, staleCutoff)
+	work := n.table.CollectMaintenanceWork(now, freshCutoff, freshCutoff)
 	n.tabMu.Unlock()
 
-	// 1. PING pending entries — at most maintPendingPerCycle per heartbeat.
-	// Remainder stays in the pending list and is retried next cycle.
-	pending := work.PendingToProbe
-	if len(pending) > maintPendingPerCycle {
-		pending = pending[:maintPendingPerCycle]
-	}
-	for _, ni := range pending {
-		if ctx.Err() != nil {
-			return
-		}
-		var id a2al.NodeID
-		if len(ni.NodeID) != len(id) {
-			continue
-		}
-		copy(id[:], ni.NodeID)
-		addr, ok := n.lookupPeer(id)
-		if !ok {
-			// No dial address yet: try to use the IP:Port from NodeInfo.
-			if len(ni.IP) > 0 && ni.Port != 0 {
-				addr = &net.UDPAddr{IP: append([]byte(nil), ni.IP...), Port: int(ni.Port)}
-				n.BindPeerAddr(id, addr)
-			} else {
-				n.tabMu.Lock()
-				n.table.MarkPendingFailed(id)
-				n.tabMu.Unlock()
-				continue
-			}
-		}
-		pctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-		_, err := n.PingIdentity(pctx, addr)
-		cancel()
-		if err == nil {
-			// PingIdentity → recordSuccess → UpdateVerifiedAt already ran.
-			// Now move the entry from pending to the main bucket.
-			n.tabMu.Lock()
-			n.table.MarkPendingVerified(id, routing.EntryMeta{VerifiedAt: time.Now()}, time.Now())
-			n.tabMu.Unlock()
-		} else {
-			// Probe failure: undo the failCount++ that PingIdentity's recordFailure
-			// applied.  Pending nodes have no prior communication history; their
-			// failure must not push them into PeerHealthBad.
-			n.recordProbeFailure(id, addr)
-			n.tabMu.Lock()
-			n.table.MarkPendingFailed(id)
-			n.tabMu.Unlock()
-		}
-	}
-
-	// 2. PING stale unverified main-bucket entries — at most maintStalePerCycle.
-	stale := work.StaleToProbe
-	if len(stale) > maintStalePerCycle {
-		stale = stale[:maintStalePerCycle]
-	}
-	for _, ni := range stale {
-		if ctx.Err() != nil {
-			return
-		}
-		var id a2al.NodeID
-		if len(ni.NodeID) != len(id) {
-			continue
-		}
-		copy(id[:], ni.NodeID)
-		addr, ok := n.lookupPeer(id)
-		if !ok {
-			if len(ni.IP) > 0 && ni.Port != 0 {
-				addr = &net.UDPAddr{IP: append([]byte(nil), ni.IP...), Port: int(ni.Port)}
-				n.BindPeerAddr(id, addr)
-			} else {
-				// No address available: treat as failed, remove from main bucket.
-				n.tabMu.Lock()
-				n.table.Remove(id)
-				n.tabMu.Unlock()
-				continue
-			}
-		}
-
-		// For high-CPL buckets (≥ stalePunchBucketThreshold), nodes occupy a
-		// small slice of key space and are hard to replace.  If an endpoint
-		// record with a signal URL is available, trigger ICE speculatively
-		// before the UDP probe so both paths run in parallel.  At this point the
-		// health entry is nil (hearsay, never contacted), which lets the request
-		// bypass triggerPunch's punchMinBackoff gate naturally.  If ICE succeeds,
-		// OnPunchComplete re-adds the node as verified even if the UDP probe fails.
-		if routing.BucketIndex(n.nid, id) >= stalePunchBucketThreshold {
-			if er := n.lookupEndpointRecord(id); er != nil {
-				n.triggerPunch(id, er, PunchPriorityHigh)
-			}
-		}
-
-		pctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-		_, err := n.PingIdentity(pctx, addr)
-		cancel()
-		if err != nil {
-			// Probe failure: undo failCount increment (same reasoning as pending).
-			n.recordProbeFailure(id, addr)
-			// When network is suspected down, retain the node in the routing
-			// table so it is available for ObserveFromRouting once connectivity
-			// is restored. Normal removal resumes as soon as any RPC succeeds.
-			if !n.suspectOffline() {
-				n.tabMu.Lock()
-				n.table.Remove(id)
-				n.tabMu.Unlock()
-			}
-		}
-		// Success: PingIdentity → recordSuccess → UpdateVerifiedAt handled it.
-	}
-
-	// 3. Refill under-filled buckets — at most maintRefillPerCycle FindNode queries.
+	// Refill under-filled buckets — at most maintRefillPerCycle FindNode queries.
 	// Sort descending by bucket index so higher-CPL (closer-to-self, routing-critical)
 	// buckets are served first when the cap binds.
 	//

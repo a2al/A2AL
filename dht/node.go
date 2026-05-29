@@ -315,6 +315,7 @@ type Node struct {
 	// The entry is deleted whenever an endpoint record for the same nodeID is
 	// written to the local store by any code path (see clearEpPrefetchNeg).
 	epPrefetchNeg map[string]epPrefetchNegEntry // nodeIDKey(id) → entry
+
 }
 
 type waitEntry struct {
@@ -914,6 +915,7 @@ func (n *Node) recordSuccess(id a2al.NodeID, addr net.Addr, rtt time.Duration) {
 	n.tabMu.Lock()
 	n.table.UpdateVerifiedAt(id, now)
 	n.tabMu.Unlock()
+
 }
 
 // recordFailure increments the consecutive-failure counter for the address
@@ -1246,6 +1248,12 @@ func (n *Node) EstimatedNetworkSizeFiltered(cutoff time.Time) (int, float64) {
 // when IP:port looks usable, registers the UDP dial address.
 // learnedFrom is the NodeID of the peer whose FIND_NODE response included ni
 // (zero value if the source is unknown or it is a local routing-table seed).
+//
+// For XOR-close hearsay nodes (bucket ≥ hearsayProbeBucketThreshold) that have
+// never been contacted before, a single opportunistic PING is fired in the
+// background.  This is fire-and-forget: no retry on failure, no removal from the
+// routing table on failure.  Success promotes the entry to verified via the
+// normal recordSuccess path.
 func (n *Node) absorbNodeInfo(ni protocol.NodeInfo, learnedFrom a2al.NodeID) {
 	meta := routing.EntryMeta{LearnedFrom: learnedFrom} // VerifiedAt zero = hearsay
 	n.tabAdd(ni, meta, nil)
@@ -1259,6 +1267,21 @@ func (n *Node) absorbNodeInfo(ni protocol.NodeInfo, learnedFrom a2al.NodeID) {
 	copy(id[:], ni.NodeID)
 	udp := &net.UDPAddr{IP: append([]byte(nil), ni.IP...), Port: int(ni.Port)}
 	n.bindPeerLive(id, udp, rankHearsay)
+
+	// Opportunistic single probe for routing-critical hearsay nodes.
+	if routing.BucketIndex(n.nid, id) >= hearsayProbeBucketThreshold {
+		n.healthMu.RLock()
+		hasHistory := n.health[nodeIDKey(id)] != nil
+		n.healthMu.RUnlock()
+		if !hasHistory {
+			addr := udp // capture for goroutine
+			go func() {
+				pctx, cancel := context.WithTimeout(n.ctx, rpcAttemptTimeout)
+				defer cancel()
+				n.PingIdentity(pctx, addr) //nolint:errcheck — fire-and-forget
+			}()
+		}
+	}
 }
 
 func (n *Node) bindPeerLive(id a2al.NodeID, addr net.Addr, rank addrRank) {

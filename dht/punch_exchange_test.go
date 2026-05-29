@@ -147,3 +147,94 @@ func TestExchangeAfterPunch_badNodeFiltered(t *testing.T) {
 		t.Error("nodeD (PeerHealthBad) should NOT be absorbed during exchange")
 	}
 }
+
+// TestTriggerStoreAfterPunch_perTrackGate is a regression test for the bug
+// where triggerStoreAfterPunch computed need = nRep - len(rs.nodes) and
+// skipped a repSet that had total=nRep nodes but open slots in both tracks.
+//
+// Example: 4 direct + 4 punched = 8 total = nRep.
+// Old gate: nRep - 8 = 0 → skip.  ← BUG: both tracks still need 4 more each.
+// New gate: directCount(4) < nRep(8) → trigger.
+func TestTriggerStoreAfterPunch_perTrackGate(t *testing.T) {
+	netw := transport.NewMemNetwork()
+	tr, _ := netw.NewTransport("trig-gate")
+	defer tr.Close()
+	// Do NOT call n.Start() — we want replCh to accumulate items without the
+	// background replMaintainer consuming them mid-test.
+	n := newTestNode(t, tr, nil)
+
+	_, _, rec := makeSignedEndpointRecord(t, "ws://sig/test")
+
+	rk := repKey{}
+	rs := &repSet{
+		storeKey: rk.storeKey,
+		rec:      rec,
+		nodes:    make(map[string]*repNodeEntry),
+	}
+	// 4 direct + 4 punched = nRep total; both tracks have 4 open slots.
+	for i := 0; i < 4; i++ {
+		var id a2al.NodeID
+		id[31] = byte(i + 1)
+		rs.nodes[nodeIDKey(id)] = &repNodeEntry{nodeID: id, isPunched: false}
+	}
+	for i := 0; i < 4; i++ {
+		var id a2al.NodeID
+		id[31] = byte(i + 50)
+		rs.nodes[nodeIDKey(id)] = &repNodeEntry{nodeID: id, isPunched: true}
+	}
+
+	n.repMu.Lock()
+	n.repSets[rk] = rs
+	n.repMu.Unlock()
+
+	n.triggerStoreAfterPunch()
+
+	select {
+	case <-n.replCh:
+		// expected
+	default:
+		t.Error("triggerStoreAfterPunch must enqueue a task when either track has room (4+4=8 nodes, both tracks need 4 more)")
+	}
+}
+
+// TestTriggerStoreAfterPunch_fullBothTracks verifies that triggerStoreAfterPunch
+// does NOT enqueue when both direct and punched tracks are at nRep capacity.
+func TestTriggerStoreAfterPunch_fullBothTracks(t *testing.T) {
+	netw := transport.NewMemNetwork()
+	tr, _ := netw.NewTransport("trig-full")
+	defer tr.Close()
+	n := newTestNode(t, tr, nil) // no Start() — avoid race with replMaintainer
+
+	_, _, rec := makeSignedEndpointRecord(t, "ws://sig/test")
+
+	rk := repKey{}
+	rs := &repSet{
+		storeKey: rk.storeKey,
+		rec:      rec,
+		nodes:    make(map[string]*repNodeEntry),
+	}
+	// nRep direct + nRep punched = repHardCap total; both tracks are full.
+	for i := 0; i < nRep; i++ {
+		var id a2al.NodeID
+		id[31] = byte(i + 1)
+		rs.nodes[nodeIDKey(id)] = &repNodeEntry{nodeID: id, isPunched: false}
+	}
+	for i := 0; i < nRep; i++ {
+		var id a2al.NodeID
+		id[30] = byte(i + 1)
+		rs.nodes[nodeIDKey(id)] = &repNodeEntry{nodeID: id, isPunched: true}
+	}
+
+	n.repMu.Lock()
+	n.repSets[rk] = rs
+	n.repMu.Unlock()
+
+	n.triggerStoreAfterPunch()
+
+	select {
+	case <-n.replCh:
+		t.Error("triggerStoreAfterPunch must NOT enqueue when both tracks are at nRep capacity")
+	default:
+		// expected: no task enqueued
+	}
+}
