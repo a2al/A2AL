@@ -440,15 +440,24 @@ func (d *Daemon) Run(ctx context.Context, mcpStdio bool) error {
 	// (resolve, discover, publish) will return errors or empty results until
 	// bootstrap completes, which is correct behaviour.
 	go func() {
-		if urls := runBootstrapChain(netCtx, d.h, d.cfg, d.dataDir, d.log, d.beacon); len(urls) > 0 {
-			d.h.SetBootstrapHubURLs(urls)
-		}
-		d.h.RunNATProbe(netCtx) // active NAT classification after bootstrap
-		// Populate routing-table hub candidates after NAT probe so NATFullCone is known.
-		d.h.SetRoutingHubCandidates(d.h.DeriveRoutingHubURLs(maxSignalCandidates))
-		// Start signal pool before initial publish so hubs can connect during
-		// the endpoint probe window (~1–2 s), reducing startup double-publishes.
+		// Signal pool starts immediately: runSignalSlot polls effectiveICESignalURLs()
+		// every 5 s when no URLs are available yet, so starting early is safe.
+		// If config already has ice_signal_urls, hubs connect before bootstrap finishes.
+		// For the dynamic case, hub URLs are set by runBootstrapChain below and the
+		// slots pick them up on the next poll cycle (≤5 s).
 		go d.runICEListener(netCtx)
+
+		joined := runBootstrapChain(netCtx, d.h, d.cfg, d.dataDir, d.log, d.beacon)
+		// Retry trusted seeds in the background regardless of the initial result.
+		go d.startColdStartRetry(netCtx, joined)
+		// NAT probe classifies the node's connectivity and populates routing-table
+		// hub candidates. It runs in the background so initialAutoPublish can start
+		// immediately; the republish loop will re-publish with updated NAT info once
+		// the probe completes (typically within a few seconds).
+		go func() {
+			d.h.RunNATProbe(netCtx)
+			d.h.SetRoutingHubCandidates(d.h.DeriveRoutingHubURLs(maxSignalCandidates))
+		}()
 		d.initialAutoPublish(netCtx)
 		d.beacon.start(netCtx, func() []a2al.NodeID { return d.allAgentKeys() })
 		d.h.SetBeaconStatsProvider(d.beacon.Stats)

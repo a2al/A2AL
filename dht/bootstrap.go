@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/a2al/a2al"
@@ -21,10 +22,9 @@ import (
 const storeStagger = 200 * time.Millisecond
 
 // BootstrapAddrs connects to seed nodes by raw network addresses (ip:port only).
-// For each address it sends PING, extracts the peer's identity from the PONG,
-// registers the peer, then runs FIND_NODE(self) to widen the routing table.
-// This is the recommended bootstrap entry point — callers do not need to know
-// the seed's Address or NodeID in advance.
+// All pings run concurrently; FindNode(self) is launched as soon as the first
+// peer responds, without waiting for slower or failing seeds. This ensures the
+// routing table starts widening at the earliest possible moment.
 func (n *Node) BootstrapAddrs(ctx context.Context, addrs []net.Addr) error {
 	if n == nil {
 		return errors.New("dht: nil node")
@@ -39,9 +39,11 @@ func (n *Node) BootstrapAddrs(ctx context.Context, addrs []net.Addr) error {
 	for _, a := range addrs {
 		a := a
 		go func() {
-			pctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-			defer cancel()
-			pi, err := n.PingIdentity(pctx, a)
+			// Use ctx directly so sendAndWait's internal retry mechanism
+			// (rpcMaxAttempts × rpcAttemptTimeout) can fire. An additional
+			// per-ping deadline would cap the inner attempt context and prevent
+			// any retry before the outer context expires.
+			pi, err := n.PingIdentity(ctx, a)
 			if err != nil {
 				n.log.Debug("bootstrap ping failed", "addr", a, "err", err)
 				ch <- pingResult{addr: a}
@@ -51,24 +53,49 @@ func (n *Node) BootstrapAddrs(ctx context.Context, addrs []net.Addr) error {
 			ch <- pingResult{addr: a, ok: true}
 		}()
 	}
+
+	// findNodeDone is closed when FindNode(self) completes. It is created before
+	// any ping result arrives so BootstrapAddrs can wait on it unconditionally.
+	findNodeDone := make(chan struct{})
+
+	// findNodeOnce triggers FindNode on the first successful ping so routing table
+	// expansion overlaps with the remaining in-flight pings. BootstrapAddrs waits
+	// for completion before returning, ensuring the caller's context (which has a
+	// deadline from tryBootstrap) stays alive for the full FindNode traversal.
+	var findNodeOnce sync.Once
+	launchFindNode := func() {
+		findNodeOnce.Do(func() {
+			go func() {
+				defer close(findNodeDone)
+				q := NewQuery(n)
+				peers, err := q.FindNode(ctx, n.nid)
+				if err != nil {
+					n.log.Debug("bootstrap FindNode(self) failed", "err", err)
+				} else {
+					n.log.Debug("bootstrap FindNode(self) done", "peers_found", len(peers))
+				}
+			}()
+		})
+	}
+
 	contacted := 0
 	for range addrs {
-		if (<-ch).ok {
+		r := <-ch
+		if r.ok {
 			contacted++
+			launchFindNode()
 		}
 	}
 
 	if contacted == 0 && len(addrs) > 0 {
 		return errors.New("dht: all bootstrap seeds unreachable")
 	}
-	if contacted > 0 {
-		q := NewQuery(n)
-		peers, err := q.FindNode(ctx, n.nid)
-		if err != nil {
-			n.log.Debug("bootstrap FindNode(self) failed", "err", err)
-		} else {
-			n.log.Debug("bootstrap FindNode(self) done", "peers_found", len(peers))
-		}
+	// Wait for FindNode to finish. If no peer was contacted the channel is never
+	// closed; in that case we already returned the error above, so this select is
+	// only reached when contacted > 0 (FindNode was launched).
+	select {
+	case <-findNodeDone:
+	case <-ctx.Done():
 	}
 	return nil
 }

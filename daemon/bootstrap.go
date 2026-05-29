@@ -6,85 +6,146 @@ package daemon
 import (
 	"context"
 	"encoding/hex"
+	"log/slog"
 	"net"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/a2al/a2al/config"
 	"github.com/a2al/a2al/host"
 	"github.com/a2al/a2al/internal/peerscache"
+	"github.com/a2al/a2al/internal/retry"
 	"github.com/a2al/a2al/signaling"
-	"log/slog"
 )
 
 const dnsBootstrapName = "_a2al-bootstrap.a2al.org"
 
-// runBootstrapChain joins the DHT, then derives ICE signal hub candidates from
-// trusted sources (config or DNS TXT only). peers.cache is used for fast DHT
-// cold-start but is explicitly excluded from signal URL derivation, since it
-// contains arbitrary DHT peers rather than designated signaling infrastructure.
-func runBootstrapChain(ctx context.Context, h *host.Host, cfg *config.Config, dataDir string, log *slog.Logger, bm *beaconManager) []string {
-	if !bootstrapDHT(ctx, h, cfg, dataDir, log, bm) {
-		log.Info("no bootstrap peers reachable, starting as standalone node")
-		return nil
+// coldStartRetry constants bound the background retry of trusted bootstrap
+// seeds during a cold start: re-ping each failed seed every interval, give up
+// joining after the window, accept standalone operation.
+//
+// coldStartPingTimeout must exceed rpcAttemptTimeout (5 s) so that
+// sendAndWait's per-attempt deadline is not prematurely cancelled by the outer
+// context — otherwise no internal retry can ever fire.
+const (
+	coldStartRetryInterval = 10 * time.Second
+	coldStartRetryWindow   = 60 * time.Second
+	coldStartPingTimeout   = 6 * time.Second // > rpcAttemptTimeout (5 s)
+)
+
+// runBootstrapChain joins the DHT and sets ICE signal hub candidates.
+//
+// Signal hub URLs are derived and installed regardless of whether the DHT join
+// succeeds: the signal TCP path is independent of the DHT UDP path, so a node
+// that is standalone on DHT can still send/receive ICE sessions via signal hubs.
+//
+// Returns true if at least one DHT peer was contacted.
+func runBootstrapChain(ctx context.Context, h *host.Host, cfg *config.Config, dataDir string, log *slog.Logger, bm *beaconManager) bool {
+	joined := bootstrapDHT(ctx, h, cfg, dataDir, log, bm)
+	// Derive and install signal hub URLs unconditionally so runICEListener (already
+	// running) can connect to hubs even when the DHT join failed.
+	if urls := deriveSignalURLs(cfg, log); len(urls) > 0 {
+		h.SetBootstrapHubURLs(urls)
 	}
-	return deriveSignalURLs(cfg, log)
+	if !joined {
+		log.Warn("network connectivity issue; entering standalone mode, retrying to join in background")
+	}
+	return joined
 }
 
-// bootstrapDHT joins the DHT using persisted peers, then optional config seeds,
-// then optional DNS TXT seeds.
+// bootstrapDHT joins the DHT using persisted peers and trusted seeds.
 //
-// If cfg.Bootstrap is non-empty, the user supplied their own seeds: we try
-// peers.cache then config only — no public DNS lookup (full operator control).
+// Address sources and their priority:
 //
-// If cfg.Bootstrap is empty, after peers.cache we always attempt DNS TXT once
-// when records exist: this heals splits and corrects a stale peers.cache without
-// requiring a config field.
+//	peers.cache  — fast local snapshot; always tried first.
+//	cfg.Bootstrap — operator-controlled seeds (private deployments); tried in parallel
+//	               with peers.cache when set; skips public DNS (full operator control).
+//	DNS TXT      — public infra; resolved in parallel with peers.cache when cfg.Bootstrap
+//	               is empty; heals stale caches without requiring a config change.
+//	beacon       — last resort when all other sources fail.
+//
+// All sources (except beacon) are tried concurrently; the first successful contact
+// starts FindNode immediately without waiting for slower seeds.
 func bootstrapDHT(ctx context.Context, h *host.Host, cfg *config.Config, dataDir string, log *slog.Logger, bm *beaconManager) bool {
-	var ok bool
-
+	// Collect seeds: peers.cache is always included; the second source is either
+	// cfg.Bootstrap (private) or a live DNS lookup (public), both fetched in parallel.
+	var cacheAddrs []net.Addr
 	cachePath := filepath.Join(dataDir, "peers.cache")
 	if lines, err := peerscache.Load(cachePath); err == nil && len(lines) > 0 {
-		if addrs := resolveBootstrapAddrs(lines, log); len(addrs) > 0 {
-			log.Info("connecting to network", "source", "peers.cache", "peers", len(addrs))
-			if tryBootstrap(ctx, h, addrs, log, "peers.cache") {
-				ok = true
-			}
-		}
+		cacheAddrs = resolveBootstrapAddrs(lines, log)
 	} else if err != nil {
 		log.Debug("peers.cache", "err", err)
 	}
 
+	// Fetch the second address source concurrently with peers.cache resolution above.
+	var secondTXT []string // raw hostport strings; needed for DNS reuse in deriveSignalURLs
+	type secondResult struct {
+		addrs []net.Addr
+		txt   []string // set only for the DNS path
+	}
+	secondCh := make(chan secondResult, 1)
 	if len(cfg.Bootstrap) > 0 {
-		if addrs := resolveBootstrapAddrs(cfg.Bootstrap, log); len(addrs) > 0 {
+		// Private deployment: use config seeds directly, no DNS.
+		go func() {
+			addrs := resolveBootstrapAddrs(cfg.Bootstrap, log)
 			addrs = filterByNodeID(ctx, h, addrs, cfg.BootstrapNodeIDs, log)
-			if len(addrs) > 0 {
-				log.Info("connecting to network", "source", "config", "peers", len(addrs))
-				if tryBootstrap(ctx, h, addrs, log, "config") {
-					ok = true
+			secondCh <- secondResult{addrs: addrs}
+		}()
+	} else {
+		// Public network: resolve DNS TXT in the background while peers.cache pings proceed.
+		go func() {
+			txt := lookupBootstrapTXT(dnsBootstrapName)
+			addrs := resolveBootstrapAddrs(txt, log)
+			addrs = filterByNodeID(ctx, h, addrs, cfg.BootstrapNodeIDs, log)
+			secondCh <- secondResult{addrs: addrs, txt: txt}
+		}()
+	}
+
+	// Dedup helper: merges addr slices, skipping duplicates by string key.
+	dedup := func(a, b []net.Addr) []net.Addr {
+		seen := make(map[string]struct{}, len(a)+len(b))
+		out := make([]net.Addr, 0, len(a)+len(b))
+		for _, addr := range append(a, b...) {
+			if k := addr.String(); k != "" {
+				if _, dup := seen[k]; !dup {
+					seen[k] = struct{}{}
+					out = append(out, addr)
 				}
 			}
 		}
-		return ok
+		return out
 	}
 
-	log.Info("looking up public peers (bootstrap)")
-	if txt := lookupBootstrapTXT(dnsBootstrapName); len(txt) > 0 {
-		if addrs := resolveBootstrapAddrs(txt, log); len(addrs) > 0 {
-			addrs = filterByNodeID(ctx, h, addrs, cfg.BootstrapNodeIDs, log)
-			if len(addrs) > 0 {
-				log.Info("connecting to network", "source", "dns", "peers", len(addrs))
-				if tryBootstrap(ctx, h, addrs, log, "dns_txt") {
-					ok = true
-				}
-			}
+	second := <-secondCh
+	secondTXT = second.txt
+
+	// Merge both sources and ping them all in one parallel batch.
+	allAddrs := dedup(cacheAddrs, second.addrs)
+	var ok bool
+	if len(allAddrs) > 0 {
+		src := "peers.cache+dns"
+		if len(cfg.Bootstrap) > 0 {
+			src = "peers.cache+config"
+		}
+		log.Info("connecting to network", "source", src, "peers", len(allAddrs))
+		if tryBootstrap(ctx, h, allAddrs, log, src) {
+			ok = true
 		}
 	}
 
-	// Last resort: infrastructure DNS TXT for well-known DHT peer addresses (auxiliary
-	// read/store and this bootstrap attempt) — only when all earlier steps failed.
-	if !ok {
+	// Store DNS TXT result for reuse by deriveSignalURLs so we avoid a second lookup.
+	if len(secondTXT) > 0 {
+		storeDNSTXTResult(secondTXT)
+	}
+
+	// Last resort: public beacon infrastructure — only when all other sources failed
+	// AND no operator-supplied bootstrap is configured. A private deployment that
+	// explicitly set cfg.Bootstrap must not silently widen to public infra when its
+	// seeds are temporarily unreachable.
+	if !ok && len(cfg.Bootstrap) == 0 {
 		if beaconAddrs := bm.refreshAddrs(); len(beaconAddrs) > 0 {
 			log.Info("connecting to network", "source", "aux_dht_bootstrap")
 			if tryBootstrap(ctx, h, beaconAddrs, log, "aux_dht_bootstrap") {
@@ -96,6 +157,23 @@ func bootstrapDHT(ctx context.Context, h *host.Host, cfg *config.Config, dataDir
 	return ok
 }
 
+// dnsTXTCache holds the most recent DNS TXT bootstrap result so deriveSignalURLs
+// can reuse it without issuing a second DNS query during the same startup.
+var dnsTXTCacheMu sync.Mutex
+var dnsTXTCached []string
+
+func storeDNSTXTResult(txt []string) {
+	dnsTXTCacheMu.Lock()
+	dnsTXTCached = txt
+	dnsTXTCacheMu.Unlock()
+}
+
+func loadDNSTXTResult() []string {
+	dnsTXTCacheMu.Lock()
+	defer dnsTXTCacheMu.Unlock()
+	return dnsTXTCached
+}
+
 // maxSignalCandidates caps the number of bootstrap-derived signal hub candidates.
 // This bounds the subscriber goroutines and the Signals[] list in DHT records.
 const maxSignalCandidates = 4
@@ -104,6 +182,9 @@ const maxSignalCandidates = 4
 // only (config.Bootstrap or DNS TXT records). peers.cache is intentionally excluded
 // because it contains arbitrary DHT peers, not signaling hubs. Returns up to
 // maxSignalCandidates unique URLs, preserving bootstrap list order.
+//
+// When cfg.Bootstrap is empty, the DNS TXT result cached by bootstrapDHT is reused
+// to avoid a second DNS round-trip during the same startup sequence.
 func deriveSignalURLs(cfg *config.Config, log *slog.Logger) []string {
 	var out []string
 	seen := make(map[string]struct{})
@@ -128,7 +209,13 @@ func deriveSignalURLs(cfg *config.Config, log *slog.Logger) []string {
 	if len(cfg.Bootstrap) > 0 {
 		addHostPorts(cfg.Bootstrap, "config")
 	} else {
-		if txt := lookupBootstrapTXT(dnsBootstrapName); len(txt) > 0 {
+		// Reuse the DNS TXT result from bootstrapDHT if available; fall back to a
+		// fresh lookup only when called outside the normal startup sequence.
+		txt := loadDNSTXTResult()
+		if len(txt) == 0 {
+			txt = lookupBootstrapTXT(dnsBootstrapName)
+		}
+		if len(txt) > 0 {
 			addHostPorts(txt, "dns")
 		}
 	}
@@ -186,9 +273,9 @@ func tryBootstrap(ctx context.Context, h *host.Host, addrs []net.Addr, log *slog
 		log.Warn("bootstrap failed", "source", src, "err", err)
 		return false
 	}
-	obctx, ocancel := context.WithTimeout(ctx, 10*time.Second)
-	defer ocancel()
-	h.ObserveFromPeers(obctx, addrs)
+	// Observed_addr is already recorded in PingIdentity → notifyObserved on
+	// each successful bootstrap ping; a second ObserveFromPeers round would
+	// re-ping every seed including known-failed addresses.
 
 	peers := len(h.Node().BootstrapCandidateAddrs(10))
 	minAgree := h.Sense().MinAgreeing()
@@ -255,6 +342,111 @@ func (d *Daemon) maybeRebootstrap(ctx context.Context) {
 		case d.netChangeNotify <- struct{}{}:
 		default:
 		}
+	}
+}
+
+// trustedSeedAddrs returns the set of trusted bootstrap seed addresses to retry
+// during a cold start. Only infrastructure-controlled sources are included:
+// config seeds, DNS TXT, or beacon. peers.cache is intentionally excluded because
+// it is a snapshot of the routing table (may contain unverified hearsay addresses)
+// and is only suitable for the one-shot fast-start attempt in bootstrapDHT.
+func trustedSeedAddrs(cfg *config.Config, bm *beaconManager, log *slog.Logger) []net.Addr {
+	var out []net.Addr
+	seen := make(map[string]struct{})
+	add := func(addrs []net.Addr) {
+		for _, a := range addrs {
+			k := a.String()
+			if _, dup := seen[k]; dup {
+				continue
+			}
+			seen[k] = struct{}{}
+			out = append(out, a)
+		}
+	}
+
+	if len(cfg.Bootstrap) > 0 {
+		add(resolveBootstrapAddrs(cfg.Bootstrap, log))
+		return out // operator-controlled seeds: do not widen to public DNS/beacon
+	}
+	if txt := lookupBootstrapTXT(dnsBootstrapName); len(txt) > 0 {
+		add(resolveBootstrapAddrs(txt, log))
+	}
+	if len(out) == 0 && bm != nil {
+		add(bm.refreshAddrs())
+	}
+	return out
+}
+
+// startColdStartRetry re-pings trusted bootstrap seeds that are not yet reachable
+// every coldStartRetryInterval for up to coldStartRetryWindow, then accepts
+// standalone operation. It runs whether or not the initial bootstrap succeeded:
+// seeds that are already reachable resolve on their first probe and drop out, so
+// only genuinely-failed trusted seeds keep being retried.
+//
+// On the transition from "not joined" to "joined" it applies hub URLs and fires
+// netChangeNotify so the main loop runs a republish cascade. Must be called in a
+// goroutine; returns when every seed has resolved or the window/ctx closes.
+func (d *Daemon) startColdStartRetry(ctx context.Context, alreadyJoined bool) {
+	// A strict NodeID allowlist requires verifying each seed's identity before
+	// admitting it; that belongs to the verified maybeRebootstrap path. Skip the
+	// fast plain-ping retry here to avoid admitting unverified addresses.
+	if len(d.cfg.BootstrapNodeIDs) > 0 {
+		return
+	}
+	seeds := trustedSeedAddrs(d.cfg, d.beacon, d.log)
+	if len(seeds) == 0 {
+		return
+	}
+	byKey := make(map[string]net.Addr, len(seeds))
+	for _, a := range seeds {
+		byKey[a.String()] = a
+	}
+
+	var joined atomic.Bool
+	joined.Store(alreadyJoined)
+	var once sync.Once
+
+	attempt := func(actx context.Context, key string) retry.Outcome {
+		addr := byKey[key]
+		pctx, cancel := context.WithTimeout(actx, coldStartPingTimeout)
+		_, err := d.h.Node().PingIdentity(pctx, addr)
+		cancel()
+		if err != nil {
+			return retry.Again
+		}
+		// Reachable: PingIdentity has already added this peer to the routing
+		// table. If we weren't joined before, fire the hub-URL setup and the
+		// netChangeNotify cascade exactly once. When alreadyJoined=true the
+		// initial bootstrap already applied URLs; we just fill the routing table.
+		joined.Store(true)
+		if !alreadyJoined {
+			once.Do(func() {
+				if urls := deriveSignalURLs(d.cfg, d.log); len(urls) > 0 {
+					d.h.SetBootstrapHubURLs(urls)
+				}
+				d.h.SetRoutingHubCandidates(d.h.DeriveRoutingHubURLs(maxSignalCandidates))
+				d.log.Info("bootstrap succeeded after cold-start retry")
+				select {
+				case d.netChangeNotify <- struct{}{}:
+				default:
+				}
+			})
+		}
+		return retry.Done
+	}
+
+	wctx, cancel := context.WithTimeout(ctx, coldStartRetryWindow)
+	defer cancel()
+	// Factor 1 keeps a constant interval; ctx bounds the window, so no per-key
+	// give-up policy is needed.
+	sched := retry.New[string](retry.Policy{Base: coldStartRetryInterval, Factor: 1}, attempt, nil)
+	for k := range byKey {
+		sched.Add(k)
+	}
+	sched.Run(wctx)
+
+	if !joined.Load() {
+		d.log.Warn("standalone mode: no peers reachable after retry window; operating standalone")
 	}
 }
 
