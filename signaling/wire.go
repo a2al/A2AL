@@ -12,7 +12,7 @@ const SubprotocolICE = "a2al.ice.v1"
 
 // Frame is a CBOR envelope on the signaling WebSocket.
 // T is "cred" | "cand" | "eoc" | "reg" | "incoming" | "noagent" |
-// "punch-init" | "punch-ack" | "punch-go".
+// "punch-init" | "punch-ack" | "punch-go" | "dht".
 type Frame struct {
 	T      string   `cbor:"t"`
 	U      string   `cbor:"u,omitempty"`    // ufrag (cred)
@@ -27,6 +27,7 @@ type Frame struct {
 	Ts     int64    `cbor:"ts,omitempty"`   // punch-init/ack: Unix millisecond timestamp
 	T0     int64    `cbor:"t0,omitempty"`   // punch-go: agreed fire time (Unix milliseconds)
 	Nat    uint8    `cbor:"nt,omitempty"`   // punch-init/ack: sender's NAT type (natsense constants)
+	Data   []byte   `cbor:"d,omitempty"`    // dht: opaque signed DHT message bytes
 }
 
 // EncodeFrame CBOR-encodes a frame.

@@ -30,6 +30,13 @@ type Hub struct {
 	sessionsTotal   atomic.Uint64
 	sessionsActive  atomic.Int32
 	noAgentTotal    atomic.Uint64
+
+	// OnDHTRequest is an optional hook for read-only DHT proxying over the
+	// signaling WebSocket. When set, incoming "dht" frames are passed to it as
+	// raw signed DHT request bytes; the return value is sent back as a "dht"
+	// response frame. Only read-only operations (PING, FIND_NODE, FIND_VALUE)
+	// are expected; implementations should reject write operations.
+	OnDHTRequest func(req []byte) (resp []byte)
 }
 
 // ListenHub serves /signal and /ice on tcpAddr (e.g. "0.0.0.0:4121").
@@ -142,6 +149,16 @@ func (h *Hub) signalConnLoop(c *websocket.Conn) {
 				ackCtx, ackCancel := context.WithTimeout(ctx, 5*time.Second)
 				_ = c.Write(ackCtx, websocket.MessageBinary, ack)
 				ackCancel()
+			}
+			continue
+		}
+		if fr.T == "dht" && len(fr.Data) > 0 && h.OnDHTRequest != nil {
+			if resp := h.OnDHTRequest(fr.Data); len(resp) > 0 {
+				if out, e := EncodeFrame(Frame{T: "dht", Data: resp}); e == nil {
+					wctx, wcancel := context.WithTimeout(ctx, 5*time.Second)
+					_ = c.Write(wctx, websocket.MessageBinary, out)
+					wcancel()
+				}
 			}
 		}
 	}

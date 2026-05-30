@@ -354,6 +354,7 @@ func (d *Daemon) Run(ctx context.Context, mcpStdio bool) error {
 		if err != nil {
 			d.log.Warn("signal hub listen", "addr", addr, "err", err)
 		} else {
+			hub.OnDHTRequest = d.h.Node().HandleReadRequest
 			d.h.SetSignalStatsProvider(hub.StatsMap)
 			closeSignalHub = func() { _ = hub.Close() }
 			d.log.Info("signal hub listening", "addr", hub.Addr().String())

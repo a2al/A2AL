@@ -159,30 +159,37 @@ func TestDeliverUsesL0PastHairpinLastInbound(t *testing.T) {
 	}
 }
 
-func TestDeliverReplyUsesL0PastHairpinHint(t *testing.T) {
+// TestReplyViaIsFaithfulToInboundSource verifies that a UDP-channel reply
+// goes back to the exact datagram source, never to the peer's remembered anchor
+// or advertised endpoint. This is the request/response invariant: the reverse
+// path is proven reachable by the inbound packet, so no outbound path selection
+// (anchor / health-aware / skip-cold) may redirect the reply.
+func TestReplyViaIsFaithfulToInboundSource(t *testing.T) {
 	netw := transport.NewMemNetwork()
-	trA, _ := netw.NewTransport("hp-rep-a")
-	trB, _ := netw.NewTransport("hp-rep-b")
+	trA, _ := netw.NewTransport("rep-faithful-a")
+	trSrc, _ := netw.NewTransport("rep-faithful-src")    // actual inbound source
+	trAnchor, _ := netw.NewTransport("rep-faithful-anch") // stale remembered addr
 	defer trA.Close()
-	defer trB.Close()
+	defer trSrc.Close()
+	defer trAnchor.Close()
 
 	nodeA := newTestNode(t, trA, nil)
 	nodeA.SetLearnedPathFirst(true)
-	nodeA.SetSelfExtIP(net.IPv4(47, 74, 189, 180))
 
 	peerAddr, peerID, _ := makeSignedEndpointRecord(t, "wss://signal.example.com")
-	nodeA.BindPeerAddr(peerID, trB.LocalAddr())
+	// The peer's remembered/anchor address points at trAnchor, NOT the source
+	// the request actually arrived from. A faithful reply must ignore it.
+	nodeA.BindPeerAddr(peerID, trAnchor.LocalAddr())
 
-	hairpin := &net.UDPAddr{IP: net.IPv4(47, 74, 189, 180), Port: 65090}
 	req := &protocol.DecodedMessage{
 		Header:     protocol.Header{MsgType: protocol.MsgPing, TxID: []byte{1, 2, 3, 4}},
 		SenderAddr: peerAddr,
 	}
-	raw := []byte("reply-past-hairpin")
-	if err := nodeA.deliverReply(hairpin, req, raw); err != nil {
+	raw := []byte("faithful-reply")
+	if err := nodeA.replyVia(trSrc.LocalAddr(), inboundChannelUDP, req, raw); err != nil {
 		t.Fatal(err)
 	}
-	pkt, _, err := trB.Receive()
+	pkt, _, err := trSrc.Receive()
 	if err != nil {
 		t.Fatal(err)
 	}

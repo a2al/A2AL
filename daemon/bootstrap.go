@@ -6,6 +6,7 @@ package daemon
 import (
 	"context"
 	"encoding/hex"
+	"fmt"
 	"log/slog"
 	"net"
 	"path/filepath"
@@ -14,10 +15,15 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/coder/websocket"
+
+	"github.com/a2al/a2al"
 	"github.com/a2al/a2al/config"
+	"github.com/a2al/a2al/dht"
 	"github.com/a2al/a2al/host"
 	"github.com/a2al/a2al/internal/peerscache"
 	"github.com/a2al/a2al/internal/retry"
+	"github.com/a2al/a2al/protocol"
 	"github.com/a2al/a2al/signaling"
 )
 
@@ -47,11 +53,18 @@ func runBootstrapChain(ctx context.Context, h *host.Host, cfg *config.Config, da
 	joined := bootstrapDHT(ctx, h, cfg, dataDir, log, bm)
 	// Derive and install signal hub URLs unconditionally so runICEListener (already
 	// running) can connect to hubs even when the DHT join failed.
-	if urls := deriveSignalURLs(cfg, log); len(urls) > 0 {
-		h.SetBootstrapHubURLs(urls)
+	hubURLs := deriveSignalURLs(cfg, log)
+	if len(hubURLs) > 0 {
+		h.SetBootstrapHubURLs(hubURLs)
 	}
 	if !joined {
-		log.Warn("network connectivity issue; entering standalone mode, retrying to join in background")
+		// UDP bootstrap failed. Attempt to seed the routing table via the
+		// hub's read-only DHT proxy so the node is not completely isolated.
+		if len(hubURLs) > 0 && bootstrapViaSignal(ctx, h, hubURLs, log) {
+			joined = true
+		} else {
+			log.Warn("network connectivity issue; entering standalone mode, retrying to join in background")
+		}
 	}
 	return joined
 }
@@ -477,4 +490,190 @@ func filterByNodeID(ctx context.Context, h *host.Host, addrs []net.Addr, allowed
 		}
 	}
 	return out
+}
+
+// bootstrapViaSignal seeds the routing table and attempts to build a DHT view
+// via ICE when UDP bootstrap has completely failed.
+//
+// Per hub it runs: FIND_NODE → AddContact → FIND_VALUE(Endpoint) → SeedRecord
+// → ICE punch → QUIC FindNode(self).  Returns true when at least one peer was
+// added to the routing table (even if the ICE step did not complete).
+func bootstrapViaSignal(ctx context.Context, h *host.Host, hubURLs []string, log *slog.Logger) bool {
+	node := h.Node()
+	findNodeReq, err := node.BuildFindNodeRequest(node.NodeID())
+	if err != nil {
+		log.Debug("signal bootstrap: build request failed", "err", err)
+		return false
+	}
+	for _, base := range hubURLs {
+		if bootstrapViaHub(ctx, h, base, findNodeReq, log) {
+			return true
+		}
+	}
+	return false
+}
+
+// bootstrapViaHub executes the full signal-bootstrap sequence for one hub on a
+// single reused WebSocket connection.  Returns true when at least one peer was
+// added to the routing table.
+func bootstrapViaHub(ctx context.Context, h *host.Host, hubBase string, findNodeReq []byte, log *slog.Logger) bool {
+	queryCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	signalURL, err := signaling.SubscribeURL(hubBase)
+	if err != nil {
+		return false
+	}
+	dialCtx, dialCancel := context.WithTimeout(queryCtx, 8*time.Second)
+	c, _, err := websocket.Dial(dialCtx, signalURL, &websocket.DialOptions{
+		Subprotocols: []string{signaling.SubprotocolICE},
+	})
+	dialCancel()
+	if err != nil {
+		log.Debug("signal bootstrap: dial failed", "hub", hubBase, "err", err)
+		return false
+	}
+	defer c.CloseNow()
+
+	// ── Step 1: FIND_NODE → seed routing table ───────────────────────────────
+	fnDec, err := hubDHTQuery(queryCtx, c, findNodeReq, protocol.MsgFindNodeResp)
+	if err != nil {
+		log.Debug("signal bootstrap: find_node failed", "hub", hubBase, "err", err)
+		return false
+	}
+	fnBody := fnDec.Body.(*protocol.BodyFindNodeResp)
+
+	node := h.Node()
+	count := 0
+	var nodeIDs []a2al.NodeID
+	for _, ni := range fnBody.Nodes {
+		if len(ni.IP) != 4 && len(ni.IP) != 16 {
+			continue
+		}
+		udpAddr := &net.UDPAddr{IP: ni.IP, Port: int(ni.Port)}
+		node.AddContact(udpAddr, ni)
+		count++
+		if len(ni.NodeID) == len(a2al.NodeID{}) {
+			var nid a2al.NodeID
+			copy(nid[:], ni.NodeID)
+			nodeIDs = append(nodeIDs, nid)
+		}
+	}
+	if count == 0 {
+		return false
+	}
+	log.Info("signal bootstrap: routing table seeded", "hub", hubBase, "peers", count)
+
+	// ── Step 2: FIND_VALUE(Endpoint) → first record with signal URL ──────────
+	sr, seedNID := findEndpointViaHub(queryCtx, c, nodeIDs, node)
+	if sr == nil {
+		return true // routing table seeded; no ICE path available from this hub
+	}
+	er, err := protocol.ParseEndpointRecord(*sr)
+	if err != nil || (er.Signal == "" && len(er.Signals) == 0) {
+		return true
+	}
+	if err := node.SeedRecord(*sr); err != nil {
+		log.Debug("signal bootstrap: seed record failed", "err", err)
+		return true
+	}
+
+	// ── Step 3: ICE punch + FindNode(self) over QUIC ─────────────────────────
+	// The /signal bootstrap connection is no longer needed; punch opens its own.
+	cancel()
+	h.DHTpunchPool().Punch(seedNID, &er, dht.PunchPriorityHigh)
+
+	punchCtx, punchCancel := context.WithTimeout(ctx, 20*time.Second)
+	defer punchCancel()
+	if !signalPollHasConn(punchCtx, func() bool { return h.DHTpunchPool().HasConn(seedNID) }) {
+		log.Debug("signal bootstrap: ICE punch timed out", "seed", seedNID)
+		return true
+	}
+
+	q := dht.NewQuery(node)
+	if _, err := q.FindNode(punchCtx, node.NodeID()); err != nil {
+		log.Debug("signal bootstrap: FindNode(self) via QUIC failed", "err", err)
+	} else {
+		log.Info("signal bootstrap: DHT view built via ICE", "hub", hubBase)
+	}
+	return true
+}
+
+// hubDHTQuery sends reqBytes as a "dht" WebSocket frame and reads until a "dht"
+// response frame with the expected DHT message type arrives.  Non-dht frames
+// (e.g. initial "ack") are skipped.
+func hubDHTQuery(ctx context.Context, c *websocket.Conn, reqBytes []byte, wantType uint8) (*protocol.DecodedMessage, error) {
+	out, err := signaling.EncodeFrame(signaling.Frame{T: "dht", Data: reqBytes})
+	if err != nil {
+		return nil, err
+	}
+	if err := c.Write(ctx, websocket.MessageBinary, out); err != nil {
+		return nil, err
+	}
+	for {
+		_, data, err := c.Read(ctx)
+		if err != nil {
+			return nil, err
+		}
+		fr, err := signaling.DecodeFrame(data)
+		if err != nil || fr.T != "dht" || len(fr.Data) == 0 {
+			continue
+		}
+		dec, err := protocol.VerifyAndDecode(fr.Data)
+		if err != nil {
+			return nil, err
+		}
+		if dec.Header.MsgType != wantType {
+			return nil, fmt.Errorf("signal bootstrap: unexpected msg_type %d (want %d)", dec.Header.MsgType, wantType)
+		}
+		return dec, nil
+	}
+}
+
+// findEndpointViaHub sends FIND_VALUE(RecType=Endpoint) for each nodeID over c,
+// returning the first SignedRecord that carries at least one signal URL.
+// Returns nil when no hub-stored record satisfies the condition.
+func findEndpointViaHub(ctx context.Context, c *websocket.Conn, nodeIDs []a2al.NodeID, node *dht.Node) (*protocol.SignedRecord, a2al.NodeID) {
+	now := time.Now()
+	for _, nid := range nodeIDs {
+		req, err := node.BuildFindValueRequest(nid, protocol.RecTypeEndpoint)
+		if err != nil {
+			continue
+		}
+		dec, err := hubDHTQuery(ctx, c, req, protocol.MsgFindValueResp)
+		if err != nil {
+			return nil, a2al.NodeID{} // hub closed or timed out; stop
+		}
+		body := dec.Body.(*protocol.BodyFindValueResp)
+		candidates := body.Records
+		if body.Record != nil {
+			candidates = append(candidates, *body.Record)
+		}
+		for i := range candidates {
+			sr := candidates[i]
+			if protocol.VerifySignedRecord(sr, now) != nil {
+				continue
+			}
+			er, err := protocol.ParseEndpointRecord(sr)
+			if err != nil || (er.Signal == "" && len(er.Signals) == 0) {
+				continue
+			}
+			return &sr, nid
+		}
+	}
+	return nil, a2al.NodeID{}
+}
+
+// signalPollHasConn polls hasConn every 100 ms until it returns true or ctx expires.
+func signalPollHasConn(ctx context.Context, hasConn func() bool) bool {
+	for {
+		if hasConn() {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return hasConn()
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
 }

@@ -439,7 +439,7 @@ func (n *Node) dispatchIncoming(from net.Addr, ch inboundChannel, dec *protocol.
 	case protocol.MsgNATProbeEcho:
 		n.onNATProbeEcho(from, ch, dec)
 	case protocol.MsgDHTPush:
-		n.onDHTPush(from, dec)
+		n.onDHTPush(from, ch, dec)
 	default:
 	}
 }
@@ -1432,7 +1432,7 @@ func (n *Node) isHairpinAddr(addr net.Addr) bool {
 	return true
 }
 
-func (n *Node) reply(from net.Addr, req *protocol.DecodedMessage, msgType uint8, body any) {
+func (n *Node) reply(from net.Addr, ch inboundChannel, req *protocol.DecodedMessage, msgType uint8, body any) {
 	hdr := protocol.Header{
 		Version: protocol.ProtocolVersion,
 		MsgType: msgType,
@@ -1443,17 +1443,30 @@ func (n *Node) reply(from net.Addr, req *protocol.DecodedMessage, msgType uint8,
 		n.log.Warn("dht reply marshal failed", "msg_type", msgType, "to", from, "err", err)
 		return
 	}
-	if err := n.deliverReply(from, req, raw); err != nil {
+	if err := n.replyVia(from, ch, req, raw); err != nil {
 		n.log.Warn("dht reply send failed", "msg_type", msgType, "to", from, "size", len(raw), "err", err)
 	} else {
 		n.statsTx.Add(1)
 	}
 }
 
-func (n *Node) deliverReply(from net.Addr, req *protocol.DecodedMessage, raw []byte) error {
-	peerID := a2al.NodeIDFromAddress(req.SenderAddr)
-	_, err := n.deliver(n.ctx, peerID, from, raw)
-	return err
+// replyVia sends a response back along the exact channel and source the request
+// arrived on. The reverse path is already proven reachable by the inbound packet,
+// so replies are faithful to it and never consult outboundPlan (anchor / health /
+// skip-cold selection), which is reserved for actively-initiated RPCs.
+//
+//   - inboundChannelQUIC: reply over the same Mode B control-plane connection
+//     (keyed by NodeID); if it dropped meanwhile, fall back to the UDP source.
+//   - inboundChannelUDP: reply verbatim to the datagram source.
+func (n *Node) replyVia(from net.Addr, ch inboundChannel, req *protocol.DecodedMessage, raw []byte) error {
+	if ch == inboundChannelQUIC && n.punch != nil {
+		peerID := a2al.NodeIDFromAddress(req.SenderAddr)
+		if sent, err := n.punch.SendTo(n.ctx, peerID, raw); sent {
+			return err
+		}
+		// Mode B connection gone between receive and reply: fall back to UDP source.
+	}
+	return n.tr.Send(from, raw)
 }
 
 func (n *Node) onPing(from net.Addr, ch inboundChannel, dec *protocol.DecodedMessage) {
@@ -1462,7 +1475,7 @@ func (n *Node) onPing(from net.Addr, ch inboundChannel, dec *protocol.DecodedMes
 		Address:      n.addr[:],
 		ObservedAddr: ObservedAddr(from),
 	}
-	n.reply(from, dec, protocol.MsgPong, body)
+	n.reply(from, ch, dec, protocol.MsgPong, body)
 }
 
 func (n *Node) onFindNode(from net.Addr, ch inboundChannel, dec *protocol.DecodedMessage) {
@@ -1471,7 +1484,7 @@ func (n *Node) onFindNode(from net.Addr, ch inboundChannel, dec *protocol.Decode
 	var tid a2al.NodeID
 	copy(tid[:], target)
 	resp := &protocol.BodyFindNodeResp{
-		Nodes:        n.adaptNodeListForAsker(n.tabNearestVerified(tid, routing.K), from),
+		Nodes:        n.adaptNodeListForAsker(n.tabNearestHealthy(tid, routing.K), from),
 		ObservedAddr: ObservedAddr(from),
 	}
 	for len(resp.Nodes) > 1 {
@@ -1481,7 +1494,7 @@ func (n *Node) onFindNode(from net.Addr, ch inboundChannel, dec *protocol.Decode
 		}
 		resp.Nodes = resp.Nodes[:len(resp.Nodes)-1]
 	}
-	n.reply(from, dec, protocol.MsgFindNodeResp, resp)
+	n.reply(from, ch, dec, protocol.MsgFindNodeResp, resp)
 }
 
 func (n *Node) onFindValue(from net.Addr, ch inboundChannel, dec *protocol.DecodedMessage) {
@@ -1493,7 +1506,7 @@ func (n *Node) onFindValue(from net.Addr, ch inboundChannel, dec *protocol.Decod
 	records := n.store.GetAll(tid, body.RecType, now)
 	best := n.store.Get(tid, now)
 	resp := &protocol.BodyFindValueResp{
-		Nodes:        n.adaptNodeListForAsker(n.tabNearestVerified(tid, routing.K), from),
+		Nodes:        n.adaptNodeListForAsker(n.tabNearestHealthy(tid, routing.K), from),
 		ObservedAddr: ObservedAddr(from),
 		Records:      records,
 	}
@@ -1534,7 +1547,7 @@ func (n *Node) onFindValue(from net.Addr, ch inboundChannel, dec *protocol.Decod
 	if hasRecords {
 		n.statsFindValueServed.Add(1)
 	}
-	n.reply(from, dec, protocol.MsgFindValueResp, resp)
+	n.reply(from, ch, dec, protocol.MsgFindValueResp, resp)
 
 	// Register oneShot subscription only when this node confirmed it holds records
 	// (proven valid neighbor principle: §4.2). Nodes that returned nothing are
@@ -1568,7 +1581,7 @@ func (n *Node) onStore(from net.Addr, ch inboundChannel, dec *protocol.DecodedMe
 		}
 		n.log.Debug("store rejected", "from", from, "key", hex.EncodeToString(key[:4]), "reason", reason, "err", err)
 	}
-	n.reply(from, dec, protocol.MsgStoreResp, &protocol.BodyStoreResp{Stored: ok, AlreadyHad: alreadyHad, Reason: reason})
+	n.reply(from, ch, dec, protocol.MsgStoreResp, &protocol.BodyStoreResp{Stored: ok, AlreadyHad: alreadyHad, Reason: reason})
 
 	// Deliver DHT_PUSH to all one-shot subscribers for this key.
 	// Only fires on genuinely new records (not already-had / rejected).
@@ -1607,7 +1620,7 @@ func (n *Node) pushToSubscriber(key a2al.NodeID, rec protocol.SignedRecord, sub 
 }
 
 // onDHTPush handles an incoming MsgDHTPush (this node is the subscriber / daemon).
-func (n *Node) onDHTPush(from net.Addr, dec *protocol.DecodedMessage) {
+func (n *Node) onDHTPush(from net.Addr, ch inboundChannel, dec *protocol.DecodedMessage) {
 	body := dec.Body.(*protocol.BodyDHTPush)
 	var key a2al.NodeID
 	copy(key[:], body.Key)
@@ -1621,7 +1634,7 @@ func (n *Node) onDHTPush(from net.Addr, dec *protocol.DecodedMessage) {
 	}
 
 	msgID := sha256.Sum256(body.Record.Payload)
-	n.reply(from, dec, protocol.MsgDHTPushACK, &protocol.BodyDHTPushACK{
+	n.reply(from, ch, dec, protocol.MsgDHTPushACK, &protocol.BodyDHTPushACK{
 		Key:              key[:],
 		MsgID:            msgID[:],
 		OneShotSubscribe: resubscribe,
@@ -2214,5 +2227,113 @@ func (n *Node) Close() error {
 	err := n.tr.Close()
 	n.wg.Wait()
 	return err
+}
+
+// HandleReadRequest processes a raw signed DHT request received over a non-UDP
+// channel (e.g. the signaling WebSocket) and returns the signed response bytes.
+// Only read-only operations (PING, FIND_NODE, FIND_VALUE) are served; STORE and
+// any other write operations are rejected by returning nil.
+func (n *Node) HandleReadRequest(raw []byte) []byte {
+	dec, err := protocol.VerifyAndDecode(raw)
+	if err != nil {
+		return nil
+	}
+	switch dec.Header.MsgType {
+	case protocol.MsgPing:
+		return n.buildSignedReply(dec, protocol.MsgPong, &protocol.BodyPong{
+			Address: n.addr[:],
+		})
+	case protocol.MsgFindNode:
+		target := dec.Body.(*protocol.BodyFindNode).Target
+		var tid a2al.NodeID
+		copy(tid[:], target)
+		resp := &protocol.BodyFindNodeResp{
+			Nodes: n.tabNearestHealthy(tid, routing.K),
+		}
+		// Trim to wire-size limit (same guard as onFindNode).
+		for len(resp.Nodes) > 1 {
+			sz, e := protocol.FindNodeResponseWireSize(resp)
+			if e != nil || sz <= maxResponsePayload {
+				break
+			}
+			resp.Nodes = resp.Nodes[:len(resp.Nodes)-1]
+		}
+		return n.buildSignedReply(dec, protocol.MsgFindNodeResp, resp)
+	case protocol.MsgFindValue:
+		body := dec.Body.(*protocol.BodyFindValue)
+		var tid a2al.NodeID
+		copy(tid[:], body.Target)
+		now := time.Now()
+		records := n.store.GetAll(tid, body.RecType, now)
+		best := n.store.Get(tid, now)
+		resp := &protocol.BodyFindValueResp{
+			Nodes:   n.tabNearestHealthy(tid, routing.K),
+			Records: records,
+		}
+		if best != nil && len(records) == 0 && (body.RecType == 0 || best.RecType == body.RecType) {
+			r := *best
+			resp.Record = &r
+		}
+		return n.buildSignedReply(dec, protocol.MsgFindValueResp, resp)
+	default:
+		return nil
+	}
+}
+
+// BuildFindNodeRequest creates a signed FIND_NODE request targeting the given
+// NodeID, suitable for sending via the signaling WebSocket DHT proxy.
+func (n *Node) BuildFindNodeRequest(target a2al.NodeID) ([]byte, error) {
+	var txID [16]byte
+	if _, err := crand.Read(txID[:]); err != nil {
+		return nil, err
+	}
+	hdr := protocol.Header{
+		Version: protocol.ProtocolVersion,
+		MsgType: protocol.MsgFindNode,
+		TxID:    txID[:],
+	}
+	return protocol.MarshalSignedMessageKeyStore(hdr, &protocol.BodyFindNode{Target: target[:]}, n.ks, n.addr)
+}
+
+// BuildFindValueRequest creates a signed FIND_VALUE request for the given key
+// and record type, suitable for sending via the signaling WebSocket DHT proxy.
+// recType 0 requests all record types.
+func (n *Node) BuildFindValueRequest(target a2al.NodeID, recType uint8) ([]byte, error) {
+	var txID [16]byte
+	if _, err := crand.Read(txID[:]); err != nil {
+		return nil, err
+	}
+	hdr := protocol.Header{
+		Version: protocol.ProtocolVersion,
+		MsgType: protocol.MsgFindValue,
+		TxID:    txID[:],
+	}
+	return protocol.MarshalSignedMessageKeyStore(hdr,
+		&protocol.BodyFindValue{Target: target[:], RecType: recType},
+		n.ks, n.addr)
+}
+
+// SeedRecord writes a pre-validated SignedRecord directly into the local store
+// without triggering replication. For bootstrap seeding only: used when a record
+// is obtained out-of-band (e.g. via the signaling WebSocket DHT proxy) and needs
+// to be available locally before the DHT layer is operational.
+func (n *Node) SeedRecord(rec protocol.SignedRecord) error {
+	return n.store.Put(a2al.NodeID{}, rec, time.Now())
+}
+
+// buildSignedReply signs and serialises a DHT response body, reusing the
+// request's TxID. Returns nil on marshalling error.
+func (n *Node) buildSignedReply(req *protocol.DecodedMessage, msgType uint8, body any) []byte {
+	hdr := protocol.Header{
+		Version: protocol.ProtocolVersion,
+		MsgType: msgType,
+		TxID:    append([]byte(nil), req.Header.TxID...),
+	}
+	raw, err := protocol.MarshalSignedMessageKeyStore(hdr, body, n.ks, n.addr)
+	if err != nil {
+		n.log.Debug("dht: buildSignedReply failed", "msg_type", msgType, "err", err)
+		return nil
+	}
+	return raw
 }
 
