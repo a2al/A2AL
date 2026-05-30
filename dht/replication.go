@@ -1022,7 +1022,7 @@ func (n *Node) execRepProbe(ctx context.Context, id a2al.NodeID) repProbeExecOut
 	}
 
 	pctx, cancel := context.WithTimeout(ctx, queryPeerTimeout)
-	n.log.Debug("replication probe: ping", "nodeID", id, "profile", profile, "addr", probeAddr, "ice_skip", out.probeSkip)
+	// n.log.Debug("replication probe: ping", "nodeID", id, "profile", profile, "addr", probeAddr, "ice_skip", out.probeSkip)
 	_, err := n.PingIdentity(pctx, probeAddr)
 	cancel()
 	if err != nil {

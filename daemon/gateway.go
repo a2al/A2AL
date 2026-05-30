@@ -72,6 +72,7 @@ const (
 )
 
 func (d *Daemon) gatewayAcceptLoop(ctx context.Context) {
+	go d.sharedTransportAcceptLoop(ctx)
 	for {
 		ac, err := d.h.Accept(ctx)
 		if err != nil {
@@ -83,6 +84,31 @@ func (d *Daemon) gatewayAcceptLoop(ctx context.Context) {
 		}
 		if !d.tryAcquireGatewayConn() {
 			d.log.Warn("gateway: max connections reached", "limit", maxGatewayConns)
+			_ = ac.CloseWithError(1, "too many connections")
+			continue
+		}
+		go func() {
+			defer d.releaseGatewayConn()
+			d.serveGatewayConn(ctx, ac)
+		}()
+	}
+}
+
+// sharedTransportAcceptLoop accepts connections that arrive on shared ICE
+// transports (callers reusing an existing hole-punched path for additional
+// agents). It feeds the same serveGatewayConn pipeline as the main listener.
+func (d *Daemon) sharedTransportAcceptLoop(ctx context.Context) {
+	for {
+		ac, err := d.h.AcceptShared(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			d.log.Debug("accept shared", "reason", err)
+			continue
+		}
+		if !d.tryAcquireGatewayConn() {
+			d.log.Warn("gateway: max connections reached (shared)", "limit", maxGatewayConns)
 			_ = ac.CloseWithError(1, "too many connections")
 			continue
 		}

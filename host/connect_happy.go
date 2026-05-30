@@ -185,15 +185,28 @@ func (h *Host) ConnectFromRecord(ctx context.Context, expectRemote a2al.Address,
 		"quic_targets", len(targets),
 		"direct_targets", len(directTargets),
 	)
+	hostKey := nodeTransportKey(er)
+	// Opportunistically reuse an existing ICE transport to the same remote host.
+	if hostKey != "" {
+		if qc := h.nodeTransPool.tryDial(ctx, hostKey, cert, expectRemote); qc != nil {
+			if ctrlErr := h.doDialerControlStream(ctx, qc, expectRemote); ctrlErr == nil {
+				h.log.Debug("connect via shared transport", "remote_aid", expectRemote)
+				return qc, false, nil
+			}
+			_ = qc.CloseWithError(1, "agent-route")
+			// Fall through to normal path.
+		}
+	}
+
 	if len(directTargets) > 0 && hasSignal {
-		return h.connectRace(ctx, cert, h.addr, expectRemote, directTargets, er, false)
+		return h.connectRace(ctx, cert, h.addr, expectRemote, directTargets, er, false, hostKey)
 	}
 	if len(directTargets) > 0 {
 		conn, err := h.connectHappy(ctx, cert, expectRemote, directTargets, DefaultConnectStagger)
 		return conn, false, err
 	}
 	if hasSignal {
-		return h.connectViaICESignal(ctx, cert, h.addr, expectRemote, er, false)
+		return h.connectViaICESignal(ctx, cert, h.addr, expectRemote, er, false, hostKey)
 	}
 	if terr != nil {
 		return nil, false, terr
@@ -235,15 +248,28 @@ func (h *Host) ConnectFromRecordFor(ctx context.Context, localAgent, expectRemot
 		"quic_targets", len(targets),
 		"direct_targets", len(directTargets),
 	)
+	hostKey := nodeTransportKey(er)
+	// Opportunistically reuse an existing ICE transport to the same remote host.
+	if hostKey != "" {
+		if qc := h.nodeTransPool.tryDial(ctx, hostKey, ag.cert, expectRemote); qc != nil {
+			if ctrlErr := h.doDialerControlStream(ctx, qc, expectRemote); ctrlErr == nil {
+				h.log.Debug("connect via shared transport", "local_aid", localAgent, "remote_aid", expectRemote)
+				return qc, false, nil
+			}
+			_ = qc.CloseWithError(1, "agent-route")
+			// Fall through to normal path.
+		}
+	}
+
 	if len(directTargets) > 0 && hasSignal {
-		return h.connectRace(ctx, ag.cert, localAgent, expectRemote, directTargets, er, opts.DisableRelay)
+		return h.connectRace(ctx, ag.cert, localAgent, expectRemote, directTargets, er, opts.DisableRelay, hostKey)
 	}
 	if len(directTargets) > 0 {
 		conn, err := h.connectHappy(ctx, ag.cert, expectRemote, directTargets, DefaultConnectStagger)
 		return conn, false, err
 	}
 	if hasSignal {
-		return h.connectViaICESignal(ctx, ag.cert, localAgent, expectRemote, er, opts.DisableRelay)
+		return h.connectViaICESignal(ctx, ag.cert, localAgent, expectRemote, er, opts.DisableRelay, hostKey)
 	}
 	if terr != nil {
 		return nil, false, terr
@@ -258,7 +284,7 @@ func (h *Host) ConnectFromRecordFor(ctx context.Context, localAgent, expectRemot
 // When a winner is found the losing path's context is cancelled so its
 // goroutine exits promptly. Both goroutines always send exactly one value to
 // the buffered channel, so the collector never blocks indefinitely.
-func (h *Host) connectRace(ctx context.Context, localCert tls.Certificate, localAgent, expectRemote a2al.Address, targets []*net.UDPAddr, er *protocol.EndpointRecord, disableRelay bool) (quic.Connection, bool, error) {
+func (h *Host) connectRace(ctx context.Context, localCert tls.Certificate, localAgent, expectRemote a2al.Address, targets []*net.UDPAddr, er *protocol.EndpointRecord, disableRelay bool, hostKey string) (quic.Connection, bool, error) {
 	type res struct {
 		c         quic.Connection
 		isRelayed bool
@@ -286,7 +312,7 @@ func (h *Host) connectRace(ctx context.Context, localCert tls.Certificate, local
 			return
 		case <-t.C:
 		}
-		c, relayed, err := h.connectViaICESignal(raceCtx, localCert, localAgent, expectRemote, er, disableRelay)
+		c, relayed, err := h.connectViaICESignal(raceCtx, localCert, localAgent, expectRemote, er, disableRelay, hostKey)
 		ch <- res{c: c, isRelayed: relayed, err: err}
 	}()
 

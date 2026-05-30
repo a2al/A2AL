@@ -398,7 +398,7 @@ func startICESession(ctx context.Context, wsURL string, urls []*stun.URI, contro
 	})
 	_ = agent.OnSelectedCandidatePairChange(func(local, remote ice.Candidate) {
 		relayed := local.Type() == ice.CandidateTypeRelay || remote.Type() == ice.CandidateTypeRelay
-		slog.Info("ice pair selected",
+		slog.Debug("ice pair selected",
 			"controlling", controlling,
 			"local", fmt.Sprintf("%s:%d(%s)", local.Address(), local.Port(), local.Type()),
 			"remote", fmt.Sprintf("%s:%d(%s)", remote.Address(), remote.Port(), remote.Type()),
