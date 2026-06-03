@@ -75,6 +75,13 @@ type PunchTransport interface {
 	// for nodeID. Used by triggerPunch to skip redundant punch attempts when
 	// the pool already has a healthy connection.
 	HasConn(nodeID a2al.NodeID) bool
+
+	// InvalidateConn closes and evicts the Mode B QUIC connection for nodeID.
+	// Called by sendAndWait when a QUIC-routed RPC times out, indicating the
+	// connection is no longer viable. The next outboundPlan call will see
+	// HasConn=false and fall back to UDP or deferICE naturally.
+	// No-op when no connection exists for nodeID.
+	InvalidateConn(nodeID a2al.NodeID)
 }
 
 // Punch priority levels for PunchTransport.Punch (§11 trigger table).
@@ -120,7 +127,7 @@ type Config struct {
 	PunchTransport PunchTransport
 
 	// LearnedPathFirst enables learned-path outbound selection (lastInbound,
-	// skipCold DeferICE). Default false preserves legacy L0-only behaviour.
+	// skipCold, DeferICE). Default false preserves legacy direct-UDP behaviour.
 	LearnedPathFirst bool
 
 	// PushHandler is called when this node receives a MsgDHTPush (oneShot delivery).
@@ -147,6 +154,16 @@ const badHealthThreshold = 2
 // probeInitDelay<<10 ≈ 8.5 h, which is effectively "give up for now".
 const maxBackoffShift = 10
 
+// correlatedFailThreshold is the number of distinct peers that must fail within
+// correlatedFailWindow before the failures are considered correlated (i.e. caused
+// by a local network outage rather than individual remote-side problems).
+// When reached, SetOfflineSuspect(true) is called automatically.
+const correlatedFailThreshold = 4
+
+// correlatedFailWindow is the sliding time window over which distinct-peer
+// failures are counted for correlated-failure detection.
+const correlatedFailWindow = 15 * time.Second
+
 // offlineSuspectThreshold is the quiet period without any successful outbound
 // RPC after which the node suspects its own network connectivity is lost.
 // Three probe ticks (3 × probeTickInterval = 45 s) provides enough margin
@@ -155,10 +172,11 @@ const offlineSuspectThreshold = 45 * time.Second
 
 // familyHealth tracks reachability statistics for a single IP family (v4 or v6).
 type familyHealth struct {
-	failCount   int           // consecutive failures; reset to 0 on success
-	rtt         time.Duration // last successful RTT
-	nextRetryAt time.Time     // exponential backoff expiry; zero = contact freely
-	lastSuccess time.Time     // most recent success on this family; zero = never
+	failCount        int           // consecutive failures; reset to 0 on success
+	pendingFailCount int           // failures held during suspected outage; settled or discarded by recordSuccess
+	rtt              time.Duration // last successful RTT
+	nextRetryAt      time.Time     // exponential backoff expiry; zero = contact freely
+	lastSuccess      time.Time     // most recent success on this family; zero = never
 	// everUsed is set when at least one RPC has been attempted on this family
 	// (success or failure). Inactive families do not contribute to PeerHealthOf
 	// aggregation, preserving equivalence with the old single-family model for
@@ -257,6 +275,22 @@ type Node struct {
 	// offlineSuspectThreshold, failure recording is suppressed so that
 	// healthy peers are not penalised for our own connectivity loss.
 	lastAnySuccessAt atomic.Int64
+
+	// localOutageSuspect is set by the daemon when strong external evidence
+	// of a local network outage is detected (sleep/wake, no default route).
+	// It takes effect immediately, unlike the time-based offlineSuspectThreshold,
+	// and is cleared automatically by recordSuccess on the first RPC success.
+	localOutageSuspect atomic.Bool
+
+	// correlatedFailMu guards correlatedFail* fields.
+	correlatedFailMu sync.Mutex
+	// correlatedFailPeers tracks distinct peers that failed within the current window.
+	// A set (not a counter) prevents one misbehaving peer from inflating the count.
+	// Cleared on any success.
+	correlatedFailPeers map[string]struct{}
+	// correlatedFailWindowStart is the start of the current counting window.
+	// Resets when the threshold is reached or the window expires.
+	correlatedFailWindowStart time.Time
 
 	// NAT probe: SendNATProbeReq registers a token → notify channel here;
 	// onNATProbeEcho delivers incoming echoes to the matching channel.
@@ -550,6 +584,35 @@ func (n *Node) lookupPeerHealthAware(id a2al.NodeID) (net.Addr, bool) {
 	}
 	if pa.v6.bestStable() != nil && v6ok {
 		return pa.v6.bestStable(), true
+	}
+	return nil, false
+}
+
+// lookupFamilyHealthAware returns the stable dial address for a single IP
+// family when that family is not in back-off. Unlike lookupPeerHealthAware it
+// never falls back to the other family: a nil/false result means the requested
+// family has no known address or is currently penalised.
+func (n *Node) lookupFamilyHealthAware(id a2al.NodeID, v6 bool) (net.Addr, bool) {
+	n.peerMu.Lock()
+	pa := n.peers[nodeIDKey(id)]
+	n.peerMu.Unlock()
+	if pa == nil {
+		return nil, false
+	}
+	n.healthMu.RLock()
+	e := n.health[nodeIDKey(id)]
+	n.healthMu.RUnlock()
+	now := time.Now()
+	if v6 {
+		ok := e == nil || !e.v6.everUsed || e.v6.nextRetryAt.IsZero() || now.After(e.v6.nextRetryAt)
+		if pa.v6.bestStable() != nil && ok {
+			return pa.v6.bestStable(), true
+		}
+	} else {
+		ok := e == nil || !e.v4.everUsed || e.v4.nextRetryAt.IsZero() || now.After(e.v4.nextRetryAt)
+		if pa.v4.bestStable() != nil && ok {
+			return pa.v4.bestStable(), true
+		}
 	}
 	return nil, false
 }
@@ -876,19 +939,37 @@ func nodeInfoWithUDPAddr(ni protocol.NodeInfo, addr *net.UDPAddr) protocol.NodeI
 // recordSuccess marks the peer's address family as healthy: resets that
 // family's failCount, clears its backoff, and updates RTT.
 // Also refreshes the routing table VerifiedAt timestamp.
+// On confirmed outage (suspectOffline), clears all pending failures globally.
 func (n *Node) recordSuccess(id a2al.NodeID, addr net.Addr, rtt time.Duration) {
 	key := nodeIDKey(id)
 	now := time.Now()
-	// Detect recovery: first success after a suspected-offline period.
-	// Must be checked before clearing lastAnySuccessAt.
-	if n.suspectOffline() {
+	// Read suspectOffline before updating lastAnySuccessAt/localOutageSuspect
+	// so it reflects the state that produced any pending failures.
+	wasSuspect := n.suspectOffline()
+	if wasSuspect {
 		select {
 		case n.recoveryNotify <- struct{}{}:
 		default:
 		}
 	}
-	n.lastAnySuccessAt.Store(now.UnixNano()) // clear offline-suspect state
+	n.lastAnySuccessAt.Store(now.UnixNano())
+	n.localOutageSuspect.Store(false) // clear explicit outage flag set by daemon
+	n.correlatedFailMu.Lock()
+	n.correlatedFailPeers = nil // reset breadth window on any success
+	n.correlatedFailMu.Unlock()
 	n.healthMu.Lock()
+
+	// Confirmed outage: discard all pending and reset backoff globally.
+	if wasSuspect {
+		for _, pe := range n.health {
+			pe.v4.pendingFailCount = 0
+			pe.v6.pendingFailCount = 0
+			pe.v4.nextRetryAt = time.Time{}
+			pe.v6.nextRetryAt = time.Time{}
+		}
+	}
+	// Non-suspect path: each peer settles its own pending on its own success.
+
 	e := n.health[key]
 	if e == nil {
 		e = &peerHealthEntry{}
@@ -898,6 +979,7 @@ func (n *Node) recordSuccess(id a2al.NodeID, addr net.Addr, rtt time.Duration) {
 	fh := e.familyFor(addr)
 	fh.everUsed = true
 	fh.failCount = 0
+	fh.pendingFailCount = 0
 	fh.nextRetryAt = time.Time{}
 	fh.lastSuccess = now
 	n.clearSkipColdUDP(fh)
@@ -945,8 +1027,21 @@ func (n *Node) recordFailure(id a2al.NodeID, addr net.Addr) {
 	}
 	fh := e.familyFor(addr)
 	fh.everUsed = true
-	fh.failCount++
-	shift := fh.failCount - 1
+	// Accumulate into pendingFailCount instead of failCount directly.
+	// pendingFailCount contributes to PeerHealthOf immediately (see
+	// familyHealthState), so query routing still deprioritises this peer.
+	// Settlement happens per-peer in recordSuccess:
+	//   - wasSuspect=true  → all pending globally discarded; failCount stays
+	//                         at 0, peer instantly recovers from Bad.
+	//   - wasSuspect=false → only THIS peer's pending is cleared (self-
+	//                         settlement). Other peers retain their pending
+	//                         until they each individually succeed, so genuine
+	//                         bad peers cannot hide behind an unrelated success.
+	fh.pendingFailCount++
+	// nextRetryAt uses the combined (failCount + pendingFailCount) projection
+	// to prevent tight-loop retries regardless of settlement outcome.
+	combined := fh.failCount + fh.pendingFailCount
+	shift := combined - 1
 	if shift > maxBackoffShift {
 		shift = maxBackoffShift
 	}
@@ -955,28 +1050,72 @@ func (n *Node) recordFailure(id a2al.NodeID, addr net.Addr) {
 		fh.skipColdUDP = true
 		fh.skipColdAt = time.Now()
 	}
-	turnedBad := fh.failCount >= badHealthThreshold
+	turnedBad := combined >= badHealthThreshold
 	n.healthMu.Unlock()
 
 	if turnedBad {
-		// The family just turned Bad: revoke the fresh-live preference so that
-		// preferred() falls back to anchor immediately instead of waiting out
-		// liveVerifiedFreshWindow.  This keeps the "my observation" advantage
-		// accurate — once the observed path is confirmed dead, the peer's
-		// advertised anchor should reassert.
-		//
-		// peerMu is acquired AFTER healthMu is released to respect the global
-		// lock order (lookupPeerHealthAware takes peerMu before healthMu).
+		// Revoke the fresh-live preference the same way the original code did:
+		// once the combined failure count crosses the threshold, stop preferring
+		// the observed path over the advertised anchor.
 		n.peerMu.Lock()
 		if pa := n.peers[key]; pa != nil {
 			if udp, ok := addr.(*net.UDPAddr); ok && udp != nil {
 				pa.familyFor(udp).liveAt = time.Time{}
 			} else {
-				// Non-UDP addr defaults to v4 (same convention as familyHealth).
 				pa.v4.liveAt = time.Time{}
 			}
 		}
 		n.peerMu.Unlock()
+	}
+
+	// Correlated-failure detection: track distinct peers failing within a
+	// short window. Using a set ensures a single misbehaving peer that fails
+	// repeatedly cannot trigger the outage signal on its own. If enough
+	// distinct peers fail without any recent success, the failures are almost
+	// certainly caused by a local network outage rather than individual
+	// remote-side problems. Trigger SetOfflineSuspect immediately so
+	// subsequent recordFailure calls are suppressed.
+	//
+	// Two guards prevent false positives:
+	//
+	//  1. Cold start (lastAnySuccessAt==0): never triggered. Before any
+	//     successful RPC we cannot distinguish dead seeds from a local
+	//     outage — same reasoning as the last==0 guard in suspectOffline().
+	//
+	//  2. Recent success within correlatedFailWindow: not triggered even
+	//     when the distinct-peer count reaches the threshold. During
+	//     bootstrap a node may quickly succeed with one seed while many
+	//     others are dead; the interleaved successes prove connectivity is
+	//     up, so failures are seed-quality heterogeneity, not an outage.
+	//     Only when the last success is older than the window (i.e. no
+	//     success for ≥15 s AND 4 distinct peers failed) do we conclude
+	//     that the outage likely started.
+	lastSuccessNano := n.lastAnySuccessAt.Load()
+	if lastSuccessNano == 0 {
+		return
+	}
+	now := time.Now()
+	n.correlatedFailMu.Lock()
+	if n.correlatedFailWindowStart.IsZero() || now.Sub(n.correlatedFailWindowStart) > correlatedFailWindow {
+		// Start a fresh window with this peer as the first entry.
+		n.correlatedFailPeers = map[string]struct{}{key: {}}
+		n.correlatedFailWindowStart = now
+	} else {
+		if n.correlatedFailPeers == nil {
+			n.correlatedFailPeers = make(map[string]struct{})
+		}
+		n.correlatedFailPeers[key] = struct{}{}
+	}
+	// Only trigger when the threshold is reached AND the last success
+	// predates the current window — proving the failures are not merely
+	// interleaved with ongoing connectivity.
+	reachedThreshold := len(n.correlatedFailPeers) >= correlatedFailThreshold
+	lastSuccessBeforeWindow := now.Sub(time.Unix(0, lastSuccessNano)) >= correlatedFailWindow
+	triggered := reachedThreshold && lastSuccessBeforeWindow
+	n.correlatedFailMu.Unlock()
+
+	if triggered {
+		n.SetOfflineSuspect(true)
 	}
 }
 
@@ -1004,11 +1143,36 @@ func (n *Node) PeerAllowContact(id a2al.NodeID) bool {
 // so healthy peers are not penalised for a local outage. Any recordSuccess
 // call clears the condition immediately.
 func (n *Node) suspectOffline() bool {
+	if n.localOutageSuspect.Load() {
+		return true
+	}
 	last := n.lastAnySuccessAt.Load()
 	if last == 0 {
 		return false // never succeeded this session; new node, do not assume offline
 	}
 	return time.Since(time.Unix(0, last)) > offlineSuspectThreshold
+}
+
+// SetOfflineSuspect lets the daemon signal that local network connectivity
+// is known to be unavailable (e.g. sleep/wake detected, no default route).
+// recordSuccess clears the flag automatically when the first RPC succeeds.
+// When v is true, any accumulated pending failures are discarded immediately
+// so they cannot be flushed into failCount on the next success.
+func (n *Node) SetOfflineSuspect(v bool) {
+	n.localOutageSuspect.Store(v)
+	if v {
+		n.healthMu.Lock()
+		for _, pe := range n.health {
+			pe.v4.pendingFailCount = 0
+			pe.v6.pendingFailCount = 0
+			// Clear nextRetryAt so PeerAllowContact stays consistent with
+			// PeerHealthOf: once pending is discarded the peer is no longer
+			// Bad, and callers should be allowed to retry immediately.
+			pe.v4.nextRetryAt = time.Time{}
+			pe.v6.nextRetryAt = time.Time{}
+		}
+		n.healthMu.Unlock()
+	}
 }
 
 // RecoveryNotify returns the channel that receives a token whenever the node
@@ -1070,8 +1234,12 @@ func (n *Node) recordProbeFailure(id a2al.NodeID, addr net.Addr) {
 		return
 	}
 	fh := e.familyFor(addr)
-	// Undo the failCount++ that PingIdentity's sendAndWait applied.
-	if fh.failCount > 0 {
+	// Undo the pendingFailCount++ that PingIdentity's sendAndWait applied.
+	// (recordFailure now writes to pendingFailCount, not failCount directly.)
+	if fh.pendingFailCount > 0 {
+		fh.pendingFailCount--
+	} else if fh.failCount > 0 {
+		// Fallback: handle the case where pending was already flushed.
 		fh.failCount--
 	}
 	// Halve the remaining back-off window instead of growing it.
@@ -1088,11 +1256,18 @@ func (n *Node) recordProbeFailure(id a2al.NodeID, addr net.Addr) {
 // familyHealthState classifies the health state of a single family sub-entry.
 // Returns PeerHealthUnknown when the family has never been used (everUsed=false),
 // which prevents inactive families from biasing the aggregate result.
+//
+// Both failCount and pendingFailCount contribute to the Bad threshold.
+// pendingFailCount holds failures not yet settled: discarded globally on
+// confirmed outage (wasSuspect or SetOfflineSuspect), or cleared per-peer
+// when that peer individually succeeds (self-settlement). Including both
+// here ensures query routing deprioritises unreliable peers immediately —
+// while still allowing instant recovery once the outage is confirmed.
 func familyHealthState(fh *familyHealth) PeerHealthState {
 	if !fh.everUsed {
 		return PeerHealthUnknown // sentinel: inactive family
 	}
-	if fh.failCount >= badHealthThreshold {
+	if fh.failCount+fh.pendingFailCount >= badHealthThreshold {
 		return PeerHealthBad
 	}
 	if !fh.lastSuccess.IsZero() {
@@ -1267,6 +1442,16 @@ func (n *Node) absorbNodeInfo(ni protocol.NodeInfo, learnedFrom a2al.NodeID) {
 	copy(id[:], ni.NodeID)
 	udp := &net.UDPAddr{IP: append([]byte(nil), ni.IP...), Port: int(ni.Port)}
 	n.bindPeerLive(id, udp, rankHearsay)
+
+	// When ni.IP is a v4 address (typical: FIND_NODE response adapted for a v4
+	// asker), also absorb the peer's v6 address from its EndpointRecord if we
+	// have one locally. This prevents peerAddrs.v6 from staying empty for
+	// dual-stack peers discovered only through v4 FIND_NODE exchanges.
+	if udp.IP.To4() != nil {
+		if v6addr := n.advertisedStableAddr(id, true); v6addr != nil {
+			n.bindPeerLive(id, v6addr, rankHearsay)
+		}
+	}
 
 	// Opportunistic single probe for routing-critical hearsay nodes.
 	if routing.BucketIndex(n.nid, id) >= hearsayProbeBucketThreshold {
@@ -1835,6 +2020,14 @@ func (n *Node) sendAndWait(ctx context.Context, to net.Addr, hdr protocol.Header
 			if ctx.Err() != nil {
 				return nil, lastMeta, ctx.Err()
 			}
+			// QUIC RPC timed out: the connection is no longer viable.
+			// Evict it so the next attempt re-evaluates outboundPlan with
+			// HasConn=false, falling back to UDP or triggering re-punch.
+			if lastMeta.viaQUIC && n.punch != nil {
+				if peerID, ok := n.lookupPeerID(to); ok {
+					n.punch.InvalidateConn(peerID)
+				}
+			}
 			n.log.Debug("dht rpc timeout, retrying", "to", to, "msg_type", hdr.MsgType, "attempt", attempt+1)
 			// per-attempt timeout; retry
 		case <-n.ctx.Done():
@@ -1921,7 +2114,8 @@ func (n *Node) PingIdentity(ctx context.Context, peer net.Addr) (*PeerIdentity, 
 
 // StoreAt sends STORE to peer. storeKey zero omits BodyStore.Key (receiver derives key from rec.Address).
 // On success peerID is the remote node's identity from the STORE response.
-func (n *Node) StoreAt(ctx context.Context, peer net.Addr, storeKey a2al.NodeID, rec protocol.SignedRecord) (stored bool, peerID a2al.NodeID, err error) {
+// meta describes the outbound path actually used (for diagnostic logging).
+func (n *Node) StoreAt(ctx context.Context, peer net.Addr, storeKey a2al.NodeID, rec protocol.SignedRecord) (stored bool, peerID a2al.NodeID, meta deliverMeta, err error) {
 	body := &protocol.BodyStore{Record: rec}
 	if storeKey != (a2al.NodeID{}) {
 		body.Key = storeKey[:]
@@ -1939,7 +2133,7 @@ func (n *Node) StoreAt(ctx context.Context, peer net.Addr, storeKey a2al.NodeID,
 			}
 			n.recordFailure(id, failAddr)
 		}
-		return false, a2al.NodeID{}, err
+		return false, a2al.NodeID{}, meta, err
 	}
 	peerNID := a2al.NodeIDFromAddress(dec.SenderAddr)
 	dial := successDialAddr(peer, meta)
@@ -1954,7 +2148,7 @@ func (n *Node) StoreAt(ctx context.Context, peer net.Addr, storeKey a2al.NodeID,
 	case !resp.Stored && resp.Reason == protocol.StoreReasonRecordInvalid:
 		n.log.Debug("dht store: record invalid", "peer", peer, "key", hex.EncodeToString(storeKey[:4]))
 	}
-	return resp.Stored, peerNID, nil
+	return resp.Stored, peerNID, meta, nil
 }
 
 // rememberStoreSuccess registers dial→nodeID mapping after a successful outbound

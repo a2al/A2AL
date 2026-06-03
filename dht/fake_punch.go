@@ -191,3 +191,7 @@ func (t *FakePunchTransport) HasConn(nodeID a2al.NodeID) bool {
 	t.network.mu.Unlock()
 	return ok && pe.node != nil
 }
+
+// InvalidateConn implements dht.PunchTransport.
+// FakePunchTransport has no real connection pool; this is a no-op.
+func (t *FakePunchTransport) InvalidateConn(_ a2al.NodeID) {}

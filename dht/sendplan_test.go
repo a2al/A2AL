@@ -69,7 +69,7 @@ func TestOutboundPlanPrefersHasConn(t *testing.T) {
 	var peerID a2al.NodeID
 	peerID[0] = 0x11
 
-	plan := nodeA.outboundPlan(peerID, nil)
+	plan := nodeA.outboundPlan(peerID, nil, false)
 	if plan.transport != sendTransportQUIC || plan.reason != "has_conn" {
 		t.Fatalf("plan = %+v, want QUIC has_conn", plan)
 	}
@@ -92,7 +92,7 @@ func TestOutboundPlanLastInbound(t *testing.T) {
 	inbound := addrV4(55106)
 	nodeA.setLastInbound(peerID, inbound)
 
-	plan := nodeA.outboundPlan(peerID, inbound)
+	plan := nodeA.outboundPlan(peerID, inbound, false)
 	if plan.transport != sendTransportUDP || plan.reason != "last_inbound" {
 		t.Fatalf("plan = %+v, want last_inbound UDP", plan)
 	}
@@ -113,7 +113,7 @@ func TestOutboundPlanSkipsHairpinLastInbound(t *testing.T) {
 	nodeA.setLastInbound(peerID, hairpin)
 	nodeA.BindPeerAddr(peerID, stable)
 
-	plan := nodeA.outboundPlan(peerID, stable)
+	plan := nodeA.outboundPlan(peerID, stable, false)
 	if plan.reason == "last_inbound" {
 		t.Fatalf("plan = %+v, hairpin lastInbound must not be selected", plan)
 	}
@@ -140,7 +140,7 @@ func TestDeliverUsesL0PastHairpinLastInbound(t *testing.T) {
 	hairpin := &net.UDPAddr{IP: net.IPv4(47, 74, 189, 180), Port: 65090}
 	nodeA.setLastInbound(peerID, hairpin)
 
-	plan := nodeA.outboundPlan(peerID, hairpin)
+	plan := nodeA.outboundPlan(peerID, hairpin, false)
 	if plan.reason == "last_inbound" {
 		t.Fatalf("plan = %+v, must not use hairpin lastInbound", plan)
 	}
@@ -237,7 +237,7 @@ func TestOutboundPlanFamilyHintIgnoresOtherFamily(t *testing.T) {
 	e.v6.lastInboundAt = e.v4.lastInboundAt.Add(time.Second)
 	nodeA.healthMu.Unlock()
 
-	plan := nodeA.outboundPlan(peerID, addrV4(4121))
+	plan := nodeA.outboundPlan(peerID, addrV4(4121), false)
 	if plan.reason != "last_inbound" || plan.addr.String() != v4Inbound.String() {
 		t.Fatalf("expected v4 last_inbound, got %+v", plan)
 	}
@@ -262,7 +262,7 @@ func TestOutboundPlanV6SkipColdDoesNotDeferV4(t *testing.T) {
 	nodeA.health[key] = e
 	nodeA.healthMu.Unlock()
 
-	plan := nodeA.outboundPlan(peerID, stableV4)
+	plan := nodeA.outboundPlan(peerID, stableV4, false)
 	if plan.transport == sendTransportDeferICE {
 		t.Fatalf("v6 skipCold must not defer v4-targeted plan, got %+v", plan)
 	}
@@ -281,13 +281,13 @@ func TestOutboundPlanReplansAfterHasConnLost(t *testing.T) {
 	inbound := addrV4(55106)
 	nodeA.setLastInbound(peerID, inbound)
 
-	plan := nodeA.outboundPlan(peerID, inbound)
+	plan := nodeA.outboundPlan(peerID, inbound, false)
 	if plan.transport != sendTransportQUIC {
 		t.Fatalf("first plan = %+v, want QUIC", plan)
 	}
 
 	mock.hasConn.Store(false)
-	plan = nodeA.outboundPlan(peerID, inbound)
+	plan = nodeA.outboundPlan(peerID, inbound, false)
 	if plan.reason != "last_inbound" || plan.addr.String() != inbound.String() {
 		t.Fatalf("replanned to %+v, want last_inbound via %v", plan, inbound)
 	}
@@ -425,5 +425,103 @@ func TestDeliverPlanWorthLogging(t *testing.T) {
 		if deliverPlanWorthLogging(reason) {
 			t.Fatalf("routine reason %q should not be worth logging", reason)
 		}
+	}
+}
+
+// TestOutboundPlanWarmPrefersVerifiedLive verifies that warm=true causes
+// outboundPlan to prefer a recently-verified live address over the anchor
+// for ReachPublic peers.
+func TestOutboundPlanWarmPrefersVerifiedLive(t *testing.T) {
+	n := newHealthTestNode(t)
+	n.SetLearnedPathFirst(true)
+
+	var peerID a2al.NodeID
+	peerID[0] = 0xAB
+
+	anchor := addrV4(4121)
+	live := addrV4(55200) // different port = different path from anchor
+
+	// Register anchor so reachProfile returns ReachPublic.
+	n.BindPeerAnchor(peerID, anchor)
+
+	// Register a fresh verified-live address (mimics a successful RPC).
+	n.peerMu.Lock()
+	key := nodeIDKey(peerID)
+	if n.peers[key] == nil {
+		n.peers[key] = &peerAddrs{}
+	}
+	n.peers[key].v4.tryLive(live, rankVerified)
+	n.peerMu.Unlock()
+
+	// cold: should use anchor
+	coldPlan := n.outboundPlan(peerID, nil, false)
+	if coldPlan.reason != "l0_public_anchor" {
+		t.Fatalf("cold plan reason = %q, want l0_public_anchor", coldPlan.reason)
+	}
+
+	// warm: should prefer verified live
+	warmPlan := n.outboundPlan(peerID, nil, true)
+	if warmPlan.reason != "l1_warm_live" {
+		t.Fatalf("warm plan reason = %q, want l1_warm_live", warmPlan.reason)
+	}
+	if warmPlan.addr.String() != live.String() {
+		t.Fatalf("warm plan addr = %v, want live %v", warmPlan.addr, live)
+	}
+}
+
+// TestOutboundPlanWarmFallsBackToAnchorWhenNoLive verifies that warm=true
+// falls back to anchor when no fresh verified live is available.
+func TestOutboundPlanWarmFallsBackToAnchorWhenNoLive(t *testing.T) {
+	n := newHealthTestNode(t)
+	n.SetLearnedPathFirst(true)
+
+	var peerID a2al.NodeID
+	peerID[0] = 0xAC
+
+	anchor := addrV4(4121)
+	n.BindPeerAnchor(peerID, anchor)
+
+	// No live address set — warm should fall back to anchor.
+	plan := n.outboundPlan(peerID, nil, true)
+	if plan.reason != "l0_public_anchor" {
+		t.Fatalf("warm plan reason = %q, want l0_public_anchor (no live available)", plan.reason)
+	}
+	if plan.addr.String() != anchor.String() {
+		t.Fatalf("warm plan addr = %v, want anchor %v", plan.addr, anchor)
+	}
+}
+
+// TestOutboundPlanWarmPrefersLastInboundOverAnchor verifies that warm=true
+// uses fresh lastInbound (non-hairpin) before anchor when no verified live.
+func TestOutboundPlanWarmPrefersLastInboundOverAnchor(t *testing.T) {
+	n := newHealthTestNode(t)
+	n.SetLearnedPathFirst(true)
+
+	var peerID a2al.NodeID
+	peerID[0] = 0xAD
+
+	anchor := addrV4(4121)
+	inbound := addrV4(55300)
+	n.BindPeerAnchor(peerID, anchor)
+	n.setLastInbound(peerID, inbound)
+
+	plan := n.outboundPlan(peerID, nil, true)
+	if plan.reason != "l1_warm_inbound" {
+		t.Fatalf("warm plan reason = %q, want l1_warm_inbound", plan.reason)
+	}
+	if plan.addr.String() != inbound.String() {
+		t.Fatalf("warm plan addr = %v, want inbound %v", plan.addr, inbound)
+	}
+}
+
+func TestDeliverPathLabel(t *testing.T) {
+	if got := deliverPathLabel(deliverMeta{viaQUIC: true, reason: "has_conn"}); got != "quic/has_conn" {
+		t.Fatalf("got %q", got)
+	}
+	if got := deliverPathLabel(deliverMeta{reason: "l0_public_anchor"}); got != "udp/l0_public_anchor" {
+		t.Fatalf("got %q", got)
+	}
+	if got := deliverPathLabel(deliverMeta{}); got != "udp" {
+		t.Fatalf("got %q", got)
 	}
 }

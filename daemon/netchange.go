@@ -10,6 +10,7 @@ import (
 	"net"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -64,6 +65,8 @@ func (d *Daemon) runNetworkMonitor(ctx context.Context) {
 // poll re-evaluates the current network topology from scratch, and immediately
 // triggers a cascade without waiting for the normal debounce window.
 func (d *Daemon) onSleepWakeDetected(ctx context.Context) {
+	// Mark peers as suspect immediately; QUIC paths are frozen during sleep.
+	d.h.Node().SetOfflineSuspect(true)
 	d.netMu.Lock()
 	d.netStableFP = "" // force re-baseline on next pollNetworkFingerprint
 	d.netPendingFP = ""
@@ -77,6 +80,15 @@ func (d *Daemon) pollNetworkFingerprint() {
 	fp := d.fingerprint()
 	if fp == "" {
 		return
+	}
+
+	// No outbound route: mark suspect immediately to suppress health penalties.
+	// Guarded: d.h is nil in unit tests that exercise only debounce logic.
+	if d.h != nil {
+		v4, v6 := daemonOutboundIP()
+		if v4 == nil && v6 == nil {
+			d.h.Node().SetOfflineSuspect(true)
+		}
 	}
 
 	d.netMu.Lock()
@@ -278,30 +290,38 @@ func (d *Daemon) tryConsumeNetChangeEvent() bool {
 func (d *Daemon) handleNetworkChangeCascade(ctx context.Context) {
 	start := d.now()
 
-	// Bootstrap recovery uses an independent goroutine so it cannot consume
-	// the cascade's budget (120 s, sized for observe+probe+publish).
-	// When there are no peers the normal cascade steps fail fast anyway;
-	// subsequent cascade or probe ticks will benefit from newly joined peers.
+	// ① Evict stale ICE/QUIC paths bound to the old interface/NAT mapping.
+	d.h.DHTpunchPool().EvictAll()
+
+	// ② Bootstrap recovery in background — must not consume the cascade budget.
 	go func() {
 		rbCtx, rbCancel := context.WithTimeout(ctx, 90*time.Second)
 		defer rbCancel()
 		d.maybeRebootstrap(rbCtx)
 	}()
 
+	// ③ Invalidate stale ext-IP and reach-hint caches.
 	d.h.InvalidateNetworkCaches()
 
-	obsCtx, obsCancel := context.WithTimeout(ctx, 10*time.Second)
-	observed := d.h.ObserveFromRouting(obsCtx, 8)
-	obsCancel()
+	// ④ Observe and NAT probe concurrently — no dependency between them.
+	var observed int
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		obsCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		observed = d.h.ObserveFromRouting(obsCtx, 8)
+	}()
+	go func() {
+		defer wg.Done()
+		probeCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		defer cancel()
+		d.h.RunNATProbe(probeCtx)
+	}()
+	wg.Wait()
 
-	probeCtx, probeCancel := context.WithTimeout(ctx, 20*time.Second)
-	d.h.RunNATProbe(probeCtx)
-	probeCancel()
-
-	// Force-publish unconditionally: the cached endpoint fingerprint may be
-	// stale after a network change, and Signal hubs need time to reconnect.
-	// forcePublishNodeOnce also relaxes peer health throttles and gates on
-	// Signal readiness so the published record includes live hub URLs.
+	// ⑤ Force-publish to refresh endpoint record and hub URLs.
 	d.forcePublishNodeOnce(ctx)
 
 	d.log.Info("network change handled",

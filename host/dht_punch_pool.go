@@ -25,6 +25,7 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -259,6 +260,82 @@ func (p *DHTpunchPool) runReadLoop(ctx context.Context, nodeID a2al.NodeID, qc q
 	}
 }
 
+// ProbeAndPrune tests each cached Mode B connection and evicts dead ones.
+// Called at the start of handleNetworkChangeCascade to eliminate stale
+// HasConn entries before they can pollute send-plan decisions.
+//
+// For each entry:
+//   - If qc.Context().Err() != nil: already dead, evict immediately (no I/O).
+//   - Otherwise: attempt OpenStreamSync; failure → evict.
+//     A successful probe opens and immediately closes an empty stream, which
+//     is harmless to the remote's runReadLoop (empty data → handler returns).
+//
+// All probes run concurrently; total elapsed ≤ timeout regardless of pool size.
+// Returns the number of evicted connections.
+func (p *DHTpunchPool) ProbeAndPrune(timeout time.Duration) int {
+	p.mu.Lock()
+	type entry struct {
+		id a2al.NodeID
+		qc quic.Connection
+	}
+	snapshot := make([]entry, 0, len(p.pool))
+	for id, mb := range p.pool {
+		snapshot = append(snapshot, entry{id, mb.qc})
+	}
+	p.mu.Unlock()
+
+	if len(snapshot) == 0 {
+		return 0
+	}
+
+	// pruneOne evicts the entry only if pool still holds the same qc instance,
+	// guarding against a freshly established connection being removed.
+	pruneOne := func(id a2al.NodeID, qc quic.Connection) {
+		p.mu.Lock()
+		mb, ok := p.pool[id]
+		if ok && mb.qc == qc {
+			delete(p.pool, id)
+		} else {
+			ok = false
+		}
+		p.mu.Unlock()
+		if ok {
+			mb.cancel()
+		}
+	}
+
+	var pruned atomic.Int32
+	var wg sync.WaitGroup
+	for _, e := range snapshot {
+		if e.qc.Context().Err() != nil {
+			// Fast path: QUIC context already cancelled — dead with no I/O needed.
+			pruneOne(e.id, e.qc)
+			pruned.Add(1)
+			continue
+		}
+		// Slow path: verify with a stream open under timeout.
+		wg.Add(1)
+		go func(id a2al.NodeID, qc quic.Connection) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			defer cancel()
+			st, err := qc.OpenStreamSync(ctx)
+			if err != nil {
+				pruneOne(id, qc)
+				pruned.Add(1)
+				return
+			}
+			_ = st.Close()
+		}(e.id, e.qc)
+	}
+	wg.Wait()
+
+	n := int(pruned.Load())
+	p.log.Info("wake/netchange: punch pool probed",
+		"total", len(snapshot), "evicted", n, "kept", len(snapshot)-n)
+	return n
+}
+
 // HasConn implements dht.PunchTransport.
 // Returns true if an active Mode B QUIC connection exists for nodeID.
 func (p *DHTpunchPool) HasConn(nodeID a2al.NodeID) bool {
@@ -266,6 +343,34 @@ func (p *DHTpunchPool) HasConn(nodeID a2al.NodeID) bool {
 	_, ok := p.pool[nodeID]
 	p.mu.Unlock()
 	return ok
+}
+
+// InvalidateConn implements dht.PunchTransport.
+// Closes and evicts the Mode B QUIC connection for nodeID.
+// Called by the DHT layer when a QUIC-routed RPC times out.
+func (p *DHTpunchPool) InvalidateConn(nodeID a2al.NodeID) {
+	p.log.Debug("dht punch: invalidating stale conn", "node", nodeID)
+	p.removeConn(nodeID)
+}
+
+// EvictAll closes and evicts all Mode B QUIC connections.
+// Called when the network topology changes: ICE-negotiated paths are bound
+// to the old interface/NAT mapping and must be treated as invalid wholesale.
+// Re-punch happens naturally on the next DHT RPC via deferICE / replication-probe.
+func (p *DHTpunchPool) EvictAll() {
+	p.mu.Lock()
+	ids := make([]a2al.NodeID, 0, len(p.pool))
+	for id := range p.pool {
+		ids = append(ids, id)
+	}
+	p.mu.Unlock()
+
+	for _, id := range ids {
+		p.removeConn(id)
+	}
+	if len(ids) > 0 {
+		p.log.Info("dht punch: evicted all conns after network change", "count", len(ids))
+	}
 }
 
 // ConnCount returns the number of active Mode B connections (for diagnostics).

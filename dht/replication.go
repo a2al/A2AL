@@ -423,22 +423,67 @@ func (n *Node) storeAndRecord(ctx context.Context, peers []protocol.NodeInfo, rk
 			continue
 		}
 		if n.isHairpinAddr(addr) {
+			n.log.Debug("replication StoreAt skipped", "peer", addr, "reason", "hairpin")
 			continue
 		}
 
 		if n.learnedPathFirst.Load() {
-			n.maybeWaitRepSetPunch(ctx, id, rs, addr)
-			if planAddr := n.outboundPlan(id, addr).addr; planAddr != nil {
+			// warm=true for confirmed repSet members: prefer verified live over anchor.
+			warm := n.repSetContains(rs, id)
+			// Prefer v6 hint when the peer has a healthy v6 stable address.
+			// lookupPeerHealthAware is v4-first; this restores v6 participation
+			// for dual-stack peers on the L1 warm path without changing L0 semantics.
+			// If v6 is in back-off or has no known address, hint stays as the v4 addr.
+			hint := addr
+			if v6hint, ok := n.lookupFamilyHealthAware(id, true); ok {
+				hint = v6hint
+			}
+			n.maybeWaitRepSetPunch(ctx, id, rs, hint)
+			if planAddr := n.outboundPlan(id, hint, warm).addr; planAddr != nil {
 				addr = planAddr
 			}
 		}
 
 		pctx, cancel := context.WithTimeout(ctx, queryPeerTimeout)
-		stored, _, err := n.StoreAt(pctx, addr, rk.storeKey, rec)
+		stored, _, meta, err := n.StoreAt(pctx, addr, rk.storeKey, rec)
 		cancel()
 		if err != nil {
-			n.log.Debug("replication StoreAt failed", "peer", addr, "err", err)
-			continue
+			dial := meta.dialAddr
+			if dial == nil {
+				dial = addr
+			}
+			n.log.Debug("replication StoreAt failed",
+				"peer", addr,
+				"path", deliverPathLabel(meta),
+				"dial", dial,
+				"err", err,
+			)
+			// Warm-path anchor fallback: when a verified-live or lastInbound
+			// path fails, retry once with the published anchor before giving up.
+			// Skipped when the warm path already fell through to anchor (same addr).
+			if meta.reason == "l1_warm_live" || meta.reason == "l1_warm_inbound" {
+				v6, _ := addrIsV6(addr)
+				if fallback := n.publicStableDialAddr(id, v6); fallback != nil && fallback.String() != addr.String() {
+					pctx2, cancel2 := context.WithTimeout(ctx, queryPeerTimeout)
+					stored, _, meta, err = n.StoreAt(pctx2, fallback, rk.storeKey, rec)
+					cancel2()
+					if err != nil {
+						fdial := meta.dialAddr
+						if fdial == nil {
+							fdial = fallback
+						}
+						n.log.Debug("replication StoreAt failed (anchor fallback)",
+							"peer", fallback,
+							"path", deliverPathLabel(meta),
+							"dial", fdial,
+							"err", err,
+						)
+					}
+				}
+			}
+			if err != nil {
+				continue
+			}
 		}
 		if !stored {
 			// The peer is reachable but its recordAuthPolicy rejected this
@@ -994,20 +1039,16 @@ func (n *Node) execRepProbe(ctx context.Context, id a2al.NodeID) repProbeExecOut
 		}
 	}
 
-	profile := n.reachProfile(id)
+	// repSet probe uses the same warm candidate selection as renewal: prefer
+	// recently-verified live paths over the published anchor so that probe and
+	// StoreAt agree on which path is actually reachable.
 	var (
 		probeAddr net.Addr
 		ok        bool
 	)
-	if profile.prefersUDPAnchor() {
-		v6 := false
-		if a, has := n.lookupPeerHealthAware(id); has {
-			if isV6, ok2 := addrIsV6(a); ok2 {
-				v6 = isV6
-			}
-		}
-		probeAddr = n.publicStableDialAddr(id, v6)
-		ok = probeAddr != nil
+	if plan := n.outboundPlan(id, nil, true /* warm: always a repSet member */); plan.addr != nil {
+		probeAddr = plan.addr
+		ok = true
 	}
 	if !ok {
 		probeAddr, ok = n.lookupPeerHealthAware(id)
@@ -1016,7 +1057,7 @@ func (n *Node) execRepProbe(ctx context.Context, id a2al.NodeID) repProbeExecOut
 		probeAddr, ok = n.lookupPeer(id)
 	}
 	if !ok {
-		n.log.Debug("replication probe: no dial addr", "nodeID", id, "profile", profile)
+		n.log.Debug("replication probe: no dial addr", "nodeID", id)
 		out.noAddr = true
 		return out
 	}

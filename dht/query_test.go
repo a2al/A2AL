@@ -76,7 +76,7 @@ func TestBootstrap_iterativeResolveMem(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ok, _, err := A.n.StoreAt(ctx, R.tr.LocalAddr(), a2al.NodeID{}, rec)
+	ok, _, _, err := A.n.StoreAt(ctx, R.tr.LocalAddr(), a2al.NodeID{}, rec)
 	if err != nil || !ok {
 		t.Fatalf("store at R: ok=%v err=%v", ok, err)
 	}
@@ -200,7 +200,7 @@ func TestTenNodes_memMultiHop(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ok, _, err := pub.n.StoreAt(ctx, hub.tr.LocalAddr(), a2al.NodeID{}, rec)
+	ok, _, _, err := pub.n.StoreAt(ctx, hub.tr.LocalAddr(), a2al.NodeID{}, rec)
 	if err != nil || !ok {
 		t.Fatalf("store: ok=%v err=%v", ok, err)
 	}

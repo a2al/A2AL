@@ -5,11 +5,25 @@ package routing
 
 import (
 	"bytes"
+	"net"
 	"time"
 
 	"github.com/a2al/a2al"
 	"github.com/a2al/a2al/protocol"
 )
+
+// sameIPFamily reports whether two raw IP byte slices belong to the same
+// address family (both IPv4 / both IPv6). IPv4-mapped IPv6 addresses
+// (16-byte with ::ffff: prefix) are treated as IPv4.
+func sameIPFamily(a, b []byte) bool {
+	isV4 := func(ip []byte) bool {
+		if len(ip) == 4 {
+			return true
+		}
+		return len(ip) == 16 && net.IP(ip).To4() != nil
+	}
+	return isV4(a) == isV4(b)
+}
 
 const (
 	K          = 16
@@ -142,7 +156,13 @@ func (b *bucket) addOrTouch(n protocol.NodeInfo, meta EntryMeta, addedAt time.Ti
 		}
 		// Only update IP:Port from direct contact to prevent hearsay from
 		// overwriting a verified address with potentially stale third-party data.
-		if !meta.VerifiedAt.IsZero() && len(n.IP) > 0 && n.Port != 0 {
+		// Additionally, only overwrite when the new address is the same IP family
+		// as the existing entry: a v4 outbound success must not erase a v6 routing
+		// hint that was learned from a direct v6 inbound contact (and vice-versa).
+		// Both families carry independent reachability evidence and should not
+		// invalidate each other.
+		if !meta.VerifiedAt.IsZero() && len(n.IP) > 0 && n.Port != 0 &&
+			(len(b.nodes[i].info.IP) == 0 || sameIPFamily(b.nodes[i].info.IP, n.IP)) {
 			b.nodes[i].info.IP = append([]byte(nil), n.IP...)
 			b.nodes[i].info.Port = n.Port
 			// Direct-contact evidence: node has proven UDP reachability, so it

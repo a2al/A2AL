@@ -30,7 +30,8 @@ func (m *mockPunch) Punch(_ a2al.NodeID, _ *protocol.EndpointRecord, _ int) {
 	atomic.AddInt32(&m.punchCalls, 1)
 }
 
-func (m *mockPunch) HasConn(_ a2al.NodeID) bool { return false }
+func (m *mockPunch) HasConn(_ a2al.NodeID) bool      { return false }
+func (m *mockPunch) InvalidateConn(_ a2al.NodeID)    {}
 
 // newTestNode builds a minimal DHT node wired to the given MemTransport, with
 // an optional PunchTransport.

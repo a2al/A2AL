@@ -59,7 +59,7 @@ func TestOutboundPlan_PublicPrefersAnchorOverLastInbound(t *testing.T) {
 	n.setLastInbound(peerID, addrV4(57691))
 	n.SetLearnedPathFirst(true)
 
-	plan := n.outboundPlan(peerID, nil)
+	plan := n.outboundPlan(peerID, nil, false)
 	if plan.reason != "l0_public_anchor" {
 		t.Fatalf("reason = %q, want l0_public_anchor", plan.reason)
 	}

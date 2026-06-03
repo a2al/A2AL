@@ -52,7 +52,11 @@ func (n *Node) preferredFamilyIsV6(peerID a2al.NodeID, addrHint net.Addr) bool {
 	return false
 }
 
-func (n *Node) outboundPlan(peerID a2al.NodeID, addrHint net.Addr) sendPlan {
+// outboundPlan selects the best outbound path for peerID.
+// warm=true is used for confirmed repSet members (renewal/probe): in that
+// case recently-verified live paths are preferred over the published anchor.
+// warm=false preserves the existing cold / discovery behaviour.
+func (n *Node) outboundPlan(peerID a2al.NodeID, addrHint net.Addr, warm bool) sendPlan {
 	if n.punch != nil && n.punch.HasConn(peerID) {
 		return sendPlan{transport: sendTransportQUIC, reason: "has_conn"}
 	}
@@ -61,11 +65,22 @@ func (n *Node) outboundPlan(peerID a2al.NodeID, addrHint net.Addr) sendPlan {
 	profile := n.reachProfile(peerID)
 
 	if profile.prefersUDPAnchor() {
+		if warm {
+			// Warm renewal/probe: prefer recently-verified live path over anchor.
+			// The peer is a confirmed replica; use the path we know actually works.
+			if addr, ok := n.freshVerifiedLiveForFamily(peerID, v6); ok {
+				return sendPlan{transport: sendTransportUDP, addr: addr, reason: "l1_warm_live"}
+			}
+			if addr, ok := n.freshLastInboundForFamily(peerID, v6); ok &&
+				!n.isHairpinAddr(addr) && !n.isUnusableControlPlaneReachAddr(addr) {
+				return sendPlan{transport: sendTransportUDP, addr: addr, reason: "l1_warm_inbound"}
+			}
+		}
 		if addr := n.publicStableDialAddr(peerID, v6); addr != nil {
 			return sendPlan{transport: sendTransportUDP, addr: addr, reason: "l0_public_anchor"}
 		}
-		// Public-capable peer without a resolvable anchor: skip lastInbound and
-		// fall through to L0 health-aware / stable selection below.
+		// Public-capable peer without a resolvable anchor: fall through to
+		// L0 health-aware / stable selection below.
 	} else if addr, ok := n.freshLastInboundForFamily(peerID, v6); ok && !n.skipColdForPeer(peerID, addr) && !n.isUnusableControlPlaneReachAddr(addr) {
 		return sendPlan{transport: sendTransportUDP, addr: addr, reason: "last_inbound"}
 	}
@@ -96,7 +111,7 @@ func (n *Node) deliver(ctx context.Context, peerID a2al.NodeID, addrHint net.Add
 		return meta, n.sendToOrFallbackLegacy(ctx, meta.dialAddr, raw)
 	}
 
-	plan := n.outboundPlan(peerID, addrHint)
+	plan := n.outboundPlan(peerID, addrHint, false)
 	meta.reason = plan.reason
 	n.logDeliverPlanIfChanged(peerID, plan, addrHint)
 
@@ -149,6 +164,18 @@ func sendPlanLogSig(plan sendPlan) string {
 		addr = plan.addr.String()
 	}
 	return fmt.Sprintf("%d|%s|%s", plan.transport, plan.reason, addr)
+}
+
+// deliverPathLabel formats outbound deliver meta as "quic/has_conn" or "udp/l0_public_anchor".
+func deliverPathLabel(meta deliverMeta) string {
+	t := "udp"
+	if meta.viaQUIC {
+		t = "quic"
+	}
+	if meta.reason != "" {
+		return t + "/" + meta.reason
+	}
+	return t
 }
 
 // deliverPlanWorthLogging reports whether an outbound plan reason indicates a
@@ -242,7 +269,7 @@ func (n *Node) sendToOrFallbackLegacy(ctx context.Context, to net.Addr, raw []by
 	return n.tr.Send(to, raw)
 }
 
-// SetLearnedPathFirst toggles learned-path outbound selection at runtime.
+// SetLearnedPathFirst toggles learned-path outbound selection at runtime (tests / rollout).
 func (n *Node) SetLearnedPathFirst(on bool) {
 	n.learnedPathFirst.Store(on)
 }
@@ -280,6 +307,28 @@ func (n *Node) maybeWaitRepSetPunch(ctx context.Context, id a2al.NodeID, rs *rep
 	n.triggerPunchWithOptions(id, er, PunchPriorityHigh, true)
 
 	waitForHasConn(ctx, func() bool { return n.punch.HasConn(id) }, repSetPunchWait)
+}
+
+// freshVerifiedLiveForFamily returns the peer's verified-live address for the
+// requested family, but only when it was written within liveVerifiedFreshWindow.
+// Used by the warm outbound path to prefer recently-proven reachability over
+// the published anchor.  Returns nil,false when no fresh verified live exists.
+func (n *Node) freshVerifiedLiveForFamily(peerID a2al.NodeID, v6 bool) (net.Addr, bool) {
+	n.peerMu.Lock()
+	pa := n.peers[nodeIDKey(peerID)]
+	n.peerMu.Unlock()
+	if pa == nil {
+		return nil, false
+	}
+	fa := &pa.v4
+	if v6 {
+		fa = &pa.v6
+	}
+	if fa.live != nil && fa.liveRank >= rankVerified &&
+		!fa.liveAt.IsZero() && time.Since(fa.liveAt) < liveVerifiedFreshWindow {
+		return fa.live, true
+	}
+	return nil, false
 }
 
 // waitForHasConn polls until hasConn returns true or timeout elapses.

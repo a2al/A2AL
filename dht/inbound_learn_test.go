@@ -267,9 +267,12 @@ func TestClearReachabilityHints(t *testing.T) {
 		n.healthMu.RUnlock()
 		t.Fatal("expected v4 reach hints cleared")
 	}
-	if e.v4.failCount == 0 {
+	// Failures now accumulate in pendingFailCount until settled by recordSuccess;
+	// ClearReachabilityHints must not touch health counters regardless of which
+	// field holds the count.
+	if e.v4.failCount+e.v4.pendingFailCount == 0 {
 		n.healthMu.RUnlock()
-		t.Fatal("failCount must be preserved across hint clear")
+		t.Fatal("failure count must be preserved across hint clear")
 	}
 	n.healthMu.RUnlock()
 }
