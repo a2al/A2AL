@@ -109,7 +109,7 @@ async function refreshHeader() {
   } catch (e) {
     dot.className = 'status-dot err';
     stLabel.textContent = t('status.offline');
-    meta.innerHTML = `<span class="muted">${esc(t('common.unavailable'))} — ${esc(e.message)}</span>`;
+    meta.innerHTML = `<span class="muted">${esc(t('daemon.unreachable'))} — ${esc(t('daemon.unreachable_hint'))}</span>`;
   }
 }
 

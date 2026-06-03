@@ -697,7 +697,7 @@ export async function renderAgents(mount, ctx) {
             <div style="margin-bottom:.35rem"><strong>${esc(t('agent.fn.network.endpoints'))}</strong><br/>${eps}</div>
             <div><strong>${esc(t('agent.fn.network.nat'))}</strong> ${esc(nat)}</div>`;
         } catch (e) {
-          panel.innerHTML = `<p style="color:var(--error)">${esc(t('common.error', { msg: e.message }))}</p>`;
+          panel.innerHTML = `<p style="color:var(--error)">${esc(t('discover.resolve.unavailable'))}</p><p class="muted" style="font-size:.85rem;margin:.15rem 0 0">${esc(t('discover.resolve.unavailable_hint'))}</p>`;
         }
         break;
       }

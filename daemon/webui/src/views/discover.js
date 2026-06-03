@@ -265,6 +265,7 @@ export async function renderDiscover(mount, ctx) {
   const cat         = wrap.querySelector('#dqCat');
 
   let currentAid      = '';
+  let queryGen        = 0;
   let currentTunnelId = null;
   let oneshotTimer    = null;
   let cardFetched     = false;
@@ -273,6 +274,10 @@ export async function renderDiscover(mount, ctx) {
   let lastServices    = [];
   let lastProfile     = null;
   const favTunnels    = new Map();
+
+  function queryStale(gen) {
+    return gen !== queryGen || isStale?.();
+  }
 
   let favSortBy  = 'addedAt';
   let favSortAsc = false;
@@ -511,11 +516,37 @@ export async function renderDiscover(mount, ctx) {
     }
   };
 
+  /* ── Profile / services (async, does not block network info) ── */
+  async function loadProfileAndServices(aid, gen) {
+    try {
+      const [profRes, agRes] = await Promise.allSettled([
+        api(`/resolve/${encodeURIComponent(aid)}/records?type=2`),
+        api(`/agents/${encodeURIComponent(aid)}`),
+      ]);
+      if (queryStale(gen)) return;
+
+      lastServices = agRes.status === 'fulfilled' ? (agRes.value.services || []) : [];
+      renderLocalServices(lastServices);
+
+      const records = profRes.status === 'fulfilled' ? (profRes.value.records || []) : [];
+      const profRecord = Array.isArray(records) ? records.find((r) => r.profile) : null;
+      lastProfile = profRecord ? profRecord.profile : null;
+      renderCapabilities(lastProfile, lastServices);
+      updateStar(currentAid);
+    } catch (_) {
+      if (queryStale(gen)) return;
+      lastServices = [];
+      lastProfile = null;
+      renderCapabilities(null, []);
+    }
+  }
+
   /* ── runQuery ──────────────────────────────────────────── */
   async function runQuery() {
     const raw = aidInput.value.trim();
     aidErr.classList.add('hidden');
     if (!raw) { aidErr.textContent = t('discover.aid.required'); aidErr.classList.remove('hidden'); return; }
+    const gen = ++queryGen;
     currentAid = raw;
     lastServices = [];
     lastProfile = null;
@@ -546,11 +577,13 @@ export async function renderDiscover(mount, ctx) {
     wrap.querySelector('#dMsgPanel').classList.add('hidden');
     msgBtnActive = false;
 
-    const [resRes, agRes, profRes] = await Promise.allSettled([
-      api(`/resolve/${encodeURIComponent(currentAid)}`, { method: 'POST', body: '{}' }),
-      api(`/agents/${encodeURIComponent(currentAid)}`),
-      api(`/resolve/${encodeURIComponent(currentAid)}/records?type=2`),
-    ]);
+    let resRes;
+    try {
+      resRes = { status: 'fulfilled', value: await api(`/resolve/${encodeURIComponent(currentAid)}`, { method: 'POST', body: '{}' }) };
+    } catch (reason) {
+      resRes = { status: 'rejected', reason };
+    }
+    if (queryStale(gen)) return;
 
     let ttlValid = false;
     let lastSeenStr = null;
@@ -573,22 +606,15 @@ export async function renderDiscover(mount, ctx) {
         </div>`;
       setStatus(null, ttlValid, lastSeenStr);
       api(`/connect/${encodeURIComponent(currentAid)}`, { method: 'POST', body: '{}' })
-        .then(() => setStatus(true, ttlValid, lastSeenStr))
-        .catch((e) => setStatus(e.status === 412 ? true : false, ttlValid, lastSeenStr));
+        .then(() => { if (!queryStale(gen)) setStatus(true, ttlValid, lastSeenStr); })
+        .catch((e) => { if (!queryStale(gen)) setStatus(e.status === 412 ? true : false, ttlValid, lastSeenStr); });
+      loadProfileAndServices(currentAid, gen);
     } else {
       resolveBox.style.color = 'var(--error)';
-      resolveBox.innerHTML = `<p style="margin:0">${esc(t('common.error', { msg: resRes.reason?.message ?? '' }))}</p>`;
+      resolveBox.innerHTML = `<p style="margin:0">${esc(t('discover.resolve.unavailable'))}</p><p class="muted" style="margin:.2rem 0 0;font-size:.83rem">${esc(t('discover.resolve.unavailable_hint'))}</p>`;
       setStatus(false, false, null);
+      profileBox.innerHTML = `<p class="muted" style="margin:.1rem 0;font-size:.87rem">${esc(t('discover.profile.none'))}</p>`;
     }
-
-    lastServices = agRes.status === 'fulfilled' ? (agRes.value.services || []) : [];
-    renderLocalServices(lastServices);
-
-    const records = profRes.status === 'fulfilled' ? (profRes.value.records || []) : [];
-    const profRecord = Array.isArray(records) ? records.find((r) => r.profile) : null;
-    lastProfile = profRecord ? profRecord.profile : null;
-    renderCapabilities(lastProfile, lastServices);
-    updateStar(currentAid); // refresh star with populated lastServices/lastProfile
   }
 
   wrap.querySelector('#dQuery').onclick = runQuery;
@@ -686,7 +712,8 @@ export async function renderDiscover(mount, ctx) {
         deactivateActions();
       };
     } catch (e) {
-      actionOut.innerHTML = `<p style="color:var(--error);margin:0">${esc(e.status === 412 ? t('connect.no_direct_path') : t('connect.peer_offline'))}</p>`;
+      const _is412 = e.status === 412;
+      actionOut.innerHTML = `<p style="color:var(--error);margin:0">${esc(_is412 ? t('connect.no_direct_path') : t('connect.peer_offline'))}</p><p class="muted" style="margin:.2rem 0 0;font-size:.83rem">${esc(_is412 ? t('connect.relay_required_hint') : t('connect.unreachable_hint'))}</p>`;
     } finally {
       setLoading(btn, false);
     }
@@ -723,7 +750,8 @@ export async function renderDiscover(mount, ctx) {
         if (cd) cd.textContent = t('discover.oneshot.countdown', { n: remaining });
       }, 1000);
     } catch (e) {
-      actionOut.innerHTML = `<p style="color:var(--error);margin:0">${esc(e.status === 412 ? t('connect.no_direct_path') : t('connect.peer_offline'))}</p>`;
+      const _is412 = e.status === 412;
+      actionOut.innerHTML = `<p style="color:var(--error);margin:0">${esc(_is412 ? t('connect.no_direct_path') : t('connect.peer_offline'))}</p><p class="muted" style="margin:.2rem 0 0;font-size:.83rem">${esc(_is412 ? t('connect.relay_required_hint') : t('connect.unreachable_hint'))}</p>`;
     } finally {
       setLoading(btn, false);
     }
@@ -1065,7 +1093,8 @@ export async function renderDiscover(mount, ctx) {
         deactivateFavBtns();
       };
     } catch (e) {
-      panel.innerHTML = `<p style="color:var(--error);margin:0;font-size:.86rem">${esc(e.status === 412 ? t('connect.no_direct_path') : t('connect.peer_offline'))}</p>`;
+      const _is412 = e.status === 412;
+      panel.innerHTML = `<p style="color:var(--error);margin:0;font-size:.86rem">${esc(_is412 ? t('connect.no_direct_path') : t('connect.peer_offline'))}</p><p class="muted" style="margin:.2rem 0 0;font-size:.82rem">${esc(_is412 ? t('connect.relay_required_hint') : t('connect.unreachable_hint'))}</p>`;
     }
   }
 
@@ -1188,7 +1217,7 @@ export async function renderDiscover(mount, ctx) {
         svcOut.appendChild(row);
       }
     } catch (e) {
-      svcOut.innerHTML = `<p style="color:var(--error)">${esc(t('common.error', { msg: e.message }))}</p>`;
+      svcOut.innerHTML = `<p style="color:var(--error)">${esc(t('discover.search.failed'))}</p><p class="muted" style="font-size:.85rem;margin:.15rem 0 0">${esc(t('discover.search.failed_hint'))}</p>`;
     } finally {
       setLoading(btn, false);
     }
