@@ -252,11 +252,7 @@ func (q *Query) runIterQuery(
 		if n.IsPunching(id) {
 			return
 		}
-		addr, ok := n.lookupPeer(id)
-		if !ok {
-			return
-		}
-		if n.isHairpinAddr(addr) {
+		if _, ok := n.lookupPeer(id); !ok {
 			return
 		}
 		if !tryMark(k) {

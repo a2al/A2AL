@@ -512,7 +512,9 @@ func (d *Daemon) execAgentsList() []map[string]any {
 			m["dht_record_expires_at"] = nil
 		}
 		storeKey := a2al.NodeIDFromAddress(e.AID)
-		m["dht_local_replicas"] = d.h.Node().RepSetSize(storeKey, storeKey)
+		activeRep, totalRep := d.h.Node().RepSetCounts(storeKey, storeKey)
+		m["dht_active_replicas"] = activeRep
+		m["dht_local_replicas"] = totalRep
 		out = append(out, m)
 	}
 	return out
@@ -559,7 +561,9 @@ func (d *Daemon) execAgentGet(ctx context.Context, aidStr string) (map[string]an
 	}
 	// Local repSet size: pure in-memory read, no RPC.
 	storeKey := a2al.NodeIDFromAddress(aid)
-	out["dht_local_replicas"] = d.h.Node().RepSetSize(storeKey, storeKey)
+	activeRep, totalRep := d.h.Node().RepSetCounts(storeKey, storeKey)
+	out["dht_active_replicas"] = activeRep
+	out["dht_local_replicas"] = totalRep
 	return out, nil
 }
 

@@ -1283,9 +1283,18 @@ func familyHealthState(fh *familyHealth) PeerHealthState {
 //   - Any active family Good  → PeerHealthGood
 //   - All active families Bad → PeerHealthBad
 //   - No active family at all → PeerHealthUnknown
+//
+// Exception: if any family has a fresh lastInbound (within lastInboundFreshTTL),
+// Bad is suppressed to Unknown. A peer that recently sent us an inbound message
+// is demonstrably alive; discarding it would waste the active NAT mapping.
 func (n *Node) PeerHealthOf(id a2al.NodeID) PeerHealthState {
 	n.healthMu.RLock()
 	e := n.health[nodeIDKey(id)]
+	var v4InboundAt, v6InboundAt time.Time
+	if e != nil {
+		v4InboundAt = e.v4.lastInboundAt
+		v6InboundAt = e.v6.lastInboundAt
+	}
 	n.healthMu.RUnlock()
 	if e == nil {
 		return PeerHealthUnknown
@@ -1306,6 +1315,12 @@ func (n *Node) PeerHealthOf(id a2al.NodeID) PeerHealthState {
 		return PeerHealthUnknown
 	}
 	if e.v6.everUsed && v6s != PeerHealthBad {
+		return PeerHealthUnknown
+	}
+	// Fresh inbound evidence: peer is demonstrably alive. Suppress Bad → Unknown
+	// so it is not dropped from tabNearestHealthy or the query engine.
+	now := time.Now()
+	if now.Sub(v4InboundAt) < lastInboundFreshTTL || now.Sub(v6InboundAt) < lastInboundFreshTTL {
 		return PeerHealthUnknown
 	}
 	return PeerHealthBad
@@ -2017,16 +2032,16 @@ func (n *Node) sendAndWait(ctx context.Context, to net.Addr, hdr protocol.Header
 			if n.ctx.Err() != nil {
 				return nil, lastMeta, n.ctx.Err()
 			}
-			if ctx.Err() != nil {
-				return nil, lastMeta, ctx.Err()
-			}
-			// QUIC RPC timed out: the connection is no longer viable.
-			// Evict it so the next attempt re-evaluates outboundPlan with
-			// HasConn=false, falling back to UDP or triggering re-punch.
+			// QUIC RPC timed out: evict the connection before checking ctx so a
+			// short outer deadline doesn't skip eviction and leave a stale conn
+			// in the pool.
 			if lastMeta.viaQUIC && n.punch != nil {
 				if peerID, ok := n.lookupPeerID(to); ok {
 					n.punch.InvalidateConn(peerID)
 				}
+			}
+			if ctx.Err() != nil {
+				return nil, lastMeta, ctx.Err()
 			}
 			n.log.Debug("dht rpc timeout, retrying", "to", to, "msg_type", hdr.MsgType, "attempt", attempt+1)
 			// per-attempt timeout; retry

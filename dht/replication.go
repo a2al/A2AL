@@ -63,10 +63,11 @@ type repNodeEntry struct {
 
 // repSet tracks confirmed remote replicas for one (storeKey, publisher) pair.
 type repSet struct {
-	mu       sync.Mutex
-	storeKey a2al.NodeID
-	rec      protocol.SignedRecord
-	nodes    map[string]*repNodeEntry // nodeIDKey(id) → entry
+	mu          sync.Mutex
+	storeKey    a2al.NodeID
+	rec         protocol.SignedRecord
+	nodes       map[string]*repNodeEntry // nodeIDKey(id) → entry
+	renewEpoch time.Time // set to cycleStart after each renewBackground completes; active = confirmedAt.After(renewEpoch)
 }
 
 // replTask is a work item for the replication maintainer (过程二).
@@ -110,22 +111,40 @@ func (n *Node) getOrCreateRepSet(rk repKey) *repSet {
 	return rs
 }
 
-// RepSetSize returns the number of confirmed remote replicas for a record
-// identified by (storeKey, publisher).  Returns 0 if no repSet exists yet.
-// The value is a point-in-time snapshot; it can change as renewBackground and
-// probeRepNode run in the background.
+// RepSetSize returns the total number of tracked remote replicas for a record.
+// Deprecated: prefer RepSetCounts which also returns the active (confirmed this
+// cycle) count. RepSetSize is kept for callers that only need the total.
 func (n *Node) RepSetSize(storeKey, publisher a2al.NodeID) int {
+	_, total := n.RepSetCounts(storeKey, publisher)
+	return total
+}
+
+// RepSetCounts returns (active, total) replica counts for (storeKey, publisher).
+//
+//   - active: confirmed in the most recent renewBackground cycle — these are
+//     the replicas we have 100% confidence in right now.
+//   - total: all entries currently tracked (includes entries whose renewal has
+//     not yet succeeded in the current cycle).
+//
+// Before the first renewal cycle completes, active == 0.
+func (n *Node) RepSetCounts(storeKey, publisher a2al.NodeID) (active, total int) {
 	rk := repKey{storeKey: storeKey, publisher: publisher}
 	n.repMu.RLock()
 	rs := n.repSets[rk]
 	n.repMu.RUnlock()
 	if rs == nil {
-		return 0
+		return 0, 0
 	}
 	rs.mu.Lock()
-	sz := len(rs.nodes)
-	rs.mu.Unlock()
-	return sz
+	defer rs.mu.Unlock()
+	epoch := rs.renewEpoch
+	for _, e := range rs.nodes {
+		total++
+		if !epoch.IsZero() && e.confirmedAt.After(epoch) {
+			active++
+		}
+	}
+	return active, total
 }
 
 // RemoveRepSetsForPublisher removes all repSets whose publisher matches the
@@ -180,17 +199,19 @@ func (n *Node) processReplTask(ctx context.Context, task replTask) {
 	if len(rec.Address) == 0 {
 		return
 	}
-	directNeed, punchedNeed, total := repSetTrackNeeds(rs)
-	if total >= repHardCap || (directNeed <= 0 && punchedNeed <= 0) {
+	directNeed, punchedNeed, active := repSetTrackNeeds(rs)
+	if active >= repHardCap || (directNeed <= 0 && punchedNeed <= 0) {
 		return
 	}
 
 	directPool := n.tabNearestHealthy(task.rk.storeKey, repHardCap)
 	xorPool := n.tabNearest(task.rk.storeKey, repHardCap)
 	// Proactively fetch endpoint records for NAT candidates that are not yet
-	// cached locally (same as in renewBackground).
-	xorFar, hasXorFar := xorFarthestInRepSet(rs)
-	n.prefetchNATEndpoints(ctx, task.rk.storeKey, hasXorFar, xorFar, xorPool)
+	// cached locally (same as in renewBackground).  Only worthwhile while the
+	// punched track still needs filling — when full the picker selects no NAT.
+	if punchedNeed > 0 {
+		n.prefetchNATEndpoints(ctx, xorPool)
+	}
 	direct, nat := n.pickGapFillPeers(task.rk.storeKey, rs, directPool, xorPool, existing)
 	if len(direct) > 0 {
 		n.storeAndRecord(ctx, direct, task.rk, rec, rs)
@@ -256,6 +277,10 @@ func (n *Node) scheduleReplicate(storeKey a2al.NodeID, rec protocol.SignedRecord
 //     queued to 过程二.
 func (n *Node) renewBackground(rk repKey, rs *repSet) {
 	ctx := n.ctx
+	// Record the cycle start before any I/O.  renewEpoch is set to this value
+	// only after all storeAndRecord calls complete, so that active = "confirmed
+	// in the most recently COMPLETED cycle" is always a stable snapshot.
+	cycleStart := time.Now()
 
 	// Always read the latest record (may have been updated while we were queued).
 	rs.mu.Lock()
@@ -282,17 +307,16 @@ func (n *Node) renewBackground(rk repKey, rs *repSet) {
 	}
 
 	rs.mu.Lock()
+	now := time.Now()
 	existingIDs := make([]a2al.NodeID, 0, len(rs.nodes))
 	existing := make(map[string]struct{}, len(rs.nodes))
 	// Snapshot confirmedAt so we can detect which renewals failed below.
 	preRenewConfirmed := make(map[string]time.Time, len(rs.nodes))
 	// Phase 6: collect bad repSet members for punch trigger after unlock.
 	var badRepNodes []a2al.NodeID
-	{
-		now := time.Now()
-		for k, e := range rs.nodes {
-			existing[k] = struct{}{}
-			preRenewConfirmed[k] = e.confirmedAt
+	for k, e := range rs.nodes {
+		existing[k] = struct{}{}
+		preRenewConfirmed[k] = e.confirmedAt
 		// For confirmed replicas (existing repSet members), skip renewal only
 		// when the repSet-level eviction grace window is active (badSince set
 		// by probeRepNode after repeated dedicated-probe failures).  The global
@@ -307,8 +331,7 @@ func (n *Node) renewBackground(rk repKey, rs *repSet) {
 			badRepNodes = append(badRepNodes, e.nodeID) // Phase 6
 			continue
 		}
-			existingIDs = append(existingIDs, e.nodeID)
-		}
+		existingIDs = append(existingIDs, e.nodeID)
 	}
 	rs.mu.Unlock()
 
@@ -354,13 +377,24 @@ func (n *Node) renewBackground(rk repKey, rs *repSet) {
 	// Proactively fetch endpoint records for NAT candidates that are not yet
 	// cached locally.  Without their signal URLs, pickGapFillPeers would skip
 	// them; this ensures the NAT track can actually be populated this cycle.
-	xorFar, hasXorFar := xorFarthestInRepSet(rs)
-	n.prefetchNATEndpoints(ctx, rk.storeKey, hasXorFar, xorFar, xorPool)
+	// Only worthwhile while the punched track still needs filling — when full
+	// the picker selects no NAT.
+	if _, punchedNeed, _ := repSetTrackNeeds(rs); punchedNeed > 0 {
+		n.prefetchNATEndpoints(ctx, xorPool)
+	}
 	direct, nat := n.pickGapFillPeers(rk.storeKey, rs, directPool, xorPool, existing)
 	if len(direct) > 0 {
 		n.storeAndRecord(ctx, direct, rk, rec, rs)
 	}
 	n.gapFillStoreNAT(ctx, rk, rec, rs, nat)
+
+	// Cycle complete: publish the epoch so RepSetCounts and repSetTrackNeeds
+	// reflect this cycle's results.  Setting it here (after all storeAndRecord
+	// calls) ensures active is always a stable snapshot of a completed cycle,
+	// never a transient partial view mid-renewal.
+	rs.mu.Lock()
+	rs.renewEpoch = cycleStart
+	rs.mu.Unlock()
 
 	// If either track is still short, queue 过程二 refill (may surface candidates
 	// from routing-table updates not yet visible to this renewBackground run).
@@ -368,11 +402,10 @@ func (n *Node) renewBackground(rk repKey, rs *repSet) {
 	if directNeed > 0 || punchedNeed > 0 {
 		n.enqueueReplication(rk, protocol.SignedRecord{})
 	}
-	rs.mu.Lock()
-	finalSize := len(rs.nodes)
-	rs.mu.Unlock()
+	active, finalSize := n.RepSetCounts(rk.storeKey, rk.publisher)
 	n.log.Debug("replication status",
 		"key", fmt.Sprintf("%x", rk.storeKey[:4]),
+		"active", active,
 		"replicas", finalSize,
 		"target", nRep,
 	)
@@ -422,11 +455,6 @@ func (n *Node) storeAndRecord(ctx context.Context, peers []protocol.NodeInfo, rk
 		if !ok {
 			continue
 		}
-		if n.isHairpinAddr(addr) {
-			n.log.Debug("replication StoreAt skipped", "peer", addr, "reason", "hairpin")
-			continue
-		}
-
 		if n.learnedPathFirst.Load() {
 			// warm=true for confirmed repSet members: prefer verified live over anchor.
 			warm := n.repSetContains(rs, id)
@@ -557,60 +585,72 @@ func (n *Node) storeAndRecord(ctx context.Context, peers []protocol.NodeInfo, rk
 	}
 }
 
-// repSetTrackNeeds returns remaining direct and punched slots (each targets nRep).
-func repSetTrackNeeds(rs *repSet) (directNeed, punchedNeed, total int) {
+// repSetTrackNeeds returns remaining direct and punched slots (each targets nRep)
+// and the active replica count.
+//
+// Both need values and the returned active count are derived exclusively from
+// active replicas — those confirmed in the most recently completed
+// renewBackground cycle (confirmedAt.After(renewEpoch)).  The hardcap guard
+// in callers uses active, not the raw node count, so that stale entries from
+// a prior cycle do not permanently block gap-fill.
+//
+// Before the first cycle completes (renewEpoch.IsZero()), all entries are
+// counted, preventing an initial gap-fill from being suppressed.
+func repSetTrackNeeds(rs *repSet) (directNeed, punchedNeed, active int) {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
 	var direct, punched int
+	epoch := rs.renewEpoch
 	for _, e := range rs.nodes {
+		if !epoch.IsZero() && !e.confirmedAt.After(epoch) {
+			continue
+		}
 		if e.isPunched {
 			punched++
 		} else {
 			direct++
 		}
 	}
-	total = len(rs.nodes)
+	active = direct + punched
 	if n := nRep - direct; n > 0 {
 		directNeed = n
 	}
 	if n := nRep - punched; n > 0 {
 		punchedNeed = n
 	}
-	return directNeed, punchedNeed, total
+	return directNeed, punchedNeed, active
 }
 
 // pickGapFillPeers splits gap-fill candidates into direct and NAT (signal) tracks.
-// Direct: reachability first, no XOR gate. NAT: XOR-near from xorPool, signal required.
+//
+// Direct track: reachability first, no XOR gate. Fills directNeed unconditionally;
+// when at capacity (directNeed=0) admits one extra candidate that is XOR-closer than
+// the farthest punched member, enabling a recovered direct node to displace a worse
+// punched entry without waiting for the next TTL renewal.
+//
+// NAT track: no XOR gate.  Fills punchedNeed candidates from xorPool (which is
+// XOR-ascending, so nearest are tried first).  When the track is full
+// (punchedNeed=0) it admits nothing: NAT quality converges over refill cycles
+// via the nearest-first ordering, rather than via active ICE-punch displacement
+// (which would be too costly for a mere distance swap).
 func (n *Node) pickGapFillPeers(storeKey a2al.NodeID, rs *repSet, directPool, xorPool []protocol.NodeInfo, existing map[string]struct{}) (direct, nat []protocol.NodeInfo) {
-	directNeed, punchedNeed, total := repSetTrackNeeds(rs)
-	if total >= repHardCap || (directNeed <= 0 && punchedNeed <= 0) {
+	directNeed, punchedNeed, active := repSetTrackNeeds(rs)
+	if active >= repHardCap || (directNeed <= 0 && punchedNeed <= 0) {
 		return nil, nil
 	}
 
-	// Single pass: compute both the overall farthest XOR distance (NAT-track gate)
-	// and the farthest punched member's distance (quality-displacement gate).
-	//
-	// NAT gate: only XOR-closer candidates are worth punching to.
-	// NOTE: xorFarthestInRepSet performs the same computation for the prefetch
-	// path.  The two are intentionally kept separate so pickGapFillPeers remains
-	// self-contained; if this gate logic ever changes, update both sites.
-	//
-	// Quality-displacement: when the direct track is at capacity (directNeed=0)
-	// but punched members exist, one direct candidate that is XOR-closer than
-	// the farthest punched member is admitted.  rebalanceRepSets then recomputes
-	// global XOR-set and direct-set membership and evicts the global-worst entry
-	// (not necessarily that specific punched node).  This enables a recovered
-	// direct node to re-enter the repSet without waiting for the next TTL renewal.
-	var xorFarthest, xorFarthestPunched a2al.NodeID
-	hasXorFarthest, hasXorFarthestPunched := false, false
+	// Farthest punched member's XOR distance — for the direct quality-displacement
+	// gate (admit a direct node closer than the worst punched member when the
+	// direct track is full).
+	var xorFarthestPunched a2al.NodeID
+	hasXorFarthestPunched := false
 	rs.mu.Lock()
 	for _, e := range rs.nodes {
-		d := xorNodeID(e.nodeID, storeKey)
-		if !hasXorFarthest || xorGT(d, xorFarthest) {
-			xorFarthest, hasXorFarthest = d, true
-		}
-		if e.isPunched && (!hasXorFarthestPunched || xorGT(d, xorFarthestPunched)) {
-			xorFarthestPunched, hasXorFarthestPunched = d, true
+		if e.isPunched {
+			d := xorNodeID(e.nodeID, storeKey)
+			if !hasXorFarthestPunched || xorGT(d, xorFarthestPunched) {
+				xorFarthestPunched, hasXorFarthestPunched = d, true
+			}
 		}
 	}
 	rs.mu.Unlock()
@@ -672,12 +712,6 @@ func (n *Node) pickGapFillPeers(storeKey a2al.NodeID, rs *repSet, directPool, xo
 		}
 		if n.lookupEndpointRecord(id) == nil || n.reachProfile(id).prefersUDPAnchor() {
 			continue
-		}
-		if hasXorFarthest {
-			d := xorNodeID(id, storeKey)
-			if !xorGT(xorFarthest, d) {
-				continue
-			}
 		}
 		hasConn := n.punch != nil && n.punch.HasConn(id)
 		if !hasConn {
@@ -1168,10 +1202,7 @@ func (n *Node) applyRepProbeOutcome(ctx context.Context, rk repKey, rs *repSet, 
 //     (lookupEndpointRecordAny != nil): either a signal URL was found on a
 //     prior fetch (lookupEndpointRecord will return it), or we already know
 //     there is no signal URL — either way another FindRecords adds nothing.
-//  3. XOR gate: skip candidates that are farther than the current farthest
-//     replica (same gate used by pickGapFillPeers).  Even if we retrieved
-//     their endpoint record they would still be filtered out by the picker.
-//  4. Negative cache (epPrefetchNeg): skip nodes whose recent FindRecords
+//  3. Negative cache (epPrefetchNeg): skip nodes whose recent FindRecords
 //     failed, with two suppression tiers:
 //       - ErrNoMatchingRecords (confirmed absent): probeBadDelay (30 min).
 //         The network was queried and truly has no endpoint record; retrying
@@ -1191,7 +1222,7 @@ func (n *Node) applyRepProbeOutcome(ctx context.Context, rk repKey, rs *repSet, 
 // the immediately-following pickGapFillPeers call can find them.
 //
 // Concurrency is bounded to gapFillPunchBudget×2 goroutines.
-func (n *Node) prefetchNATEndpoints(ctx context.Context, storeKey a2al.NodeID, hasXorFarthest bool, xorFarthest a2al.NodeID, candidates []protocol.NodeInfo) {
+func (n *Node) prefetchNATEndpoints(ctx context.Context, candidates []protocol.NodeInfo) {
 	type work struct{ id a2al.NodeID }
 	now := time.Now()
 	var jobs []work
@@ -1208,23 +1239,12 @@ func (n *Node) prefetchNATEndpoints(ctx context.Context, storeKey a2al.NodeID, h
 		if n.reachProfile(id).prefersUDPAnchor() {
 			continue
 		}
-		// Filter 2: XOR gate — mirrors the same condition in pickGapFillPeers.
-		// A node farther than our current farthest replica would not be selected
-		// by the picker even if we retrieved its endpoint record.
-		// Applied before the store and neg-cache lookups (both of which acquire
-		// locks) because this check is a free computation.
-		if hasXorFarthest {
-			d := xorNodeID(id, storeKey)
-			if !xorGT(xorFarthest, d) {
-				continue
-			}
-		}
-		// Filter 3: any cached endpoint record means we already fetched and stored
+		// Filter 2: any cached endpoint record means we already fetched and stored
 		// the result (with or without a signal URL); no need to query again.
 		if n.lookupEndpointRecordAny(id) != nil {
 			continue
 		}
-		// Filter 4: negative cache — skip recently-failed lookups.
+		// Filter 3: negative cache — skip recently-failed lookups.
 		n.epPrefetchNegMu.RLock()
 		negEntry, neg := n.epPrefetchNeg[nodeIDKey(id)]
 		n.epPrefetchNegMu.RUnlock()
@@ -1319,23 +1339,6 @@ func (n *Node) prefetchNATEndpoints(ctx context.Context, storeKey a2al.NodeID, h
 const natEndpointFetchTimeout = 5 * time.Second
 
 // ─── XOR distance helpers ────────────────────────────────────────────────────
-
-// xorFarthestInRepSet returns the XOR distance (relative to rs.storeKey) of
-// the farthest node currently in rs.  Used by prefetchNATEndpoints to apply
-// the same XOR gate as pickGapFillPeers: there is no point fetching the
-// endpoint record of a node that is farther than every existing replica.
-func xorFarthestInRepSet(rs *repSet) (far a2al.NodeID, ok bool) {
-	rs.mu.Lock()
-	for _, e := range rs.nodes {
-		d := xorNodeID(e.nodeID, rs.storeKey)
-		if !ok || xorGT(d, far) {
-			far = d
-			ok = true
-		}
-	}
-	rs.mu.Unlock()
-	return
-}
 
 func xorNodeID(a, b a2al.NodeID) a2al.NodeID {
 	var d a2al.NodeID
