@@ -293,9 +293,11 @@ func (n *Node) maybeWaitRepSetPunch(ctx context.Context, id a2al.NodeID, rs *rep
 	if n.punch.HasConn(id) {
 		return
 	}
-	if n.reachProfile(id).prefersUDPAnchor() {
-		return
-	}
+	// The ReachPublic guard (prefersUDPAnchor) was intentionally removed: a
+	// repSet member with a stable anchor may still need ICE when the anchor
+	// is transiently unreachable.  shouldDeferICEForFamily gates on skipColdUDP
+	// (set only after persistent UDP failures), so this path is a no-op for
+	// healthy public peers and only fires when UDP has already proven Bad.
 	v6 := n.preferredFamilyIsV6(id, addrHint)
 	if !n.shouldDeferICEForFamily(id, v6) {
 		return

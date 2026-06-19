@@ -939,6 +939,10 @@ func nodeInfoWithUDPAddr(ni protocol.NodeInfo, addr *net.UDPAddr) protocol.NodeI
 // recordSuccess marks the peer's address family as healthy: resets that
 // family's failCount, clears its backoff, and updates RTT.
 // Also refreshes the routing table VerifiedAt timestamp.
+//
+// recordSuccess marks the peer's address family as healthy: resets that
+// family's failCount, clears its backoff, and updates RTT.
+// Also refreshes the routing table VerifiedAt timestamp.
 // On confirmed outage (suspectOffline), clears all pending failures globally.
 func (n *Node) recordSuccess(id a2al.NodeID, addr net.Addr, rtt time.Duration) {
 	key := nodeIDKey(id)
@@ -1009,7 +1013,6 @@ func (n *Node) recordSuccess(id a2al.NodeID, addr net.Addr, rtt time.Duration) {
 // so diagnostic counters remain accurate.
 func (n *Node) recordFailure(id a2al.NodeID, addr net.Addr) {
 	// Endpoint lookup touches the store; never call it while holding healthMu.
-	profile := n.reachProfile(id)
 	hasSignal := n.lookupEndpointRecord(id) != nil
 
 	key := nodeIDKey(id)
@@ -1046,11 +1049,17 @@ func (n *Node) recordFailure(id a2al.NodeID, addr net.Addr) {
 		shift = maxBackoffShift
 	}
 	fh.nextRetryAt = time.Now().Add(probeInitDelay << shift)
-	if hasSignal && profile.prefersICEOverColdUDP() {
+	turnedBad := combined >= badHealthThreshold
+	// Set skip-cold when the peer has a Signal URL and UDP has proven persistently
+	// unreliable (combined failures reach Bad threshold).  Previously this only
+	// fired for ReachNAT peers; extending to any peer with a signal URL lets
+	// ReachPublic nodes (anchor present but anchor unreachable) also upgrade to
+	// ICE on the next renewal cycle.  Gating on turnedBad avoids triggering ICE
+	// for single transient timeouts.
+	if hasSignal && turnedBad {
 		fh.skipColdUDP = true
 		fh.skipColdAt = time.Now()
 	}
-	turnedBad := combined >= badHealthThreshold
 	n.healthMu.Unlock()
 
 	if turnedBad {
@@ -1285,8 +1294,10 @@ func familyHealthState(fh *familyHealth) PeerHealthState {
 //   - No active family at all → PeerHealthUnknown
 //
 // Exception: if any family has a fresh lastInbound (within lastInboundFreshTTL),
-// Bad is suppressed to Unknown. A peer that recently sent us an inbound message
-// is demonstrably alive; discarding it would waste the active NAT mapping.
+// Bad is suppressed to Unknown.  A peer that recently sent us an inbound message
+// is demonstrably alive; the reply path (back to their source address) is
+// available via the active NAT mapping, so treating them as fully unreachable
+// would discard a working path and waste the inbound evidence.
 func (n *Node) PeerHealthOf(id a2al.NodeID) PeerHealthState {
 	n.healthMu.RLock()
 	e := n.health[nodeIDKey(id)]
@@ -1317,8 +1328,10 @@ func (n *Node) PeerHealthOf(id a2al.NodeID) PeerHealthState {
 	if e.v6.everUsed && v6s != PeerHealthBad {
 		return PeerHealthUnknown
 	}
-	// Fresh inbound evidence: peer is demonstrably alive. Suppress Bad → Unknown
-	// so it is not dropped from tabNearestHealthy or the query engine.
+	// Fresh inbound on any family: the peer is demonstrably alive and the
+	// reply path via the active NAT mapping is available.  Suppress Bad →
+	// Unknown so this peer is not dropped from tabNearestHealthy or the
+	// query engine's Good/Unknown tracks.
 	now := time.Now()
 	if now.Sub(v4InboundAt) < lastInboundFreshTTL || now.Sub(v6InboundAt) < lastInboundFreshTTL {
 		return PeerHealthUnknown
@@ -1641,6 +1654,27 @@ func (n *Node) reply(from net.Addr, ch inboundChannel, req *protocol.DecodedMess
 	raw, err := protocol.MarshalSignedMessageKeyStore(hdr, body, n.ks, n.addr)
 	if err != nil {
 		n.log.Warn("dht reply marshal failed", "msg_type", msgType, "to", from, "err", err)
+		if errors.Is(err, protocol.ErrInvalidMessage) {
+			var nodes []protocol.NodeInfo
+			switch b := body.(type) {
+			case *protocol.BodyFindNodeResp:
+				nodes = b.Nodes
+			case *protocol.BodyFindValueResp:
+				nodes = b.Nodes
+			}
+			for i, ni := range nodes {
+				if len(ni.IP) != 4 && len(ni.IP) != 16 {
+					var nid a2al.NodeID
+					copy(nid[:], ni.NodeID)
+					n.log.Debug("dht reply: bad node ip", "idx", i, "node", nid, "ip_len", len(ni.IP))
+					break
+				}
+				if len(ni.Address) != len(a2al.Address{}) || len(ni.NodeID) != len(a2al.NodeID{}) {
+					n.log.Debug("dht reply: bad node lengths", "idx", i, "addr_len", len(ni.Address), "nid_len", len(ni.NodeID))
+					break
+				}
+			}
+		}
 		return
 	}
 	if err := n.replyVia(from, ch, req, raw); err != nil {
@@ -1766,6 +1800,18 @@ func (n *Node) onStore(from net.Addr, ch inboundChannel, dec *protocol.DecodedMe
 	if len(body.Key) == len(key) {
 		copy(key[:], body.Key)
 	}
+	// Pre-check: for sovereign records, record whether the slot is already
+	// occupied before the Put so we can avoid arming soft expiry on existing
+	// legitimate replica members (cross-contamination guard, Direction B).
+	var sovereignSlotOccupied bool
+	if protocol.RecordCategory(body.Record.RecType) == protocol.CategorySovereign {
+		ck := key
+		if ck == (a2al.NodeID{}) {
+			ck = recordKeyForSigned(body.Record)
+		}
+		sovereignSlotOccupied = len(n.store.GetAll(ck, body.Record.RecType, time.Now())) > 0
+	}
+
 	err := n.store.Put(key, body.Record, time.Now())
 	alreadyHad := errors.Is(err, ErrStaleRecord)
 	ok := err == nil || alreadyHad
@@ -1788,6 +1834,57 @@ func (n *Node) onStore(from net.Addr, ch inboundChannel, dec *protocol.DecodedMe
 	if err == nil {
 		n.dispatchDHTPush(key, body.Record)
 	}
+
+	// Path-cache registration for sovereign records (Direction B).
+	// Distinguish publisher's direct StoreAt from a querier's path-cache StoreAt
+	// by comparing the sender's NodeID with the record's publisher NodeID.
+	//   Publisher's STORE → clear soft expiry (record is now authoritative here).
+	//   Querier's STORE   → set soft expiry + async register with publisher so
+	//                       this node enters publisher's repSet for future updates.
+	if (err == nil || alreadyHad) && protocol.RecordCategory(body.Record.RecType) == protocol.CategorySovereign {
+		senderID := a2al.NodeIDFromAddress(dec.SenderAddr)
+		publisherID := recordKeyForSigned(body.Record)
+		storeKey := key
+		if storeKey == (a2al.NodeID{}) {
+			storeKey = publisherID
+		}
+		if senderID == publisherID {
+			n.store.ClearSoftExpiry(storeKey, body.Record.RecType)
+		} else if err == nil && !sovereignSlotOccupied {
+			// Freshly stored path-cached record into an empty slot: arm soft
+			// expiry and try to register with publisher so they can push future
+			// updates here.  Skip if the slot already had a record to avoid
+			// cross-contaminating legitimate repSet members with soft expiry.
+			n.store.SetSoftExpiry(storeKey, body.Record.RecType, time.Now().Add(pathCacheSoftTTL))
+			rec := body.Record
+			go n.registerWithPublisher(storeKey, rec)
+		}
+	}
+}
+
+// registerWithPublisher sends a FindNode RPC directly to the record's publisher.
+// Receiving the RPC causes the publisher to add this node to its routing table,
+// so future renewBackground calls will discover this node and include it in
+// storeAndRecord — eventually promoting it to a full repSet member.
+// On success the soft expiry is cleared; if unreachable the expiry fires naturally.
+func (n *Node) registerWithPublisher(storeKey a2al.NodeID, rec protocol.SignedRecord) {
+	publisherID := recordKeyForSigned(rec)
+	addr, ok := n.lookupPeerHealthAware(publisherID)
+	if !ok {
+		addr, ok = n.lookupPeer(publisherID)
+	}
+	if !ok {
+		return // publisher not in routing table; soft expiry will handle cleanup
+	}
+	ctx, cancel := context.WithTimeout(n.ctx, queryPeerTimeout)
+	defer cancel()
+	if _, err := n.FindNode(ctx, addr, storeKey); err != nil {
+		return // publisher unreachable; soft expiry stays
+	}
+	// FindNode succeeded: publisher has added this node to its routing table.
+	// Clear the soft expiry — the publisher's next renewBackground will push the
+	// latest record here, confirming this node as part of the authoritative repSet.
+	n.store.ClearSoftExpiry(storeKey, rec.RecType)
 }
 
 // dispatchDHTPush delivers a newly stored record to all oneShot subscribers via MsgDHTPush.
@@ -2032,9 +2129,13 @@ func (n *Node) sendAndWait(ctx context.Context, to net.Addr, hdr protocol.Header
 			if n.ctx.Err() != nil {
 				return nil, lastMeta, n.ctx.Err()
 			}
-			// QUIC RPC timed out: evict the connection before checking ctx so a
-			// short outer deadline doesn't skip eviction and leave a stale conn
-			// in the pool.
+			// QUIC RPC timed out (no response within window): evict the connection
+			// regardless of whether the caller's ctx has also expired.  The next
+			// outboundPlan call will see HasConn=false and fall back to UDP or
+			// trigger re-punch.  Without this, a short outer deadline (e.g.
+			// queryPeerTimeout=2s < rpcAttemptTimeout=5s) causes ctx.Err() to
+			// fire first, skipping the eviction and leaving a stale conn in the
+			// pool that HasConn keeps selecting on every subsequent cycle.
 			if lastMeta.viaQUIC && n.punch != nil {
 				if peerID, ok := n.lookupPeerID(to); ok {
 					n.punch.InvalidateConn(peerID)

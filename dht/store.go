@@ -9,6 +9,7 @@ import (
 	"errors"
 	"net"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -55,6 +56,12 @@ type Store struct {
 	lastAccess  map[string]int64 // key -> unix timestamp of last Put or Get
 	auth        RecordAuthFunc   // nil -> no authority check
 	maxKeys     int
+	// softExpiry holds node-local expiry overrides for path-cached sovereign records.
+	// Key format: nodeIDKey(storeKey) + string([]byte{recType}).
+	// When set, GetAll / Get suppress the record after the deadline even if the
+	// signed TTL has not expired.  Cleared when the publisher stores the record
+	// directly, confirming C is now in the authoritative repSet.
+	softExpiry map[string]time.Time
 
 	oneShotMu      sync.Mutex
 	oneShotPending map[string][]oneShotSub // nodeIDKey -> []sub
@@ -79,8 +86,32 @@ func NewStore(auth RecordAuthFunc, maxKeys int) *Store {
 		lastAccess:     make(map[string]int64),
 		auth:           auth,
 		maxKeys:        maxKeys,
+		softExpiry:     make(map[string]time.Time),
 		oneShotPending: make(map[string][]oneShotSub),
 	}
+}
+
+// softExpiryKey returns the softExpiry map key for a (storeKey, recType) slot.
+func softExpiryKey(key a2al.NodeID, recType uint8) string {
+	return nodeIDKey(key) + string([]byte{recType})
+}
+
+// SetSoftExpiry marks a path-cached record slot with a node-local expiry deadline.
+// After deadline, GetAll / Get suppress the record even if its signed TTL is still valid.
+// Thread-safe.
+func (s *Store) SetSoftExpiry(key a2al.NodeID, recType uint8, deadline time.Time) {
+	s.mu.Lock()
+	s.softExpiry[softExpiryKey(key, recType)] = deadline
+	s.mu.Unlock()
+}
+
+// ClearSoftExpiry removes a soft-expiry deadline for a record slot.
+// Called when the publisher's direct StoreAt confirms the record is authoritative.
+// Thread-safe.
+func (s *Store) ClearSoftExpiry(key a2al.NodeID, recType uint8) {
+	s.mu.Lock()
+	delete(s.softExpiry, softExpiryKey(key, recType))
+	s.mu.Unlock()
 }
 
 func recordKeyForSigned(rec protocol.SignedRecord) a2al.NodeID {
@@ -355,6 +386,11 @@ func (s *Store) evictLRUKeysLocked() {
 		}
 		delete(s.m, oldestKey)
 		delete(s.lastAccess, oldestKey)
+		for k2 := range s.softExpiry {
+			if strings.HasPrefix(k2, oldestKey) {
+				delete(s.softExpiry, k2)
+			}
+		}
 	}
 }
 
@@ -373,6 +409,9 @@ func (s *Store) GetAll(key a2al.NodeID, recType uint8, now time.Time) []protocol
 			continue
 		}
 		if recType != 0 && r.RecType != recType {
+			continue
+		}
+		if dl, ok := s.softExpiry[softExpiryKey(key, r.RecType)]; ok && now.After(dl) {
 			continue
 		}
 		out = append(out, r)
@@ -396,6 +435,9 @@ func (s *Store) Get(key a2al.NodeID, now time.Time) *protocol.SignedRecord {
 			continue
 		}
 		if err := protocol.VerifySignedRecord(r, now); err != nil {
+			continue
+		}
+		if dl, ok := s.softExpiry[softExpiryKey(key, r.RecType)]; ok && now.After(dl) {
 			continue
 		}
 		if best == nil || protocol.RecordIsNewer(r, *best) {
@@ -456,6 +498,11 @@ func (s *Store) Invalidate(key a2al.NodeID, recType uint8) {
 	if recType == 0 {
 		delete(s.m, k)
 		delete(s.lastAccess, k)
+		for k2 := range s.softExpiry {
+			if strings.HasPrefix(k2, k) {
+				delete(s.softExpiry, k2)
+			}
+		}
 		return
 	}
 	newList := s.m[k][:0]
@@ -470,6 +517,7 @@ func (s *Store) Invalidate(key a2al.NodeID, recType uint8) {
 	} else {
 		s.m[k] = newList
 	}
+	delete(s.softExpiry, softExpiryKey(key, recType))
 }
 
 // Len is the number of distinct key buckets with at least one record.

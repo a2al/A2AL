@@ -250,22 +250,40 @@ func TestClearReachabilityHints(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	addr := addrV4(4121)
 	inbound := addrV4(55106)
 	n.setLastInbound(peerID, inbound)
-	n.recordFailure(peerID, addrV4(4121))
-
-	n.ClearReachabilityHints()
+	// Two failures reach badHealthThreshold → skipColdUDP is set.
+	n.recordFailure(peerID, addr)
+	n.recordFailure(peerID, addr)
 
 	key := nodeIDKey(peerID)
 	n.healthMu.RLock()
 	e := n.health[key]
+	if e == nil || !e.v4.skipColdUDP {
+		n.healthMu.RUnlock()
+		t.Fatal("pre-condition: skipColdUDP must be set before ClearReachabilityHints")
+	}
+	n.healthMu.RUnlock()
+
+	n.ClearReachabilityHints()
+
+	n.healthMu.RLock()
+	e = n.health[key]
 	if e == nil {
 		n.healthMu.RUnlock()
 		t.Fatal("expected health entry")
 	}
-	if e.v4.skipColdUDP || e.v4.lastInbound != nil || !e.v4.lastInboundAt.IsZero() {
+	// skipColdUDP survives hint clear: it reflects persistent remote unreachability,
+	// not a local path observation. Only recordSuccess resets it.
+	if !e.v4.skipColdUDP {
 		n.healthMu.RUnlock()
-		t.Fatal("expected v4 reach hints cleared")
+		t.Fatal("skipColdUDP must be preserved across ClearReachabilityHints")
+	}
+	// lastInbound is a local NAT-mapped address; it must be cleared.
+	if e.v4.lastInbound != nil || !e.v4.lastInboundAt.IsZero() {
+		n.healthMu.RUnlock()
+		t.Fatal("lastInbound must be cleared by ClearReachabilityHints")
 	}
 	// Failures now accumulate in pendingFailCount until settled by recordSuccess;
 	// ClearReachabilityHints must not touch health counters regardless of which
@@ -294,14 +312,24 @@ func TestRecordFailureSetsSkipColdWhenSignal(t *testing.T) {
 	}
 
 	addr := addrV4(4121)
+	// A single failure must NOT yet set skipColdUDP (transient UDP blip).
 	n.recordFailure(peerID, addr)
-
 	key := nodeIDKey(peerID)
 	n.healthMu.RLock()
 	e := n.health[key]
+	if e != nil && e.v4.skipColdUDP {
+		n.healthMu.RUnlock()
+		t.Fatal("skipColdUDP must not be set on first failure (transient)")
+	}
+	n.healthMu.RUnlock()
+
+	// Second failure reaches badHealthThreshold → skipColdUDP must be set.
+	n.recordFailure(peerID, addr)
+	n.healthMu.RLock()
+	e = n.health[key]
 	if e == nil || !e.v4.skipColdUDP {
 		n.healthMu.RUnlock()
-		t.Fatal("expected skipColdUDP after failure with signal endpoint")
+		t.Fatal("expected skipColdUDP after persistent failures with signal endpoint")
 	}
 	n.healthMu.RUnlock()
 

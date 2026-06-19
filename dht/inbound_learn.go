@@ -36,10 +36,15 @@ func (n *Node) inboundLearn(from net.Addr, ch inboundChannel, dec *protocol.Deco
 			if udp, ok := from.(*net.UDPAddr); ok {
 				n.setLastInbound(peerID, udp)
 			}
-			// L1 only: upgrade to Mode B when endpoint has Signal.
+			// L1 only: ICE bootstrap/fallback for NAT peers where UDP isn't
+			// established. Skip for public peers (prefersUDPAnchor → use anchor)
+			// and for currently-healthy peers (UDP is working, no need for ICE).
 			if n.learnedPathFirst.Load() && n.punch != nil && !hasConn {
 				if er := n.lookupEndpointRecord(peerID); er != nil {
-					n.triggerPunch(peerID, er, PunchPriorityLowest)
+					if !n.reachProfile(peerID).prefersUDPAnchor() &&
+						n.PeerHealthOf(peerID) != PeerHealthGood {
+						n.triggerPunch(peerID, er, PunchPriorityLowest)
+					}
 				}
 			}
 		}
@@ -126,10 +131,15 @@ func (n *Node) skipColdForPeer(peerID a2al.NodeID, addr net.Addr) bool {
 
 // shouldDeferICEForFamily reports whether L1 should prefer ICE over cold stable
 // UDP on the given address family (v4 when v6=false).
+//
+// The ReachPublic guard (prefersUDPAnchor) was intentionally removed: a peer
+// with a stable anchor is not guaranteed to be reachable on that anchor at all
+// times.  When recordFailure marks skipColdUDP after persistent UDP failures,
+// this function must honour that signal regardless of ReachProfile so that ICE
+// can be used as a fallback.  The skipColdUDP flag is cleared by recordSuccess,
+// so the peer automatically returns to the UDP-first path once connectivity
+// recovers.
 func (n *Node) shouldDeferICEForFamily(peerID a2al.NodeID, v6 bool) bool {
-	if n.reachProfile(peerID).prefersUDPAnchor() {
-		return false
-	}
 	if n.lookupEndpointRecord(peerID) == nil {
 		return false
 	}
@@ -156,18 +166,23 @@ func (n *Node) clearSkipColdUDP(fh *familyHealth) {
 }
 
 // ClearReachabilityHints resets learned-path hints after network topology changes.
-// PeerHealth backoff and failCount are preserved; only skipCold and lastInbound
-// evidence are cleared so stale paths are not preferred on a new network.
+// PeerHealth backoff and failCount are preserved; lastInbound evidence is cleared
+// so stale NAT-mapped addresses are not preferred on the new network.
+//
+// skipColdUDP is intentionally NOT cleared here: it represents "UDP anchor has
+// been confirmed persistently unreachable for this peer", which is a property
+// of the remote peer rather than a local path observation.  Changing networks
+// does not invalidate that conclusion — the anchor is still likely unreachable.
+// Its only correct reset path is recordSuccess, which fires as soon as any RPC
+// to the peer succeeds (proving the anchor or ICE path is now working).
 func (n *Node) ClearReachabilityHints() {
 	n.healthMu.Lock()
 	cleared := 0
 	for _, e := range n.health {
 		for _, fh := range []*familyHealth{&e.v4, &e.v6} {
-			if fh.skipColdUDP || fh.lastInbound != nil || !fh.lastInboundAt.IsZero() {
+			if fh.lastInbound != nil || !fh.lastInboundAt.IsZero() {
 				cleared++
 			}
-			fh.skipColdUDP = false
-			fh.skipColdAt = time.Time{}
 			fh.lastInbound = nil
 			fh.lastInboundAt = time.Time{}
 		}

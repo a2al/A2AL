@@ -23,6 +23,10 @@ const (
 	nRep              = 8                // soft replication target N_rep
 	repHardCap        = routing.K        // hard cap = K = 16
 	probeInitDelay    = 30 * time.Second // Unknown node: initial probe interval
+	// pathCacheSoftTTL is the node-local expiry for path-cached sovereign records
+	// when the publisher cannot be reached to confirm the node is in repSet.
+	// Aligned to 4× probeInitDelay so it fits naturally in the health-probe cycle.
+	pathCacheSoftTTL = 4 * probeInitDelay // = 2 minutes
 	probeMaxDelay     = 1 * time.Hour    // Good node: ceiling; in practice StoreAt (every 30 min) contacts the node first
 	probeBadDelay     = 30 * time.Minute // Bad node: grace window before eviction
 	probeTickInterval  = 15 * time.Second // health probe loop wake-up interval

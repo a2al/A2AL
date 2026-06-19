@@ -275,7 +275,9 @@ func (q *Query) runIterQuery(
 	// Seed candidate pools from the local routing table.
 	// Use tabNearest so Bad peers are also seeded into the bad track;
 	// tabNearestHealthy truncates at K and can silently drop all Bad peers.
-	for _, ni := range n.tabNearest(target, routing.K) {
+	// K*4 widens the initial window so that reachable nodes beyond the first K
+	// XOR-closest (which may all be unreachable) are included as candidates.
+	for _, ni := range n.tabNearest(target, routing.K*4) {
 		n.absorbNodeInfo(ni, a2al.NodeID{}) // local table: no specific source
 		addCand(ni)
 	}
@@ -296,6 +298,11 @@ func (q *Query) runIterQuery(
 
 	hitReached := false
 	allSeen := make(map[string]protocol.NodeInfo)
+
+	// pathCands accumulates nodes that responded to FindValue but returned no
+	// records (sorted by XOR distance ascending).  Used for path caching in
+	// FindRecords mode (findValue=true, hitThreshold>0).
+	var pathCands []reachCandItem
 
 	// ── RPC helpers ───────────────────────────────────────────────────────
 	// Buffered channel: holds results from all in-flight goroutines without blocking.
@@ -394,7 +401,18 @@ func (q *Query) runIterQuery(
 			}
 			addCand(ni)
 		}
-		if !findValue || len(r.recs) == 0 {
+		if !findValue {
+			return
+		}
+		// Track nodes that responded but held no records; used for path caching.
+		if hitThreshold > 0 && r.from != (a2al.NodeID{}) && len(r.recs) == 0 {
+			dist := xorNodeID(r.from, target)
+			pathCands = insertReach(pathCands, reachCandItem{
+				ni:   protocol.NodeInfo{NodeID: append([]byte(nil), r.from[:]...)},
+				dist: dist,
+			})
+		}
+		if len(r.recs) == 0 {
 			return
 		}
 		now := time.Now()
@@ -507,6 +525,51 @@ mainLoop:
 	if findValue && len(outRecs) == 0 {
 		return nil, outNodes, ErrNoMatchingRecords
 	}
+
+	// Path caching (Direction B): after a successful FindRecords network query,
+	// cache the found records at the XOR-closest path node that responded but
+	// had no record.  For sovereign records a publisher Ping verifies the record
+	// is still live before spreading it; non-sovereign records are cached directly.
+	// A single async StoreAt keeps amplification minimal.
+	if findValue && hitThreshold > 0 && len(outRecs) > 0 && len(pathCands) > 0 {
+		var pcID a2al.NodeID
+		copy(pcID[:], pathCands[0].ni.NodeID)
+		recs := outRecs
+		go func() {
+			pctx, cancel := context.WithTimeout(context.Background(), queryPeerTimeout)
+			defer cancel()
+
+			// For sovereign records, verify the publisher is still reachable
+			// before propagating the record to a new node.  Skip caching if the
+			// publisher cannot be found in the routing table or fails the Ping.
+			for _, rec := range recs {
+				if protocol.RecordCategory(rec.RecType) == protocol.CategorySovereign {
+					var pubAddr a2al.Address
+					copy(pubAddr[:], rec.Address)
+					pubID := a2al.NodeIDFromAddress(pubAddr)
+					pAddr, ok := n.lookupPeerHealthAware(pubID)
+					if !ok {
+						pAddr, ok = n.lookupPeer(pubID)
+					}
+					if !ok {
+						return // publisher not reachable from here; skip
+					}
+					if err := n.Ping(pctx, pAddr); err != nil {
+						return // publisher unreachable; don't spread potentially stale record
+					}
+				}
+			}
+
+			addr, ok := n.lookupPeer(pcID)
+			if !ok {
+				return
+			}
+			for _, rec := range recs {
+				_, _, _, _ = n.StoreAt(pctx, addr, target, rec)
+			}
+		}()
+	}
+
 	return outRecs, outNodes, nil
 }
 
