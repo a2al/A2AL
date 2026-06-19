@@ -105,13 +105,13 @@ func (p *DHTpunchPool) SendTo(ctx context.Context, nodeID a2al.NodeID, msg []byt
 
 	st, err := mb.qc.OpenStreamSync(ctx)
 	if err != nil {
-		p.removeConn(nodeID)
+		p.evictConn(nodeID, mb.qc)
 		return false, nil
 	}
 	defer st.Close()
 
 	if _, err := st.Write(msg); err != nil {
-		p.removeConn(nodeID)
+		p.evictConn(nodeID, mb.qc)
 		return false, nil
 	}
 	return true, nil
@@ -208,16 +208,15 @@ func (p *DHTpunchPool) HandleIncomingPunch(ctx context.Context, callerNodeID a2a
 	}
 }
 
-// addConn registers a Mode B QUIC connection and starts the read loop.
-// If a previous connection for the same nodeID exists it is closed first.
+// addConn registers a Mode B QUIC connection and starts its read loop.
+// Any previous connection for the same nodeID is left alive: both read loops
+// run concurrently so that in-flight RPCs on either connection can complete.
+// The old loop exits naturally when its underlying QUIC connection closes.
 func (p *DHTpunchPool) addConn(nodeID a2al.NodeID, qc quic.Connection) {
 	ctx, cancel := context.WithCancel(context.Background())
 	mb := &modeBConn{qc: qc, cancel: cancel}
 
 	p.mu.Lock()
-	if old, ok := p.pool[nodeID]; ok {
-		old.cancel()
-	}
 	p.pool[nodeID] = mb
 	p.mu.Unlock()
 
@@ -237,11 +236,33 @@ func (p *DHTpunchPool) removeConn(nodeID a2al.NodeID) {
 	}
 }
 
+// evictConn removes nodeID from the pool only if it still holds qc.
+// Used by SendTo to avoid evicting a newer connection that replaced a failed one.
+func (p *DHTpunchPool) evictConn(nodeID a2al.NodeID, qc quic.Connection) {
+	p.mu.Lock()
+	mb, ok := p.pool[nodeID]
+	if ok && mb.qc == qc {
+		delete(p.pool, nodeID)
+		p.mu.Unlock()
+		mb.cancel()
+		return
+	}
+	p.mu.Unlock()
+}
+
 // runReadLoop accepts QUIC streams from a Mode B connection and injects each
 // message into the DHT node via InjectReceived. Exits when ctx is cancelled or
 // the QUIC connection closes.
 func (p *DHTpunchPool) runReadLoop(ctx context.Context, nodeID a2al.NodeID, qc quic.Connection) {
-	defer p.removeConn(nodeID)
+	defer func() {
+		// Only evict the pool entry if it still points to this connection.
+		// A newer addConn may have replaced it while this loop was running.
+		p.mu.Lock()
+		if mb, ok := p.pool[nodeID]; ok && mb.qc == qc {
+			delete(p.pool, nodeID)
+		}
+		p.mu.Unlock()
+	}()
 	for {
 		st, err := qc.AcceptStream(ctx)
 		if err != nil {

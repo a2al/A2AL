@@ -138,12 +138,14 @@ func (s *iceSession) isRelayedCandidate() bool {
 	return pair.Local.Type() == ice.CandidateTypeRelay || pair.Remote.Type() == ice.CandidateTypeRelay
 }
 
-// isDirectCandidate reports whether the ICE-selected path is host or
-// server-reflexive on both local and remote sides, meaning neither end is
-// going through a TURN relay.
+// isDirectCandidate reports whether the ICE-selected candidate pair is host
+// or server-reflexive on both local and remote sides — no prflx hole-punch
+// and no TURN relay was required to establish connectivity.
 //
-// Used by Phase 8 (误分类纠正): if true the remote should be reclassified as
-// a direct node rather than a punched node in the routing table.
+// Used by Phase 8 (误分类纠正): if true the remote is admitted to the standard
+// routing bucket (tabAdd + tryLive) rather than the punched zone (AddPunched +
+// tryEphemeral). Note: srflx still traverses NAT; "direct" means no ongoing
+// hole-punch maintenance is needed, not that the path is NAT-free.
 func (s *iceSession) isDirectCandidate() bool {
 	if s.agent == nil {
 		return false

@@ -403,9 +403,12 @@ func (h *Host) tryICEViaHub(ctx context.Context, localCert tls.Certificate, loca
 // picks a different "winner" (see ICE打洞排障记录-2026-05.md, Bug A). When
 // nil, the first established QUIC connection wins without verification (Mode B).
 //
-// isDirect is true when the selected ICE candidate pair is host/srflx on the
-// remote side, indicating the remote is directly reachable without NAT punching.
-// Used by Phase 8 reclassification in DHTpunchPool.
+// isDirect is true when the selected ICE candidate pair is host/srflx on both
+// local and remote sides — no prflx hole-punch or TURN relay was required.
+// This is the Phase 8 reclassification trigger: the peer is admitted to the
+// standard routing bucket (tabAdd) rather than the punched zone. Note that
+// srflx still involves NAT; "direct" here means "no ongoing punch maintenance
+// required", not "NAT-free". DCUtR punch paths always yield isDirect=false.
 //
 // The caller must invoke teardown when the connection is no longer needed.
 //
@@ -545,12 +548,11 @@ func (h *Host) acceptICEToQUIC(ctx context.Context, wsURL string, cert tls.Certi
 			return
 		}
 		for w := range punchOutCh {
-			ch <- connResult{
-				qc:       w.qc,
-				peerUDP:  w.peer,
-				isDirect: true, // punch path bypasses relay
-				teardown: w.teardown,
-			}
+		ch <- connResult{
+			qc:       w.qc,
+			peerUDP:  w.peer,
+			teardown: w.teardown,
+		}
 		}
 		ch <- connResult{pathEnd: true}
 	}()
@@ -678,7 +680,7 @@ func (h *Host) acceptICEToQUIC(ctx context.Context, wsURL string, cert tls.Certi
 					// Punch winners (sr.tr==nil) need sess.Close() since their
 					// punchWin teardown only releases the UDP socket reference.
 					// ICE relay winners' teardown already handles CloseSignaling.
-					if sr.isDirect {
+					if sr.tr == nil {
 						origTD := sr.teardown
 						winTD = func() {
 							if origTD != nil {
@@ -884,9 +886,13 @@ func (h *Host) connectViaICEForDHT(ctx context.Context, er *protocol.EndpointRec
 	return nil, nil, false, errors.Join(errs...)
 }
 
-// tryICEForDHT attempts a full ICE → QUIC handshake through one signal hub for
-// Mode B (DHT control-plane). No agent-route control stream is opened.
-// isDirect is true when the selected ICE candidate is host/srflx (Phase 8).
+// tryICEForDHT dials one signal hub for Mode B (DHT control-plane).
+//
+// ICE connectivity checks and DCUtR punch run in parallel; the first
+// established QUIC connection wins. No agent-route control stream is opened
+// (Mode B carries raw DHT messages only). isDirect is true when the winning
+// path used host/srflx candidates on both sides (no prflx punch, no relay) —
+// Phase 8 reclassification trigger; DCUtR punch paths yield isDirect=false.
 func (h *Host) tryICEForDHT(ctx context.Context, cert tls.Certificate, expectRemote a2al.Address, signalBase, room string, iceURLs []*stun.URI) (quic.Connection, *net.UDPAddr, bool, error) {
 	wsURL, err := signaling.AppendRoomToICEURL(signalBase, room)
 	if err != nil {
@@ -903,9 +909,12 @@ func (h *Host) tryICEForDHT(ctx context.Context, cert tls.Certificate, expectRem
 
 	hints := h.iceCache.Hints(expectRemote)
 
+	// startICESession instead of runICESession so completeICESession can run
+	// in parallel with punchDial below.
 	var (
-		sess *iceSession
-		lerr error
+		sess       *iceSession
+		remoteCred [2]string
+		lerr       error
 	)
 	for attempt := 0; attempt <= noAgentRetries; attempt++ {
 		if attempt > 0 {
@@ -915,9 +924,13 @@ func (h *Host) tryICEForDHT(ctx context.Context, cert tls.Certificate, expectRem
 			case <-time.After(noAgentRetryDelay):
 			}
 		}
-		sess, lerr = runICESession(ctx, wsURL, iceURLs, true, false, true, h.cfg.ICENetworkTypes, hints)
+		sess, remoteCred, lerr = startICESession(ctx, wsURL, iceURLs, true, false, true, h.cfg.ICENetworkTypes, hints)
 		if !errors.Is(lerr, ErrNoAgent) {
 			break
+		}
+		if sess != nil {
+			sess.Close()
+			sess = nil
 		}
 		h.log.Debug("dht ice retry on noagent", "remote", expectRemote, "hub", signalBase, "attempt", attempt+1)
 	}
@@ -925,40 +938,144 @@ func (h *Host) tryICEForDHT(ctx context.Context, cert tls.Certificate, expectRem
 		return nil, nil, false, lerr
 	}
 
-	// Phase 8: check if the remote is actually directly reachable (host/srflx candidate).
-	isDirect := sess.isDirectCandidate()
-
-	h.recordICESession(expectRemote, sess)
-
-	pconn := &icePacketConn{c: sess.iceConn}
-	tr := &quic.Transport{Conn: pconn}
-	teardown := func() {
-		_ = tr.Close()
-		sess.CloseSignaling()
-	}
-
-	ra := sess.iceConn.RemoteAddr()
-	udpRA, ok := ra.(*net.UDPAddr)
-	if !ok || udpRA == nil {
-		teardown()
-		return nil, nil, false, fmt.Errorf("a2al/host: ice remote addr is %T", ra)
-	}
-
-	cliTLS, err := quicClientTLSWithCert(cert, expectRemote)
-	if err != nil {
-		teardown()
-		return nil, nil, false, err
-	}
-	qc, err := tr.Dial(ctx, udpRA, cliTLS, modeBQUICConfig())
-	if err != nil {
-		teardown()
-		return nil, nil, false, err
-	}
-
-	// Mode B: no doDialerControlStream — connection carries raw DHT messages only.
-	go func() {
-		<-qc.Context().Done()
-		teardown()
+	sessOwned := true
+	defer func() {
+		if sessOwned {
+			sess.Close()
+		}
 	}()
-	return qc, udpRA, isDirect, nil
+
+	// Race ICE against DCUtR punch. Both use modeBQUICConfig; no stream check needed.
+	type dhtResult struct {
+		qc       quic.Connection
+		peerUDP  *net.UDPAddr
+		isDirect bool
+		fromICE  bool
+		teardown func()
+		pathEnd  bool
+		err      error
+	}
+
+	raceCtx, raceCancel := context.WithCancel(ctx)
+	defer raceCancel()
+
+	ch := make(chan dhtResult, 5)
+
+	// ICE goroutine.
+	go func() {
+		if iErr := completeICESession(raceCtx, sess, true, remoteCred); iErr != nil {
+			ch <- dhtResult{pathEnd: true, err: iErr}
+			return
+		}
+		ra, ok := sess.iceConn.RemoteAddr().(*net.UDPAddr)
+		if !ok || ra == nil {
+			ch <- dhtResult{pathEnd: true, err: fmt.Errorf("a2al/host: dht ice remote addr is %T", sess.iceConn.RemoteAddr())}
+			return
+		}
+		cliTLS, tlsErr := quicClientTLSWithCert(cert, expectRemote)
+		if tlsErr != nil {
+			ch <- dhtResult{pathEnd: true, err: tlsErr}
+			return
+		}
+		pconn := &icePacketConn{c: sess.iceConn}
+		tr := &quic.Transport{Conn: pconn}
+		qc, dialErr := tr.Dial(raceCtx, ra, cliTLS, modeBQUICConfig())
+		if dialErr != nil {
+			_ = tr.Close()
+			ch <- dhtResult{pathEnd: true, err: dialErr}
+			return
+		}
+		ch <- dhtResult{
+			qc:       qc,
+			peerUDP:  ra,
+			isDirect: sess.isDirectCandidate(),
+			fromICE:  true,
+			teardown: func() { _ = tr.Close(); sess.CloseSignaling() },
+		}
+		ch <- dhtResult{pathEnd: true}
+	}()
+
+	// Punch goroutine: DCUtR concurrent path via 4121.
+	// Uses the same signaling WebSocket as ICE; orthogonal to ICE (different
+	// socket, existing natsense-warmed NAT mapping).
+	go func() {
+		punchOutCh := make(chan punchWin, 2)
+		if pErr := h.punchDial(raceCtx, sess, true, cert, expectRemote, modeBQUICConfig(), punchOutCh); pErr != nil {
+			ch <- dhtResult{pathEnd: true, err: pErr}
+			return
+		}
+		for w := range punchOutCh {
+		ch <- dhtResult{
+			qc:       w.qc,
+			peerUDP:  w.peer,
+			teardown: w.teardown,
+		}
+		}
+		ch <- dhtResult{pathEnd: true}
+	}()
+
+	// Collect: first established QUIC connection wins.
+	pathsDone := 0
+	var win *dhtResult
+	var errs []error
+	for win == nil && pathsDone < 2 {
+		r := <-ch
+		if r.pathEnd {
+			pathsDone++
+			if r.err != nil {
+				errs = append(errs, r.err)
+			}
+			continue
+		}
+		raceCancel()
+		cp := r
+		win = &cp
+	}
+
+	if win == nil {
+		return nil, nil, false, errors.Join(errs...)
+	}
+
+	sessOwned = false
+
+	if win.fromICE {
+		// Record ICE hints for future connections to this peer.
+		h.recordICESession(expectRemote, sess)
+		// Teardown already owns tr.Close + sess.CloseSignaling.
+	} else {
+		// Punch winner: ICE session was never fully established; close it via sess.Close.
+		origTD := win.teardown
+		win.teardown = func() {
+			if origTD != nil {
+				origTD()
+			}
+			sess.Close()
+		}
+	}
+
+	// Drain any trailing outputs from the losing goroutine.
+	go func(rem int) {
+		for rem > 0 {
+			r := <-ch
+			if r.pathEnd {
+				rem--
+				continue
+			}
+			if r.qc != nil {
+				_ = r.qc.CloseWithError(0, "superseded by faster path")
+				if r.teardown != nil {
+					r.teardown()
+				}
+			}
+		}
+	}(2 - pathsDone)
+
+	// Mode B: no doDialerControlStream. Tie resource teardown to QUIC lifetime.
+	go func() {
+		<-win.qc.Context().Done()
+		if win.teardown != nil {
+			win.teardown()
+		}
+	}()
+	return win.qc, win.peerUDP, win.isDirect, nil
 }

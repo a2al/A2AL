@@ -142,7 +142,7 @@ type Config struct {
 	// SeenPeersPath is forwarded to the DHT node for seenPeers persistence (spec §7.3).
 	// Empty disables persistence.
 	SeenPeersPath string
-	// LearnedPathFirst enables P-Reach L1 outbound path selection in the DHT node.
+	// LearnedPathFirst enables learned-path outbound selection in the DHT node.
 	LearnedPathFirst bool
 	// ICENetworkTypes lists the ICE network types used for candidate gathering.
 	// Defaults to {ice.NetworkTypeUDP4, ice.NetworkTypeUDP6} (dual-stack) when
@@ -745,7 +745,7 @@ func (h *Host) BuildEndpointPayload(ctx context.Context) (protocol.EndpointPaylo
 	// Inform the DHT node of our public IPv4 so it can detect NAT hairpin peers
 	// (nodes behind the same NAT share the same public IP).  IPv6 GUA nodes are
 	// directly reachable without hairpinning, so v6 hairpin detection is
-	// intentionally skipped. The v6 IP is stored separately for beacon self-identify.
+	// intentionally skipped. The v6 IP is stored separately for self-identification.
 	if ext != "" {
 		ipStr := ext
 		if host, _, err := net.SplitHostPort(ext); err == nil {
