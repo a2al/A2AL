@@ -51,6 +51,7 @@ type repKey struct {
 type repNodeEntry struct {
 	nodeID         a2al.NodeID
 	confirmedAt    time.Time
+	confirmedSeq   uint64        // Seq of the last record this node confirmed holding (0 = unknown)
 	failCount      int
 	badSince       time.Time     // non-zero: node is in 30-min grace window before eviction
 	nextProbeAt    time.Time
@@ -310,6 +311,17 @@ func (n *Node) renewBackground(rk repKey, rs *repSet) {
 		}
 	}
 
+	// Re-read the latest record after FindNode: the goroutine may have been
+	// suspended (e.g. OS sleep/wake) or a new publication may have arrived
+	// while FindNode was in flight.  Using the freshest record here ensures
+	// we never push a stale or expired record to existing replicas.
+	rs.mu.Lock()
+	rec = rs.rec
+	rs.mu.Unlock()
+	if len(rec.Address) == 0 {
+		return
+	}
+
 	rs.mu.Lock()
 	now := time.Now()
 	existingIDs := make([]a2al.NodeID, 0, len(rs.nodes))
@@ -331,8 +343,34 @@ func (n *Node) renewBackground(rk repKey, rs *repSet) {
 		// Relying on badSince keeps the two concerns separate: global health
 		// governs new candidate selection; repSet-level health governs eviction.
 		if !e.badSince.IsZero() {
-			e.nextProbeAt = now
+			// Do not shorten the grace window: only override nextProbeAt when
+			// probeBadDelay has already elapsed.  Cascades triggered by
+			// sleep/wake or network change call renewBackground immediately,
+			// and resetting nextProbeAt = now would collapse the 30-min grace
+			// to a single probeTickInterval (15 s), causing healthy nodes to
+			// be evicted faster than the normal eviction path.
+			if time.Since(e.badSince) >= probeBadDelay {
+				e.nextProbeAt = now
+			}
 			badRepNodes = append(badRepNodes, e.nodeID) // Phase 6
+			continue
+		}
+		// Skip renewal RPC only when all three conditions hold:
+		//   1. rec version unchanged (confirmedSeq == rec.Seq)
+		//   2. already confirmed by a real RPC in the current cycle
+		//      (confirmedAt.After(renewEpoch)); nodes not yet confirmed this
+		//      cycle must be contacted regardless — that is the mandatory
+		//      fact-finding of each renewal pass.
+		//   3. node is probe-healthy (failCount == 0); a node with pending
+		//      probe failures needs a StoreAt to re-establish facts.
+		// confirmedAt is intentionally NOT updated here: it is a pure fact
+		// field updated only by a successful StoreAt RPC.  Nodes removed from
+		// preRenewConfirmed are excluded from the post-renewal fast-probe check
+		// so they are not mistaken for renewal failures.
+		if e.confirmedSeq == rec.Seq &&
+			e.confirmedAt.After(rs.renewEpoch) &&
+			e.failCount == 0 {
+			delete(preRenewConfirmed, k)
 			continue
 		}
 		existingIDs = append(existingIDs, e.nodeID)
@@ -358,10 +396,11 @@ func (n *Node) renewBackground(rk repKey, rs *repSet) {
 		}
 		n.storeAndRecord(ctx, existingPeers, rk, rec, rs)
 
-		// For nodes whose renewal just failed (confirmedAt unchanged), set
-		// nextProbeAt = now so 过程三 detects failure within one tick (≤15 s)
-		// instead of waiting up to probeMaxDelay (10 min) for the next scheduled
-		// probe.
+		// For nodes whose renewal just failed (confirmedAt unchanged from the
+		// pre-renewal snapshot), set nextProbeAt = now so 过程三 detects the
+		// failure within one tick (≤15 s) instead of waiting up to probeMaxDelay.
+		// Skipped nodes were removed from preRenewConfirmed above and will not
+		// appear here, so they are not mistaken for renewal failures.
 		now := time.Now()
 		rs.mu.Lock()
 		for k, before := range preRenewConfirmed {
@@ -419,8 +458,14 @@ func (n *Node) renewBackground(rk repKey, rs *repSet) {
 // between launches and records confirmed stores into the repSet.
 // Used by processReplTask and renewBackground.
 //
-// Fix 3: successful StoreAt only updates confirmedAt / failCount.
-// The probe schedule (nextProbeDelay/nextProbeAt) is owned exclusively by
+// Rejection semantics:
+//   - StoreReasonRecordInvalid: the record itself was rejected (e.g. expired
+//     in the brief window between our validity check and the RPC).  The peer is
+//     reachable and healthy; do NOT remove it from the repSet.
+//   - StoreReasonPolicy: the peer permanently refuses this key/record.  Remove
+//     it from the repSet so gap-fill can find a willing replacement.
+//
+// Probe schedule (nextProbeDelay/nextProbeAt) is owned exclusively by
 // probeRepNode (过程三) so that the exponential back-off is not reset on
 // every TTL renewal.
 func (n *Node) storeAndRecord(ctx context.Context, peers []protocol.NodeInfo, rk repKey, rec protocol.SignedRecord, rs *repSet) {
@@ -477,7 +522,7 @@ func (n *Node) storeAndRecord(ctx context.Context, peers []protocol.NodeInfo, rk
 		}
 
 		pctx, cancel := context.WithTimeout(ctx, queryPeerTimeout)
-		stored, _, meta, err := n.StoreAt(pctx, addr, rk.storeKey, rec)
+		stored, _, meta, reason, err := n.StoreAt(pctx, addr, rk.storeKey, rec)
 		cancel()
 		if err != nil {
 			dial := meta.dialAddr
@@ -497,7 +542,7 @@ func (n *Node) storeAndRecord(ctx context.Context, peers []protocol.NodeInfo, rk
 				v6, _ := addrIsV6(addr)
 				if fallback := n.publicStableDialAddr(id, v6); fallback != nil && fallback.String() != addr.String() {
 					pctx2, cancel2 := context.WithTimeout(ctx, queryPeerTimeout)
-					stored, _, meta, err = n.StoreAt(pctx2, fallback, rk.storeKey, rec)
+					stored, _, meta, reason, err = n.StoreAt(pctx2, fallback, rk.storeKey, rec)
 					cancel2()
 					if err != nil {
 						fdial := meta.dialAddr
@@ -518,16 +563,16 @@ func (n *Node) storeAndRecord(ctx context.Context, peers []protocol.NodeInfo, rk
 			}
 		}
 		if !stored {
-			// The peer is reachable but its recordAuthPolicy rejected this
-			// record (e.g. unsupported delegation type, policy mismatch).
-			// This is a record-scoped signal: do not penalise the peer's
-			// global health score.
-			//
-			// If the peer was already a confirmed replica (renewal path),
-			// remove it from the repSet — it is no longer holding the record
-			// and will not accept a re-store.  The stillNeed check at the end
-			// of renewBackground will detect the resulting gap and queue a
-			// processReplTask to find a replacement.
+			// The peer is reachable but rejected the record.  Classify by reason:
+			//   RecordInvalid — the record itself was bad (peer is healthy).
+			//     Do not remove from repSet; the concurrent fresh-record publish
+			//     will succeed on the next renewal cycle.
+			//   Policy (or unknown) — the peer permanently refuses this key.
+			//     Remove from repSet so gap-fill can find a willing replacement.
+			if reason == protocol.StoreReasonRecordInvalid {
+				n.log.Debug("replication StoreAt rejected: record invalid, keeping in repSet", "peer", addr)
+				continue
+			}
 			k := infoKey(ni)
 			rs.mu.Lock()
 			_, wasReplica := rs.nodes[k]
@@ -551,18 +596,21 @@ func (n *Node) storeAndRecord(ctx context.Context, peers []protocol.NodeInfo, rk
 		punched := n.table.IsPunched(id)
 		n.tabMu.RUnlock()
 
+		now := time.Now()
 		rs.mu.Lock()
 		if e, exists := rs.nodes[k]; exists {
 			// Renewal confirmed: update liveness state but leave probe schedule alone.
-			e.confirmedAt = time.Now()
+			e.confirmedAt = now
+			e.confirmedSeq = rec.Seq
 			e.failCount = 0
 			e.badSince = time.Time{}
 			e.isPunched = punched // refresh in case the node was promoted from punched
 		} else {
 			rs.nodes[k] = &repNodeEntry{
 				nodeID:         id,
-				confirmedAt:    time.Now(),
-				nextProbeAt:    time.Now().Add(probeInitDelay),
+				confirmedAt:    now,
+				confirmedSeq:   rec.Seq,
+				nextProbeAt:    now.Add(probeInitDelay),
 				nextProbeDelay: probeInitDelay,
 				isPunched:      punched,
 			}
@@ -1164,6 +1212,25 @@ func (n *Node) applyRepProbeOutcome(ctx context.Context, rk repKey, rs *repSet, 
 		n.enqueueReplication(rk, protocol.SignedRecord{})
 
 	case e.failCount >= badHealthThreshold:
+		// If the node was confirmed in the most recently completed renewal
+		// cycle (confirmedAt.After(renewEpoch)), it was healthy just moments
+		// ago.  Give it one extra fast-retry round before entering the 30-min
+		// grace window: reset failCount to 1 so the next probe failure is the
+		// first "real" strike.  This dampens false evictions during the brief
+		// connectivity gap that follows a sleep/wake or network change event.
+		//
+		// The check is intentionally narrow: only nodes confirmed this cycle
+		// benefit; stale entries that merely survived from earlier cycles do
+		// not.  The grace window (badSince) is still entered on the very next
+		// failure, so eviction is delayed by at most one probeInitDelay (30 s),
+		// not indefinitely.
+		if e.confirmedAt.After(rs.renewEpoch) {
+			e.failCount = 1
+			e.nextProbeAt = time.Now().Add(probeInitDelay)
+			rs.mu.Unlock()
+			n.log.Debug("replication probe: node bad deferred (recently confirmed)", "nodeID", e.nodeID)
+			return
+		}
 		// Newly bad: enter 30-min grace window.
 		e.badSince = time.Now()
 		e.nextProbeAt = time.Now().Add(probeBadDelay)

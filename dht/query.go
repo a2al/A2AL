@@ -565,7 +565,7 @@ mainLoop:
 				return
 			}
 			for _, rec := range recs {
-				_, _, _, _ = n.StoreAt(pctx, addr, target, rec)
+				_, _, _, _, _ = n.StoreAt(pctx, addr, target, rec)
 			}
 		}()
 	}

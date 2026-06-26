@@ -198,7 +198,7 @@ func TestNode_storeAndFindValue(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	ok, _, _, err := nodeA.StoreAt(ctx, trB.LocalAddr(), a2al.NodeID{}, rec)
+	ok, _, _, _, err := nodeA.StoreAt(ctx, trB.LocalAddr(), a2al.NodeID{}, rec)
 	if err != nil || !ok {
 		t.Fatalf("store %v %v", ok, err)
 	}

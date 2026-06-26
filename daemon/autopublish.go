@@ -10,6 +10,7 @@ import (
 	mrand "math/rand"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -83,13 +84,15 @@ func (d *Daemon) saveNodePublishState() error {
 
 func endpointPayloadFingerprint(ep protocol.EndpointPayload) string {
 	var b strings.Builder
-	for _, x := range ep.Endpoints {
+	endpoints := slices.Sorted(slices.Values(ep.Endpoints))
+	for _, x := range endpoints {
 		b.WriteString(x)
 		b.WriteByte('|')
 	}
 	b.WriteString(ep.Signal)
 	b.WriteByte('|')
-	for _, u := range ep.Signals {
+	signals := slices.Sorted(slices.Values(ep.Signals))
+	for _, u := range signals {
 		b.WriteString(u)
 		b.WriteByte(',')
 	}

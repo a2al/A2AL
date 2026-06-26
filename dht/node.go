@@ -2231,7 +2231,16 @@ func (n *Node) PingIdentity(ctx context.Context, peer net.Addr) (*PeerIdentity, 
 // StoreAt sends STORE to peer. storeKey zero omits BodyStore.Key (receiver derives key from rec.Address).
 // On success peerID is the remote node's identity from the STORE response.
 // meta describes the outbound path actually used (for diagnostic logging).
-func (n *Node) StoreAt(ctx context.Context, peer net.Addr, storeKey a2al.NodeID, rec protocol.SignedRecord) (stored bool, peerID a2al.NodeID, meta deliverMeta, err error) {
+// StoreAt sends a STORE RPC to peer and returns the outcome.
+//
+// stored is true when the remote node confirmed holding the record — either by
+// accepting the write (resp.Stored) or because it already had an equal-or-newer
+// copy (resp.AlreadyHad). Both mean the record is safe on that node.
+//
+// reason carries the machine-readable rejection cause when stored is false.
+// It is StoreReasonOK (0) on success or when the remote is an older node that
+// does not populate the field.
+func (n *Node) StoreAt(ctx context.Context, peer net.Addr, storeKey a2al.NodeID, rec protocol.SignedRecord) (stored bool, peerID a2al.NodeID, meta deliverMeta, reason protocol.StoreReason, err error) {
 	body := &protocol.BodyStore{Record: rec}
 	if storeKey != (a2al.NodeID{}) {
 		body.Key = storeKey[:]
@@ -2249,22 +2258,25 @@ func (n *Node) StoreAt(ctx context.Context, peer net.Addr, storeKey a2al.NodeID,
 			}
 			n.recordFailure(id, failAddr)
 		}
-		return false, a2al.NodeID{}, meta, err
+		return false, a2al.NodeID{}, meta, protocol.StoreReasonOK, err
 	}
 	peerNID := a2al.NodeIDFromAddress(dec.SenderAddr)
 	dial := successDialAddr(peer, meta)
 	n.recordSuccess(peerNID, dial, time.Since(t0))
 	n.rememberStoreSuccess(peerNID, dial)
 	resp := dec.Body.(*protocol.BodyStoreResp)
+	// AlreadyHad means the remote independently holds an equal-or-newer record —
+	// treat as confirmed storage regardless of resp.Stored.
+	stored = resp.Stored || resp.AlreadyHad
 	switch {
 	case resp.AlreadyHad:
 		n.log.Debug("dht store: peer already had record", "peer", peer, "key", hex.EncodeToString(storeKey[:4]))
-	case !resp.Stored && resp.Reason == protocol.StoreReasonPolicy:
+	case !stored && resp.Reason == protocol.StoreReasonPolicy:
 		n.log.Debug("dht store: peer policy rejected", "peer", peer, "key", hex.EncodeToString(storeKey[:4]))
-	case !resp.Stored && resp.Reason == protocol.StoreReasonRecordInvalid:
+	case !stored && resp.Reason == protocol.StoreReasonRecordInvalid:
 		n.log.Debug("dht store: record invalid", "peer", peer, "key", hex.EncodeToString(storeKey[:4]))
 	}
-	return resp.Stored, peerNID, meta, nil
+	return stored, peerNID, meta, resp.Reason, nil
 }
 
 // rememberStoreSuccess registers dial→nodeID mapping after a successful outbound
