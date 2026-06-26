@@ -104,13 +104,43 @@ func newDualPacketConn(c4, c6 *net.UDPConn) *dualPacketConn {
 	return d
 }
 
+// readLoopMaxErrStreak is the number of consecutive ReadFromUDP errors after
+// which readLoop gives up and exits, treating the socket as permanently broken.
+// Each error is followed by a readLoopErrBackoff sleep, so this bounds the
+// total retry window to readLoopMaxErrStreak * readLoopErrBackoff = 30 s.
+const (
+	readLoopMaxErrStreak = 600
+	readLoopErrBackoff   = 50 * time.Millisecond
+)
+
 func (d *dualPacketConn) readLoop(c *net.UDPConn) {
 	buf := make([]byte, readBufSize)
+	errStreak := 0
 	for {
 		n, addr, err := c.ReadFromUDP(buf)
 		if err != nil {
-			return // socket closed or network error; goroutine exits
+			// Close() closes d.done before c4.Close()/c6.Close(), so if
+			// d.done is already closed this is an orderly shutdown — exit
+			// immediately without counting it as an error.
+			select {
+			case <-d.done:
+				return
+			default:
+			}
+			// Transient OS error (e.g. WSAENETDOWN during a Windows interface
+			// change). The socket is still bound to 0.0.0.0/[::] and should
+			// recover once the interface is back. Sleep briefly and retry.
+			errStreak++
+			if errStreak >= readLoopMaxErrStreak {
+				// Persistent error for ~30 s — treat socket as permanently
+				// broken and exit, matching the original single-error exit
+				// behaviour as a safety net.
+				return
+			}
+			time.Sleep(readLoopErrBackoff)
+			continue
 		}
+		errStreak = 0
 		// Normalise v4-mapped source addresses from the IPv6 socket.
 		if addr != nil {
 			if v4 := addr.IP.To4(); v4 != nil && len(addr.IP) == net.IPv6len {

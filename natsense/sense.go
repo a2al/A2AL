@@ -74,6 +74,11 @@ type Sense struct {
 	probeResultV4 *bool // nil=unknown, true=reachable, false=unreachable
 	probeAtV4     time.Time
 
+	// v4 mapping probe: active port-consistency test (set by host.runMappingProbeV4).
+	// nil=unknown, true=symmetric (no majority port), false=non-symmetric (majority port exists).
+	mappingProbeResultV4 *bool
+	mappingProbeAtV4     time.Time
+
 	// v6 active classification state.
 	v6GUABind     bool  // local interface has a GUA (globally unique address)
 	probeResultV6 *bool // nil=unknown, true=direct, false=firewalled
@@ -146,6 +151,24 @@ func (s *Sense) ClearV4ProbeResult() {
 	s.mu.Unlock()
 }
 
+// RecordMappingProbeV4 records the result of the active v4 NAT port-consistency
+// probe. symmetric=true means no single external port held a strict majority
+// across probe targets (Symmetric NAT behaviour); false means one port dominated.
+func (s *Sense) RecordMappingProbeV4(symmetric bool) {
+	s.mu.Lock()
+	s.mappingProbeResultV4 = &symmetric
+	s.mappingProbeAtV4 = time.Now()
+	s.mu.Unlock()
+}
+
+// ClearMappingProbeV4 discards the cached v4 mapping probe result.
+func (s *Sense) ClearMappingProbeV4() {
+	s.mu.Lock()
+	s.mappingProbeResultV4 = nil
+	s.mappingProbeAtV4 = time.Time{}
+	s.mu.Unlock()
+}
+
 // --- v6 bind / probe state ---
 
 // RecordV6GUABind records whether the local interface has an IPv6 Globally
@@ -199,6 +222,7 @@ func (s *Sense) RecordProbeResult(reachable bool) { s.RecordV4ProbeResult(reacha
 func (s *Sense) ClearProbeResult() {
 	s.ClearV4ProbeResult()
 	s.ClearV6ProbeResult()
+	s.ClearMappingProbeV4()
 }
 
 // --- Passive vote management ---
@@ -472,16 +496,19 @@ type symDetectResult struct {
 // not a single NAT device varying its mapping.  The fix is to group votes by
 // public IP first, then look for ≥2 well-supported ports *within the same IP*.
 //
+// filterIP, if non-nil, restricts analysis to votes where the observed IP
+// equals filterIP.  Pass nil to analyse all v4 paths (worst-case).
+//
 // v6 votes are excluded: GUA ports are stable and must not bias this check.
 //
 // Must be called with s.mu held.
-func (s *Sense) detectSymmetricV4(cutoff time.Time) symDetectResult {
+func (s *Sense) detectSymmetricV4(cutoff time.Time, filterIP net.IP) symDetectResult {
 	minPerPort := 2
 	if s.min <= 1 {
 		minPerPort = 1
 	}
 
-	// hostPortReporters: public-IP → port → set-of-reporters
+	// hostPortReporters: IP → port → set-of-reporters
 	type portMap = map[uint16]map[nodeIDKey]struct{}
 	hostPortReporters := make(map[string]portMap)
 	total := 0
@@ -492,7 +519,12 @@ func (s *Sense) detectSymmetricV4(cutoff time.Time) symDetectResult {
 			continue
 		}
 		// v4 only — v6 GUA ports are stable and irrelevant.
-		if ip := net.ParseIP(host); ip == nil || ip.To4() == nil {
+		ip := net.ParseIP(host)
+		if ip == nil || ip.To4() == nil {
+			continue
+		}
+		// Optional per-path filter: only analyse the specified IP.
+		if filterIP != nil && !filterIP.Equal(ip.To4()) {
 			continue
 		}
 		reporters := make(map[nodeIDKey]struct{})
@@ -552,21 +584,43 @@ func (s *Sense) detectSymmetricV4(cutoff time.Time) symDetectResult {
 	}
 }
 
+// trustedV4IPLocked returns the primary v4 IP that has reached consensus
+// threshold in the passive vote window, or nil if none exists.
+// Used by PublishNatType to filter symmetric detection to the STUN path.
+// Must be called with s.mu held.
+func (s *Sense) trustedV4IPLocked(cutoff time.Time) net.IP {
+	min := s.effectiveMin(cutoff)
+	for key, reps := range s.votes {
+		if liveVotes(reps, cutoff) < min {
+			continue
+		}
+		h, _, err := net.SplitHostPort(key)
+		if err != nil {
+			continue
+		}
+		ip := net.ParseIP(h)
+		if ip != nil && ip.To4() != nil {
+			return ip.To4()
+		}
+	}
+	return nil
+}
+
 // InferNATType returns the best NAT classification for local operational use
-// (punch strategy, session signalling). It is intentionally conservative:
-// when the active probe has not yet run it returns NATRestricted so that
-// punch and ICE paths are prepared even before confirmation.
+// (punch strategy, session signalling). It is intentionally worst-case:
+// symmetric detection considers ALL v4 paths — if any path shows symmetric
+// behaviour the result is NATSymmetric, so the punch peer sprays ports.
+// A false-positive symmetric here wastes spray bandwidth but never breaks
+// connectivity; a false-negative would cause punch to miss.
 //
 // Do NOT use this for publishing to the DHT — call PublishNatType() instead,
-// which returns NATUnknown in the unconfirmed case rather than NATRestricted,
-// so that connecting peers treat us optimistically until we have real evidence.
+// which restricts symmetric detection to the STUN-confirmed path and uses
+// the active mapping probe as the authoritative signal for that path.
 //
 // Decision flow:
 //
 //  1. Public bind (QUIC socket on a WAN IPv4)  → NATFullCone.
-//  2. Symmetric mapping: ≥2 well-supported ports under the same public IPv4 →
-//     NATSymmetric.  Ports across different public IPs (multi-homed host) are
-//     NOT counted together; that would be a false positive.
+//  2. Symmetric (worst-case): passive all-path OR fresh mapping probe → NATSymmetric.
 //  3. Insufficient passive evidence             → NATUnknown.
 //  4. Active probe result (RecordV4ProbeResult):
 //     reachable=true  → NATFullCone  (any peer can initiate; Full Cone or cloud NAT)
@@ -581,12 +635,18 @@ func (s *Sense) InferNATType() uint8 {
 		return NATFullCone
 	}
 
-	// ② Passive mapping stability: symmetric detection, v4 only, grouped by IP.
 	cutoff := time.Now().Add(-voteTTL)
 	effMin := s.effectiveMin(cutoff)
-	sym := s.detectSymmetricV4(cutoff)
-	if sym.isSymmetric {
+	// Worst-case: no IP filter — any v4 path showing symmetric behaviour counts.
+	sym := s.detectSymmetricV4(cutoff, nil)
+
+	// ② Symmetric (worst-case OR): passive any-path symmetric, or fresh mapping
+	// probe confirmed symmetric on the STUN path.  Mapping probe result only
+	// ADDS symmetric evidence here; it does NOT suppress the passive conclusion.
+	freshProbe := s.mappingProbeResultV4 != nil && time.Since(s.mappingProbeAtV4) < probeResultTTL
+	if sym.isSymmetric || (freshProbe && *s.mappingProbeResultV4) {
 		slog.Debug("nat: symmetric detected", "component", "natsense",
+			"passive", sym.isSymmetric, "probe", freshProbe && *s.mappingProbeResultV4,
 			"supported_ports", sym.supportedPorts, "ports", sym.portsByHost,
 			"total_reporters", sym.total)
 		return NATSymmetric
@@ -610,19 +670,21 @@ func (s *Sense) InferNATType() uint8 {
 }
 
 // PublishNatType returns the NAT capability value to embed in a published
-// DHT endpoint record. It differs from InferNATType in exactly one case:
+// DHT endpoint record. It differs from InferNATType in two ways:
 //
-//   - When passive evidence is sufficient (stable single-port mapping) but the
-//     active probe has not yet completed, InferNATType returns NATRestricted as
-//     a conservative local hint; PublishNatType returns NATUnknown instead.
+//  1. Symmetric detection is restricted to the STUN-confirmed v4 path
+//     (trustedV4IPLocked).  Other paths (VPN, private) are excluded so that
+//     a stable public endpoint is not mis-classified as Symmetric because of
+//     an unrelated path's NAT behaviour.
 //
-// The rationale: a published NATRestricted causes connecting peers to skip v4
-// direct-dial and go straight to ICE, which is wasteful if we later confirm
-// full-cone reachability. NATUnknown instructs peers to try direct optimistically
-// while keeping ICE ready — the correct behaviour when we simply don't know yet.
+//  2. A fresh active mapping probe is authoritative for the STUN path: when
+//     one is available it overrides the passive vote analysis (which may be
+//     contaminated by UPnP session reuse).  Without a fresh probe the passive
+//     analysis acts as a fallback.
 //
-// All other cases (public bind, Symmetric, confirmed probe results, insufficient
-// evidence) return the same value as InferNATType.
+//  3. When passive evidence is sufficient but the active probe has not yet
+//     completed, InferNATType returns NATRestricted; PublishNatType returns
+//     NATUnknown so that peers attempt direct-dial optimistically.
 func (s *Sense) PublishNatType() uint8 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -632,11 +694,22 @@ func (s *Sense) PublishNatType() uint8 {
 		return NATFullCone
 	}
 
-	// ② Symmetric mapping (same detection as InferNATType, grouped by IP).
 	cutoff := time.Now().Add(-voteTTL)
 	effMin := s.effectiveMin(cutoff)
-	sym := s.detectSymmetricV4(cutoff)
-	if sym.isSymmetric {
+	// Restrict passive symmetric detection to the STUN-confirmed path.
+	// nil primaryIP (no consensus yet) falls back to all-path analysis.
+	primaryIP := s.trustedV4IPLocked(cutoff)
+	sym := s.detectSymmetricV4(cutoff, primaryIP)
+
+	// ② Symmetric: mapping probe is authoritative for the STUN path when fresh.
+	// It overrides a passive symmetric conclusion that may be UPnP-session-
+	// polluted.  Without a fresh probe, fall back to the (filtered) passive result.
+	if s.mappingProbeResultV4 != nil && time.Since(s.mappingProbeAtV4) < probeResultTTL {
+		if *s.mappingProbeResultV4 {
+			return NATSymmetric
+		}
+		// Mapping probe says non-symmetric on the STUN path: trust it.
+	} else if sym.isSymmetric {
 		return NATSymmetric
 	}
 

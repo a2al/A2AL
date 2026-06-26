@@ -142,7 +142,7 @@ type Config struct {
 	// SeenPeersPath is forwarded to the DHT node for seenPeers persistence (spec §7.3).
 	// Empty disables persistence.
 	SeenPeersPath string
-	// LearnedPathFirst enables learned-path outbound selection in the DHT node.
+	// LearnedPathFirst enables P-Reach L1 outbound path selection in the DHT node.
 	LearnedPathFirst bool
 	// ICENetworkTypes lists the ICE network types used for candidate gathering.
 	// Defaults to {ice.NetworkTypeUDP4, ice.NetworkTypeUDP6} (dual-stack) when
@@ -542,6 +542,7 @@ func (h *Host) ObserveFromRouting(ctx context.Context, n int) int {
 //	QUIC bind IP is a public v4 WAN address   → sense.RecordV4BindPublic(true); skip echo probe
 //	echo received from ≥1 v4 candidate        → sense.RecordV4ProbeResult(true)
 //	no echo despite known v4 external address → sense.RecordV4ProbeResult(false)
+//	mapping probe (majority port rule)        → sense.RecordMappingProbeV4(symmetric)
 //
 // IPv6 classification:
 //
@@ -555,6 +556,7 @@ func (h *Host) RunNATProbe(ctx context.Context) {
 	defer h.natProbeMu.Unlock()
 
 	h.runNATProbeV4(ctx)
+	h.runMappingProbeV4(ctx)
 	h.runNATProbeV6(ctx)
 }
 
@@ -725,6 +727,115 @@ func (h *Host) selectNATProbeTargetsV6(n int) []net.Addr {
 	return out
 }
 
+// runMappingProbeV4 probes up to 5 v4 peers via PingIdentity, groups the
+// observed IP:port responses by IP, and records whether the STUN-confirmed
+// path shows symmetric NAT behaviour.
+//
+// Per-path majority rule: for the STUN path, if one port accounts for
+// strictly more than half of the responses (maxCount*2 > total), the NAT is
+// non-symmetric on that path; otherwise it is treated as Symmetric.
+//
+// Only v4 observed addresses are counted; v6 addresses are silently ignored.
+// If fewer than 3 responses arrive on the STUN path the probe is inconclusive
+// and no result is recorded (existing state is preserved).
+//
+// If no STUN-consensus IP is available the probe is skipped entirely — private
+// deployments without a STUN-confirmed address rely on passive detection.
+func (h *Host) runMappingProbeV4(ctx context.Context) {
+	if h.sense.IsV4BindPublic() {
+		return // no NAT — port-consistency check is irrelevant
+	}
+	targets := h.selectNATProbeTargets(5)
+	if len(targets) < 2 {
+		h.log.Debug("mapping probe v4: not enough targets", "found", len(targets))
+		return
+	}
+
+	type result struct {
+		ip   net.IP // v4 only; nil means unusable
+		port uint16
+	}
+	results := make(chan result, len(targets))
+	for _, addr := range targets {
+		addr := addr
+		go func() {
+			pCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			id, err := h.node.PingIdentity(pCtx, addr)
+			if err != nil || id == nil || len(id.ObservedWire) == 0 {
+				results <- result{}
+				return
+			}
+			host, port, ok := protocol.ParseObservedUDP(id.ObservedWire)
+			if !ok {
+				results <- result{}
+				return
+			}
+			ip := net.ParseIP(host)
+			if ip == nil || ip.To4() == nil {
+				results <- result{} // exclude v6 observed addresses
+				return
+			}
+			results <- result{ip: ip.To4(), port: port}
+		}()
+	}
+
+	// Collect per-IP port counts.
+	type portCount = map[uint16]int
+	ipGroups := make(map[string]portCount)
+	for range targets {
+		r := <-results
+		if r.ip == nil {
+			continue
+		}
+		key := r.ip.String()
+		if ipGroups[key] == nil {
+			ipGroups[key] = make(portCount)
+		}
+		ipGroups[key][r.port]++
+	}
+
+	// Determine the STUN-confirmed primary IP.
+	var stunIP net.IP
+	if w, ok := h.sense.TrustedWireV4(); ok {
+		if host, _, ok2 := protocol.ParseObservedUDP(w); ok2 {
+			if ip := net.ParseIP(host); ip != nil {
+				stunIP = ip.To4()
+			}
+		}
+	}
+	if stunIP == nil {
+		h.log.Debug("mapping probe v4: no STUN-consensus IP; skipping")
+		return
+	}
+
+	counts := ipGroups[stunIP.String()]
+	total := 0
+	for _, c := range counts {
+		total += c
+	}
+	if total < 3 {
+		h.log.Debug("mapping probe v4: STUN path responses insufficient",
+			"responded", total)
+		return
+	}
+
+	var maxCount int
+	for _, c := range counts {
+		if c > maxCount {
+			maxCount = c
+		}
+	}
+	// Symmetric if no single port holds a strict majority (maxCount*2 > total).
+	// Ties (50/50) are treated as non-symmetric: insufficient evidence to
+	// conclude symmetric, and false-positive symmetric is more costly.
+	isSymmetric := maxCount*2 < total
+	h.sense.RecordMappingProbeV4(isSymmetric)
+	h.log.Debug("mapping probe v4 done", "stun_ip", stunIP,
+		"symmetric", isSymmetric, "responded", total,
+		"max_same_port", maxCount, "distinct_ports", len(counts))
+}
+
 // BuildEndpointPayload builds ordered, deduplicated quic:// candidates (Phase 2b).
 // UPnP discovery and external IP probing (STUN + HTTP) run concurrently.
 func (h *Host) BuildEndpointPayload(ctx context.Context) (protocol.EndpointPayload, error) {
@@ -745,7 +856,7 @@ func (h *Host) BuildEndpointPayload(ctx context.Context) (protocol.EndpointPaylo
 	// Inform the DHT node of our public IPv4 so it can detect NAT hairpin peers
 	// (nodes behind the same NAT share the same public IP).  IPv6 GUA nodes are
 	// directly reachable without hairpinning, so v6 hairpin detection is
-	// intentionally skipped. The v6 IP is stored separately for self-identification.
+	// intentionally skipped. The v6 IP is stored separately for beacon self-identify.
 	if ext != "" {
 		ipStr := ext
 		if host, _, err := net.SplitHostPort(ext); err == nil {
