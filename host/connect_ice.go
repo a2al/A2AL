@@ -243,7 +243,7 @@ func (h *Host) tryICEViaHub(ctx context.Context, localCert tls.Certificate, loca
 			ch <- connResult{pathEnd: true, err: iErr}
 			return
 		}
-		pconn := &icePacketConn{c: sess.iceConn}
+		pconn := newIcePacketConn(sess.iceConn)
 		tr := &quic.Transport{Conn: pconn}
 		ra, ok := sess.iceConn.RemoteAddr().(*net.UDPAddr)
 		if !ok || ra == nil {
@@ -469,7 +469,7 @@ func (h *Host) acceptICEToQUIC(ctx context.Context, wsURL string, cert tls.Certi
 			h.recordICESession(expectRemote, sess)
 		}
 		direct := sess.isDirectCandidate()
-		pconn := &icePacketConn{c: sess.iceConn}
+		pconn := newIcePacketConn(sess.iceConn)
 		tr := &quic.Transport{Conn: pconn}
 		srvTLS := quicServerTLSWithSNI(cert, h.certForSNI)
 		ln, lnErr := tr.Listen(srvTLS, qcfg)
@@ -977,7 +977,7 @@ func (h *Host) tryICEForDHT(ctx context.Context, cert tls.Certificate, expectRem
 			ch <- dhtResult{pathEnd: true, err: tlsErr}
 			return
 		}
-		pconn := &icePacketConn{c: sess.iceConn}
+		pconn := newIcePacketConn(sess.iceConn)
 		tr := &quic.Transport{Conn: pconn}
 		qc, dialErr := tr.Dial(raceCtx, ra, cliTLS, modeBQUICConfig())
 		if dialErr != nil {
