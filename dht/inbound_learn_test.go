@@ -46,6 +46,47 @@ func TestInboundLearnUDPTriggersPunch(t *testing.T) {
 	mock := &mockPunch{}
 	n.punch = mock
 
+	// Use a signal-only (ReachNAT) record: no Endpoints field means
+	// advertisedStableAddr returns nil → reachProfile = ReachNAT, so
+	// inboundLearn must trigger punch (no stable anchor to fall back on).
+	ks := newMemKS(t)
+	now := uint64(time.Now().Unix())
+	sr, err := protocol.SignEndpointRecord(ks.priv, ks.addr, protocol.EndpointPayload{
+		NatType: protocol.NATRestricted,
+		Signal:  "wss://signal.example.com",
+	}, 1, now, 3600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerID := a2al.NodeIDFromAddress(ks.addr)
+	if err := n.LocalStorePut(peerID, sr); err != nil {
+		t.Fatal(err)
+	}
+
+	from := &net.UDPAddr{IP: net.IPv4(10, 0, 0, 9), Port: 12345}
+	dec := &protocol.DecodedMessage{
+		Header:     protocol.Header{MsgType: protocol.MsgFindNode},
+		SenderAddr: ks.addr,
+	}
+	n.inboundLearn(from, inboundChannelUDP, dec)
+
+	if atomic.LoadInt32(&mock.punchCalls) != 1 {
+		t.Fatalf("punchCalls = %d, want 1 for ReachNAT peer", mock.punchCalls)
+	}
+}
+
+// TestInboundLearnReachPublicSkipsPunch verifies that a peer with a stable
+// quic:// anchor (ReachPublic) does NOT trigger punch on inbound UDP.
+// ReachPublic peers should be dialled via their anchor; ICE is only triggered
+// by the failure-driven DeferICE path (skipColdUDP) in outboundPlan.
+func TestInboundLearnReachPublicSkipsPunch(t *testing.T) {
+	n := newHealthTestNode(t)
+	n.SetLearnedPathFirst(true)
+	mock := &mockPunch{}
+	n.punch = mock
+
+	// makeSignedEndpointRecord produces NATRestricted + quic://10.0.0.1:4242
+	// → advertisedStableAddr non-nil → reachProfile = ReachPublic.
 	addr, peerID, sr := makeSignedEndpointRecord(t, "wss://signal.example.com")
 	if err := n.LocalStorePut(peerID, sr); err != nil {
 		t.Fatal(err)
@@ -58,12 +99,9 @@ func TestInboundLearnUDPTriggersPunch(t *testing.T) {
 	}
 	n.inboundLearn(from, inboundChannelUDP, dec)
 
-	deadline := time.Now().Add(500 * time.Millisecond)
-	for atomic.LoadInt32(&mock.punchCalls) == 0 && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if atomic.LoadInt32(&mock.punchCalls) != 1 {
-		t.Fatalf("punchCalls = %d, want 1", mock.punchCalls)
+	time.Sleep(50 * time.Millisecond)
+	if atomic.LoadInt32(&mock.punchCalls) != 0 {
+		t.Fatalf("punchCalls = %d, want 0 for ReachPublic peer (anchor should be used instead)", mock.punchCalls)
 	}
 }
 
