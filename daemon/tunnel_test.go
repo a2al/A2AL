@@ -121,7 +121,6 @@ func TestTunnelStatus_fields(t *testing.T) {
 
 func TestCloseTunnel_notFound(t *testing.T) {
 	d := newTestDaemon(t)
-	d.tunnels = newTunnelRegistry()
 	if d.closeTunnel("doesnotexist") {
 		t.Fatal("closeTunnel should return false for unknown id")
 	}
@@ -129,7 +128,6 @@ func TestCloseTunnel_notFound(t *testing.T) {
 
 func TestCloseTunnel_stopsAccepting(t *testing.T) {
 	d := newTestDaemon(t)
-	d.tunnels = newTunnelRegistry()
 
 	// Build a minimal tunnelEntry with a real listener.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -208,7 +206,6 @@ func TestExecTunnelOpen_multipleConns(t *testing.T) {
 	// over plain TCP (no QUIC). This exercises the lifecycle code paths.
 
 	d := newTestDaemon(t)
-	d.tunnels = newTunnelRegistry()
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

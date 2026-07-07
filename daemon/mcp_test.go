@@ -147,6 +147,41 @@ func TestMCP_status(t *testing.T) {
 	if sc["node_aid"] == nil || sc["node_aid"] == "" {
 		t.Errorf("missing node_aid in status response")
 	}
+	if sc["node_aid"] != d.nodeAddr.String() {
+		t.Errorf("node_aid=%v want %s", sc["node_aid"], d.nodeAddr)
+	}
+	for _, key := range []string{"tunnel_active_count", "tunnel_bytes_up_total", "tunnel_bytes_down_total", "uptime_seconds", "network_ready", "update_enabled"} {
+		if _, ok := sc[key]; !ok {
+			t.Errorf("missing field %q in status response", key)
+		}
+	}
+	if n, ok := sc["tunnel_active_count"].(float64); !ok || n != 0 {
+		t.Errorf("tunnel_active_count=%v want 0", sc["tunnel_active_count"])
+	}
+}
+
+func TestMCP_tunnelList_empty(t *testing.T) {
+	d := newTestDaemon(t)
+	cs := newMCPClientSession(t, buildMCPServer(d))
+
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "a2al_tunnel_list",
+		Arguments: map[string]any{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.IsError {
+		t.Fatalf("tool error: %v", res.Content)
+	}
+	sc := res.StructuredContent.(map[string]any)
+	tunnels, ok := sc["tunnels"].([]any)
+	if !ok {
+		t.Fatalf("tunnels=%T want []any", sc["tunnels"])
+	}
+	if len(tunnels) != 0 {
+		t.Fatalf("tunnels len=%d want 0", len(tunnels))
+	}
 }
 
 func TestMCP_agentHeartbeat_notRegistered(t *testing.T) {

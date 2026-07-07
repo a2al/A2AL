@@ -35,6 +35,13 @@ type tunnelEntry struct {
 	lastActivity atomic.Int64 // unix nano; updated on each new TCP accept
 	activeConns  atomic.Int32
 
+	// data-plane byte counters: cumulative totals across all bridge goroutines.
+	// bytesUp = bytes forwarded from local TCP (browser) → remote QUIC stream.
+	// bytesDown = bytes forwarded from remote QUIC stream → local TCP (browser).
+	bytesUp      atomic.Int64
+	bytesDown    atomic.Int64
+	lastProgress atomic.Int64 // unix nano; updated whenever either direction advances
+
 	// shutdown
 	cancel context.CancelFunc
 	done   <-chan struct{} // closed when the accept loop exits
@@ -42,15 +49,18 @@ type tunnelEntry struct {
 
 // tunnelStatus is the JSON-serialisable view of a tunnelEntry.
 type tunnelStatus struct {
-	ID           string    `json:"id"`
-	LocalAID     string    `json:"local_aid"`
-	RemoteAID    string    `json:"remote_aid"`
-	Listen       string    `json:"listen"`
-	HTTPSURL     string    `json:"https_url,omitempty"`
-	IsRelayed    bool      `json:"is_relayed"`
-	OpenedAt     time.Time `json:"opened_at"`
-	LastActivity time.Time `json:"last_activity,omitempty"`
-	ActiveConns  int32     `json:"active_conns"`
+	ID             string    `json:"id"`
+	LocalAID       string    `json:"local_aid"`
+	RemoteAID      string    `json:"remote_aid"`
+	Listen         string    `json:"listen"`
+	HTTPSURL       string    `json:"https_url,omitempty"`
+	IsRelayed      bool      `json:"is_relayed"`
+	OpenedAt       time.Time `json:"opened_at"`
+	LastActivity   time.Time `json:"last_activity,omitempty"`
+	ActiveConns    int32     `json:"active_conns"`
+	BytesUp        int64     `json:"bytes_up"`
+	BytesDown      int64     `json:"bytes_down"`
+	LastProgressAt time.Time `json:"last_progress_at,omitempty"`
 }
 
 func (e *tunnelEntry) status() tunnelStatus {
@@ -63,9 +73,14 @@ func (e *tunnelEntry) status() tunnelStatus {
 		IsRelayed:   e.isRelayed,
 		OpenedAt:    e.openedAt,
 		ActiveConns: e.activeConns.Load(),
+		BytesUp:     e.bytesUp.Load(),
+		BytesDown:   e.bytesDown.Load(),
 	}
 	if ns := e.lastActivity.Load(); ns != 0 {
 		s.LastActivity = time.Unix(0, ns)
+	}
+	if ns := e.lastProgress.Load(); ns != 0 {
+		s.LastProgressAt = time.Unix(0, ns)
 	}
 	return s
 }
@@ -297,7 +312,8 @@ func (d *Daemon) execTunnelOpen(ctx context.Context, remoteAidStr string, req tu
 				// can use https://127.0.0.1:PORT with the persisted
 				// self-signed certificate.
 				conn := sniffAndUpgrade(tcpConn, d.tunnelTLS)
-				bridgeTCPQUICStream(qs, conn)
+				onProgress := func() { entry.lastProgress.Store(time.Now().UnixNano()) }
+				bridgeTCPQUICStream(qs, conn, &entry.bytesUp, &entry.bytesDown, onProgress)
 			}()
 		}
 	}()

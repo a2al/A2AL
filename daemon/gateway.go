@@ -63,6 +63,39 @@ type sessionInfo struct {
 	CallerPubkey string    `json:"caller_pubkey"` // base64url-encoded Ed25519 public key
 	LocalAID     string    `json:"local_aid"`
 	ConnectedAt  time.Time `json:"connected_at"`
+
+	// Data-plane byte counters. Updated atomically during bridging.
+	// BytesUp   = bytes forwarded TCP(service) → QUIC stream.
+	// BytesDown = bytes forwarded QUIC stream → TCP(service).
+	BytesUp      atomic.Int64 `json:"-"`
+	BytesDown    atomic.Int64 `json:"-"`
+	LastProgress atomic.Int64 `json:"-"` // unix nano; updated whenever either direction advances
+}
+
+// sessionSnapshot is the JSON-serialisable view of sessionInfo.
+type sessionSnapshot struct {
+	CallerAID        string    `json:"caller_aid"`
+	CallerPubkey     string    `json:"caller_pubkey"`
+	LocalAID         string    `json:"local_aid"`
+	ConnectedAt      time.Time `json:"connected_at"`
+	BytesUp          int64     `json:"bytes_up"`
+	BytesDown        int64     `json:"bytes_down"`
+	LastProgressAt   time.Time `json:"last_progress_at,omitempty"`
+}
+
+func (s *sessionInfo) snapshot() sessionSnapshot {
+	snap := sessionSnapshot{
+		CallerAID:    s.CallerAID,
+		CallerPubkey: s.CallerPubkey,
+		LocalAID:     s.LocalAID,
+		ConnectedAt:  s.ConnectedAt,
+		BytesUp:      s.BytesUp.Load(),
+		BytesDown:    s.BytesDown.Load(),
+	}
+	if ns := s.LastProgress.Load(); ns != 0 {
+		snap.LastProgressAt = time.Unix(0, ns)
+	}
+	return snap
 }
 
 const (
@@ -135,16 +168,69 @@ func (d *Daemon) releaseGatewayConn() {
 	d.gatewayConns.Add(-1)
 }
 
+// gatewayHandshakeTimeout caps the a2r1/a2r2 control-stream exchange on the
+// acceptor side.  Normal round-trips complete in milliseconds; 15 s is a
+// generous upper bound that prevents a single slow or malicious peer from
+// blocking this goroutine indefinitely.
+const gatewayHandshakeTimeout = 15 * time.Second
+
 func (d *Daemon) serveGatewayConn(ctx context.Context, ac *host.AgentConn) {
+	// Resolve the target local agent via the a2r1/a2r2 control-stream
+	// exchange.  This runs here (inside a goroutine, off the accept loop) so
+	// that one bad connection can never stall Accept() for all other callers.
+	//
+	// ICE connections (AcceptICEViaSignal) must NOT call this path: their
+	// Stream 0 has already been consumed inside acceptICEToQUIC's onConn
+	// callback for winner selection.  Those callers invoke
+	// serveResolvedGatewayConn directly to skip this step.
+	csCtx, csCancel := context.WithTimeout(ctx, gatewayHandshakeTimeout)
+	if local, err := d.h.ResolveInboundAgent(csCtx, ac.Connection); err == nil {
+		ac.Local = local
+	}
+	csCancel()
+	d.serveResolvedGatewayConn(ctx, ac)
+}
+
+// serveResolvedGatewayConn is the second half of connection serving: registry
+// lookup, identity check, and the AcceptStream dispatch loop.
+//
+// Precondition: ac.Local must already be resolved and Stream 0 must have been
+// consumed by the caller.  Use serveGatewayConn when Stream 0 has not yet
+// been read (direct and shared-transport connections).
+//
+// Currently called directly by the ICE path (AcceptICEViaSignal, where Stream 0
+// was consumed by acceptICEToQUIC's onConn callback) and indirectly by
+// serveGatewayConn for direct/shared connections.
+//
+// When a new connection source is added: if its host-layer Accept variant
+// internally consumes Stream 0 (as AcceptICEViaSignal does), call this
+// function directly.  If it does not consume Stream 0, call serveGatewayConn.
+// This distinction will be eliminated once §7C (unified Accept queue) lands.
+func (d *Daemon) serveResolvedGatewayConn(ctx context.Context, ac *host.AgentConn) {
 	d.log.Debug("gateway: quic accepted", "local_aid", ac.Local.String(), "remote_aid", ac.Remote.String())
 	d.regMu.RLock()
 	reg := d.reg.Get(ac.Local)
 	d.regMu.RUnlock()
-	if reg == nil {
+
+	// Network-layer identity check: accept connections for any AID that
+	// belongs to this node — either a registered application agent or the
+	// node's own default AID (which exists intrinsically and is valid as a
+	// network endpoint regardless of whether it has a service_tcp configured).
+	// Reject only AIDs that are neither registered nor the node identity.
+	if reg == nil && ac.Local != d.nodeAddr {
 		d.log.Warn("gateway: unknown local agent", "aid", ac.Local.String())
 		_ = ac.CloseWithError(1, "unknown agent")
 		return
 	}
+
+	// Application-layer service address: empty for the node AID (no service_tcp).
+	// dispatchInboundStream handles probe and mailbox frames without service_tcp;
+	// bridgeInboundStream rejects plain TCP-bridge streams when service_tcp is empty.
+	serviceTCP := ""
+	if reg != nil {
+		serviceTCP = reg.ServiceTCP
+	}
+
 	defer ac.CloseWithError(0, "gateway closed")
 	var streamCount atomic.Int64
 	for {
@@ -160,7 +246,7 @@ func (d *Daemon) serveGatewayConn(ctx context.Context, ac *host.AgentConn) {
 		streamCount.Add(1)
 		go func() {
 			defer streamCount.Add(-1)
-			d.dispatchInboundStream(ac, str, reg.ServiceTCP)
+			d.dispatchInboundStream(ac, str, serviceTCP)
 		}()
 	}
 }
@@ -227,10 +313,46 @@ func (d *Daemon) bridgeInboundStream(ac *host.AgentConn, str quic.Stream, servic
 	d.sessions.Store(srcPort, si)
 	defer d.sessions.Delete(srcPort)
 
-	bridgeTCPQUICStream(str, tcp)
+	onProgress := func() { si.LastProgress.Store(time.Now().UnixNano()) }
+	bridgeTCPQUICStream(str, tcp, &si.BytesUp, &si.BytesDown, onProgress)
 }
 
-func bridgeTCPQUICStream(str quic.Stream, tcp net.Conn) {
+// closeWriter is implemented by *net.TCPConn, *tls.Conn, and peekConn.
+// It half-closes the write side of a TCP connection (sends FIN) without
+// closing the read side, allowing the remote peer to detect end-of-response.
+type closeWriter interface {
+	CloseWrite() error
+}
+
+// countingReader wraps an io.Reader, atomically accumulates bytes read into
+// count, and calls onProgress after each successful read. Both may be nil.
+type countingReader struct {
+	r          io.Reader
+	count      *atomic.Int64
+	onProgress func()
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	if n > 0 {
+		if c.count != nil {
+			c.count.Add(int64(n))
+		}
+		if c.onProgress != nil {
+			c.onProgress()
+		}
+	}
+	return n, err
+}
+
+// bridgeTCPQUICStream copies bidirectionally between a QUIC stream and a TCP
+// connection. Bytes are accumulated in real time into the provided counters so
+// that callers can observe progress while the bridge is still running:
+//   - bytesUp:   TCP→QUIC direction
+//   - bytesDown: QUIC→TCP direction
+//
+// bytesUp, bytesDown, and onProgress may all be nil.
+func bridgeTCPQUICStream(str quic.Stream, tcp net.Conn, bytesUp, bytesDown *atomic.Int64, onProgress func()) {
 	if tc, ok := tcp.(*net.TCPConn); ok {
 		_ = tc.SetKeepAlive(true)
 		_ = tc.SetKeepAlivePeriod(tcpBridgeDeadline)
@@ -239,18 +361,19 @@ func bridgeTCPQUICStream(str quic.Stream, tcp net.Conn) {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(tcp, str)
-		if tw, ok := tcp.(*net.TCPConn); ok {
-			_ = tw.CloseWrite()
+		cr := &countingReader{r: str, count: bytesDown, onProgress: onProgress}
+		_, _ = io.Copy(tcp, cr)
+		// Half-close the TCP write side so the peer (browser or backend)
+		// receives EOF and knows the response is complete.
+		if cw, ok := tcp.(closeWriter); ok {
+			_ = cw.CloseWrite()
 		}
 	}()
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(str, tcp)
+		cr := &countingReader{r: tcp, count: bytesUp, onProgress: onProgress}
+		_, _ = io.Copy(str, cr)
 		// Signal EOF on the QUIC send side with a clean FIN, not RESET_STREAM.
-		// CancelWrite would discard unacknowledged data in flight and send
-		// RESET_STREAM, causing the remote reader to get a StreamError instead
-		// of io.EOF — breaking HTTP responses that are still in transit.
 		_ = str.Close()
 	}()
 	wg.Wait()

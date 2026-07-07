@@ -182,6 +182,27 @@ func TestExecFetchDirect_postWithBody(t *testing.T) {
 	}
 }
 
+func TestExecFetchDirect_httpsScheme(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("tls-ok"))
+	}))
+	defer srv.Close()
+
+	hostPort := strings.TrimPrefix(srv.URL, "https://")
+	resp, err := execFetchDirect(context.Background(), "https://"+hostPort, fetchReq{Path: "/"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Status != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.Status)
+	}
+	body, _ := base64.StdEncoding.DecodeString(resp.Body)
+	if string(body) != "tls-ok" {
+		t.Errorf("body = %q, want tls-ok", string(body))
+	}
+}
+
 func TestExecFetchDirect_404(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)

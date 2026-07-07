@@ -54,11 +54,13 @@ func newTestDaemon(t *testing.T) *Daemon {
 		h:                h,
 		reg:              reg,
 		nodeAddr:         ks.Address(),
+		startedAt:        time.Now(),
 		agentLastPublish: make(map[a2al.Address]time.Time),
 		heartbeatAt:      make(map[a2al.Address]time.Time),
 		mboxStore:        newMailboxStore(filepath.Join(dir, "mailbox_store.cbor"), slog.New(slog.NewTextHandler(io.Discard, nil))),
 		mboxStoreStop:    make(chan struct{}),
 		bus:              NewEventBus(slog.New(slog.NewTextHandler(io.Discard, nil))),
+		tunnels:          newTunnelRegistry(),
 	}
 }
 

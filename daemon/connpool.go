@@ -13,6 +13,7 @@ import (
 	"golang.org/x/sync/singleflight"
 
 	"github.com/a2al/a2al"
+	"github.com/a2al/a2al/host"
 	"github.com/a2al/a2al/protocol"
 	"github.com/quic-go/quic-go"
 )
@@ -162,13 +163,15 @@ func (p *modeAConnPool) acquire(ctx context.Context, local, remote a2al.Address,
 		defer p.mu.Unlock()
 
 		if dialErr != nil {
-			// Only record backoff for genuine network failures. Context
-			// cancellation from the dial timeout itself is also a network
-			// event, so we treat DeadlineExceeded as a failure but skip
-			// Canceled (which can only come from our own dialCancel after a
-			// successful dial path, or from an upstream cancellation that
-			// somehow propagated — neither should penalise the pool).
-			if !errors.Is(dialErr, context.Canceled) {
+			// Only record backoff for genuine network failures. Two cases are
+			// excluded from the backoff penalty:
+			//   context.Canceled: our own dialCancel fired after a successful
+			//     sibling, or an upstream cancel — not a network failure.
+			//   host.ErrControlExchangeIncomplete: QUIC+TLS succeeded (remote
+			//     is reachable) but B→A control exchange failed; the broken
+			//     connection has already been closed. Do not penalise future
+			//     dials — the remote should be retried immediately.
+			if !errors.Is(dialErr, context.Canceled) && !errors.Is(dialErr, host.ErrControlExchangeIncomplete) {
 				ent := p.pool[key]
 				if ent == nil {
 					ent = &connPoolEntry{}
@@ -301,6 +304,29 @@ func (p *modeAConnPool) retain(local, remote a2al.Address, noRelay bool) {
 		ent.refs++
 	}
 	p.mu.Unlock()
+}
+
+// invalidate closes and evicts the cached QUIC connection for (local → remote, noRelay).
+// Unlike a dial failure, invalidate does not write a backoff record — the caller
+// explicitly requested the reset, so the next acquire re-dials immediately.
+// If no cached connection exists for the key, invalidate is a no-op.
+// The connection is closed after the pool lock is released to avoid holding
+// the mutex during network I/O.
+func (p *modeAConnPool) invalidate(local, remote a2al.Address, noRelay bool) {
+	key := connPoolKey{local, remote, noRelay}
+	p.mu.Lock()
+	ent := p.pool[key]
+	if ent == nil {
+		p.mu.Unlock()
+		return
+	}
+	toClose := ent.conn // may be nil for a backoff-only entry
+	delete(p.pool, key)
+	p.log.Debug("connpool: invalidating connection", "key", key.String())
+	p.mu.Unlock()
+	if toClose != nil {
+		_ = toClose.CloseWithError(0, "reconnect requested")
+	}
 }
 
 // release decrements the active-user count. When refs reaches zero the

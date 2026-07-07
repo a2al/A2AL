@@ -497,6 +497,9 @@ func (d *Daemon) execAgentsList() []map[string]any {
 			"published_to_dht": e.Seq > 0,
 			"services":         e.Services,
 		}
+		if e.Profile != nil {
+			m["profile"] = e.Profile
+		}
 		if hbT, ok := hbSnap[e.AID]; ok {
 			m["heartbeat_seconds_ago"] = time.Since(hbT).Seconds()
 		} else {
@@ -538,6 +541,9 @@ func (d *Daemon) execAgentGet(ctx context.Context, aidStr string) (map[string]an
 		"seq":              e.Seq,
 		"published_to_dht": e.Seq > 0,
 		"services":         e.Services,
+	}
+	if e.Profile != nil {
+		out["profile"] = e.Profile
 	}
 	d.heartbeatMu.Lock()
 	hbT, hbOK := d.heartbeatAt[e.AID]
@@ -790,6 +796,18 @@ func (d *Daemon) execStatus() map[string]any {
 		out[k] = v
 	}
 
+	// Tunnel byte counters: cumulative across all active outbound tunnels on
+	// this node. Does not include inbound gateway sessions (see GET /sessions).
+	var totalUp, totalDown int64
+	tunnels := d.tunnels.list()
+	for i := range tunnels {
+		totalUp += tunnels[i].BytesUp
+		totalDown += tunnels[i].BytesDown
+	}
+	out["tunnel_active_count"] = len(tunnels)
+	out["tunnel_bytes_up_total"] = totalUp
+	out["tunnel_bytes_down_total"] = totalDown
+
 	return out
 }
 
@@ -961,7 +979,7 @@ func (d *Daemon) execConnect(ctx context.Context, remoteAidStr string, body conn
 			return
 		}
 		d.log.Debug("tunnel bridge start", "local_aid", local.String(), "remote_aid", remote.String())
-		bridgeTCPQUICStream(qs, tcpConn)
+		bridgeTCPQUICStream(qs, tcpConn, nil, nil, nil)
 		d.log.Debug("tunnel bridge done", "local_aid", local.String(), "remote_aid", remote.String())
 	}()
 	return ln.Addr().String(), nil

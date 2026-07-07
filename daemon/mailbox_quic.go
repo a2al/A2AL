@@ -80,10 +80,12 @@ func (d *Daemon) acceptMailboxFrame(ac *host.AgentConn, rw io.ReadWriter) {
 
 	// ac.Local is the recipient AID (the QUIC connection is bound to this agent).
 	// sr.Address is the sender AID; it is validated indirectly by VerifySignedRecord above.
+	// Accept mailbox frames for any local AID: a registered application agent OR the
+	// node's default AID (which is a valid endpoint identity even without service_tcp).
 	d.regMu.RLock()
-	reg := d.reg.Get(ac.Local)
+	knownAID := d.reg.Get(ac.Local) != nil || ac.Local == d.nodeAddr
 	d.regMu.RUnlock()
-	if reg == nil {
+	if !knownAID {
 		return
 	}
 

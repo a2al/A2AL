@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -202,7 +203,12 @@ func execFetchDirect(ctx context.Context, serviceTCP string, req fetchReq) (fetc
 		return fetchResp{}, err
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, pf.method, "http://"+serviceTCP+pf.path, pf.body)
+	scheme, addr := parseServiceTCP(serviceTCP)
+	baseURL := "http://" + addr
+	if scheme == "https" {
+		baseURL = "https://" + addr
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, pf.method, baseURL+pf.path, pf.body)
 	if err != nil {
 		return fetchResp{}, err
 	}
@@ -211,7 +217,13 @@ func execFetchDirect(ctx context.Context, serviceTCP string, req fetchReq) (fetc
 	}
 	applyHeaders(httpReq, req.Headers)
 
-	resp, err := http.DefaultClient.Do(httpReq)
+	client := http.DefaultClient
+	if scheme == "https" {
+		client = &http.Client{Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
+		}}
+	}
+	resp, err := client.Do(httpReq)
 	if err != nil {
 		return fetchResp{}, err
 	}

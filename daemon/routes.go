@@ -57,6 +57,7 @@ func (d *Daemon) routes() http.Handler {
 	mux.HandleFunc("POST /fetch/{aid}", d.handleFetch)
 	mux.HandleFunc("POST /tunnel/{aid}", d.handleTunnelOpen)
 	mux.HandleFunc("DELETE /tunnel/{id}", d.handleTunnelClose)
+	mux.HandleFunc("POST /tunnel/{id}/reset", d.handleTunnelReset)
 	mux.HandleFunc("GET /tunnel", d.handleTunnelList)
 	mux.HandleFunc("GET /tunnel/{id}", d.handleTunnelGet)
 	mux.Handle("/debug/", d.h.DebugHTTPHandler())
@@ -1038,6 +1039,19 @@ func (d *Daemon) handleTunnelClose(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// handleTunnelReset forcibly invalidates the QUIC connection backing the tunnel
+// identified by {id}. The tunnel will self-close once its QUIC connection dies;
+// reopen it with POST /tunnel/{aid} to establish a fresh connection.
+func (d *Daemon) handleTunnelReset(w http.ResponseWriter, r *http.Request) {
+	e, ok := d.tunnels.get(r.PathValue("id"))
+	if !ok {
+		writeJSONStatus(w, http.StatusNotFound, map[string]string{"error": "tunnel not found"})
+		return
+	}
+	d.connPool.invalidate(e.localAID, e.remoteAID, e.noRelay)
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (d *Daemon) handleTunnelList(w http.ResponseWriter, r *http.Request) {
 	_ = r
 	writeJSON(w, map[string]any{"tunnels": d.tunnels.list()})
@@ -1154,7 +1168,7 @@ func (d *Daemon) handleGetSession(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"session not found"}`, http.StatusNotFound)
 		return
 	}
-	writeJSON(w, v)
+	writeJSON(w, v.(*sessionInfo).snapshot())
 }
 
 // mustParseAddress parses an AID string, panicking only in unreachable cases

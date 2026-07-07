@@ -17,6 +17,11 @@ import (
 
 const agentProfileTTL uint32 = 3600
 
+// maxProfileSkills caps AgentProfilePayload.Skills so the payload stays well
+// within AgentProfilePayloadMaxSize. The full, authoritative service list
+// remains discoverable per-topic via the DHT regardless of this cap.
+const maxProfileSkills = 3
+
 // agentProfileReq is the request body for POST /agents/{aid}/profile.
 type agentProfileReq struct {
 	Name       string         `json:"name,omitempty"`
@@ -78,6 +83,9 @@ func buildAgentProfilePayload(e *registry.Entry) (protocol.AgentProfilePayload, 
 		for _, svc := range e.Services {
 			p.Skills = append(p.Skills, svc.Topic)
 		}
+	}
+	if len(p.Skills) > maxProfileSkills {
+		p.Skills = p.Skills[:maxProfileSkills]
 	}
 	if len(p.Skills) > 0 {
 		hasData = true

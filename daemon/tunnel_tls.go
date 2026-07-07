@@ -99,6 +99,16 @@ type peekConn struct {
 
 func (c *peekConn) Read(b []byte) (int, error) { return c.r.Read(b) }
 
+// CloseWrite delegates to the underlying *net.TCPConn so that
+// bridgeTCPQUICStream can signal TCP half-close (send FIN without closing
+// the read side) even when the connection is wrapped in a peekConn.
+func (c *peekConn) CloseWrite() error {
+	if tc, ok := c.Conn.(*net.TCPConn); ok {
+		return tc.CloseWrite()
+	}
+	return nil
+}
+
 // sniffAndUpgrade peeks at the first byte of conn. If it is 0x16 (TLS
 // ClientHello) and cfg is non-nil, the connection is wrapped as a TLS server
 // stream. Otherwise the connection is returned as-is (plain HTTP).

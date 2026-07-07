@@ -459,7 +459,7 @@ func (d *Daemon) readICELoopFor(ctx context.Context, conn *websocket.Conn, base 
 			// Release the dedup entry as soon as the ICE/QUIC handshake phase is
 			// complete (success or failure). The dedup's purpose is to prevent
 			// parallel ICE negotiations for the same room; it must not block a
-			// retry while serveGatewayConn is running (which may last hours).
+			// retry while serveResolvedGatewayConn is running (which may last hours).
 			seen.release(room)
 			if err != nil {
 				d.log.Debug("ice accept: failed", "component", "ice",
@@ -473,7 +473,9 @@ func (d *Daemon) readICELoopFor(ctx context.Context, conn *websocket.Conn, base 
 			}
 			defer d.releaseGatewayConn()
 			d.log.Debug("ice gateway: quic accepted", "local_aid", ac.Local.String(), "remote_aid", ac.Remote.String())
-			d.serveGatewayConn(ctx, ac)
+			// Stream 0 was already consumed by acceptICEToQUIC's onConn callback
+			// for ICE-vs-punch winner selection; skip the ResolveInboundAgent step.
+			d.serveResolvedGatewayConn(ctx, ac)
 		}()
 	}
 }
