@@ -1,5 +1,5 @@
-import { esc, shortAid, setLoading, base64ToUtf8 } from '../util.js';
-import { loadFavs, addFav, removeFav, updateFavAlias, isFaved, nextDefaultAlias } from './favorites.js';
+import { esc, shortAid, setLoading, base64ToUtf8, aliasOf, setAliasOf, ensureAlias, nextUniqueDefaultAlias } from '../util.js';
+import { loadFavs, addFav, removeFav, isFaved } from './favorites.js';
 
 const NAT_TYPE_KEYS = {
   0: 'node.nat.unknown',
@@ -68,6 +68,31 @@ async function fetchAgentCard(api, aid) {
 const QUICK = ['lang', 'gen', 'sense', 'data', 'reason', 'code', 'tool'];
 const SP = 'padding:.7rem .95rem';
 const SP_SM = 'padding:.55rem .95rem';
+const SVC_CARD_STYLE = 'margin-bottom:.4rem;padding:.38rem .5rem;background:var(--bg-subtle,#f9fafb);border:1px solid var(--border,#e5e7eb);border-radius:.35rem';
+
+function svcCardHtml(svc) {
+  const topic  = svc.topic || svc.Topic || svc.service || '';
+  const protos = (svc.protocols || []).map((p) => `<span class="badge b-blue" style="font-size:.78rem">${esc(p)}</span>`).join('');
+  const tags   = (svc.tags || []).map((x) => `<span style="font-size:.77rem;color:var(--muted)">#${esc(x)}</span>`).join(' ');
+  return `
+    <div style="display:flex;flex-wrap:wrap;gap:.3rem;align-items:center;margin-bottom:${svc.name || svc.brief || tags ? '.1rem' : '0'}">
+      <span class="svc-name">${esc(topic)}</span>${protos}
+    </div>
+    ${svc.name  ? `<div style="font-size:.87rem;font-weight:500;color:var(--fg)">${esc(svc.name)}</div>` : ''}
+    ${tags       ? `<div style="margin-top:.1rem">${tags}</div>` : ''}
+    ${svc.brief  ? `<div class="muted" style="font-size:.83rem;line-height:1.45;margin-top:.12rem">${esc(svc.brief)}</div>` : ''}`;
+}
+
+// metaSummary renders a small, safe "key: value" preview of a freeform profile.meta map.
+function metaSummary(meta) {
+  if (!meta || typeof meta !== 'object') return '';
+  const parts = Object.entries(meta).slice(0, 6).map(([k, v]) => {
+    let val = v && typeof v === 'object' ? JSON.stringify(v) : String(v);
+    if (val.length > 40) val = val.slice(0, 40) + '\u2026';
+    return `${esc(k)}: ${esc(val)}`;
+  });
+  return parts.join(' &middot; ');
+}
 
 export async function renderDiscover(mount, ctx) {
   const { t, api, toast, copyText, isStale } = ctx;
@@ -132,7 +157,7 @@ export async function renderDiscover(mount, ctx) {
     <div id="tabFav" class="discover-tab-panel hidden">
       <div class="card" style="margin-top:1rem">
         <!-- Control bar: toggle-add (left) + sort (right) -->
-        <div style="display:flex;justify-content:space-between;align-items:center;padding:.5rem .85rem;flex-wrap:wrap;gap:.35rem">
+        <div class="fav-toolbar" style="display:flex;justify-content:space-between;align-items:center;padding:.5rem .85rem;flex-wrap:wrap;gap:.35rem">
           <button type="button" class="btn btn-secondary btn-sm" id="dFavAddToggle">+ ${esc(t('discover.fav.add_btn'))}</button>
           <div style="display:flex;gap:.2rem;align-items:center">
             <span class="muted" style="font-size:.79rem;margin-right:.15rem">${esc(t('discover.fav.sort'))}</span>
@@ -142,28 +167,29 @@ export async function renderDiscover(mount, ctx) {
           </div>
         </div>
         <!-- Collapsible add form -->
-        <div id="dFavAddForm" style="display:none;border-top:1px solid var(--border,#e5e7eb);padding:.6rem .85rem .7rem">
-          <div style="display:flex;gap:.45rem;flex-wrap:wrap;align-items:flex-end;margin-bottom:.4rem">
-            <div style="flex:3;min-width:11rem">
+        <div id="dFavAddForm" class="fav-add-form" style="display:none;border-top:1px solid var(--border,#e5e7eb);padding:.6rem .85rem .7rem">
+          <div class="fav-add-grid">
+            <div class="field form-grid-wide" style="margin-bottom:0">
               <label style="${LBL}">AID <span class="muted" style="font-size:.73rem">(${esc(t('common.required'))})</span></label>
               <input type="text" id="dFavAid" placeholder="${esc(t('discover.fav.aid_ph'))}" class="mono" style="width:100%" />
             </div>
-            <div style="flex:1;min-width:6rem">
+            <div class="field" style="margin-bottom:0">
               <label style="${LBL}">${esc(t('discover.fav.alias_lbl'))} <span class="muted" style="font-size:.73rem">(${esc(t('common.optional'))})</span></label>
-              <input type="text" id="dFavAlias" maxlength="24" style="width:100%" />
+              <input type="text" id="dFavAlias" maxlength="24" placeholder="${esc(t('agent.alias.placeholder'))}" style="width:100%" />
+              <div class="hint">${esc(t('agent.alias.local_hint'))}</div>
             </div>
-          </div>
-          <div style="display:flex;gap:.45rem;flex-wrap:wrap;align-items:flex-end">
-            <div style="flex:1;min-width:8rem">
+            <div class="field" style="margin-bottom:0">
               <label style="${LBL}">${esc(t('discover.fav.skill_lbl'))} <span class="muted" style="font-size:.73rem">(${esc(t('common.optional'))})</span></label>
               <input type="text" id="dFavSkill" style="width:100%" />
             </div>
-            <div style="flex:1;min-width:8rem">
+            <div class="field" style="margin-bottom:0">
               <label style="${LBL}">${esc(t('discover.fav.protocols_lbl'))} <span class="muted" style="font-size:.73rem">(${esc(t('common.optional'))})</span></label>
               <input type="text" id="dFavProtos" placeholder="http, mcp" style="width:100%" />
             </div>
-            <button type="button" class="btn btn-ghost btn-sm" id="dFavFetch">${esc(t('discover.fav.fetch'))}</button>
-            <button type="button" class="btn btn-primary btn-sm" id="dFavAdd">${esc(t('discover.fav.add'))}</button>
+            <div class="fav-add-actions form-grid-wide">
+              <button type="button" class="btn btn-ghost btn-sm" id="dFavFetch">${esc(t('discover.fav.fetch'))}</button>
+              <button type="button" class="btn btn-primary btn-sm" id="dFavAdd">${esc(t('discover.fav.add'))}</button>
+            </div>
           </div>
         </div>
       </div>
@@ -176,16 +202,23 @@ export async function renderDiscover(mount, ctx) {
 
       <div style="${SP}">
         <!-- Target row -->
-        <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:.45rem;margin-bottom:.75rem">
-          <div style="display:flex;align-items:center;gap:.4rem;flex-wrap:wrap">
-            <span style="font-size:1.05rem;font-weight:700;color:var(--muted);letter-spacing:.01em">${esc(t('discover.target'))}</span>
-            <span style="width:.55rem;display:inline-block"></span>
-            <span class="mono" id="dOpAid" style="font-size:1.05rem;font-weight:700"></span>
-            <button type="button" class="btn btn-ghost btn-sm" id="dOpCp" style="padding:.1rem .3rem;font-size:.85rem">\u29c9</button>
-            <button type="button" class="btn btn-ghost btn-sm" id="dOpStar" style="font-size:.85rem;padding:.1rem .4rem"></button>
+        <div style="display:flex;align-items:flex-start;justify-content:space-between;flex-wrap:wrap;gap:.75rem;margin-bottom:.75rem">
+          <div style="min-width:0;flex:1">
+            <div style="display:flex;align-items:center;gap:.4rem;flex-wrap:wrap">
+              <span style="font-size:.82rem;font-weight:700;color:var(--muted);letter-spacing:.05em;text-transform:uppercase">${esc(t('discover.target'))}</span>
+              <span id="dOpAlias" class="hidden" style="font-size:1.05rem;font-weight:700"></span>
+              <button type="button" class="btn btn-ghost btn-sm" id="dOpStar" style="font-size:.85rem;padding:.1rem .4rem"></button>
+            </div>
+            <div style="display:flex;align-items:center;gap:.35rem;flex-wrap:wrap;margin-top:.12rem">
+              <span class="mono muted" id="dOpAid" style="font-size:.9rem"></span>
+              <button type="button" class="btn btn-ghost btn-sm" id="dOpCp" style="padding:.1rem .3rem;font-size:.85rem">\u29c9</button>
+            </div>
+            <div id="dTargetProfile" class="hidden" style="margin-top:.5rem"></div>
           </div>
-          <div id="dStatusBadge" class="hidden" style="display:flex;align-items:center;gap:.6rem;font-size:.83rem"></div>
+          <div id="dStatusBadge" class="hidden" style="display:flex;flex-direction:column;align-items:flex-end;gap:.18rem;font-size:.83rem;min-width:9rem;text-align:right"></div>
         </div>
+
+        <div id="dQueryStrip" class="discover-query-strip hidden" aria-hidden="true"></div>
 
         <div style="display:flex;flex-wrap:wrap;gap:.4rem">
           <button type="button" class="btn btn-secondary btn-sm" id="dTunnel">${esc(t('discover.tunnel.btn2'))}</button>
@@ -216,8 +249,10 @@ export async function renderDiscover(mount, ctx) {
       ${SEP}
 
       <div style="${SP};background:var(--bg-subtle,#f9fafb)">
-        <div style="font-size:.82rem;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin-bottom:.45rem">${esc(t('discover.network'))}</div>
-        <div id="dResolve" style="font-size:.86rem;color:var(--muted)">${esc(t('discover.resolve.idle'))}</div>
+        <button type="button" class="btn btn-ghost btn-sm" id="dNetworkBtn" style="font-size:.82rem;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);padding:0">
+          <span id="dNetworkChevron" style="font-size:.68rem;opacity:.55">\u25be</span> ${esc(t('discover.network'))}
+        </button>
+        <div id="dResolve" class="hidden" style="font-size:.86rem;color:var(--muted);margin-top:.55rem">${esc(t('discover.resolve.idle'))}</div>
       </div>
 
       ${SEP}
@@ -246,15 +281,20 @@ export async function renderDiscover(mount, ctx) {
   const myAg        = wrap.querySelector('#dMyAg');
   const opArea      = wrap.querySelector('#dOp');
   const opAidEl     = wrap.querySelector('#dOpAid');
+  const opAliasEl   = wrap.querySelector('#dOpAlias');
+  const targetProfileBox = wrap.querySelector('#dTargetProfile');
   const statusBadge = wrap.querySelector('#dStatusBadge');
   const resolveBox  = wrap.querySelector('#dResolve');
   const profileBox  = wrap.querySelector('#dProfile');
   const localSvcBox = wrap.querySelector('#dLocalSvc');
+  const queryStrip  = wrap.querySelector('#dQueryStrip');
   const dCardOut    = wrap.querySelector('#dCardOut');
   const actionOut   = wrap.querySelector('#dActionOut');
   const cacheBtn    = wrap.querySelector('#dCacheBtn');
   const cacheChev   = wrap.querySelector('#dCacheChevron');
   const cardChev    = wrap.querySelector('#dCardChevron');
+  const networkBtn  = wrap.querySelector('#dNetworkBtn');
+  const networkChev = wrap.querySelector('#dNetworkChevron');
   const tunnelBtn   = wrap.querySelector('#dTunnel');
   const oneshotBtn  = wrap.querySelector('#dOneshot');
   const reqBtn      = wrap.querySelector('#dShowReq');
@@ -277,6 +317,10 @@ export async function renderDiscover(mount, ctx) {
 
   function queryStale(gen) {
     return gen !== queryGen || isStale?.();
+  }
+
+  function setQuerying(on) {
+    queryStrip.classList.toggle('hidden', !on);
   }
 
   let favSortBy  = 'addedAt';
@@ -352,7 +396,7 @@ export async function renderDiscover(mount, ctx) {
     return `<span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:${color};flex-shrink:0"></span>`;
   }
 
-  function setStatus(pingOk, ttlValid, lastSeenStr) {
+  function setStatus(pingOk, ttlValid, lastSeenStr, noteTitle = '', noteHint = '') {
     statusBadge.classList.remove('hidden');
     let dotColor, label, labelColor;
     if (pingOk === null) {
@@ -368,7 +412,30 @@ export async function renderDiscover(mount, ctx) {
     const seenHtml = lastSeenStr
       ? `<span class="muted" style="border-left:1px solid var(--border,#e5e7eb);padding-left:.55rem">${esc(t('discover.last_seen'))} ${esc(lastSeenStr)}</span>`
       : '';
-    statusBadge.innerHTML = onlineHtml + seenHtml;
+    const noteHtml = noteTitle
+      ? `<div style="font-size:.8rem;line-height:1.35"><div style="color:var(--error,#dc2626)">${esc(noteTitle)}</div>${noteHint ? `<div class="muted">${esc(noteHint)}</div>` : ''}</div>`
+      : '';
+    statusBadge.innerHTML = `<div style="display:flex;align-items:center;justify-content:flex-end;gap:.55rem;flex-wrap:wrap">${onlineHtml}${seenHtml}</div>${noteHtml}`;
+  }
+
+  function renderTargetIdentity(aid, profile) {
+    const faved = isFaved(aid);
+    const alias = faved ? (aliasOf(aid) || ensureAlias(aid)) : '';
+    opAliasEl.classList.toggle('hidden', !alias);
+    opAliasEl.textContent = alias;
+    opAidEl.textContent = shortAid(aid);
+
+    const name = profile?.name || '';
+    const brief = profile?.brief || '';
+    if (!name && !brief) {
+      targetProfileBox.classList.add('hidden');
+      targetProfileBox.innerHTML = '';
+      return;
+    }
+    targetProfileBox.classList.remove('hidden');
+    targetProfileBox.innerHTML = `
+      ${name ? `<div style="font-weight:600;font-size:.94rem">${esc(name)}</div>` : ''}
+      ${brief ? `<div class="muted" style="font-size:.86rem;line-height:1.5;margin-top:.12rem">${esc(brief)}</div>` : ''}`;
   }
 
   /* ── Star button ───────────────────────────────────────── */
@@ -384,100 +451,92 @@ export async function renderDiscover(mount, ctx) {
       const protocols = lastProfile?.protocols || lastServices[0]?.protocols || [];
       addFav(aid, null, skill, protocols);
       updateStar(aid);
+      renderTargetIdentity(aid, lastProfile);
       renderFavList();
       toast(t('discover.fav.toast_added'), 'ok');
     };
   }
 
   /* ── Capability rendering ──────────────────────────────── */
-  function renderCapabilities(profile, services) {
-    profileBox.innerHTML = '';
-    const frag = document.createDocumentFragment();
-    if (profile) {
-      if (profile.name) {
-        const d = document.createElement('div');
-        d.style.cssText = 'font-weight:600;font-size:.95rem;margin-bottom:.18rem';
-        d.textContent = profile.name;
-        frag.appendChild(d);
-      }
-      if (profile.brief) {
-        const d = document.createElement('div');
-        d.className = 'muted';
-        d.style.cssText = 'font-size:.87rem;line-height:1.5;margin-bottom:.4rem';
-        d.textContent = profile.brief;
-        frag.appendChild(d);
-      }
-      if (profile.modalities && profile.modalities.length) {
-        const d = document.createElement('div');
-        d.style.cssText = 'display:flex;flex-wrap:wrap;gap:.3rem;align-items:center;margin-bottom:.35rem';
-        d.innerHTML = `<span class="muted" style="font-size:.78rem;white-space:nowrap">${esc(t('discover.profile.modalities'))}</span>` +
-          profile.modalities.map((m) => `<span class="badge b-gray">${esc(m)}</span>`).join('');
-        frag.appendChild(d);
-      }
-    }
+  // services: full detail from local registry (own agents only).
+  // profile: the resolved AgentProfilePayload (works for any AID, self-declared preview).
+  function renderCapabilities(services, profile) {
     if (services && services.length) {
-      for (const svc of services) {
-        const topic  = svc.topic || svc.Topic || '';
-        const protos = (svc.protocols || []).map((p) => `<span class="badge b-blue" style="font-size:.78rem">${esc(p)}</span>`).join('');
-        const tags   = (svc.tags || []).map((x) => `<span style="font-size:.77rem;color:var(--muted)">#${esc(x)}</span>`).join(' ');
-        const row = document.createElement('div');
-        row.style.cssText = 'margin-bottom:.4rem;padding:.38rem .5rem;background:var(--bg-subtle,#f9fafb);border:1px solid var(--border,#e5e7eb);border-radius:.35rem';
-        row.innerHTML = `
-          <div style="display:flex;flex-wrap:wrap;gap:.3rem;align-items:center;margin-bottom:${svc.name || svc.brief || tags ? '.1rem' : '0'}">
-            <span class="svc-name">${esc(topic)}</span>${protos}
-          </div>
-          ${svc.name  ? `<div style="font-size:.87rem;font-weight:500;color:var(--fg)">${esc(svc.name)}</div>` : ''}
-          ${tags       ? `<div style="margin-top:.1rem">${tags}</div>` : ''}
-          ${svc.brief  ? `<div class="muted" style="font-size:.83rem;line-height:1.45;margin-top:.12rem">${esc(svc.brief)}</div>` : ''}`;
-        frag.appendChild(row);
-      }
-    } else if (profile) {
-      if (profile.skills && profile.skills.length) {
-        const d = document.createElement('div');
-        d.style.cssText = 'display:flex;flex-wrap:wrap;gap:.3rem;align-items:center;margin-bottom:.3rem';
-        d.innerHTML = `<span class="muted" style="font-size:.78rem;white-space:nowrap">${esc(t('discover.profile.skills'))}</span>` +
-          profile.skills.map((s) => `<span class="badge b-gray">${esc(s)}</span>`).join('');
-        frag.appendChild(d);
-      }
-      if (profile.protocols && profile.protocols.length) {
-        const d = document.createElement('div');
-        d.style.cssText = 'display:flex;flex-wrap:wrap;gap:.3rem;align-items:center;margin-bottom:.3rem';
-        d.innerHTML = `<span class="muted" style="font-size:.78rem;white-space:nowrap">${esc(t('discover.profile.protocols'))}</span>` +
-          profile.protocols.map((p) => `<span class="badge b-blue">${esc(p)}</span>`).join('');
-        frag.appendChild(d);
-      }
+      profileBox.innerHTML = services.map((svc) => `<div style="${SVC_CARD_STYLE}">${svcCardHtml(svc)}</div>`).join('');
+      return;
     }
-    if (frag.childNodes.length === 0) {
+    const skills = profile?.skills || [];
+    if (!skills.length) {
       profileBox.innerHTML = `<p class="muted" style="margin:.1rem 0;font-size:.87rem">${esc(t('discover.profile.none'))}</p>`;
-    } else {
-      profileBox.appendChild(frag);
+      return;
+    }
+    const protocols  = profile?.protocols || [];
+    const modalities = profile?.modalities || [];
+    const meta       = metaSummary(profile?.meta);
+    profileBox.innerHTML = `
+      <div style="display:flex;flex-wrap:wrap;gap:.3rem .5rem;align-items:center">
+        ${skills.map((s) => `<span class="svc-name">${esc(s)}</span>`).join('')}
+      </div>
+      ${protocols.length ? `<div style="margin-top:.4rem;display:flex;flex-wrap:wrap;gap:.3rem;align-items:center">
+        <span class="muted" style="font-size:.78rem">${esc(t('discover.profile.protocols'))}</span>
+        ${protocols.map((p) => `<span class="badge b-blue" style="font-size:.78rem">${esc(p)}</span>`).join('')}
+      </div>` : ''}
+      ${modalities.length ? `<div style="margin-top:.3rem;display:flex;flex-wrap:wrap;gap:.3rem;align-items:center">
+        <span class="muted" style="font-size:.78rem">${esc(t('discover.profile.modalities'))}</span>
+        ${modalities.map((m) => `<span class="badge b-gray" style="font-size:.78rem">${esc(m)}</span>`).join('')}
+      </div>` : ''}
+      ${meta ? `<div class="muted" style="font-size:.78rem;margin-top:.35rem">${meta}</div>` : ''}
+      <button type="button" class="btn btn-secondary btn-sm" id="dCapDetailBtn" style="margin-top:.55rem">${esc(t('discover.capabilities.detail_btn'))}</button>
+      <div id="dCapDetailOut" style="margin-top:.5rem"></div>`;
+    const detailBtn = profileBox.querySelector('#dCapDetailBtn');
+    const detailOut = profileBox.querySelector('#dCapDetailOut');
+    detailBtn.onclick = () => fetchCapabilityDetail(skills, detailBtn, detailOut);
+  }
+
+  async function fetchCapabilityDetail(skills, btn, out) {
+    setLoading(btn, true);
+    out.innerHTML = `<p class="muted" style="font-size:.85rem">${esc(t('common.loading'))}</p>`;
+    try {
+      // One /discover call per skill: passing multiple services at once triggers an
+      // AND-intersection search (host.SearchTopics), not a per-topic detail batch fetch,
+      // and only keeps the first topic's fields. Querying individually preserves each
+      // topic's own brief/tags/protocols.
+      const results = await Promise.allSettled(
+        skills.map((s) => api('/discover', { method: 'POST', body: JSON.stringify({ services: [s] }) })),
+      );
+      const target = currentAid.toLowerCase();
+      const entries = [];
+      for (const r of results) {
+        if (r.status !== 'fulfilled') continue;
+        for (const e of r.value.entries || []) {
+          if ((e.aid || '').toLowerCase() === target) entries.push(e);
+        }
+      }
+      out.innerHTML = entries.length
+        ? entries.map((e) => `<div style="${SVC_CARD_STYLE}">${svcCardHtml(e)}</div>`).join('')
+        : `<p class="muted" style="font-size:.85rem;margin:0">${esc(t('discover.capabilities.detail_empty'))}</p>`;
+    } catch (_) {
+      out.innerHTML = `<p style="color:var(--error);font-size:.85rem;margin:0">${esc(t('discover.capabilities.detail_failed'))}</p>`;
+    } finally {
+      setLoading(btn, false);
     }
   }
 
   function renderLocalServices(list) {
-    localSvcBox.innerHTML = '';
     if (!list || !list.length) {
       localSvcBox.innerHTML = `<p class="muted" style="margin:0;font-size:.86rem">${esc(t('discover.cache_empty'))}</p>`;
       return;
     }
-    for (const svc of list) {
-      const topic  = svc.topic || svc.Topic || '';
-      const protos = (svc.protocols || []).map((p) => `<span class="badge b-blue" style="font-size:.78rem">${esc(p)}</span>`).join('');
-      const tags   = (svc.tags || []).map((x) => `<span style="font-size:.77rem;color:var(--muted)">#${esc(x)}</span>`).join(' ');
-      const row = document.createElement('div');
-      row.style.cssText = 'margin-bottom:.4rem;padding:.38rem .5rem;background:var(--bg-subtle,#f9fafb);border:1px solid var(--border,#e5e7eb);border-radius:.35rem';
-      row.innerHTML = `
-        <div style="display:flex;flex-wrap:wrap;gap:.3rem;align-items:center;margin-bottom:${svc.name || svc.brief || tags ? '.1rem' : '0'}">
-          <span class="svc-name">${esc(topic)}</span>${protos}
-        </div>
-        ${svc.name  ? `<div style="font-size:.87rem;font-weight:500;color:var(--fg)">${esc(svc.name)}</div>` : ''}
-        ${tags       ? `<div style="margin-top:.1rem">${tags}</div>` : ''}
-        ${svc.brief  ? `<div class="muted" style="font-size:.83rem;line-height:1.45;margin-top:.12rem">${esc(svc.brief)}</div>` : ''}`;
-      localSvcBox.appendChild(row);
-    }
+    localSvcBox.innerHTML = list.map((svc) => `<div style="${SVC_CARD_STYLE}">${svcCardHtml(svc)}</div>`).join('');
   }
 
   /* ── 本机缓存 / Agent Card mutual exclusion ───────────── */
+  networkBtn.onclick = () => {
+    const willOpen = resolveBox.classList.contains('hidden');
+    resolveBox.classList.toggle('hidden', !willOpen);
+    networkChev.textContent = willOpen ? '\u25b4' : '\u25be';
+  };
+
   cacheBtn.onclick = () => {
     const willOpen = localSvcBox.classList.contains('hidden');
     if (willOpen) { dCardOut.classList.add('hidden'); cardChev.textContent = '\u25be'; }
@@ -531,13 +590,15 @@ export async function renderDiscover(mount, ctx) {
       const records = profRes.status === 'fulfilled' ? (profRes.value.records || []) : [];
       const profRecord = Array.isArray(records) ? records.find((r) => r.profile) : null;
       lastProfile = profRecord ? profRecord.profile : null;
-      renderCapabilities(lastProfile, lastServices);
+      renderTargetIdentity(currentAid, lastProfile);
+      renderCapabilities(lastServices, lastProfile);
       updateStar(currentAid);
     } catch (_) {
       if (queryStale(gen)) return;
       lastServices = [];
       lastProfile = null;
-      renderCapabilities(null, []);
+      renderTargetIdentity(currentAid, null);
+      renderCapabilities([]);
     }
   }
 
@@ -551,13 +612,13 @@ export async function renderDiscover(mount, ctx) {
     lastServices = [];
     lastProfile = null;
     opArea.classList.remove('hidden');
-    opAidEl.textContent = shortAid(currentAid);
+    renderTargetIdentity(currentAid, null);
     wrap.querySelector('#dOpCp').onclick = () => copyText(currentAid);
     updateStar(currentAid);
 
-    statusBadge.classList.add('hidden');
-    statusBadge.innerHTML = '';
-    profileBox.innerHTML = `<p class="muted" style="font-size:.87rem">${esc(t('discover.profile.loading'))}</p>`;
+    setQuerying(true);
+    setStatus(null, false, null);
+    profileBox.innerHTML = `<p class="muted" style="font-size:.87rem">${esc(t('common.loading'))}</p>`;
     localSvcBox.innerHTML = '';
     localSvcBox.classList.add('hidden');
     cacheChev.textContent = '\u25be';
@@ -567,6 +628,8 @@ export async function renderDiscover(mount, ctx) {
     cardFetched = false;
     resolveBox.style.color = 'var(--muted)';
     resolveBox.textContent = t('common.loading');
+    resolveBox.classList.add('hidden');
+    networkChev.textContent = '\u25be';
     wrap.querySelector('#dPingOut').textContent = '';
     if (oneshotTimer) { clearInterval(oneshotTimer); oneshotTimer = null; }
     if (currentTunnelId) {
@@ -588,6 +651,7 @@ export async function renderDiscover(mount, ctx) {
     let ttlValid = false;
     let lastSeenStr = null;
     if (resRes.status === 'fulfilled') {
+      setQuerying(false);
       const r = resRes.value;
       const nowS = Math.floor(Date.now() / 1000);
       ttlValid = !!(r.timestamp && r.ttl && (r.timestamp + r.ttl > nowS));
@@ -610,10 +674,12 @@ export async function renderDiscover(mount, ctx) {
         .catch((e) => { if (!queryStale(gen)) setStatus(e.status === 412 ? true : false, ttlValid, lastSeenStr); });
       loadProfileAndServices(currentAid, gen);
     } else {
+      setQuerying(false);
       resolveBox.style.color = 'var(--error)';
       resolveBox.innerHTML = `<p style="margin:0">${esc(t('discover.resolve.unavailable'))}</p><p class="muted" style="margin:.2rem 0 0;font-size:.83rem">${esc(t('discover.resolve.unavailable_hint'))}</p>`;
-      setStatus(false, false, null);
-      profileBox.innerHTML = `<p class="muted" style="margin:.1rem 0;font-size:.87rem">${esc(t('discover.profile.none'))}</p>`;
+      setStatus(false, false, null, t('discover.resolve.unavailable'), t('discover.resolve.unavailable_hint'));
+      renderTargetIdentity(currentAid, null);
+      renderCapabilities([]);
     }
   }
 
@@ -696,6 +762,7 @@ export async function renderDiscover(mount, ctx) {
           <code class="mono" style="font-size:.87rem">${esc(tr.listen)}</code>
           <button type="button" class="btn btn-ghost btn-sm" id="dTunnelCp">\u29c9</button>
           <button type="button" class="btn btn-ghost btn-sm" id="dTunnelClose">${esc(t('discover.tunnel.close'))}</button>
+          <button type="button" class="btn btn-ghost btn-sm" id="dTunnelReset">${esc(t('discover.tunnel.reset'))}</button>
         </div>
         <div style="display:flex;gap:.4rem;flex-wrap:wrap;align-items:center">
           <button type="button" class="btn btn-secondary btn-sm" id="dTunnelOpen">${esc(t('discover.tunnel.open'))}</button>
@@ -710,6 +777,17 @@ export async function renderDiscover(mount, ctx) {
         currentTunnelId = null;
         actionOut.innerHTML = `<p class="muted" style="margin:0">${esc(t('discover.tunnel.closed'))}</p>`;
         deactivateActions();
+      };
+      actionOut.querySelector('#dTunnelReset').onclick = async () => {
+        if (!currentTunnelId) return;
+        try {
+          await api(`/tunnel/${encodeURIComponent(currentTunnelId)}/reset`, { method: 'POST', body: '{}' });
+          currentTunnelId = null;
+          actionOut.innerHTML = `<p class="muted" style="margin:0">${esc(t('discover.tunnel.reset_ok'))}</p>`;
+          deactivateActions();
+        } catch (e) {
+          toast(t('common.error', { msg: e.message }), 'err');
+        }
       };
     } catch (e) {
       const _is412 = e.status === 412;
@@ -765,7 +843,7 @@ export async function renderDiscover(mount, ctx) {
     actionOut.innerHTML = `
       <div class="muted" style="font-size:.79rem;margin-bottom:.25rem">${esc(t('discover.aidproxy.label'))}</div>
       <div style="display:flex;align-items:center;gap:.4rem;flex-wrap:wrap;margin-bottom:.2rem">
-        <code class="mono" style="font-size:.86rem">${esc(url)}</code>
+        <a class="mono" href="${esc(url)}" target="_blank" rel="noopener" style="font-size:.86rem">${esc(url)}</a>
         <button type="button" class="btn btn-ghost btn-sm" id="dAidProxyCp">\u29c9</button>
       </div>
       <p class="muted" style="font-size:.79rem;margin:0">${esc(t('discover.aidproxy.hint'))}</p>`;
@@ -886,7 +964,7 @@ export async function renderDiscover(mount, ctx) {
 
   dFavAid.addEventListener('input', () => {
     if (dFavAid.value.trim() && !dFavAlias.value.trim()) {
-      dFavAlias.value = nextDefaultAlias(loadFavs());
+      dFavAlias.value = nextUniqueDefaultAlias();
     }
   });
 
@@ -925,7 +1003,7 @@ export async function renderDiscover(mount, ctx) {
   dFavAdd.onclick = () => {
     const aid = dFavAid.value.trim();
     if (!aid) { dFavAid.focus(); return; }
-    const alias = dFavAlias.value.trim() || nextDefaultAlias(loadFavs());
+    const alias = dFavAlias.value.trim() || nextUniqueDefaultAlias();
     const skill = dFavSkill.value.trim();
     const protocols = dFavProtos.value.split(',').map((s) => s.trim()).filter(Boolean);
     const result = addFav(aid, alias, skill, protocols);
@@ -953,7 +1031,7 @@ export async function renderDiscover(mount, ctx) {
     }
     list.sort((a, b) => {
       let av, bv;
-      if (favSortBy === 'alias') { av = (a.alias || '').toLowerCase(); bv = (b.alias || '').toLowerCase(); }
+      if (favSortBy === 'alias') { av = (aliasOf(a.aid) || '').toLowerCase(); bv = (aliasOf(b.aid) || '').toLowerCase(); }
       else if (favSortBy === 'skill') { av = (a.skill || '').toLowerCase(); bv = (b.skill || '').toLowerCase(); }
       else { av = a.addedAt || 0; bv = b.addedAt || 0; }
       if (av < bv) return favSortAsc ? -1 : 1;
@@ -978,6 +1056,7 @@ export async function renderDiscover(mount, ctx) {
     if (index > 0) rowWrap.style.borderTop = '1px solid var(--border,#e5e7eb)';
     if (index % 2 !== 0) rowWrap.style.background = 'var(--bg-subtle,#f9fafb)';
 
+    const favAlias = aliasOf(fav.aid) || ensureAlias(fav.aid);
     const protos = (fav.protocols || []);
     const shownProtos = protos.slice(0, 2).map((p) =>
       `<span class="badge b-blue" style="font-size:.75rem;padding:.1rem .35rem">${esc(truncate(p, 10))}</span>`).join('');
@@ -990,7 +1069,7 @@ export async function renderDiscover(mount, ctx) {
     rowWrap.innerHTML = `
       <div style="display:flex;align-items:center;gap:.4rem;flex-wrap:wrap;padding:.5rem .85rem">
         <div style="display:flex;align-items:center;gap:.22rem;min-width:5.5rem;flex-shrink:0">
-          <span class="fav-alias-val" style="font-size:.9rem;font-weight:500">${esc(fav.alias)}</span>
+          <span class="fav-alias-val" style="font-size:.9rem;font-weight:500">${esc(favAlias)}</span>
           <button type="button" class="btn btn-ghost btn-xs" data-alias-edit title="${esc(t('agent.alias.set'))}">&#9998;</button>
         </div>
         <span class="mono muted" style="font-size:.83rem;flex-shrink:0">${esc(shortAid(fav.aid))}</span>
@@ -1006,11 +1085,13 @@ export async function renderDiscover(mount, ctx) {
           <button class="btn btn-ghost btn-xs" data-act="del" style="color:var(--error)">${esc(t('discover.fav.del'))}</button>
         </div>
       </div>
-      <div class="fav-alias-form" style="display:none;padding:.25rem .85rem .45rem">
+      <div class="fav-alias-form field" style="display:none;padding:.35rem .85rem .5rem;margin:0;max-width:16rem">
+        <label>${esc(t('agent.alias.local_label'))}</label>
         <div style="display:flex;gap:.4rem;align-items:center">
-          <input type="text" class="fav-alias-input" maxlength="24" value="${esc(fav.alias)}" style="max-width:14rem" />
+          <input type="text" class="fav-alias-input" maxlength="24" value="${esc(favAlias)}" style="max-width:14rem" />
           <button type="button" class="btn btn-ghost btn-xs" data-alias-cancel>&#10005;</button>
         </div>
+        <div class="hint">${esc(t('agent.alias.local_hint'))}</div>
       </div>
       <div class="fav-panel" style="display:none;padding:.5rem .85rem .6rem;border-top:1px solid var(--border,#e5e7eb)"></div>`;
 
@@ -1026,9 +1107,9 @@ export async function renderDiscover(mount, ctx) {
     };
     rowWrap.querySelector('[data-alias-cancel]').onclick = () => { aliasForm.style.display = 'none'; };
     const saveAlias = () => {
-      const v = aliasInput.value.trim() || fav.alias;
-      updateFavAlias(fav.id, v);
-      fav.alias = v; aliasVal.textContent = v; aliasInput.value = v;
+      const v = aliasInput.value.trim() || favAlias;
+      setAliasOf(fav.aid, v);
+      aliasVal.textContent = v; aliasInput.value = v;
       aliasForm.style.display = 'none';
     };
     aliasInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') saveAlias(); if (e.key === 'Escape') aliasForm.style.display = 'none'; });
@@ -1079,6 +1160,7 @@ export async function renderDiscover(mount, ctx) {
           <code class="mono" style="font-size:.84rem">${esc(tr.listen)}</code>
           <button type="button" class="btn btn-ghost btn-xs" data-tcp>\u29c9</button>
           <button type="button" class="btn btn-ghost btn-xs" data-tclose>${esc(t('discover.tunnel.close'))}</button>
+          <button type="button" class="btn btn-ghost btn-xs" data-treset>${esc(t('discover.tunnel.reset'))}</button>
         </div>
         <div style="display:flex;gap:.35rem;align-items:center;flex-wrap:wrap">
           <button type="button" class="btn btn-secondary btn-sm" data-topen>${esc(t('discover.tunnel.open'))}</button>
@@ -1092,6 +1174,18 @@ export async function renderDiscover(mount, ctx) {
         if (tid) { try { await api(`/tunnel/${encodeURIComponent(tid)}`, { method: 'DELETE' }); } catch (_) {} favTunnels.delete(fav.id); }
         deactivateFavBtns();
       };
+      panel.querySelector('[data-treset]').onclick = async () => {
+        const tid = favTunnels.get(fav.id);
+        if (!tid) return;
+        try {
+          await api(`/tunnel/${encodeURIComponent(tid)}/reset`, { method: 'POST', body: '{}' });
+          favTunnels.delete(fav.id);
+          panel.innerHTML = `<p class="muted" style="margin:0;font-size:.86rem">${esc(t('discover.tunnel.reset_ok'))}</p>`;
+          deactivateFavBtns();
+        } catch (e) {
+          toast(t('common.error', { msg: e.message }), 'err');
+        }
+      };
     } catch (e) {
       const _is412 = e.status === 412;
       panel.innerHTML = `<p style="color:var(--error);margin:0;font-size:.86rem">${esc(_is412 ? t('connect.no_direct_path') : t('connect.peer_offline'))}</p><p class="muted" style="margin:.2rem 0 0;font-size:.82rem">${esc(_is412 ? t('connect.relay_required_hint') : t('connect.unreachable_hint'))}</p>`;
@@ -1103,7 +1197,7 @@ export async function renderDiscover(mount, ctx) {
     panel.innerHTML = `
       <div class="muted" style="font-size:.79rem;margin-bottom:.25rem">${esc(t('discover.aidproxy.label'))}</div>
       <div style="display:flex;align-items:center;gap:.4rem;flex-wrap:wrap;margin-bottom:.2rem">
-        <code class="mono" style="font-size:.84rem">${esc(url)}</code>
+        <a class="mono" href="${esc(url)}" target="_blank" rel="noopener" style="font-size:.84rem">${esc(url)}</a>
         <button type="button" class="btn btn-ghost btn-xs" data-ap-cp>\u29c9</button>
       </div>
       <p class="muted" style="font-size:.78rem;margin:0">${esc(t('discover.aidproxy.hint'))}</p>`;
@@ -1153,7 +1247,7 @@ export async function renderDiscover(mount, ctx) {
   function setupFavDel(fav, panel, deactivateFn) {
     panel.innerHTML = `
       <div style="display:flex;align-items:center;gap:.5rem;flex-wrap:wrap">
-        <span style="font-size:.87rem">${esc(t('discover.fav.del_confirm'))} <strong>${esc(fav.alias)}</strong>？</span>
+        <span style="font-size:.87rem">${esc(t('discover.fav.del_confirm'))} <strong>${esc(aliasOf(fav.aid) || ensureAlias(fav.aid))}</strong>？</span>
         <button type="button" class="btn btn-secondary btn-sm" data-del-ok>${esc(t('discover.fav.del_ok'))}</button>
         <button type="button" class="btn btn-ghost btn-sm" data-del-cancel>${esc(t('common.cancel'))}</button>
       </div>`;
@@ -1168,6 +1262,35 @@ export async function renderDiscover(mount, ctx) {
   }
 
   /* ── Service search ────────────────────────────────────── */
+  function searchResultIdentityHtml(aid, e) {
+    const faved = isFaved(aid);
+    if (faved) {
+      const alias = aliasOf(aid) || ensureAlias(aid);
+      const sub = e.name ? `${shortAid(aid)} · ${e.name}` : shortAid(aid);
+      return `
+        <div data-identity>
+          <div style="font-weight:600;font-size:.92rem">${esc(alias)}</div>
+          <div class="muted" style="font-size:.85rem;margin-top:.12rem">
+            ${esc(sub)}
+            <button type="button" class="btn btn-ghost btn-sm" data-cp>\u29c9</button>
+          </div>
+        </div>`;
+    }
+    return `
+      <div data-identity>
+        <div>${esc(e.name || '')}${e.name ? ' · ' : ''}${esc(shortAid(aid))}
+          <button type="button" class="btn btn-ghost btn-sm" data-cp>\u29c9</button>
+        </div>
+      </div>`;
+  }
+
+  function wireSearchResultRow(row, aid, e) {
+    row.querySelector('[data-cp]')?.remove();
+    const block = row.querySelector('[data-identity]');
+    if (block) block.outerHTML = searchResultIdentityHtml(aid, e);
+    row.querySelector('[data-cp]').onclick = () => copyText(aid);
+  }
+
   async function search() {
     const term = q.value.trim();
     if (!term) return;
@@ -1200,7 +1323,7 @@ export async function renderDiscover(mount, ctx) {
             <button type="button" class="btn btn-ghost btn-sm" data-star style="font-size:.9rem">\u2606</button>
             <button type="button" class="btn btn-primary btn-sm" data-use>${esc(t('discover.result.use'))}</button>
           </div>
-          <div>${esc(e.name || '')} · ${esc(shortAid(aid))} <button type="button" class="btn btn-ghost btn-sm" data-cp>\u29c9</button></div>
+          ${searchResultIdentityHtml(aid, e)}
           ${e.brief ? `<div class="muted" style="margin-top:.35rem">${esc(e.brief)}</div>` : ''}`;
         row.querySelector('[data-cp]').onclick = () => copyText(aid);
         const starBtn = row.querySelector('[data-star]');
@@ -1210,8 +1333,10 @@ export async function renderDiscover(mount, ctx) {
           addFav(aid, null, e.service, e.protocols || []);
           starBtn.innerHTML = '\u2605';
           starBtn.style.color = '#d97706';
+          wireSearchResultRow(row, aid, e);
           toast(t('discover.fav.toast_added'), 'ok');
           updateStar(currentAid);
+          renderFavList();
         };
         row.querySelector('[data-use]').onclick = () => { aidInput.value = aid; switchTab('aid'); runQuery(); };
         svcOut.appendChild(row);

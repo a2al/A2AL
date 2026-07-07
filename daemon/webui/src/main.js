@@ -17,8 +17,7 @@ function openModal({ title, body, footer, wide, noBackdropClose, onMount }) {
   const backdrop = document.createElement('div');
   backdrop.className = 'modal-backdrop';
   const modal = document.createElement('div');
-  modal.className = 'modal';
-  if (wide) modal.style.maxWidth = '560px';
+  modal.className = wide ? 'modal modal-wide' : 'modal';
 
   const head = document.createElement('div');
   head.className = 'modal-h';

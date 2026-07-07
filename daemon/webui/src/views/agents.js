@@ -3,12 +3,10 @@ import {
   shortAid,
   aliasOf,
   setAliasOf,
-  generateDefaultAlias,
+  ensureAlias,
+  nextUniqueDefaultAlias,
   labelAid,
   setLoading,
-  parseTags,
-  buildServiceName,
-  mapCardJson,
   parseCardData,
   normalizeServiceTCP,
   base64ToUtf8,
@@ -16,6 +14,8 @@ import {
 import { ed25519 } from '@noble/curves/ed25519.js';
 import { encode as cborEncode } from 'cborg';
 import { encrypt, decrypt, isEnvelope } from '../crypto.js';
+import { openProfileModal } from '../profile-modal.js';
+import { openPublishModal } from '../publish-modal.js';
 
 // ---------------------------------------------------------------------------
 // Local delegation signing — master private key never leaves the browser.
@@ -142,8 +142,6 @@ async function signDelegationFromMaster(masterPrivHex) {
 // Set before calling onRefresh so that renderAgents can highlight the new card.
 let _pendingNewAid = null;
 function markNewCard(aid) { _pendingNewAid = aid; }
-
-const CATS = ['lang', 'gen', 'sense', 'data', 'reason', 'code', 'tool'];
 
 // Map numeric NAT type (from published_nat_type) to an i18n key
 const NAT_TYPE_KEYS = {
@@ -344,7 +342,7 @@ export async function renderAgents(mount, ctx) {
   function buildAgentCard(ag, svcExpanded, allAgents, idx) {
     const st = agentStatus(ag);
     // Auto-assign a default alias if none is stored yet
-    if (!aliasOf(ag.aid)) setAliasOf(ag.aid, generateDefaultAlias());
+    if (!aliasOf(ag.aid)) ensureAlias(ag.aid);
     const alias = aliasOf(ag.aid);
     const isDemoActive = ag.demo_active;
     const card = document.createElement('div');
@@ -364,10 +362,12 @@ export async function renderAgents(mount, ctx) {
             <span class="aid-short mono">${esc(shortAid(ag.aid))}</span>
             <button type="button" class="btn btn-ghost btn-xs" data-copy title="Copy AID">\u29c9</button>
           </div>
-          <div id="ag-alias-form-${idx}" style="display:none;margin:.25rem 0 .4rem">
+          <div id="ag-alias-form-${idx}" class="field" style="display:none;margin:.35rem 0 .45rem;max-width:16rem">
+            <label>${esc(t('agent.alias.local_label'))}</label>
             <input type="text" class="ag2-alias-input" maxlength="24"
               value="${esc(alias)}" placeholder="${esc(t('agent.alias.placeholder'))}"
-              style="width:100%;max-width:16rem" />
+              style="width:100%" />
+            <div class="hint">${esc(t('agent.alias.local_hint'))}</div>
           </div>
           <div class="ag2-tcp-row">
             <span data-tcp-status="${esc(ag.aid)}">${tcpDot(ag, t)}</span>
@@ -403,6 +403,7 @@ export async function renderAgents(mount, ctx) {
         </span>
         <div class="ag2-actions">
           ${!ag.published_to_dht ? `<button type="button" class="btn btn-primary btn-sm" data-pub-now>${esc(t('agent.action.publish'))}</button>` : ''}
+          <button type="button" class="btn btn-secondary btn-sm" data-edit-profile>${esc(t('agent.action.edit_profile'))}</button>
           <button type="button" class="btn btn-secondary btn-sm" data-pub>${esc(t('agent.action.republish'))}</button>
           <button type="button" class="btn btn-ghost btn-sm" data-export>${esc(t('agent.action.export'))}</button>
           <button type="button" class="btn btn-danger btn-sm" data-del>${esc(t('agent.action.delete'))}</button>
@@ -421,7 +422,7 @@ export async function renderAgents(mount, ctx) {
     const saveAlias = () => {
       const v = aliasForm.querySelector('input').value.trim();
       // If cleared, regenerate a default alias instead of leaving blank
-      const finalAlias = v || generateDefaultAlias();
+      const finalAlias = v || nextUniqueDefaultAlias();
       setAliasOf(ag.aid, finalAlias);
       const existing = infoDiv.querySelector(`#ag-alias-${idx}`);
       const aidRow = infoDiv.querySelector('.ag2-aid-row');
@@ -517,6 +518,7 @@ export async function renderAgents(mount, ctx) {
     };
 
     infoDiv.querySelector('[data-export]').onclick = () => openExportModal(ag.aid);
+    infoDiv.querySelector('[data-edit-profile]').onclick = () => openProfileModal(ctx, ag);
 
     card.appendChild(infoDiv);
 
@@ -541,7 +543,7 @@ export async function renderAgents(mount, ctx) {
         <p class="ag2-svc-empty-title">${esc(t('service.empty.title'))}</p>
         <p class="muted" style="font-size:.9rem;margin:.4rem 0 1rem">${esc(t('service.empty.body')).replace(/\n/g, '<br/>')}</p>
         <button type="button" class="btn btn-primary btn-sm ag2-pub-svc-empty">${esc(t('service.action.publish'))}</button>`;
-      svcBody.querySelector('.ag2-pub-svc-empty').onclick = () => openServiceModal(allAgents, ag.aid);
+      svcBody.querySelector('.ag2-pub-svc-empty').onclick = () => openPublishModal(ctx, { agentList: allAgents, editAid: ag.aid });
     } else {
       for (const svc of ag.services) {
         const row = document.createElement('div');
@@ -579,7 +581,7 @@ export async function renderAgents(mount, ctx) {
             finally { setLoading(b, false); }
           };
         } else {
-          row.querySelector('[data-ed]').onclick = () => openServiceModal(allAgents, ag.aid, svc);
+          row.querySelector('[data-ed]').onclick = () => openPublishModal(ctx, { agentList: allAgents, editAid: ag.aid, editSvc: svc });
           row.querySelector('[data-un]').onclick = async () => {
             if (!confirm(t('service.action.unpublish') + '?')) return;
             try {
@@ -602,7 +604,7 @@ export async function renderAgents(mount, ctx) {
       svcBody.style.display = open ? 'none' : '';
       svcHeader.querySelector('.ag2-toggle-arrow').textContent = open ? '▶' : '▼';
     };
-    svcHeader.querySelector('.ag2-pub-svc-hdr').onclick = () => openServiceModal(allAgents, ag.aid);
+    svcHeader.querySelector('.ag2-pub-svc-hdr').onclick = () => openPublishModal(ctx, { agentList: allAgents, editAid: ag.aid });
 
     // ── § Function area ──
     const fnBar = document.createElement('div');
@@ -832,7 +834,7 @@ export async function renderAgents(mount, ctx) {
         panel.innerHTML = `
           <div class="muted" style="font-size:.82rem;margin-bottom:.3rem">${esc(t('discover.aidproxy.label'))}</div>
           <div style="display:flex;align-items:center;gap:.5rem;flex-wrap:wrap">
-            <code class="mono" style="font-size:.9rem">${esc(url)}</code>
+            <a class="mono" href="${esc(url)}" target="_blank" rel="noopener" style="font-size:.9rem">${esc(url)}</a>
             <button type="button" class="btn btn-ghost btn-sm" id="fn-ap-cp">\u29c9</button>
           </div>
           <p class="muted" style="font-size:.8rem;margin:.3rem 0 0">${esc(t('agent.fn.aidproxy.hint'))}</p>`;
@@ -1402,199 +1404,6 @@ export async function renderAgents(mount, ctx) {
                 body: '{}',
               });
             } catch (_) {}
-            close();
-            onRefresh();
-          } catch (e) {
-            toast(t('common.error', { msg: e.message }), 'err');
-          } finally {
-            setLoading(b, false);
-          }
-        };
-      },
-    });
-  }
-
-  function openServiceModal(agentList, editAid = null, editSvc = null) {
-    const single = agentList.length === 1;
-    const preTopic = editSvc?.topic || '';
-    let preCat = 'lang';
-    let preFn = '';
-    let preQ = '';
-    if (preTopic && preTopic.includes('.')) {
-      const dot = preTopic.indexOf('.');
-      preCat = preTopic.slice(0, dot) || 'lang';
-      const rest = preTopic.slice(dot + 1);
-      const dash = rest.indexOf('-');
-      if (dash >= 0) {
-        preFn = rest.slice(0, dash);
-        preQ = rest.slice(dash + 1);
-      } else preFn = rest;
-    }
-    const catBtns = CATS.map((c) => {
-      const on = c === preCat && CATS.includes(preCat);
-      return `<button type="button" data-cat="${c}" class="btn btn-secondary btn-sm${on ? ' cat-on' : ''}">${esc(c)}</button>`;
-    }).join('');
-    const customOn = !CATS.includes(preCat);
-    const initialAgent = agentList.find((a) => a.aid === editAid) || agentList[0];
-    const preUrl = (() => {
-      const tcp = initialAgent?.service_tcp;
-      if (!tcp) return '';
-      const base = (tcp.startsWith('https://') || tcp.startsWith('http://'))
-        ? tcp.replace(/\/$/, '')
-        : 'http://' + tcp;
-      return base + '/.well-known/agent.json';
-    })();
-    openModal({
-      title: t('service.modal.title'),
-      wide: true,
-      body: `
-        ${single ? '' : `<div class="field"><label>${esc(t('service.modal.agent_pick'))}</label><select id="svAid">${agentList.map((a) => `<option value="${esc(a.aid)}" ${a.aid === editAid ? 'selected' : ''}>${esc(labelAid(a.aid))}</option>`).join('')}</select></div>`}
-        <div class="field">
-          <label>${esc(t('service.modal.import.label'))}</label>
-          <div style="display:flex;gap:.35rem;flex-wrap:wrap">
-            <input type="url" id="svUrl" style="flex:1;min-width:12rem" placeholder="${esc(t('service.modal.import.placeholder'))}" value="${esc(preUrl)}" />
-            <button type="button" class="btn btn-secondary" id="svFetch">${esc(t('service.modal.import.fetch'))}</button>
-          </div>
-        </div>
-        <p class="muted" style="text-align:center">${esc(t('service.modal.import.or'))}</p>
-        <div class="field">
-          <label>${esc(t('service.modal.category.label'))}</label>
-          <div class="cat-btns" id="svCats">${catBtns}<button type="button" data-cat="__" class="btn btn-secondary btn-sm${customOn ? ' cat-on' : ''}">${esc(t('service.modal.category.custom'))}</button></div>
-          <input type="text" id="svCatC" class="${CATS.includes(preCat) ? 'hidden' : ''}" style="margin-top:.35rem" placeholder="category" value="${CATS.includes(preCat) ? '' : esc(preCat)}" />
-        </div>
-        <div class="field">
-          <label>${esc(t('service.modal.func.label'))}</label>
-          <input type="text" id="svFn" value="${esc(preFn)}" />
-          <div class="hint">${esc(t('service.modal.func.hint'))}</div>
-        </div>
-        <div class="field">
-          <label>${esc(t('service.modal.qualifier.label'))}</label>
-          <input type="text" id="svQ" value="${esc(preQ)}" />
-          <div class="hint">${esc(t('service.modal.qualifier.hint'))}</div>
-        </div>
-        <div class="muted" id="svPreview"></div>
-        <div class="field">
-          <label>${esc(t('service.modal.display_name'))}</label>
-          <input type="text" id="svName" value="${esc(editSvc?.name || '')}" />
-        </div>
-        <div class="field">
-          <label>${esc(t('service.modal.brief'))}</label>
-          <textarea id="svBrief" rows="2" style="width:100%">${esc(editSvc?.brief || '')}</textarea>
-        </div>
-        <div class="field">
-          <label>${esc(t('service.modal.protocols'))}</label>
-          <label class="chk"><input type="checkbox" id="svMcp" ${!editSvc || (editSvc.protocols || []).includes('mcp') ? 'checked' : ''} /> mcp</label>
-          <label class="chk"><input type="checkbox" id="svA2a" ${editSvc && (editSvc.protocols || []).includes('a2a') ? 'checked' : ''} /> a2a</label>
-          <label class="chk"><input type="checkbox" id="svHttp" ${editSvc && (editSvc.protocols || []).includes('http') ? 'checked' : ''} /> http</label>
-        </div>
-        <div class="field">
-          <label>${esc(t('service.modal.tags.label'))}</label>
-          <input type="text" id="svTags" value="${esc((editSvc?.tags || []).join(' '))}" />
-          <div class="hint">${esc(t('service.modal.tags.hint'))}</div>
-        </div>
-        <div class="field">
-          <label>${esc(t('service.modal.url.label'))}</label>
-          <input type="url" id="svMetaUrl" value="${esc(editSvc?.meta?.url || editSvc?.meta?.URL || '')}" />
-          <div class="hint">${esc(t('service.modal.url.hint'))}</div>
-        </div>
-        <details>
-          <summary>${esc(t('agent.modal.advanced'))}</summary>
-          <div class="field" style="margin-top:.75rem">
-            <label>${esc(t('service.modal.ttl.label'))}</label>
-            <input type="number" id="svTtl" value="${editSvc?.ttl || 3600}" min="0" />
-          </div>
-        </details>
-        <div style="margin-top:1rem;display:flex;gap:.5rem;justify-content:flex-end">
-          <button type="button" class="btn btn-secondary" data-close>${esc(t('common.cancel'))}</button>
-          <button type="button" class="btn btn-primary" id="svGo">${esc(t('service.modal.submit'))}</button>
-        </div>`,
-      onMount(root, { close }) {
-        let cat = CATS.includes(preCat) ? preCat : '__';
-        if (!CATS.includes(preCat)) cat = '__';
-
-        function currentCat() {
-          if (cat === '__') return root.querySelector('#svCatC').value.trim().toLowerCase();
-          return cat;
-        }
-
-        function updPreview() {
-          const name = buildServiceName(currentCat(), root.querySelector('#svFn').value, root.querySelector('#svQ').value);
-          root.querySelector('#svPreview').textContent = `${t('service.modal.preview')} ${name || '—'}`;
-        }
-        root.querySelector('#svCats').onclick = (e) => {
-          const btn = e.target.closest('[data-cat]');
-          if (!btn) return;
-          const c = btn.getAttribute('data-cat');
-          cat = c;
-          root.querySelectorAll('#svCats button').forEach((b) => b.classList.remove('cat-on'));
-          btn.classList.add('cat-on');
-          const cust = root.querySelector('#svCatC');
-          if (c === '__') cust.classList.remove('hidden');
-          else cust.classList.add('hidden');
-          updPreview();
-        };
-        ['#svFn', '#svQ', '#svCatC'].forEach((sel) => {
-          root.querySelector(sel).addEventListener('input', updPreview);
-        });
-        updPreview();
-
-        root.querySelector('#svFetch').onclick = async (ev) => {
-          const u = root.querySelector('#svUrl').value.trim();
-          if (!u) return;
-          const b = ev.currentTarget;
-          setLoading(b, true);
-          try {
-            const r = await fetch(u, { mode: 'cors' });
-            if (!r.ok) throw new Error(String(r.status));
-            const j = await r.json();
-            const m = mapCardJson(j);
-            if (m.name) root.querySelector('#svName').value = m.name;
-            if (m.brief) root.querySelector('#svBrief').value = m.brief;
-            if (m.url) root.querySelector('#svMetaUrl').value = m.url;
-            root.querySelector('#svMcp').checked = m.protocols.includes('mcp');
-            root.querySelector('#svA2a').checked = m.protocols.includes('a2a');
-            root.querySelector('#svHttp').checked = m.protocols.includes('http');
-            toast('ok', 'ok');
-          } catch (e) {
-            toast(t('common.error', { msg: e.message }), 'err');
-          } finally {
-            setLoading(b, false);
-          }
-        };
-
-        root.querySelector('#svGo').onclick = async (ev) => {
-          const aid = single
-            ? agentList[0].aid
-            : root.querySelector('#svAid').value;
-          const full = buildServiceName(
-            currentCat(),
-            root.querySelector('#svFn').value,
-            root.querySelector('#svQ').value,
-          );
-          if (!full) return;
-          const protos = [];
-          if (root.querySelector('#svMcp').checked) protos.push('mcp');
-          if (root.querySelector('#svA2a').checked) protos.push('a2a');
-          if (root.querySelector('#svHttp').checked) protos.push('http');
-          const url = root.querySelector('#svMetaUrl').value.trim();
-          const meta = url ? { url } : {};
-          const ttl = parseInt(root.querySelector('#svTtl').value, 10) || 3600;
-          const b = ev.currentTarget;
-          setLoading(b, true);
-          try {
-            await api(`/agents/${encodeURIComponent(aid)}/services`, {
-              method: 'POST',
-              body: JSON.stringify({
-                services: [full],
-                name: root.querySelector('#svName').value.trim(),
-                protocols: protos,
-                tags: parseTags(root.querySelector('#svTags').value),
-                brief: root.querySelector('#svBrief').value.trim(),
-                meta,
-                ttl,
-              }),
-            });
-            toast('ok', 'ok');
             close();
             onRefresh();
           } catch (e) {
