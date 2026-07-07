@@ -728,6 +728,12 @@ func (h *Host) acceptICEToQUIC(ctx context.Context, wsURL string, cert tls.Certi
 // AcceptICEViaSignal is the controlled (callee) side: WebSocket ICE signaling
 // on signalBase, then QUIC-over-ICE. expectRemote is the caller's agent address.
 //
+// Stream 0 (a2r1/a2r2 agent-route exchange) is consumed internally by
+// acceptICEToQUIC's onConn callback for ICE-vs-punch winner selection.
+// Callers that feed the returned AgentConn into the gateway MUST use
+// daemon.serveResolvedGatewayConn (not serveGatewayConn) to avoid a
+// duplicate AcceptStream that would swallow the first data stream.
+//
 // Same lifetime semantics as connectViaICESignal — resources are freed when
 // the AgentConn's underlying QUIC connection closes.
 func (h *Host) AcceptICEViaSignal(ctx context.Context, localAgent, expectRemote a2al.Address, signalBase string) (*AgentConn, error) {

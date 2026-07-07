@@ -142,7 +142,7 @@ type Config struct {
 	// SeenPeersPath is forwarded to the DHT node for seenPeers persistence (spec §7.3).
 	// Empty disables persistence.
 	SeenPeersPath string
-	// LearnedPathFirst enables P-Reach L1 outbound path selection in the DHT node.
+	// LearnedPathFirst enables learned-path outbound selection in the DHT node.
 	LearnedPathFirst bool
 	// ICENetworkTypes lists the ICE network types used for candidate gathering.
 	// Defaults to {ice.NetworkTypeUDP4, ice.NetworkTypeUDP6} (dual-stack) when
@@ -1278,13 +1278,14 @@ func (h *Host) Connect(ctx context.Context, expectRemote a2al.Address, udpAddr *
 	return h.dialAndAgentRoute(ctx, cert, expectRemote, udpAddr)
 }
 
-// doDialerControlStream opens Stream 0, writes the a2r2 route frame and dialer
-// control messages, then returns immediately.  Reading the acceptor's response
-// (ObservedAddr / AgentInfo) happens in a background goroutine so that the
-// caller can start opening data streams without waiting for the exchange.
+// doDialerControlStream opens Stream 0, writes the a2r2 route frame, then
+// performs the control message exchange synchronously before returning.
 //
-// Only stream-open and route-frame failures are fatal; control-message errors
-// are logged and ignored — the connection is always usable without the bonus.
+// Fatal failures (stream-open, route-frame write): return error → caller closes conn.
+// sendDialerMsgs failure: best-effort; stream is reset, connection still usable.
+// readAcceptorMsgs failure: B→A path could not deliver data; the connection is
+// closed here and ErrControlExchangeIncomplete is returned so callers know not
+// to cache it (but should not apply a backoff penalty either).
 func (h *Host) doDialerControlStream(ctx context.Context, conn quic.Connection, expectRemote a2al.Address) error {
 	str, err := conn.OpenStreamSync(ctx)
 	if err != nil {
@@ -1309,32 +1310,53 @@ func (h *Host) doDialerControlStream(ctx context.Context, conn quic.Connection, 
 		}
 	}
 
-	// The rest of the exchange is bonus: send our hint, read acceptor's reply.
-	// Run in a goroutine so the caller is not blocked on network round-trips.
-	// The goroutine terminates naturally when the stream closes (connection gone).
-	go func() {
-		if err := sendDialerMsgs(str, expectRemote, heldSeq); err != nil {
-			h.log.Debug("control: send dialer msgs", "remote_aid", expectRemote, "err", err)
-			return
-		}
-		observedWire, receivedRecs, err := readAcceptorMsgs(str)
-		if err != nil {
-			h.log.Debug("control: read acceptor msgs", "remote_aid", expectRemote, "err", err)
-		}
-		if len(observedWire) > 0 {
-			h.sense.Record(a2al.NodeIDFromAddress(expectRemote), observedWire)
-		}
-		for _, rec := range receivedRecs {
-			te, perr := protocol.ParseTopicRecord(rec)
-			if perr != nil {
-				continue
-			}
-			_ = h.node.LocalStorePut(protocol.TopicNodeID(te.Topic), rec)
-		}
-	}()
+	// Propagate ctx deadline to hint-exchange stream I/O so that a slow or
+	// unresponsive acceptor cannot block this goroutine beyond the dial timeout.
+	if dl, ok := ctx.Deadline(); ok {
+		_ = str.SetDeadline(dl)
+	}
 
+	// Send hint + FIN (best-effort: A→B write failure resets the stream but
+	// does not fail the connection). Then read acceptor's reply: if B→A stream
+	// delivery fails, the connection is closed and must not be cached.
+	if err := sendDialerMsgs(str, expectRemote, heldSeq); err != nil {
+		h.log.Debug("control: send dialer msgs", "remote_aid", expectRemote, "err", err)
+		str.CancelWrite(0) // reset stream so acceptor unblocks from readDialerMsgs
+		return nil
+	}
+	observedWire, receivedRecs, err := readAcceptorMsgs(str)
+
+	// Apply whatever DHT data was received regardless of err — best-effort.
+	// readAcceptorMsgs returns partial results even on error, and discarding
+	// them would regress the ObservedAddr / topic-record exchange semantics.
+	if len(observedWire) > 0 {
+		h.sense.Record(a2al.NodeIDFromAddress(expectRemote), observedWire)
+	}
+	for _, rec := range receivedRecs {
+		te, perr := protocol.ParseTopicRecord(rec)
+		if perr != nil {
+			continue
+		}
+		_ = h.node.LocalStorePut(protocol.TopicNodeID(te.Topic), rec)
+	}
+
+	if err != nil {
+		h.log.Debug("control: read acceptor msgs", "remote_aid", expectRemote, "err", err)
+		// B→A stream delivery failed: close the connection so it is not reused.
+		// Wrap with ErrControlExchangeIncomplete so the connpool suppresses backoff.
+		_ = conn.CloseWithError(1, "control exchange incomplete")
+		return &controlStreamError{cause: fmt.Errorf("%w: %w", ErrControlExchangeIncomplete, err)}
+	}
 	return nil
 }
+
+// ErrControlExchangeIncomplete is wrapped inside errors returned when the
+// QUIC+TLS handshake succeeded but the Stream 0 B→A exchange did not complete.
+// The connection has been closed. Callers that implement connection pools should
+// not apply a dial-failure backoff penalty for this error — the remote is
+// reachable; the incomplete exchange only means the connection must not be
+// cached for reuse.
+var ErrControlExchangeIncomplete = errors.New("a2al/host: control exchange incomplete")
 
 // controlStreamError wraps a failure that occurred after the QUIC+TLS handshake
 // succeeded but during Stream 0 control exchange.  The network path itself was
@@ -1389,6 +1411,9 @@ func (h *Host) defaultAgentCert() (tls.Certificate, error) {
 //  3. Default to the host's own Address.
 //
 // Remote peer AID is extracted from the mutual TLS client certificate.
+//
+// Stream 0 is NOT consumed here. Callers must pass the returned AgentConn
+// through the full daemon.serveGatewayConn (not serveResolvedGatewayConn).
 func (h *Host) Accept(ctx context.Context) (*AgentConn, error) {
 	for {
 		conn, err := h.qListen.Accept(ctx)
@@ -1424,6 +1449,9 @@ func (h *Host) Accept(ctx context.Context) (*AgentConn, error) {
 //
 // Run this in parallel with Accept (e.g. in a separate goroutine) to serve
 // both the main QUIC listener and the shared-transport path.
+//
+// Stream 0 is NOT consumed here. Callers must pass the returned AgentConn
+// through the full daemon.serveGatewayConn (not serveResolvedGatewayConn).
 func (h *Host) AcceptShared(ctx context.Context) (*AgentConn, error) {
 	select {
 	case <-ctx.Done():
@@ -1441,16 +1469,11 @@ func (h *Host) agentConnFromQUIC(ctx context.Context, conn quic.Connection, fall
 		ac.Remote = remote
 	}
 
-	// Try agent-route control stream (canonical, a2r1 or a2r2).
-	if target, err := h.doAcceptorControlStream(ctx, conn); err == nil {
-		h.agentsMu.RLock()
-		_, ok := h.agents[target]
-		h.agentsMu.RUnlock()
-		if ok {
-			ac.Local = target
-		}
-	} else if sni := state.ServerName; sni != "" {
-		// Fallback: TLS SNI.
+	// Quick SNI hint (no network I/O).  Used as initial value for ac.Local
+	// until the control-stream exchange in serveGatewayConn overwrites it.
+	// Intentionally kept for backward-compat with any dialer that sends a
+	// valid SNI but no a2r2 frame; will be dropped when SNI camouflage lands.
+	if sni := state.ServerName; sni != "" {
 		if addr, err := a2al.ParseAddress(sni); err == nil {
 			h.agentsMu.RLock()
 			_, ok := h.agents[addr]
@@ -1473,6 +1496,26 @@ func (h *Host) agentConnFromQUIC(ctx context.Context, conn quic.Connection, fall
 	return ac, nil
 }
 
+// ResolveInboundAgent runs the a2r1/a2r2 control-stream exchange on an
+// accepted QUIC connection and returns the resolved local agent address.
+// ctx must carry a deadline; a short timeout (10–15 s) is recommended so
+// that a slow or malicious peer cannot block the caller's goroutine
+// indefinitely.  Returns an error if the exchange fails or the resolved
+// address is not a registered agent on this host.
+func (h *Host) ResolveInboundAgent(ctx context.Context, conn quic.Connection) (a2al.Address, error) {
+	target, err := h.doAcceptorControlStream(ctx, conn)
+	if err != nil {
+		return a2al.Address{}, err
+	}
+	h.agentsMu.RLock()
+	_, ok := h.agents[target]
+	h.agentsMu.RUnlock()
+	if !ok {
+		return a2al.Address{}, errors.New("a2al/host: agent not registered")
+	}
+	return target, nil
+}
+
 // doAcceptorControlStream accepts Stream 0, reads the route frame, and (for
 // a2r2 connections) runs the control message exchange.  Side effects:
 //   - Sends ObservedAddr (the dialer's public UDP address as seen by this node).
@@ -1490,6 +1533,8 @@ func (h *Host) doAcceptorControlStream(ctx context.Context, conn quic.Connection
 	// Read magic (4 B) + target address (21 B).
 	var header [25]byte
 	if _, err := io.ReadFull(str, header[:]); err != nil {
+		str.CancelRead(0)
+		_ = str.Close()
 		return a2al.Address{}, err
 	}
 	magic := header[:4]
@@ -1521,6 +1566,8 @@ func (h *Host) doAcceptorControlStream(ctx context.Context, conn quic.Connection
 		return addr, nil
 
 	default:
+		str.CancelRead(0)
+		_ = str.Close()
 		return a2al.Address{}, errors.New("a2al/host: bad agent-route magic")
 	}
 }

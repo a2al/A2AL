@@ -65,6 +65,22 @@ func newHost(t *testing.T, ks *memKS) *Host {
 	return h
 }
 
+// acceptAndResolve mirrors daemon.serveGatewayConn: Accept returns the QUIC
+// connection, then ResolveInboundAgent completes the a2r2 control exchange.
+func acceptAndResolve(ctx context.Context, h *Host) (*AgentConn, error) {
+	ac, err := h.Accept(ctx)
+	if err != nil {
+		return nil, err
+	}
+	local, err := h.ResolveInboundAgent(ctx, ac.Connection)
+	if err != nil {
+		_ = ac.CloseWithError(1, "resolve failed")
+		return nil, err
+	}
+	ac.Local = local
+	return ac, nil
+}
+
 func TestHost_quicMutualTLS(t *testing.T) {
 	ksA, ksB := newMemKS(t), newMemKS(t)
 	ha, hb := newHost(t, ksA), newHost(t, ksB)
@@ -78,7 +94,7 @@ func TestHost_quicMutualTLS(t *testing.T) {
 	}
 	aCh := make(chan acceptResult, 1)
 	go func() {
-		ac, err := ha.Accept(ctx)
+		ac, err := acceptAndResolve(ctx, ha)
 		aCh <- acceptResult{ac, err}
 	}()
 
@@ -107,7 +123,7 @@ func TestHost_quicMutualTLS(t *testing.T) {
 		t.Fatalf("Accept Remote = %s, want %s", ar.ac.Remote, hb.Address())
 	}
 
-	// Accept consumes the agent-route stream; next AcceptStream is the app stream.
+	// Stream 0 carried the a2r2 control exchange; next AcceptStream is app data.
 	sStr, err := ar.ac.AcceptStream(ctx)
 	if err != nil {
 		t.Fatal("AcceptStream:", err)
@@ -152,7 +168,7 @@ func TestHost_sniRouting(t *testing.T) {
 	}
 	aCh := make(chan acceptResult, 1)
 	go func() {
-		ac, err := ha.Accept(ctx)
+		ac, err := acceptAndResolve(ctx, ha)
 		aCh <- acceptResult{ac, err}
 	}()
 

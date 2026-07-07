@@ -66,6 +66,24 @@ type iceSession struct {
 	localSrflx []string
 	srflxMu    sync.Mutex
 
+	// remoteEOC is closed exactly once when the remote's "eoc" (end-of-candidates)
+	// frame is received, signalling that no more remote candidates will arrive
+	// via trickle. Used by completeICESession to gate the "checklist exhausted"
+	// fast-fail verdict so a remote that is still trickling candidates is not
+	// mistaken for a hopeless session.
+	remoteEOC     chan struct{}
+	remoteEOCOnce sync.Once
+}
+
+// remoteGatherDone reports whether the remote has signalled (via "eoc") that
+// its candidate gathering is complete and no more will arrive via trickle.
+func (s *iceSession) remoteGatherDone() bool {
+	select {
+	case <-s.remoteEOC:
+		return true
+	default:
+		return false
+	}
 }
 
 // snapshotRemoteCands returns a copy of all accumulated trickle remote candidates.
@@ -368,7 +386,8 @@ func newICEAgent(urls []*stun.URI, hostOnly, disableRelay bool, networkTypes []i
 // If the remote hub reports the target is not registered, the error wraps ErrNoAgent.
 func startICESession(ctx context.Context, wsURL string, urls []*stun.URI, controlling, hostOnly, disableRelay bool, networkTypes []ice.NetworkType, hintRemotes []iceHint) (*iceSession, [2]string, error) {
 	sess := &iceSession{
-		punchCh: make(chan signaling.Frame, 8),
+		punchCh:   make(chan signaling.Frame, 8),
+		remoteEOC: make(chan struct{}),
 	}
 	ok := false
 	defer func() {
@@ -471,7 +490,11 @@ func startICESession(ctx context.Context, wsURL string, urls []*stun.URI, contro
 					sess.mu.Unlock()
 				}
 			case "eoc":
-				// Informational; ICE handles this naturally.
+				// ICE itself needs no action here, but record that the remote
+				// will not trickle any more candidates: completeICESession's
+				// fast-fail poll uses this to avoid mistaking "remote is still
+				// gathering" for "checklist is permanently exhausted".
+				sess.remoteEOCOnce.Do(func() { close(sess.remoteEOC) })
 			case "noagent":
 				// Target agent is not registered on the hub.
 				select {
@@ -534,15 +557,101 @@ func startICESession(ctx context.Context, wsURL string, urls []*stun.URI, contro
 	return sess, remoteCred, nil
 }
 
+// checklistPollInterval is how often the candidate-pair checklist is polled
+// for a definitive verdict while ICE connectivity checks are running. pion
+// fails an individual pair after its own bounded retry budget (~1.4s with
+// defaults: 7 attempts x 200ms), so this is set comfortably above that to
+// avoid a spurious read mid-retry, while still being short enough that a
+// hopeless checklist is not left idling until the caller's much longer
+// (e.g. 30s) context deadline.
+const checklistPollInterval = 1500 * time.Millisecond
+
+// eocFallbackGrace bounds how long the "checklist exhausted" verdict waits for
+// the remote's "eoc" signal before trusting the checklist anyway. A remote
+// that is still trickling candidates may turn a currently-all-failed checklist
+// into a viable one once its candidates arrive, so the fast-fail path normally
+// waits for "eoc" first. This grace period covers older peers that never send
+// "eoc" and the rare case of a dropped eoc frame, so a missing signal cannot
+// reintroduce the original long idle wait.
+const eocFallbackGrace = 5 * time.Second
+
+// errChecklistExhausted is returned by completeICESession when every gathered
+// candidate pair has definitively failed connectivity checks before ctx
+// expired. This is a certain verdict (not a guess): the gathered addresses
+// are already known to be unusable, most commonly because the peer is behind
+// a NAT whose external mapping toward this specific peer differs from the one
+// discovered via STUN. Waiting out the rest of ctx cannot change that outcome,
+// so callers can react immediately (try another hub, or let their own retry/
+// backoff run sooner) instead of idling.
+var errChecklistExhausted = errors.New("a2al/host: ice checklist exhausted, no viable candidate pair")
+
+// checklistExhausted reports whether agent has gathered at least one
+// candidate pair and every pair has definitively reached CandidatePairStateFailed.
+// An empty checklist (still gathering, or no candidates at all) is not exhausted.
+func checklistExhausted(agent *ice.Agent) bool {
+	stats := agent.GetCandidatePairsStats()
+	if len(stats) == 0 {
+		return false
+	}
+	for _, s := range stats {
+		if s.State != ice.CandidatePairStateFailed {
+			return false
+		}
+	}
+	return true
+}
+
 // completeICESession calls agent.Dial (controlling) or agent.Accept (!controlling)
 // to run ICE connectivity checks and select a candidate pair. On success
 // sess.iceConn is set. Designed to run concurrently with punchDial.
+//
+// While waiting, the checklist is polled every checklistPollInterval (see
+// checklistExhausted). If every candidate pair has definitively failed, and
+// either the remote has confirmed it is done trickling candidates ("eoc") or
+// eocFallbackGrace has elapsed without that confirmation, this returns
+// errChecklistExhausted immediately instead of blocking until ctx expires —
+// avoiding the idle wait observed when a symmetric-NAT peer's srflx candidates
+// never had a working pair to begin with (single-pair checklists fail in
+// ~1.4s, then previously sat idle for the remaining ~28s of a 30s budget).
+// Gating on "eoc" avoids mistaking a remote that is still gathering (slow STUN
+// round trip, high-latency trickle) for one that has definitively failed.
 func completeICESession(ctx context.Context, sess *iceSession, controlling bool, remoteCred [2]string) error {
+	dialCtx, dialCancel := context.WithCancel(ctx)
+	defer dialCancel()
+
+	pollDone := make(chan struct{})
+	go func() {
+		defer close(pollDone)
+		start := time.Now()
+		t := time.NewTicker(checklistPollInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-dialCtx.Done():
+				return
+			case <-t.C:
+				if !checklistExhausted(sess.agent) {
+					continue
+				}
+				if sess.remoteGatherDone() || time.Since(start) > eocFallbackGrace {
+					dialCancel()
+					return
+				}
+			}
+		}
+	}()
+
 	var err error
 	if controlling {
-		sess.iceConn, err = sess.agent.Dial(ctx, remoteCred[0], remoteCred[1])
+		sess.iceConn, err = sess.agent.Dial(dialCtx, remoteCred[0], remoteCred[1])
 	} else {
-		sess.iceConn, err = sess.agent.Accept(ctx, remoteCred[0], remoteCred[1])
+		sess.iceConn, err = sess.agent.Accept(dialCtx, remoteCred[0], remoteCred[1])
+	}
+	dialCancel()
+	<-pollDone
+
+	if err != nil && ctx.Err() == nil && checklistExhausted(sess.agent) {
+		return errChecklistExhausted
 	}
 	return err
 }

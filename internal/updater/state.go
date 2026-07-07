@@ -42,6 +42,12 @@ func stateFilePath(dataDir string) string {
 	return filepath.Join(dataDir, "update_state.json")
 }
 
+// ClearState removes update_state.json. Used by manual reinstall to void any
+// pending auto-update accounting. ErrNotExist is silently ignored.
+func ClearState(dataDir string) {
+	_ = os.Remove(stateFilePath(dataDir))
+}
+
 // ReadState reads update_state.json. Returns nil (no error) when file is absent.
 func ReadState(dataDir string) (*UpdateState, error) {
 	data, err := os.ReadFile(stateFilePath(dataDir))

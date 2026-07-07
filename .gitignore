@@ -24,3 +24,6 @@ dist/
 # local build binary
 a2ald
 a2ald.exe
+
+# local Go build cache
+.gocache/

@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/a2al/a2al/daemon"
+	"github.com/a2al/a2al/internal/updater"
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 	"golang.org/x/sys/windows/svc"
@@ -215,11 +216,19 @@ func elevateAndRun(exePath string, subcmdArgs []string) error {
 //  1. Idempotency — running from installed location + registered → success
 //  2. Privilege check — must be elevated before any side effects
 //  3. Confirm — ask [y/N] if replacing existing registration
-//  4. prepareForInstall — stop all + remove all registrations + wait file lock
+//
+// Reinstall path (SCM service already exists):
+//  4. Copy binaries while service is still running (rename trick; tunnel stays alive)
+//  5. sc config — update registration in-place, no delete+create, no 1072 risk
+//  6. sc stop → sc start (tunnel drops briefly, recovers after start)
+//
+// Fresh-install path (no SCM service):
+//  4. Clean up any Task Scheduler residue, wait for binary lock release
 //  5. Copy binaries
 //  6. sc create + description + failure policy
 //  7. sc start (rollback on failure)
-//  8. PATH + success output
+//
+//  8. PATH + success output (both paths)
 func svcInstallSCM(exePath, dataDir string) error {
 	installDir, err := targetInstallDir(false)
 	if err != nil {
@@ -239,9 +248,11 @@ func svcInstallSCM(exePath, dataDir string) error {
 		return errNeedElevation
 	}
 
-	// 3. Confirm if replacing an existing registration.
+	hasSCM := scServiceExists(svcName)
 	_, hasTask := queryTaskStatus(svcTaskName)
-	if scServiceExists(svcName) || hasTask {
+
+	// 3. Confirm if replacing an existing registration.
+	if hasSCM || hasTask {
 		if isStdinTerminal() {
 			fmt.Printf("a2ald is already installed. Reinstall and restart? [y/N]: ")
 			line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
@@ -253,40 +264,93 @@ func svcInstallSCM(exePath, dataDir string) error {
 		}
 	}
 
-	// 4. Stop all instances, remove all registrations, wait for file lock release.
-	if err := prepareForInstall(destExe); err != nil {
-		return err
-	}
-
-	// 5. Copy binaries to stable install location.
-	copied, copyErr := installBinaries(exePath, installDir)
-	if copyErr != nil {
-		rollbackCopy(copied)
-		return fmt.Errorf("install binaries: %w", copyErr)
-	}
-
-	// 6. Register with SCM.
 	binPath := fmt.Sprintf(`"%s" -data-dir "%s"`, destExe, dataDir)
-	if _, err := exec.Command("sc.exe", "create", svcName,
-		"binPath=", binPath,
-		"DisplayName=", svcDisplayName,
-		"start=", "auto",
-		"type=", "own",
-	).CombinedOutput(); err != nil {
-		rollbackCopy(copied)
-		return fmt.Errorf("create service: %w", err)
-	}
-	exec.Command("sc.exe", "description", svcName, svcDescription).Run()
-	exec.Command("sc.exe", "failure", svcName,
-		"reset=", "3600",
-		"actions=", "restart/5000/restart/15000/restart/30000",
-	).Run()
 
-	// 7. Start — rollback fully on failure.
-	if _, err := exec.Command("sc.exe", "start", svcName).CombinedOutput(); err != nil {
-		exec.Command("sc.exe", "delete", svcName).Run()
-		rollbackCopy(copied)
-		return fmt.Errorf("start service: %w", err)
+	if hasSCM {
+		// ── Reinstall: all fallible steps run while service is still up ───────
+
+		// 4. Copy binaries — service still running, tunnel still alive.
+		//    copyFile uses rename trick so the running exe can be replaced.
+		copied, copyErr := installBinaries(exePath, installDir)
+		if copyErr != nil {
+			rollbackCopy(copied)
+			return fmt.Errorf("install binaries: %w", copyErr)
+		}
+
+		// 5. Update SCM registration in-place (no delete+create → no 1072 risk).
+		//    Changes take effect on next start; service continues running meanwhile.
+		exec.Command("sc.exe", "config", svcName,
+			"binPath=", binPath,
+			"start=", "auto",
+		).Run()
+		exec.Command("sc.exe", "description", svcName, svcDescription).Run()
+		exec.Command("sc.exe", "failure", svcName,
+			"reset=", "3600",
+			"actions=", "restart/5000/restart/15000/restart/30000",
+		).Run()
+
+		// Clean up any Task Scheduler residue (best-effort, non-fatal).
+		if hasTask {
+			psTaskOp("Stop-ScheduledTask", svcTaskName)
+			psTaskOp("Unregister-ScheduledTask", svcTaskName, "-Confirm:$false")
+		}
+
+		// Void any pending auto-update accounting.
+		updater.ClearState(dataDir)
+
+		// 6. Restart — tunnel drops here, recovers once the new binary is up.
+		//    sc stop sends the control code but may return before the process fully
+		//    exits (StopPending). scStartWithRetry retries on 1056 until the service
+		//    reaches Stopped and the start succeeds.
+		fmt.Println("a2ald: reinstalling service...")
+		exec.Command("sc.exe", "stop", svcName).Run()
+		if err := scStartWithRetry(svcName, 20*time.Second); err != nil {
+			return fmt.Errorf("start service: %w", err)
+		}
+	} else {
+		// ── Fresh install (or Task-only → SCM switch) ─────────────────────────
+
+		// 4. Stop and remove any Task Scheduler registration, wait for lock release.
+		if hasTask {
+			psTaskOp("Stop-ScheduledTask", svcTaskName)
+			time.Sleep(300 * time.Millisecond)
+			psTaskOp("Unregister-ScheduledTask", svcTaskName, "-Confirm:$false")
+			time.Sleep(300 * time.Millisecond)
+		}
+		if err := waitForBinaryRelease(destExe, 5*time.Second); err != nil {
+			return err
+		}
+
+		// 5. Copy binaries.
+		copied, copyErr := installBinaries(exePath, installDir)
+		if copyErr != nil {
+			rollbackCopy(copied)
+			return fmt.Errorf("install binaries: %w", copyErr)
+		}
+		updater.ClearState(dataDir)
+
+		// 6. Register with SCM.
+		if _, err := exec.Command("sc.exe", "create", svcName,
+			"binPath=", binPath,
+			"DisplayName=", svcDisplayName,
+			"start=", "auto",
+			"type=", "own",
+		).CombinedOutput(); err != nil {
+			rollbackCopy(copied)
+			return fmt.Errorf("create service: %w", err)
+		}
+		exec.Command("sc.exe", "description", svcName, svcDescription).Run()
+		exec.Command("sc.exe", "failure", svcName,
+			"reset=", "3600",
+			"actions=", "restart/5000/restart/15000/restart/30000",
+		).Run()
+
+		// 7. Start — rollback fully on failure.
+		if _, err := exec.Command("sc.exe", "start", svcName).CombinedOutput(); err != nil {
+			exec.Command("sc.exe", "delete", svcName).Run()
+			rollbackCopy(copied)
+			return fmt.Errorf("start service: %w", err)
+		}
 	}
 
 	// 8. PATH and output.
@@ -356,6 +420,7 @@ func svcInstallTask(exePath, dataDir string) error {
 	if err := prepareForInstall(destExe); err != nil {
 		return err
 	}
+	updater.ClearState(dataDir)
 
 	// 5. Copy binaries.
 	copied, copyErr := installBinaries(exePath, installDir)
@@ -628,6 +693,26 @@ func isFileLocked(path string) bool {
 
 // ── SCM helpers ───────────────────────────────────────────────────────────────
 
+// scStartWithRetry calls "sc start" and retries on exit code 1056
+// (ERROR_SERVICE_ALREADY_RUNNING), which is returned when the service is still
+// in StopPending after a recent stop. Any other error is returned immediately.
+// Returns an error if the service has not started within timeout.
+func scStartWithRetry(name string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		out, err := exec.Command("sc.exe", "start", name).CombinedOutput()
+		if err == nil {
+			return nil
+		}
+		if isExitCode(err, 1056) {
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return fmt.Errorf("service did not stop within %s; start aborted", timeout)
+}
+
 // scServiceExists reports whether a Windows Service is registered in SCM.
 // sc.exe query does not require administrator rights.
 func scServiceExists(name string) bool {
@@ -736,6 +821,24 @@ func copyFile(src, dst string) error {
 	if strings.EqualFold(filepath.Clean(src), filepath.Clean(dst)) {
 		return nil
 	}
+	// On Windows a running exe cannot be overwritten but can be renamed.
+	// Rename the existing file to .old first so the destination path is free.
+	if fileExists(dst) {
+		old := dst + ".old"
+		if err := os.Remove(old); err != nil && !os.IsNotExist(err) {
+			// .old is held by another process — abort to keep the service running.
+			return fmt.Errorf("open %s: %w", old, err)
+		}
+		if err := os.Rename(dst, old); err != nil {
+			return fmt.Errorf("open %s: %w", dst, err)
+		}
+		// If the copy fails, restore the original so the service can still start.
+		defer func() {
+			if fileExists(old) && !fileExists(dst) {
+				_ = os.Rename(old, dst)
+			}
+		}()
+	}
 	in, err := os.Open(src)
 	if err != nil {
 		return err
@@ -766,7 +869,10 @@ func removeInstallDir(dir string) {
 	if dir == "" {
 		return
 	}
-	for _, name := range []string{"a2ald.exe", "a2al.exe"} {
+	for _, name := range []string{
+		"a2ald.exe", "a2ald.exe.old", "a2ald.exe.failed",
+		"a2al.exe", "a2al.exe.old",
+	} {
 		os.Remove(filepath.Join(dir, name))
 	}
 	os.Remove(dir)

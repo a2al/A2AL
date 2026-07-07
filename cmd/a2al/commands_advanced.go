@@ -436,6 +436,7 @@ func cmdConnect(c *Client, g globalOpts, args []string) {
 //	a2al tunnel                          — list active tunnels
 //	a2al tunnel open <aid> [flags]       — open a persistent tunnel
 //	a2al tunnel close <id>               — close a tunnel by ID
+//	a2al tunnel reset <id>               — force-close the QUIC connection; tunnel self-closes
 //	a2al tunnel status <id>              — show tunnel status
 func cmdTunnel(c *Client, g globalOpts, args []string) {
 	if len(args) == 0 {
@@ -453,13 +454,18 @@ func cmdTunnel(c *Client, g globalOpts, args []string) {
 			fatalf("usage: a2al tunnel close <id>")
 		}
 		tunnelClose(c, g, args[1])
+	case "reset":
+		if len(args) != 2 {
+			fatalf("usage: a2al tunnel reset <id>")
+		}
+		tunnelReset(c, g, args[1])
 	case "status":
 		if len(args) != 2 {
 			fatalf("usage: a2al tunnel status <id>")
 		}
 		tunnelStatus(c, g, args[1])
 	default:
-		fatalf("unknown tunnel subcommand: %s\n\nUsage:\n  a2al tunnel\n  a2al tunnel open <aid> [--local-aid …] [--idle-timeout N]\n  a2al tunnel close <id>\n  a2al tunnel status <id>", args[0])
+		fatalf("unknown tunnel subcommand: %s\n\nUsage:\n  a2al tunnel\n  a2al tunnel open <aid> [--local-aid …] [--idle-timeout N]\n  a2al tunnel close <id>\n  a2al tunnel reset <id>\n  a2al tunnel status <id>", args[0])
 	}
 }
 
@@ -542,6 +548,17 @@ func tunnelClose(c *Client, g globalOpts, id string) {
 		printJSON(true, map[string]any{"ok": true})
 	} else if !g.Quiet {
 		fmt.Println("closed", id)
+	}
+}
+
+func tunnelReset(c *Client, g globalOpts, id string) {
+	if _, _, err := c.DoRequest(http.MethodPost, "/tunnel/"+url.PathEscape(id)+"/reset", nil, nil); err != nil {
+		fatal(err)
+	}
+	if g.JSON {
+		printJSON(true, map[string]any{"ok": true})
+	} else if !g.Quiet {
+		fmt.Println("QUIC connection reset. Tunnel will close; reopen with: a2al tunnel open <aid>")
 	}
 }
 
