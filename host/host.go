@@ -520,12 +520,25 @@ func (h *Host) ObserveFromPeers(ctx context.Context, seeds []net.Addr) {
 }
 
 // ObserveFromRouting samples current routing-table candidates and performs
-// passive observed_addr collection from them.
+// passive observed_addr collection from them. Both address families are
+// sampled: for each peer, a v4 address and a v6 address are each collected
+// if available, giving natsense observed_addr votes on both families.
 func (h *Host) ObserveFromRouting(ctx context.Context, n int) int {
 	if n <= 0 {
 		n = 8
 	}
-	seeds := h.node.BootstrapCandidateAddrs(n)
+	var seeds []net.Addr
+	for _, id := range h.node.RoutingPeerIDs() {
+		if len(seeds) >= n {
+			break
+		}
+		if a, ok := h.node.FamilyStableAddr(id, false); ok {
+			seeds = append(seeds, a)
+		}
+		if a, ok := h.node.FamilyStableAddr(id, true); ok {
+			seeds = append(seeds, a)
+		}
+	}
 	if len(seeds) == 0 {
 		return 0
 	}
@@ -589,7 +602,7 @@ func (h *Host) runNATProbeV4(ctx context.Context) {
 	}
 
 	// ③ Select up to 3 v4 candidates from the routing table.
-	candidates := h.selectNATProbeTargets(3)
+	candidates := h.selectNATProbeTargets(3, false)
 	if len(candidates) == 0 {
 		h.log.Debug("nat probe v4: no public-IP candidates in routing table; skipping")
 		return
@@ -646,7 +659,7 @@ func (h *Host) runNATProbeV6(ctx context.Context) {
 	}
 
 	// ③ Select up to 3 v6 GUA candidates from the routing table.
-	candidates := h.selectNATProbeTargetsV6(3)
+	candidates := h.selectNATProbeTargets(3, true)
 	if len(candidates) == 0 {
 		h.log.Debug("nat probe v6: no GUA-v6 candidates in routing table; skipping")
 		return
@@ -696,35 +709,26 @@ func (h *Host) InvalidateNetworkCaches() {
 }
 
 // selectNATProbeTargets returns up to n UDP addresses of routing-table peers
-// with public WAN IPv4 addresses. IPv6 addresses are excluded so that the v4
-// probe track sends its claimed v4 wire address only to v4 reachable peers.
-func (h *Host) selectNATProbeTargets(n int) []net.Addr {
-	all := h.node.BootstrapCandidateAddrs(n * 5)
+// that have a known public WAN address on the requested family. v6=false
+// selects IPv4 peers; v6=true selects IPv6 (GUA) peers. No cross-family
+// fallback: a peer whose only known address is on the other family is excluded.
+//
+// Uses FamilyStableAddr (family-strict, health-aware) rather than
+// BootstrapCandidateAddrs, because probe targets must match the claimed wire
+// address family — silently substituting the other family would send a v6
+// claimed address to a v4-only peer (or vice versa) and never receive an echo.
+func (h *Host) selectNATProbeTargets(n int, v6 bool) []net.Addr {
 	var out []net.Addr
-	for _, a := range all {
-		udp, ok := a.(*net.UDPAddr)
-		if !ok || udp.IP.To4() == nil || !isPlausibleWANIP(udp.IP) {
+	for _, id := range h.node.RoutingPeerIDs() {
+		addr, ok := h.node.FamilyStableAddr(id, v6)
+		if !ok {
 			continue
 		}
-		out = append(out, a)
-		if len(out) >= n {
-			break
-		}
-	}
-	return out
-}
-
-// selectNATProbeTargetsV6 returns up to n UDP addresses of routing-table peers
-// with public WAN IPv6 (GUA) addresses for the v6 probe track.
-func (h *Host) selectNATProbeTargetsV6(n int) []net.Addr {
-	all := h.node.BootstrapCandidateAddrs(n * 5)
-	var out []net.Addr
-	for _, a := range all {
-		udp, ok := a.(*net.UDPAddr)
-		if !ok || udp.IP.To4() != nil || !isPlausibleWANIP(udp.IP) {
+		udp, ok := addr.(*net.UDPAddr)
+		if !ok || !isPlausibleWANIP(udp.IP) {
 			continue
 		}
-		out = append(out, a)
+		out = append(out, addr)
 		if len(out) >= n {
 			break
 		}
@@ -750,7 +754,7 @@ func (h *Host) runMappingProbeV4(ctx context.Context) {
 	if h.sense.IsV4BindPublic() {
 		return // no NAT — port-consistency check is irrelevant
 	}
-	targets := h.selectNATProbeTargets(5)
+	targets := h.selectNATProbeTargets(5, false)
 	if len(targets) < 2 {
 		h.log.Debug("mapping probe v4: not enough targets", "found", len(targets))
 		return

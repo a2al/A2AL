@@ -2389,6 +2389,40 @@ func (n *Node) Address() a2al.Address { return n.addr }
 // NodeID returns the DHT key for this node.
 func (n *Node) NodeID() a2al.NodeID { return n.nid }
 
+// RoutingPeerIDs returns the NodeIDs of all peers currently in the routing
+// table. This is a topology enumeration — it carries no address or dial
+// decision. Callers that need a dial address for a specific family should
+// use FamilyStableAddr.
+func (n *Node) RoutingPeerIDs() []a2al.NodeID {
+	n.tabMu.RLock()
+	peers := n.table.AllPeers()
+	n.tabMu.RUnlock()
+	ids := make([]a2al.NodeID, 0, len(peers))
+	for _, ni := range peers {
+		if len(ni.NodeID) != len(n.nid) {
+			continue
+		}
+		var id a2al.NodeID
+		copy(id[:], ni.NodeID)
+		if id == n.nid {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+// FamilyStableAddr returns the known stable dial address for id restricted to
+// the requested address family, with no cross-family fallback. Returns false
+// when the requested family has no known address or is currently in back-off.
+//
+// This is the correct primitive for read-only consumers (NAT probe, passive
+// observe) that must not silently substitute the other family. For outbound
+// send decisions that may fall back across families, use outboundPlan instead.
+func (n *Node) FamilyStableAddr(id a2al.NodeID, v6 bool) (net.Addr, bool) {
+	return n.lookupFamilyHealthAware(id, v6)
+}
+
 // BootstrapCandidateAddrs returns up to max UDP addresses for cold-start bootstrap
 // (routing table + remembered peer addrs). Best-effort for persisting peers.cache.
 //
