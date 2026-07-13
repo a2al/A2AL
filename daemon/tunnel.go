@@ -32,7 +32,7 @@ type tunnelEntry struct {
 	openedAt  time.Time
 
 	// liveness tracking
-	lastActivity atomic.Int64 // unix nano; updated on each new TCP accept
+	lastActivity atomic.Int64 // unix nano; updated on each new TCP accept and when the last active conn closes
 	activeConns  atomic.Int32
 
 	// data-plane byte counters: cumulative totals across all bridge goroutines.
@@ -83,6 +83,14 @@ func (e *tunnelEntry) status() tunnelStatus {
 		s.LastProgressAt = time.Unix(0, ns)
 	}
 	return s
+}
+
+// connDone decrements activeConns and, when the last connection closes,
+// resets lastActivity so idle timeout counts from disconnect time.
+func (e *tunnelEntry) connDone() {
+	if e.activeConns.Add(-1) == 0 {
+		e.lastActivity.Store(time.Now().UnixNano())
+	}
 }
 
 // tunnelRegistry tracks all open tunnels for this daemon session.
@@ -299,7 +307,7 @@ func (d *Daemon) execTunnelOpen(ctx context.Context, remoteAidStr string, req tu
 			entry.activeConns.Add(1)
 
 			go func() {
-				defer entry.activeConns.Add(-1)
+				defer entry.connDone()
 				openCtx, openCancel := context.WithTimeout(tctx, 30*time.Second)
 				defer openCancel()
 				qs, err := qc.OpenStreamSync(openCtx)

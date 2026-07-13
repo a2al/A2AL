@@ -99,9 +99,21 @@ func (s *sessionInfo) snapshot() sessionSnapshot {
 }
 
 const (
-	maxGatewayConns    = 1024
-	maxStreamsPerConn   = 100
-	tcpBridgeDeadline  = 30 * time.Second
+	maxGatewayConns   = 1024
+	maxStreamsPerConn = 100
+	tcpBridgeDeadline = 30 * time.Second
+
+	// gatewayDHTFallbackMaxMsg caps a speculative DHT-message read on a
+	// stream that arrived on a connection with no service_tcp configured.
+	// Mirrors host's internal Mode B stream size cap (kept as a separate
+	// constant to avoid exporting a host-internal value across the package
+	// boundary).
+	gatewayDHTFallbackMaxMsg = 64 << 10 // 64 KiB
+
+	// gatewayDHTFallbackReadTimeout bounds how long a goroutine/stream is
+	// held open waiting for data before falling back to the original
+	// reject-and-close behavior. Sized to a generous DHT RPC round trip.
+	gatewayDHTFallbackReadTimeout = 3 * time.Second
 )
 
 func (d *Daemon) gatewayAcceptLoop(ctx context.Context) {
@@ -281,8 +293,45 @@ type peekStream struct {
 
 func (p *peekStream) Read(b []byte) (int, error) { return p.Reader.Read(b) }
 
+// tryHandleAsDHTFallback recovers a Mode B (DHT control-plane) stream that
+// was misrouted into the Mode A gateway — e.g. a punch-pool connection whose
+// accept-time classification missed the punchExpect window and fell through
+// to serveGatewayConn like an ordinary application connection. Since Mode A
+// and Mode B currently share one QUIC accept path (see host.Accept), a
+// stream carrying a signed DHT message can end up here instead of the
+// punch pool's read loop; without this fallback it is silently dropped,
+// which both spams "empty service_tcp" and starves the sender's pending RPC
+// into a timeout/retry loop.
+//
+// Returns true if the stream was consumed as a valid signed DHT message and
+// handed to the DHT node (via the same InjectReceived entry point used by
+// host's punch pool read loop). Returns false for anything else — including
+// oversized, malformed, or empty reads — leaving the caller to apply the
+// original reject-and-close semantics.
+func (d *Daemon) tryHandleAsDHTFallback(ac *host.AgentConn, str quic.Stream) bool {
+	n := d.h.Node()
+	if n == nil {
+		return false
+	}
+	_ = str.SetDeadline(time.Now().Add(gatewayDHTFallbackReadTimeout))
+	data, err := io.ReadAll(io.LimitReader(str, gatewayDHTFallbackMaxMsg))
+	if err != nil || len(data) == 0 {
+		return false
+	}
+	if _, err := protocol.VerifyAndDecode(data); err != nil {
+		return false
+	}
+	n.InjectReceived(data, ac.Connection.RemoteAddr())
+	_ = str.Close()
+	d.log.Debug("gateway: recovered misrouted dht stream", "local_aid", ac.Local.String(), "remote_aid", ac.Remote.String())
+	return true
+}
+
 func (d *Daemon) bridgeInboundStream(ac *host.AgentConn, str quic.Stream, serviceTCP string) {
 	if serviceTCP == "" {
+		if d.tryHandleAsDHTFallback(ac, str) {
+			return
+		}
 		d.log.Warn("gateway: empty service_tcp", "local_aid", ac.Local.String(), "remote_aid", ac.Remote.String())
 		_ = str.Close()
 		return

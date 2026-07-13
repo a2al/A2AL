@@ -65,7 +65,9 @@ func (d *Daemon) runNetworkMonitor(ctx context.Context) {
 // poll re-evaluates the current network topology from scratch, and immediately
 // triggers a cascade without waiting for the normal debounce window.
 func (d *Daemon) onSleepWakeDetected(ctx context.Context) {
-	// Mark peers as suspect immediately; QUIC paths are frozen during sleep.
+	// Mark connectivity suspect immediately: QUIC connections are frozen
+	// during sleep and peer health must not accumulate penalties before
+	// the first successful RPC confirms the network is back.
 	d.h.Node().SetOfflineSuspect(true)
 	d.netMu.Lock()
 	d.netStableFP = "" // force re-baseline on next pollNetworkFingerprint
@@ -82,7 +84,9 @@ func (d *Daemon) pollNetworkFingerprint() {
 		return
 	}
 
-	// No outbound route: mark suspect immediately to suppress health penalties.
+	// When no outbound IP route exists, peer failures are due to a local
+	// outage, not remote issues. Mark suspect immediately so recordFailure
+	// suppresses health penalties before the 45 s timer fires.
 	// Guarded: d.h is nil in unit tests that exercise only debounce logic.
 	if d.h != nil {
 		v4, v6 := daemonOutboundIP()
@@ -290,7 +294,10 @@ func (d *Daemon) tryConsumeNetChangeEvent() bool {
 func (d *Daemon) handleNetworkChangeCascade(ctx context.Context) {
 	start := d.now()
 
-	// ① Evict stale ICE/QUIC paths bound to the old interface/NAT mapping.
+	// ① Network topology changed: all ICE-negotiated Mode B QUIC paths are
+	//   bound to the old interface/NAT mapping and must be treated as invalid.
+	//   EvictAll makes HasConn=false immediately so subsequent RPCs fall back
+	//   to UDP or trigger re-punch without waiting for a timeout to expose it.
 	d.h.DHTpunchPool().EvictAll()
 
 	// ② Bootstrap recovery in background — must not consume the cascade budget.
@@ -304,6 +311,7 @@ func (d *Daemon) handleNetworkChangeCascade(ctx context.Context) {
 	d.h.InvalidateNetworkCaches()
 
 	// ④ Observe and NAT probe concurrently — no dependency between them.
+	//   Saves ~10 s vs the previous serial order (10 s + 20 s → max 20 s).
 	var observed int
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -321,7 +329,10 @@ func (d *Daemon) handleNetworkChangeCascade(ctx context.Context) {
 	}()
 	wg.Wait()
 
-	// ⑤ Force-publish to refresh endpoint record and hub URLs.
+	// ⑤ Force-publish unconditionally: the cached endpoint fingerprint may be
+	//   stale after a network change, and Signal hubs need time to reconnect.
+	//   forcePublishNodeOnce relaxes peer health throttles and gates on Signal
+	//   readiness so the published record includes live hub URLs.
 	d.forcePublishNodeOnce(ctx)
 
 	d.log.Info("network change handled",

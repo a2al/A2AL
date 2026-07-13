@@ -87,6 +87,41 @@ func TestTunnelRegistry_closeAll(t *testing.T) {
 	}
 }
 
+func TestTunnelEntry_connDone_resetsLastActivity(t *testing.T) {
+	e := &tunnelEntry{}
+	old := time.Now().Add(-2 * time.Hour).UnixNano()
+	e.lastActivity.Store(old)
+	e.activeConns.Store(1)
+
+	e.connDone()
+
+	if e.activeConns.Load() != 0 {
+		t.Fatal("activeConns should be 0")
+	}
+	if e.lastActivity.Load() <= old {
+		t.Fatal("lastActivity should be refreshed when last conn closes")
+	}
+	if time.Since(time.Unix(0, e.lastActivity.Load())) > time.Second {
+		t.Fatal("lastActivity should be recent")
+	}
+}
+
+func TestTunnelEntry_connDone_keepsLastActivityWithRemainingConns(t *testing.T) {
+	e := &tunnelEntry{}
+	old := time.Now().Add(-2 * time.Hour).UnixNano()
+	e.lastActivity.Store(old)
+	e.activeConns.Store(2)
+
+	e.connDone()
+
+	if e.activeConns.Load() != 1 {
+		t.Fatal("activeConns should be 1")
+	}
+	if e.lastActivity.Load() != old {
+		t.Fatal("lastActivity should not change while other conns remain")
+	}
+}
+
 func TestTunnelStatus_fields(t *testing.T) {
 	_, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
