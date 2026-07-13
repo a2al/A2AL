@@ -688,6 +688,11 @@ func (h *Host) InvalidateNetworkCaches() {
 	h.sense.ClearProbeResult()
 	h.sense.InvalidateObservations()
 	h.node.ClearReachabilityHints()
+	// Cached remote ICE hints (srflx pairs from past sessions) are bound to the
+	// old egress/NAT mapping. Unlike QUIC connections they have no liveness
+	// signal to self-heal on, so they are invalidated eagerly rather than
+	// probed. See peerICECache.Clear.
+	h.iceCache.Clear()
 }
 
 // selectNATProbeTargets returns up to n UDP addresses of routing-table peers

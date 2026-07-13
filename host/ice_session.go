@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -321,13 +322,22 @@ func fetchTURNRESTCredentials(ctx context.Context, apiURL, auth string) (usernam
 
 // hintToRemoteCandidate converts a peerICECache hint into a pion/ice remote
 // candidate that can be injected via agent.AddRemoteCandidate. Relay candidates
-// are never cached, so only host and server-reflexive types are handled.
+// are never cached, so only host, server-reflexive, and peer-reflexive types
+// are handled.
 func hintToRemoteCandidate(h iceHint) (ice.Candidate, error) {
-	ip := h.addr.IP.String()
-	port := h.addr.Port
-	switch h.candType {
+	return candidateFromAddrType(h.addr.IP.String(), h.addr.Port, h.candType)
+}
+
+func candidateFromAddrType(ip string, port int, typ ice.CandidateType) (ice.Candidate, error) {
+	switch typ {
 	case ice.CandidateTypeServerReflexive:
 		return ice.NewCandidateServerReflexive(&ice.CandidateServerReflexiveConfig{
+			Network: "udp",
+			Address: ip,
+			Port:    port,
+		})
+	case ice.CandidateTypePeerReflexive:
+		return ice.NewCandidatePeerReflexive(&ice.CandidatePeerReflexiveConfig{
 			Network: "udp",
 			Address: ip,
 			Port:    port,
@@ -589,7 +599,10 @@ var errChecklistExhausted = errors.New("a2al/host: ice checklist exhausted, no v
 // candidate pair and every pair has definitively reached CandidatePairStateFailed.
 // An empty checklist (still gathering, or no candidates at all) is not exhausted.
 func checklistExhausted(agent *ice.Agent) bool {
-	stats := agent.GetCandidatePairsStats()
+	return allPairsFailed(agent.GetCandidatePairsStats())
+}
+
+func allPairsFailed(stats []ice.CandidatePairStats) bool {
 	if len(stats) == 0 {
 		return false
 	}
@@ -599,6 +612,146 @@ func checklistExhausted(agent *ice.Agent) bool {
 		}
 	}
 	return true
+}
+
+func candidateStatsByID(agent *ice.Agent) map[string]ice.CandidateStats {
+	byID := make(map[string]ice.CandidateStats)
+	for _, s := range agent.GetLocalCandidatesStats() {
+		byID[s.ID] = s
+	}
+	for _, s := range agent.GetRemoteCandidatesStats() {
+		byID[s.ID] = s
+	}
+	return byID
+}
+
+// pairUsesIPv4 reports whether either endpoint of a checklist pair is IPv4.
+func pairUsesIPv4(localID, remoteID string, byID map[string]ice.CandidateStats) bool {
+	for _, id := range []string{localID, remoteID} {
+		st, ok := byID[id]
+		if !ok {
+			continue
+		}
+		ip := net.ParseIP(st.IP)
+		if ip != nil && ip.To4() != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// v4PairsExhausted is true when at least one IPv4-involving pair exists and
+// every such pair has reached CandidatePairStateFailed.
+func v4PairsExhausted(stats []ice.CandidatePairStats, byID map[string]ice.CandidateStats) bool {
+	foundV4 := false
+	for _, s := range stats {
+		if !pairUsesIPv4(s.LocalCandidateID, s.RemoteCandidateID, byID) {
+			continue
+		}
+		foundV4 = true
+		if s.State != ice.CandidatePairStateFailed {
+			return false
+		}
+	}
+	return foundV4
+}
+
+// hasNonFailedV6Pair reports whether any IPv6-only pair is still waiting or
+// in progress (not definitively failed).
+func hasNonFailedV6Pair(stats []ice.CandidatePairStats, byID map[string]ice.CandidateStats) bool {
+	for _, s := range stats {
+		if pairUsesIPv4(s.LocalCandidateID, s.RemoteCandidateID, byID) {
+			continue
+		}
+		if s.State != ice.CandidatePairStateFailed {
+			return true
+		}
+	}
+	return false
+}
+
+// hasUnpairedIPv6HostCandidate reports whether an IPv6 host candidate (ours
+// or the remote's) has been observed but has not yet formed any checklist
+// pair. Such a candidate may still pair up and succeed via a peer-reflexive
+// address shortly after, so its mere presence is reason to wait — unlike a v6
+// candidate whose only pair already reached CandidatePairStateFailed, which
+// has already had its chance.
+func hasUnpairedIPv6HostCandidate(stats []ice.CandidatePairStats, byID map[string]ice.CandidateStats) bool {
+	paired := make(map[string]struct{}, 2*len(stats))
+	for _, s := range stats {
+		paired[s.LocalCandidateID] = struct{}{}
+		paired[s.RemoteCandidateID] = struct{}{}
+	}
+	for id, st := range byID {
+		if st.CandidateType != ice.CandidateTypeHost {
+			continue
+		}
+		ip := net.ParseIP(st.IP)
+		if ip == nil || ip.To4() != nil {
+			continue
+		}
+		if _, ok := paired[id]; !ok {
+			return true
+		}
+	}
+	return false
+}
+
+// shouldDeferICEFastFail reports whether the fast-fail verdict should be
+// deferred because IPv6 connectivity may still pan out even though every
+// IPv4-involving pair has failed: a v6 pair may still be checking, a v6 host
+// candidate may not have paired yet, or the remote may not be done trickling
+// candidates. Deferral is capped by eocFallbackGrace (like the plain
+// checklist-exhausted wait it augments) so a genuinely dead v6 path cannot
+// reintroduce the idle wait completeICESession's fast-fail exists to avoid.
+func shouldDeferICEFastFail(agent *ice.Agent, elapsed time.Duration, remoteGatherDone bool) bool {
+	if agent == nil || elapsed > eocFallbackGrace {
+		return false
+	}
+	stats := agent.GetCandidatePairsStats()
+	byID := candidateStatsByID(agent)
+	if !v4PairsExhausted(stats, byID) {
+		return false
+	}
+	if hasNonFailedV6Pair(stats, byID) {
+		return true
+	}
+	if hasUnpairedIPv6HostCandidate(stats, byID) {
+		return true
+	}
+	return !remoteGatherDone
+}
+
+// salvageableRemoteCandidates returns remote peer-reflexive candidates from
+// succeeded checklist pairs. Only pairs that completed a successful connectivity
+// check are returned — InProgress/Failed observations are excluded.
+func salvageableRemoteCandidates(agent *ice.Agent) []ice.Candidate {
+	if agent == nil {
+		return nil
+	}
+	byID := candidateStatsByID(agent)
+	seen := make(map[string]struct{})
+	var out []ice.Candidate
+	for _, ps := range agent.GetCandidatePairsStats() {
+		if ps.State != ice.CandidatePairStateSucceeded {
+			continue
+		}
+		st, ok := byID[ps.RemoteCandidateID]
+		if !ok || st.CandidateType != ice.CandidateTypePeerReflexive {
+			continue
+		}
+		key := net.JoinHostPort(st.IP, strconv.Itoa(st.Port))
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		cand, err := candidateFromAddrType(st.IP, st.Port, st.CandidateType)
+		if err != nil {
+			continue
+		}
+		out = append(out, cand)
+	}
+	return out
 }
 
 // completeICESession calls agent.Dial (controlling) or agent.Accept (!controlling)
@@ -630,6 +783,9 @@ func completeICESession(ctx context.Context, sess *iceSession, controlling bool,
 			case <-dialCtx.Done():
 				return
 			case <-t.C:
+				if shouldDeferICEFastFail(sess.agent, time.Since(start), sess.remoteGatherDone()) {
+					continue
+				}
 				if !checklistExhausted(sess.agent) {
 					continue
 				}

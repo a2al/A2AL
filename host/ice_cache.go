@@ -50,6 +50,21 @@ func (c *peerICECache) init() {
 	c.hints = make(map[a2al.Address][]iceHint)
 }
 
+// Clear discards all cached remote ICE endpoint hints.
+//
+// Called on confirmed network topology changes (see Host.InvalidateNetworkCaches):
+// hints recorded before the change reflect the old local NAT mapping/egress
+// (e.g. a VPN-routed srflx pair) and are no longer reachable candidates on the
+// new path. Injecting them into a fresh ICE session would only poison the
+// checklist with dead pairs, so the cache is wiped wholesale rather than
+// pruned selectively — unlike a live QUIC connection, a hint has no self-heal
+// signal to wait on.
+func (c *peerICECache) Clear() {
+	c.mu.Lock()
+	c.hints = make(map[a2al.Address][]iceHint)
+	c.mu.Unlock()
+}
+
 // Hints returns the non-expired cached hints for the given remote AID.
 // The caller should inject each hint into the ICE agent as a remote candidate.
 func (c *peerICECache) Hints(remote a2al.Address) []iceHint {

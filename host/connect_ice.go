@@ -62,6 +62,20 @@ func (h *Host) recordICESession(remote a2al.Address, sess *iceSession) {
 	h.iceCache.Record(remote, pair.Remote, sess.snapshotRemoteCands())
 }
 
+// salvageICESession caches remote peer-reflexive endpoints from succeeded
+// checklist pairs after a failed session so the next dial to the same peer
+// can inject known-good hints without repeating full discovery.
+func (h *Host) salvageICESession(remote a2al.Address, sess *iceSession) {
+	if sess == nil || sess.agent == nil || remote == (a2al.Address{}) {
+		return
+	}
+	cands := salvageableRemoteCandidates(sess.agent)
+	if len(cands) == 0 {
+		return
+	}
+	h.iceCache.Record(remote, cands[0], cands[1:])
+}
+
 // connectViaICESignal is the controlling (caller) ICE path:
 // WebSocket signaling → ICE pair selection → QUIC over ICE → agent-route.
 //
@@ -240,6 +254,7 @@ func (h *Host) tryICEViaHub(ctx context.Context, localCert tls.Certificate, loca
 	// ICE goroutine: complete connectivity checks then dial QUIC over ICE.
 	go func() {
 		if iErr := completeICESession(raceCtx, sess, true, remoteCred); iErr != nil {
+			h.salvageICESession(expectRemote, sess)
 			ch <- connResult{pathEnd: true, err: iErr}
 			return
 		}
@@ -328,6 +343,7 @@ func (h *Host) tryICEViaHub(ctx context.Context, localCert tls.Certificate, loca
 	}
 
 	if winnerR == nil {
+		h.salvageICESession(expectRemote, sess)
 		h.log.Warn("ice+punch both failed", "local_aid", localAgent.String(), "remote_aid", expectRemote.String(), "hub", signalBase, "errs", errs)
 		joined := errors.Join(errs...)
 		if disableRelay && hasTURNURLs(iceURLs) {
@@ -462,6 +478,9 @@ func (h *Host) acceptICEToQUIC(ctx context.Context, wsURL string, cert tls.Certi
 	// ICE goroutine: complete controlled-side connectivity checks then accept QUIC.
 	go func() {
 		if iceErr := completeICESession(raceCtx, sess, false, remoteCred); iceErr != nil {
+			if expectRemote != zeroAddr {
+				h.salvageICESession(expectRemote, sess)
+			}
 			ch <- connResult{pathEnd: true, err: iceErr}
 			return
 		}
@@ -593,6 +612,9 @@ func (h *Host) acceptICEToQUIC(ctx context.Context, wsURL string, cert tls.Certi
 			go drainCh(2 - pathsDone)
 			return r.qc, r.peerUDP, r.isDirect, r.isRelayed, r.teardown, nil
 		}
+		if expectRemote != zeroAddr {
+			h.salvageICESession(expectRemote, sess)
+		}
 		return nil, nil, false, false, nil, errors.Join(errs...)
 	}
 
@@ -719,8 +741,14 @@ func (h *Host) acceptICEToQUIC(ctx context.Context, wsURL string, cert tls.Certi
 	}
 
 	if strmLaunched > 0 {
+		if expectRemote != zeroAddr {
+			h.salvageICESession(expectRemote, sess)
+		}
 		return nil, nil, false, false, nil, fmt.Errorf("a2al/host: all paths rejected control stream: %w",
 			errors.Join(strmErrs...))
+	}
+	if expectRemote != zeroAddr {
+		h.salvageICESession(expectRemote, sess)
 	}
 	return nil, nil, false, false, nil, errors.Join(pathErrs...)
 }
@@ -970,6 +998,7 @@ func (h *Host) tryICEForDHT(ctx context.Context, cert tls.Certificate, expectRem
 	// ICE goroutine.
 	go func() {
 		if iErr := completeICESession(raceCtx, sess, true, remoteCred); iErr != nil {
+			h.salvageICESession(expectRemote, sess)
 			ch <- dhtResult{pathEnd: true, err: iErr}
 			return
 		}
@@ -1039,6 +1068,7 @@ func (h *Host) tryICEForDHT(ctx context.Context, cert tls.Certificate, expectRem
 	}
 
 	if win == nil {
+		h.salvageICESession(expectRemote, sess)
 		return nil, nil, false, errors.Join(errs...)
 	}
 
