@@ -386,6 +386,16 @@ export async function renderDiscover(mount, ctx) {
   }
 
   /* ── Helpers ───────────────────────────────────────────── */
+  async function findOrOpenTunnel(remoteAid) {
+    const aidNorm = remoteAid.toLowerCase();
+    try {
+      const { tunnels = [] } = await api('/tunnel');
+      const existing = tunnels.find((t) => (t.remote_aid || '').toLowerCase() === aidNorm);
+      if (existing) return existing;
+    } catch (_) {}
+    return api(`/tunnel/${encodeURIComponent(remoteAid)}`, { method: 'POST', body: '{}' });
+  }
+
   function fmtEndpoints(ep) {
     if (ep == null) return '—';
     if (Array.isArray(ep)) return esc(ep.map(String).join(', ')) || '—';
@@ -748,12 +758,8 @@ export async function renderDiscover(mount, ctx) {
     const btn = ev.currentTarget;
     setLoading(btn, true);
     actionOut.innerHTML = `<p class="muted">${esc(t('common.loading'))}</p>`;
-    if (currentTunnelId) {
-      api(`/tunnel/${encodeURIComponent(currentTunnelId)}`, { method: 'DELETE' }).catch(() => {});
-      currentTunnelId = null;
-    }
     try {
-      const tr = await api(`/tunnel/${encodeURIComponent(currentAid)}`, { method: 'POST', body: '{}' });
+      const tr = await findOrOpenTunnel(currentAid);
       currentTunnelId = tr.id;
       const relayBadge = tr.is_relayed ? `<span class="badge b-yellow" style="font-size:.75rem">${esc(t('tunnel.relayed'))}</span>` : '';
       actionOut.innerHTML = `
@@ -1148,10 +1154,8 @@ export async function renderDiscover(mount, ctx) {
 
   async function setupFavTunnel(fav, panel, deactivateFavBtns) {
     panel.innerHTML = `<p class="muted" style="font-size:.87rem">${esc(t('common.loading'))}</p>`;
-    const prevId = favTunnels.get(fav.id);
-    if (prevId) { api(`/tunnel/${encodeURIComponent(prevId)}`, { method: 'DELETE' }).catch(() => {}); favTunnels.delete(fav.id); }
     try {
-      const tr = await api(`/tunnel/${encodeURIComponent(fav.aid)}`, { method: 'POST', body: '{}' });
+      const tr = await findOrOpenTunnel(fav.aid);
       favTunnels.set(fav.id, tr.id);
       const relayBadge = tr.is_relayed ? `<span class="badge b-yellow" style="font-size:.72rem">${esc(t('tunnel.relayed'))}</span>` : '';
       panel.innerHTML = `
