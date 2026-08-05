@@ -223,8 +223,13 @@ type Host struct {
 
 	upnpMu             sync.Mutex
 	upnpURL            string
+	upnpExtPort        int
+	upnpInternalPort   int
+	upnpInternalClient string
+	upnpRenewAfter     time.Time // zero = force renew/verify on next ensureUPnP
 	upnpCleanup        func()
 	upnpFailRetryAfter time.Time
+	upnpFailStreak     int // consecutive Map/discover failures; drives exponential backoff
 
 	extipMu   sync.Mutex
 	extipSnap string    // "ip:port" (STUN) or "ip" (HTTP); empty = not yet resolved
@@ -706,6 +711,14 @@ func (h *Host) InvalidateNetworkCaches() {
 	// signal to self-heal on, so they are invalidated eagerly rather than
 	// probed. See peerICECache.Clear.
 	h.iceCache.Clear()
+	// UPnP: do not DeletePortMapping here. Force the next ensureUPnP to renew
+	// (or rediscover) and clear failure backoff so topology changes get one
+	// immediate probe instead of waiting out a long no-gateway streak.
+	h.upnpMu.Lock()
+	h.upnpRenewAfter = time.Time{}
+	h.upnpFailStreak = 0
+	h.upnpFailRetryAfter = time.Time{}
+	h.upnpMu.Unlock()
 }
 
 // selectNATProbeTargets returns up to n UDP addresses of routing-table peers
@@ -865,7 +878,7 @@ func (h *Host) BuildEndpointPayload(ctx context.Context) (protocol.EndpointPaylo
 	// Inform the DHT node of our public IPv4 so it can detect NAT hairpin peers
 	// (nodes behind the same NAT share the same public IP).  IPv6 GUA nodes are
 	// directly reachable without hairpinning, so v6 hairpin detection is
-	// intentionally skipped. The v6 IP is stored separately for beacon self-identify.
+	// intentionally skipped. The v6 IP is stored separately for self-identification.
 	if ext != "" {
 		ipStr := ext
 		if host, _, err := net.SplitHostPort(ext); err == nil {
@@ -1080,6 +1093,28 @@ func (h *Host) SetDHTPushHandler(fn func(key a2al.NodeID, rec protocol.SignedRec
 
 const extipCacheTTL = 5 * time.Minute
 
+// UPnP discovery failure backoff (local to Host; not shared with peer-health).
+// delay = min(base<<streak, max): 1m, 2m, 4m, 8m, 15m…
+const (
+	upnpFailBackoffBase = 60 * time.Second
+	upnpFailBackoffMax  = 15 * time.Minute
+)
+
+func upnpFailDelay(streak int) time.Duration {
+	if streak < 0 {
+		streak = 0
+	}
+	d := upnpFailBackoffBase
+	for i := 0; i < streak && d < upnpFailBackoffMax; i++ {
+		next := d * 2
+		if next > upnpFailBackoffMax || next < d {
+			return upnpFailBackoffMax
+		}
+		d = next
+	}
+	return d
+}
+
 // ensureExternalIP returns a cached or freshly probed external IP string.
 // It first tries STUN (returns "ip:port") then HTTP services (returns "ip").
 // Returns "" if both fail.
@@ -1156,6 +1191,10 @@ func (h *Host) ensureExternalIPv6(ctx context.Context) string {
 // ensureUPnP attempts IGD port mapping via UPnP. Returns the mapped quic:// URL,
 // or empty when UPnP is disabled or unavailable.
 //
+// Mappings are treated as leased session state: cached while before upnpRenewAfter,
+// then renewed in place (same external port) so WAN IP changes are picked up without
+// blindly deleting router entries. InvalidateNetworkCaches forces the renew path.
+//
 // IPv6 note: UPnP IGD is an IPv4 NAT mechanism. Nodes with a global IPv6 address
 // are directly reachable and do not need port mapping — this function is skipped
 // implicitly because their public IP is collected via natsense/STUN instead.
@@ -1163,41 +1202,145 @@ func (h *Host) ensureUPnP(ctx context.Context) string {
 	if h.cfg.DisableUPnP {
 		return ""
 	}
-	h.upnpMu.Lock()
-	if h.upnpURL != "" {
-		u := h.upnpURL
-		h.upnpMu.Unlock()
+
+	now := time.Now()
+	if u, ok := h.upnpCached(now); ok {
 		return u
 	}
-	if time.Now().Before(h.upnpFailRetryAfter) {
-		h.upnpMu.Unlock()
+	if h.upnpInFailBackoff(now) {
 		return ""
 	}
-	h.upnpMu.Unlock()
 
 	lan := natmap.LocalIPv4ForUPnP()
 	if lan == "" {
 		h.upnpMu.Lock()
-		h.upnpFailRetryAfter = time.Now().Add(60 * time.Second)
+		delay := h.noteUPnPFailLocked()
 		h.upnpMu.Unlock()
+		h.log.Debug("upnp: no lan for mapping", "backoff", delay)
 		return ""
 	}
+
+	// Renew existing session mapping when possible (same LAN client + ports).
+	if u, ok := h.tryRenewUPnP(ctx, lan, now); ok {
+		return u
+	}
+
 	port := h.QUICLocalAddr().Port
-	extIP, extPort, cleanup, err := natmap.MapUDPPort(ctx, port, lan)
+	m, err := natmap.MapUDPPort(ctx, port, lan)
 
 	h.upnpMu.Lock()
 	defer h.upnpMu.Unlock()
 	if err != nil {
-		h.upnpFailRetryAfter = time.Now().Add(60 * time.Second)
+		delay := h.noteUPnPFailLocked()
+		h.log.Debug("upnp: map failed", "err", err, "backoff", delay, "streak", h.upnpFailStreak)
 		return ""
 	}
 	if h.upnpURL != "" {
-		cleanup()
+		// Another goroutine won the race; keep theirs, release ours safely.
+		m.Cleanup()
 		return h.upnpURL
 	}
-	h.upnpCleanup = cleanup
-	h.upnpURL = natmap.QUICURL(extIP, extPort)
+	h.upnpURL = natmap.QUICURL(m.ExternalIP, m.ExternalPort)
+	h.upnpExtPort = m.ExternalPort
+	h.upnpInternalPort = m.InternalPort
+	h.upnpInternalClient = m.InternalClient
+	h.upnpRenewAfter = time.Now().Add(m.Lease / 2)
+	h.upnpCleanup = m.Cleanup
+	h.clearUPnPFailLocked()
 	return h.upnpURL
+}
+
+func (h *Host) upnpCached(now time.Time) (string, bool) {
+	h.upnpMu.Lock()
+	defer h.upnpMu.Unlock()
+	if h.upnpURL != "" && !h.upnpRenewAfter.IsZero() && now.Before(h.upnpRenewAfter) {
+		return h.upnpURL, true
+	}
+	return "", false
+}
+
+func (h *Host) upnpInFailBackoff(now time.Time) bool {
+	h.upnpMu.Lock()
+	defer h.upnpMu.Unlock()
+	return h.upnpURL == "" && now.Before(h.upnpFailRetryAfter)
+}
+
+// tryRenewUPnP renews the in-session mapping. Returns ("", false) when remap is needed.
+func (h *Host) tryRenewUPnP(ctx context.Context, lan string, now time.Time) (string, bool) {
+	h.upnpMu.Lock()
+	url := h.upnpURL
+	extPort := h.upnpExtPort
+	internalPort := h.upnpInternalPort
+	internalClient := h.upnpInternalClient
+	h.upnpMu.Unlock()
+
+	if url == "" {
+		return "", false
+	}
+	if extPort <= 0 || internalPort <= 0 || internalClient == "" {
+		h.clearUPnP(true)
+		return "", false
+	}
+	if lan != internalClient {
+		h.log.Debug("upnp: lan client changed, remapping", "was", internalClient, "now", lan)
+		h.clearUPnP(true)
+		return "", false
+	}
+
+	// Double-check: another goroutine may have renewed while we waited.
+	if u, ok := h.upnpCached(now); ok {
+		return u, true
+	}
+
+	extIP, lease, err := natmap.RenewUDPPort(ctx, extPort, internalPort, internalClient)
+	if err != nil {
+		h.log.Debug("upnp: renew failed, remapping", "ext_port", extPort, "err", err)
+		h.clearUPnP(true)
+		return "", false
+	}
+
+	h.upnpMu.Lock()
+	defer h.upnpMu.Unlock()
+	if h.upnpURL != "" && !h.upnpRenewAfter.IsZero() && time.Now().Before(h.upnpRenewAfter) {
+		return h.upnpURL, true
+	}
+	h.upnpURL = natmap.QUICURL(extIP, extPort)
+	h.upnpRenewAfter = time.Now().Add(lease / 2)
+	h.clearUPnPFailLocked()
+	return h.upnpURL, true
+}
+
+// noteUPnPFailLocked records a discovery/map failure and returns the backoff applied.
+// Caller must hold upnpMu.
+func (h *Host) noteUPnPFailLocked() time.Duration {
+	delay := upnpFailDelay(h.upnpFailStreak)
+	h.upnpFailStreak++
+	h.upnpFailRetryAfter = time.Now().Add(delay)
+	return delay
+}
+
+// clearUPnPFailLocked resets failure backoff after a successful Map/Renew.
+// Caller must hold upnpMu.
+func (h *Host) clearUPnPFailLocked() {
+	h.upnpFailStreak = 0
+	h.upnpFailRetryAfter = time.Time{}
+}
+
+// clearUPnP releases session UPnP state. When callCleanup is true the
+// verify-before-delete cleanup runs outside the lock.
+func (h *Host) clearUPnP(callCleanup bool) {
+	h.upnpMu.Lock()
+	cleanup := h.upnpCleanup
+	h.upnpCleanup = nil
+	h.upnpURL = ""
+	h.upnpExtPort = 0
+	h.upnpInternalPort = 0
+	h.upnpInternalClient = ""
+	h.upnpRenewAfter = time.Time{}
+	h.upnpMu.Unlock()
+	if callCleanup && cleanup != nil {
+		cleanup()
+	}
 }
 
 // SymmetricNATReachabilityHint returns a user-facing note when NAT looks symmetric.
@@ -1604,12 +1747,8 @@ func (h *Host) StartDebugHTTP(addr string) (stop func(), err error) {
 }
 
 func (h *Host) Close() error {
+	h.clearUPnP(true)
 	h.upnpMu.Lock()
-	if h.upnpCleanup != nil {
-		h.upnpCleanup()
-		h.upnpCleanup = nil
-	}
-	h.upnpURL = ""
 	h.upnpFailRetryAfter = time.Time{}
 	h.upnpMu.Unlock()
 
