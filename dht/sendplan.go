@@ -36,6 +36,13 @@ type deliverMeta struct {
 	viaQUIC  bool
 	dialAddr net.Addr
 	reason   string // outboundPlan reason; attached to RPC failure logs for troubleshooting
+
+	// senderAddr is the responder's cryptographically-verified Address, set by
+	// RPC wrappers (e.g. StoreAt) from dec.SenderAddr on success. NodeID is a
+	// one-way hash of Address (a2al.NodeIDFromAddress), so once a caller only
+	// has NodeID, Address cannot be recovered — it must be threaded through
+	// here at the point of decode, not reconstructed later.
+	senderAddr a2al.Address
 }
 
 // preferredFamilyIsV6 derives the target address family from addrHint, then

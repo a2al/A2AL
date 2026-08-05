@@ -623,17 +623,35 @@ func (n *Node) storeAndRecord(ctx context.Context, peers []protocol.NodeInfo, rk
 		// Every successful STORE is evidence of reachability; absorbing it here
 		// ensures the routing table reflects our actual communication outcomes
 		// (§4.4: every DHT interaction refreshes the routing table).
-		var tabNI protocol.NodeInfo
-		tabNI.NodeID = append([]byte(nil), id[:]...)
-		if ua, ok := addr.(*net.UDPAddr); ok {
-			if ip4 := ua.IP.To4(); ip4 != nil {
-				tabNI.IP = append([]byte(nil), ip4...)
-			} else {
-				tabNI.IP = append([]byte(nil), ua.IP.To16()...)
+		//
+		// Only done for raw-UDP successes. When the STORE went via Mode B QUIC
+		// (meta.viaQUIC), addr is merely the pre-send hint — never actually
+		// dialled — so it is not valid UDP reachability evidence (same hazard
+		// M6 already guards against for inbound QUIC addresses in remember(),
+		// dht/inbound_learn.go). Fresh admission for QUIC-reached peers is
+		// already handled by OnPunchComplete with a fully-populated NodeInfo
+		// (NodeID + Address + ICE-verified IP); StoreAt success over an
+		// existing Mode B connection needs no additional table write here.
+		if !meta.viaQUIC {
+			var tabNI protocol.NodeInfo
+			tabNI.NodeID = append([]byte(nil), id[:]...)
+			// Address is the peer's cryptographically-verified identity from
+			// this same RPC response (meta.senderAddr, set by StoreAt from
+			// dec.SenderAddr). Required by protocol.nodeInfoCheck for this
+			// entry to ever be propagated via FIND_NODE/FIND_VALUE; omitting
+			// it silently poisons the bucket with an entry that fails wire
+			// validation the next time this node replies to a peer.
+			tabNI.Address = append([]byte(nil), meta.senderAddr[:]...)
+			if ua, ok := addr.(*net.UDPAddr); ok {
+				if ip4 := ua.IP.To4(); ip4 != nil {
+					tabNI.IP = append([]byte(nil), ip4...)
+				} else {
+					tabNI.IP = append([]byte(nil), ua.IP.To16()...)
+				}
+				tabNI.Port = uint16(ua.Port)
 			}
-			tabNI.Port = uint16(ua.Port)
+			n.tabAdd(tabNI, routing.EntryMeta{VerifiedAt: time.Now()}, addr)
 		}
-		n.tabAdd(tabNI, routing.EntryMeta{VerifiedAt: time.Now()}, addr)
 	}
 }
 

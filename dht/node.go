@@ -173,7 +173,7 @@ const offlineSuspectThreshold = 45 * time.Second
 // familyHealth tracks reachability statistics for a single IP family (v4 or v6).
 type familyHealth struct {
 	failCount        int           // consecutive failures; reset to 0 on success
-	pendingFailCount int           // failures held during suspected outage; settled or discarded by recordSuccess
+	pendingFailCount int           // failures not yet applied: flushed into failCount on the next success (network was up), or discarded when suspectOffline is confirmed (network was down)
 	rtt              time.Duration // last successful RTT
 	nextRetryAt      time.Time     // exponential backoff expiry; zero = contact freely
 	lastSuccess      time.Time     // most recent success on this family; zero = never
@@ -284,12 +284,16 @@ type Node struct {
 
 	// correlatedFailMu guards correlatedFail* fields.
 	correlatedFailMu sync.Mutex
-	// correlatedFailPeers tracks distinct peers that failed within the current window.
-	// A set (not a counter) prevents one misbehaving peer from inflating the count.
-	// Cleared on any success.
+	// correlatedFailPeers is the set of distinct peer keys that have failed
+	// within the current correlatedFailWindow. Using a set (not a counter)
+	// prevents a single misbehaving peer from counting multiple times and
+	// triggering a false outage signal. When len reaches
+	// correlatedFailThreshold, SetOfflineSuspect(true) is called.
+	// Reset to nil on any success.
 	correlatedFailPeers map[string]struct{}
-	// correlatedFailWindowStart is the start of the current counting window.
-	// Resets when the threshold is reached or the window expires.
+	// correlatedFailWindowStart is the beginning of the current counting window.
+	// The window resets when the threshold is reached or when more than
+	// correlatedFailWindow has elapsed since the first failure in the window.
 	correlatedFailWindowStart time.Time
 
 	// NAT probe: SendNATProbeReq registers a token → notify channel here;
@@ -940,15 +944,18 @@ func nodeInfoWithUDPAddr(ni protocol.NodeInfo, addr *net.UDPAddr) protocol.NodeI
 // family's failCount, clears its backoff, and updates RTT.
 // Also refreshes the routing table VerifiedAt timestamp.
 //
-// recordSuccess marks the peer's address family as healthy: resets that
-// family's failCount, clears its backoff, and updates RTT.
-// Also refreshes the routing table VerifiedAt timestamp.
-// On confirmed outage (suspectOffline), clears all pending failures globally.
+// Retrospective-penalty settlement (per-peer self-settlement model):
+//   - Each peer clears its own pending on its own success — "X succeeded"
+//     only proves X was reachable, not that other failing peers were at fault.
+//   - When suspectOffline is true (confirmed outage), discard ALL pending
+//     globally: no peer should be penalised for a local network outage.
+//   - Genuine bad peers self-heal only when they individually succeed; they
+//     cannot hide behind an unrelated peer's success.
 func (n *Node) recordSuccess(id a2al.NodeID, addr net.Addr, rtt time.Duration) {
 	key := nodeIDKey(id)
 	now := time.Now()
-	// Read suspectOffline before updating lastAnySuccessAt/localOutageSuspect
-	// so it reflects the state that produced any pending failures.
+	// suspectOffline must be read BEFORE updating lastAnySuccessAt / localOutageSuspect,
+	// so it reflects the state during the period that accumulated pending failures.
 	wasSuspect := n.suspectOffline()
 	if wasSuspect {
 		select {
@@ -963,7 +970,11 @@ func (n *Node) recordSuccess(id a2al.NodeID, addr net.Addr, rtt time.Duration) {
 	n.correlatedFailMu.Unlock()
 	n.healthMu.Lock()
 
-	// Confirmed outage: discard all pending and reset backoff globally.
+	// Confirmed outage: discard all pending globally so no peer carries debt
+	// for failures that occurred while the local network was down.
+	// Also clear nextRetryAt so PeerAllowContact is immediately consistent
+	// with PeerHealthOf returning to Unknown/Good — same behaviour as
+	// SetOfflineSuspect(true) for daemon-signalled outages.
 	if wasSuspect {
 		for _, pe := range n.health {
 			pe.v4.pendingFailCount = 0
@@ -972,7 +983,8 @@ func (n *Node) recordSuccess(id a2al.NodeID, addr net.Addr, rtt time.Duration) {
 			pe.v6.nextRetryAt = time.Time{}
 		}
 	}
-	// Non-suspect path: each peer settles its own pending on its own success.
+	// Non-suspect path: do NOT flush other peers' pending into failCount.
+	// Each peer settles its own debt below when its own fh is updated.
 
 	e := n.health[key]
 	if e == nil {
@@ -1572,7 +1584,7 @@ func (n *Node) SetSelfExtIP(ip net.IP) {
 // SetSelfExtIPv6 records our own public IPv6 GUA (from STUN/HTTP probe).
 // Unlike the v4 counterpart this is not used for hairpin detection (v6 GUA
 // nodes are directly reachable); it is used to self-identify when the node's
-// v6 address appears in the well-known DNS list.
+// self-identify when the node's v6 address appears in the well-known DNS list.
 func (n *Node) SetSelfExtIPv6(ip net.IP) {
 	n.selfExtMu.Lock()
 	n.selfExtIPv6 = ip
@@ -2261,6 +2273,7 @@ func (n *Node) StoreAt(ctx context.Context, peer net.Addr, storeKey a2al.NodeID,
 		return false, a2al.NodeID{}, meta, protocol.StoreReasonOK, err
 	}
 	peerNID := a2al.NodeIDFromAddress(dec.SenderAddr)
+	meta.senderAddr = dec.SenderAddr
 	dial := successDialAddr(peer, meta)
 	n.recordSuccess(peerNID, dial, time.Since(t0))
 	n.rememberStoreSuccess(peerNID, dial)
