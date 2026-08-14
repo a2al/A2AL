@@ -45,6 +45,12 @@ type deliverMeta struct {
 	senderAddr a2al.Address
 }
 
+// DialAddr is the UDP address actually used for the last deliver attempt.
+func (m deliverMeta) DialAddr() net.Addr { return m.dialAddr }
+
+// Reason is the outbound plan reason (e.g. l0_explicit_hint, l0_public_anchor).
+func (m deliverMeta) Reason() string { return m.reason }
+
 // preferredFamilyIsV6 derives the target address family from addrHint, then
 // lookupPeerHealthAware, defaulting to v4 (same priority as L0).
 func (n *Node) preferredFamilyIsV6(peerID a2al.NodeID, addrHint net.Addr) bool {
@@ -110,6 +116,25 @@ func (n *Node) deliver(ctx context.Context, peerID a2al.NodeID, addrHint net.Add
 
 	if peerID == (a2al.NodeID{}) {
 		meta.dialAddr = addrHint
+		return meta, n.sendToOrFallbackLegacy(ctx, addrHint, raw)
+	}
+
+	// Data-plane QUIC, if live, still wins over any UDP memory/hint.
+	if n.learnedPathFirst.Load() && n.punch != nil && n.punch.HasConn(peerID) {
+		meta.viaQUIC = true
+		meta.reason = "has_conn"
+		sent, err := n.punch.SendTo(ctx, peerID, raw)
+		if sent {
+			return meta, err
+		}
+		meta.viaQUIC = false
+	}
+
+	// Send: caller already chose a concrete control-plane address. Do not
+	// re-Select onto a stale Anchor (beacon/bootstrap IP change).
+	if n.usableExplicitHint(peerID, addrHint) {
+		meta.dialAddr = addrHint
+		meta.reason = "l0_explicit_hint"
 		return meta, n.sendToOrFallbackLegacy(ctx, addrHint, raw)
 	}
 
@@ -248,6 +273,9 @@ func (n *Node) logDeliverPlanIfChanged(peerID a2al.NodeID, plan sendPlan, addrHi
 }
 
 func (n *Node) legacyDialAddr(peerID a2al.NodeID, addrHint net.Addr) net.Addr {
+	if n.usableExplicitHint(peerID, addrHint) {
+		return addrHint
+	}
 	if addr, ok := n.lookupPeerHealthAware(peerID); ok {
 		return addr
 	}
@@ -258,6 +286,39 @@ func (n *Node) legacyDialAddr(peerID a2al.NodeID, addrHint net.Addr) net.Addr {
 		return addr
 	}
 	return nil
+}
+
+// usableExplicitHint reports whether addrHint is a caller-chosen control-plane
+// dial target that must not be replaced by remembered Anchor/live.
+func (n *Node) usableExplicitHint(peerID a2al.NodeID, hint net.Addr) bool {
+	if hint == nil {
+		return false
+	}
+	udp, ok := hint.(*net.UDPAddr)
+	if !ok || udp.Port == 0 {
+		return false
+	}
+	if n.isUnusableControlPlaneReachAddr(hint) {
+		return false
+	}
+	n.peerMu.Lock()
+	pa := n.peers[nodeIDKey(peerID)]
+	n.peerMu.Unlock()
+	if pa != nil {
+		fa := pa.familyFor(udp)
+		if fa.ephemeral != nil && addrsEqual(fa.ephemeral, udp) &&
+			!fa.ephemeralAt.IsZero() && time.Since(fa.ephemeralAt) < peerAddrEphemeralTTL {
+			return false
+		}
+	}
+	return true
+}
+
+func addrsEqual(a, b *net.UDPAddr) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.Port == b.Port && a.IP.Equal(b.IP) && a.Zone == b.Zone
 }
 
 // sendToOrFallbackLegacy is the legacy blind-send path. It preserves

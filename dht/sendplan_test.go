@@ -525,3 +525,56 @@ func TestDeliverPathLabel(t *testing.T) {
 		t.Fatalf("got %q", got)
 	}
 }
+
+func TestDeliverExplicitHintBeatsStaleAnchor(t *testing.T) {
+	n := newHealthTestNode(t)
+	n.SetLearnedPathFirst(true)
+
+	var peerID a2al.NodeID
+	peerID[0] = 0xB1
+	old := addrV4(4121)
+	fresh := &net.UDPAddr{IP: net.IPv4(35, 200, 71, 159), Port: 4121}
+	n.BindPeerAnchor(peerID, old)
+
+	meta, _ := n.deliver(context.Background(), peerID, fresh, []byte("x"))
+	if meta.reason != "l0_explicit_hint" {
+		t.Fatalf("reason = %q, want l0_explicit_hint", meta.reason)
+	}
+	if meta.dialAddr == nil || meta.dialAddr.String() != fresh.String() {
+		t.Fatalf("dialAddr = %v, want hint %v", meta.dialAddr, fresh)
+	}
+}
+
+func TestLegacyDialAddrExplicitHintBeatsAnchor(t *testing.T) {
+	n := newHealthTestNode(t)
+	n.SetLearnedPathFirst(false)
+
+	var peerID a2al.NodeID
+	peerID[0] = 0xB2
+	old := addrV4(4121)
+	fresh := &net.UDPAddr{IP: net.IPv4(35, 200, 71, 159), Port: 4121}
+	n.BindPeerAnchor(peerID, old)
+
+	got := n.legacyDialAddr(peerID, fresh)
+	if got == nil || got.String() != fresh.String() {
+		t.Fatalf("legacyDialAddr = %v, want hint %v", got, fresh)
+	}
+}
+
+func TestUsableExplicitHintRejectsEphemeral(t *testing.T) {
+	n := newHealthTestNode(t)
+	var peerID a2al.NodeID
+	peerID[0] = 0xB3
+	eph := addrV4(65000)
+	n.peerMu.Lock()
+	n.peers[nodeIDKey(peerID)] = &peerAddrs{}
+	n.peers[nodeIDKey(peerID)].v4.tryEphemeral(eph)
+	n.peerMu.Unlock()
+
+	if n.usableExplicitHint(peerID, eph) {
+		t.Fatal("ephemeral punch port must not count as explicit hint")
+	}
+	if !n.usableExplicitHint(peerID, addrV4(4121)) {
+		t.Fatal("stable UDP hint should be usable")
+	}
+}
