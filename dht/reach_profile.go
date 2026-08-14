@@ -95,22 +95,23 @@ func (n *Node) advertisedStableAddr(id a2al.NodeID, v6 bool) *net.UDPAddr {
 
 // publicStableDialAddr returns the best UDP anchor for a public-capable peer on
 // the requested family. Used by outbound/probe paths that must not fall back to
-// stale live/ephemeral ports when an anchor exists.
+// stale live/ephemeral ports when an anchor exists. A family in health back-off
+// is skipped so a dead Anchor cannot keep winning.
 func (n *Node) publicStableDialAddr(id a2al.NodeID, v6 bool) net.Addr {
 	n.peerMu.Lock()
 	pa := n.peers[nodeIDKey(id)]
 	n.peerMu.Unlock()
 	if pa != nil {
-		if v6 && pa.v6.anchor != nil {
+		if v6 && pa.v6.anchor != nil && n.familyContactOK(id, true) {
 			return pa.v6.anchor
 		}
-		if !v6 && pa.v4.anchor != nil {
+		if !v6 && pa.v4.anchor != nil && n.familyContactOK(id, false) {
 			return pa.v4.anchor
 		}
-		if !v6 && pa.v6.anchor != nil {
+		if !v6 && pa.v6.anchor != nil && n.familyContactOK(id, true) {
 			return pa.v6.anchor
 		}
-		if v6 && pa.v4.anchor != nil {
+		if v6 && pa.v4.anchor != nil && n.familyContactOK(id, false) {
 			return pa.v4.anchor
 		}
 	}

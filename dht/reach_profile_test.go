@@ -124,6 +124,39 @@ func TestPublicStableDialAddr_PrefersAnchorOverLive(t *testing.T) {
 	}
 }
 
+func TestLookupPeerHealthAwarePrefersFreshLive(t *testing.T) {
+	n := newHealthTestNode(t)
+	var peerID a2al.NodeID
+	peerID[0] = 0x44
+
+	anchor := addrV4(4121)
+	live := addrV4(55201)
+	n.BindPeerAnchor(peerID, anchor)
+	n.BindPeerAddr(peerID, live)
+
+	got, ok := n.lookupPeerHealthAware(peerID)
+	if !ok || got.String() != live.String() {
+		t.Fatalf("lookupPeerHealthAware = %v ok=%v, want fresh live %v", got, ok, live)
+	}
+}
+
+func TestPublicStableDialAddrSkipsBackoffFamily(t *testing.T) {
+	n := newHealthTestNode(t)
+	var peerID a2al.NodeID
+	peerID[0] = 0x45
+
+	anchor := addrV4(4121)
+	n.BindPeerAnchor(peerID, anchor)
+	for i := 0; i < badHealthThreshold; i++ {
+		n.recordFailure(peerID, anchor)
+	}
+
+	got := n.publicStableDialAddr(peerID, false)
+	if got != nil && got.String() == anchor.String() {
+		t.Fatalf("publicStableDialAddr returned backoff anchor %v", got)
+	}
+}
+
 func TestReachProfile_UnknownWithoutEvidence(t *testing.T) {
 	n := newHealthTestNode(t)
 	var peerID [32]byte

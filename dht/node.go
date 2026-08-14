@@ -550,20 +550,12 @@ func (n *Node) lookupPeer(id a2al.NodeID) (net.Addr, bool) {
 	return a, a != nil
 }
 
-// lookupPeerHealthAware returns the best dial address for id that is not
-// currently in back-off, selecting between v4 and v6 based on health state.
+// lookupPeerHealthAware returns the best control-plane dial address for id that
+// is not currently in back-off, selecting between v4 and v6 based on health.
 //
-// Unlike lookupPeer (which blindly prefers v4 anchor/live), this function skips a
-// family whose back-off window has not expired and tries the other family
-// instead.  Specifically:
-//   - If v4 anchor or live is known and its back-off has expired (or it was never
-//     used), return that address.
-//   - Else if v6 anchor or live is known and its back-off has expired (or it was
-//     never used), return that address.
-//   - If all known addresses are in back-off, return nil, false.
-//
-// An "unused" family (everUsed=false) counts as back-off expired — it means
-// we have no history for that path and should try it freely.
+// Address order follows preferredStable (fresh verified live > Anchor > stale
+// live). A family whose back-off window has not expired is skipped. Unused
+// families (everUsed=false) are treated as freely contactable.
 //
 // ephemeral (hole-punch) addresses are not considered here; they are handled
 // by the ICE punch path, not the replication store path.
@@ -583,11 +575,11 @@ func (n *Node) lookupPeerHealthAware(id a2al.NodeID) (net.Addr, bool) {
 	v4ok := e == nil || !e.v4.everUsed || e.v4.nextRetryAt.IsZero() || now.After(e.v4.nextRetryAt)
 	v6ok := e == nil || !e.v6.everUsed || e.v6.nextRetryAt.IsZero() || now.After(e.v6.nextRetryAt)
 
-	if pa.v4.bestStable() != nil && v4ok {
-		return pa.v4.bestStable(), true
+	if a := pa.v4.preferredStable(); a != nil && v4ok {
+		return a, true
 	}
-	if pa.v6.bestStable() != nil && v6ok {
-		return pa.v6.bestStable(), true
+	if a := pa.v6.preferredStable(); a != nil && v6ok {
+		return a, true
 	}
 	return nil, false
 }
@@ -609,16 +601,32 @@ func (n *Node) lookupFamilyHealthAware(id a2al.NodeID, v6 bool) (net.Addr, bool)
 	now := time.Now()
 	if v6 {
 		ok := e == nil || !e.v6.everUsed || e.v6.nextRetryAt.IsZero() || now.After(e.v6.nextRetryAt)
-		if pa.v6.bestStable() != nil && ok {
-			return pa.v6.bestStable(), true
+		if a := pa.v6.preferredStable(); a != nil && ok {
+			return a, true
 		}
 	} else {
 		ok := e == nil || !e.v4.everUsed || e.v4.nextRetryAt.IsZero() || now.After(e.v4.nextRetryAt)
-		if pa.v4.bestStable() != nil && ok {
-			return pa.v4.bestStable(), true
+		if a := pa.v4.preferredStable(); a != nil && ok {
+			return a, true
 		}
 	}
 	return nil, false
+}
+
+// familyContactOK reports whether the given address family is outside its
+// health back-off window (or has never been used).
+func (n *Node) familyContactOK(id a2al.NodeID, v6 bool) bool {
+	n.healthMu.RLock()
+	e := n.health[nodeIDKey(id)]
+	n.healthMu.RUnlock()
+	if e == nil {
+		return true
+	}
+	fh := &e.v4
+	if v6 {
+		fh = &e.v6
+	}
+	return !fh.everUsed || fh.nextRetryAt.IsZero() || time.Now().After(fh.nextRetryAt)
 }
 
 // rememberLiveRank infers Live-slot rank from a stored endpoint declaration.

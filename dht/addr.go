@@ -89,7 +89,18 @@ func (fa *familyAddrs) tryEphemeral(addr *net.UDPAddr) {
 //  3. Stale live           – hearsay or expired-verified; still better than nothing.
 //  4. Ephemeral            – hole-punch address within peerAddrEphemeralTTL.
 func (fa *familyAddrs) preferred() *net.UDPAddr {
-	// Fresh verified live takes priority over anchor.
+	if a := fa.preferredStable(); a != nil {
+		return a
+	}
+	if fa.ephemeral != nil && time.Since(fa.ephemeralAt) < peerAddrEphemeralTTL {
+		return fa.ephemeral
+	}
+	return nil
+}
+
+// preferredStable is preferred() without the ephemeral slot. Control-plane
+// Select (query/replication) must not treat ICE punch ports as a stable dial.
+func (fa *familyAddrs) preferredStable() *net.UDPAddr {
 	if fa.live != nil && fa.liveRank >= rankVerified && !fa.liveAt.IsZero() &&
 		time.Since(fa.liveAt) < liveVerifiedFreshWindow {
 		return fa.live
@@ -99,9 +110,6 @@ func (fa *familyAddrs) preferred() *net.UDPAddr {
 	}
 	if fa.live != nil {
 		return fa.live
-	}
-	if fa.ephemeral != nil && time.Since(fa.ephemeralAt) < peerAddrEphemeralTTL {
-		return fa.ephemeral
 	}
 	return nil
 }
