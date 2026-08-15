@@ -1412,6 +1412,17 @@ func (h *Host) Resolve(ctx context.Context, target a2al.Address) (*protocol.Endp
 	return q.Resolve(ctx, a2al.NodeIDFromAddress(target))
 }
 
+// ResolveNetwork is Resolve without the local-store fast path.
+func (h *Host) ResolveNetwork(ctx context.Context, target a2al.Address) (*protocol.EndpointRecord, error) {
+	er, _, err := h.resolveNetwork(ctx, target)
+	return er, err
+}
+
+func (h *Host) resolveNetwork(ctx context.Context, target a2al.Address) (*protocol.EndpointRecord, protocol.SignedRecord, error) {
+	q := dht.NewQuery(h.node)
+	return q.ResolveNetwork(ctx, a2al.NodeIDFromAddress(target))
+}
+
 // FindRecords runs iterative FIND_VALUE for the given RecType filter (0 = all types).
 func (h *Host) FindRecords(ctx context.Context, target a2al.Address, recType uint8) ([]protocol.SignedRecord, error) {
 	q := dht.NewQuery(h.node)
