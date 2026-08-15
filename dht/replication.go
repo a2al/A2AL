@@ -56,6 +56,7 @@ type repNodeEntry struct {
 	badSince       time.Time     // non-zero: node is in 30-min grace window before eviction
 	nextProbeAt    time.Time
 	nextProbeDelay time.Duration // current exponential back-off interval
+	probeDeferred  bool          // one-shot: recently-confirmed node already used its extra retry
 
 	// Phase 0 reserved fields — declared here so Phase 7 can start populating
 	// them without touching unrelated code. All three are zero/false until
@@ -343,6 +344,12 @@ func (n *Node) renewBackground(rk repKey, rs *repSet) {
 		// Relying on badSince keeps the two concerns separate: global health
 		// governs new candidate selection; repSet-level health governs eviction.
 		if !e.badSince.IsZero() {
+			// Path is already back: StoreAt (not punch) is the replica
+			// confirmation. Do not reset nextProbeAt — that would collapse grace.
+			if !n.graceBlocksRenewal(e) {
+				existingIDs = append(existingIDs, e.nodeID)
+				continue
+			}
 			// Do not shorten the grace window: only override nextProbeAt when
 			// probeBadDelay has already elapsed.  Cascades triggered by
 			// sleep/wake or network change call renewBackground immediately,
@@ -604,6 +611,7 @@ func (n *Node) storeAndRecord(ctx context.Context, peers []protocol.NodeInfo, rk
 			e.confirmedSeq = rec.Seq
 			e.failCount = 0
 			e.badSince = time.Time{}
+			e.probeDeferred = false
 			e.isPunched = punched // refresh in case the node was promoted from punched
 		} else {
 			rs.nodes[k] = &repNodeEntry{
@@ -940,6 +948,18 @@ func (n *Node) healthProbeLoop(ctx context.Context) {
 	}
 }
 
+func (n *Node) hasLiveModeB(id a2al.NodeID) bool {
+	return n.punch != nil && n.punch.HasConn(id)
+}
+
+func (n *Node) graceBlocksRenewal(e *repNodeEntry) bool {
+	return !e.badSince.IsZero() && !n.hasLiveModeB(e.nodeID)
+}
+
+func (n *Node) replicaProbeDue(e *repNodeEntry, now time.Time) bool {
+	return now.After(e.nextProbeAt) || (!e.badSince.IsZero() && n.hasLiveModeB(e.nodeID))
+}
+
 func (n *Node) runHealthProbes(ctx context.Context) {
 	n.repMu.RLock()
 	keys := make([]repKey, 0, len(n.repSets))
@@ -965,7 +985,7 @@ func (n *Node) runHealthProbes(ctx context.Context) {
 		rs.mu.Lock()
 		var toProbe []*repNodeEntry
 		for _, e := range rs.nodes {
-			if now.After(e.nextProbeAt) {
+			if n.replicaProbeDue(e, now) {
 				toProbe = append(toProbe, e)
 			}
 		}
@@ -1122,25 +1142,13 @@ func (n *Node) probeRepNode(ctx context.Context, rk repKey, rs *repSet, e *repNo
 func (n *Node) execRepProbe(ctx context.Context, id a2al.NodeID) repProbeExecOutcome {
 	var out repProbeExecOutcome
 
-	// For ICE-capable NAT peers (signal URL present), consult the punch channel
-	// before attempting a UDP probe — stale NAT-mapped ports always time out.
-	if n.punch != nil {
-		profile := n.reachProfile(id)
-		er := n.lookupEndpointRecord(id)
-		if er != nil && profile.prefersICEOverColdUDP() {
-			if n.punch.HasConn(id) {
-				n.log.Debug("replication probe: ice conn ok", "nodeID", id, "profile", profile)
-				out.iceConnOK = true
-				return out
-			}
-			// NAT/ICE-dependent peer: trigger ICE redialing and count this round as
-			// a miss so the state machine advances (dead peers get evicted).
-			n.triggerPunch(id, er, PunchPriorityHigh)
-			n.log.Debug("replication probe: ice redial", "nodeID", id, "profile", profile)
-			out.probeSkip = true
-			out.punchAttempted = true
-			return out
-		}
+	// Live Mode B session is a working path; treat as probe success without a
+	// dedicated Ping (avoids a QUIC RPC that could InvalidateConn). Absence of
+	// a session is not a miss — fall through to the same warm UDP plan as StoreAt.
+	if n.punch != nil && n.punch.HasConn(id) {
+		n.log.Debug("replication probe: ice conn ok", "nodeID", id, "profile", n.reachProfile(id))
+		out.iceConnOK = true
+		return out
 	}
 
 	// repSet probe uses the same warm candidate selection as renewal: prefer
@@ -1188,6 +1196,7 @@ func (n *Node) applyRepProbeOutcome(ctx context.Context, rk repKey, rs *repSet, 
 		rs.mu.Lock()
 		e.failCount = 0
 		e.badSince = time.Time{}
+		e.probeDeferred = false
 		next := e.nextProbeDelay * 2
 		if next == 0 || next > probeMaxDelay {
 			next = probeMaxDelay
@@ -1238,12 +1247,12 @@ func (n *Node) applyRepProbeOutcome(ctx context.Context, rk repKey, rs *repSet, 
 		// connectivity gap that follows a sleep/wake or network change event.
 		//
 		// The check is intentionally narrow: only nodes confirmed this cycle
-		// benefit; stale entries that merely survived from earlier cycles do
-		// not.  The grace window (badSince) is still entered on the very next
-		// failure, so eviction is delayed by at most one probeInitDelay (30 s),
-		// not indefinitely.
-		if e.confirmedAt.After(rs.renewEpoch) {
+		// benefit, and only once (probeDeferred). Stale entries that merely
+		// survived from earlier cycles do not. After the extra probeInitDelay
+		// the next failure enters the grace window.
+		if e.confirmedAt.After(rs.renewEpoch) && !e.probeDeferred {
 			e.failCount = 1
+			e.probeDeferred = true
 			e.nextProbeAt = time.Now().Add(probeInitDelay)
 			rs.mu.Unlock()
 			n.log.Debug("replication probe: node bad deferred (recently confirmed)", "nodeID", e.nodeID)

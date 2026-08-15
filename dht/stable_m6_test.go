@@ -122,3 +122,31 @@ func TestAdaptNodeInfoStableFallbackWhenNoEndpointOrRouting(t *testing.T) {
 		t.Fatalf("adapt port = %d, want stable fallback 5001", got.Port)
 	}
 }
+
+// TestAdaptNodeInfoV6AskerGetsV6 verifies that a v6 asker is not handed a v4
+// address that is stored in the routing-table NodeInfo.  The peer is dual-stack
+// (v4 in ni.IP, v6 in peerAddrs); the adapted result must use the v6 address.
+func TestAdaptNodeInfoV6AskerGetsV6(t *testing.T) {
+	n := newHealthTestNode(t)
+	var peerID a2al.NodeID
+	peerID[0] = 0xEF
+
+	v4addr := addrV4(4121)
+	v6addr := &net.UDPAddr{IP: net.ParseIP("2001:db8::1"), Port: 4121}
+	n.BindPeerAddr(peerID, v4addr)
+	n.BindPeerAddr(peerID, v6addr)
+
+	// ni.IP carries v4 (as stored from a v4-exchange NodeInfo).
+	ni := protocol.NodeInfo{
+		NodeID: append([]byte(nil), peerID[:]...),
+		IP:     net.IPv4(10, 0, 0, 1).To4(),
+		Port:   4121,
+	}
+	got := n.adaptNodeInfoForAsker(ni, peerID, false) // v6 asker
+	if net.IP(got.IP).To4() != nil {
+		t.Fatalf("v6 asker received v4 address %v; want v6", net.IP(got.IP))
+	}
+	if !net.IP(got.IP).Equal(v6addr.IP) {
+		t.Fatalf("got IP %v, want %v", net.IP(got.IP), v6addr.IP)
+	}
+}

@@ -6,6 +6,7 @@ package dht
 import (
 	"context"
 	"errors"
+	"net"
 	"sort"
 	"time"
 
@@ -61,7 +62,23 @@ type Query struct {
 	n       *Node
 	Alpha   int           // retained for API compatibility; slot engine uses queryAlpha
 	Stagger time.Duration // retained for API compatibility; slot engine uses querySlotStagger
+
+	// nodesQueried is set by runIterQuery when the iterative walk completes.
+	// It counts the distinct peers that were actually contacted (i.e. had an RPC
+	// dispatched), which is a direct measure of query thoroughness.
+	nodesQueried int
 }
+
+// NodesContacted returns the number of distinct peers that sent a real reply
+// (success or empty-records, not timeout/error) during the most recent
+// iterative query.  It is populated after FindRecords, FindNode,
+// AggregateRecords, or Resolve returns.
+//
+// This is the correct measure of query thoroughness: a timed-out or errored
+// probe is silence, not evidence of absence.  A value ≥ routing.K + small
+// margin (e.g. 20) indicates the K-closest neighbourhood was reached and the
+// "no record found" result is authoritative.
+func (q *Query) NodesContacted() int { return q.nodesQueried }
 
 // NewQuery builds a querier backed by n.
 func NewQuery(n *Node) *Query {
@@ -226,6 +243,12 @@ func (q *Query) runIterQuery(
 
 	// queried prevents the same peer from being contacted by multiple tracks.
 	queried := make(map[string]struct{})
+	// respondedCount tracks peers that sent a real reply (r.from != zero),
+	// regardless of whether they held any records.  This is the measure of
+	// query thoroughness: timed-out or errored probes do not count because
+	// silence is not evidence of absence.
+	var respondedCount int
+	defer func() { q.nodesQueried = respondedCount }()
 	tryMark := func(k string) bool {
 		if _, ok := queried[k]; ok {
 			return false
@@ -394,6 +417,9 @@ func (q *Query) runIterQuery(
 	defer badTicker.Stop()
 
 	processResult := func(r slotRes) {
+		if r.from != (a2al.NodeID{}) {
+			respondedCount++ // count every peer that sent a real reply
+		}
 		for _, ni := range r.nodes {
 			n.absorbNodeInfo(ni, r.from) // r.from = NodeID of peer that returned ni
 			if k := infoKey(ni); k != "" {
@@ -539,24 +565,37 @@ mainLoop:
 			pctx, cancel := context.WithTimeout(context.Background(), queryPeerTimeout)
 			defer cancel()
 
-			// For sovereign records, verify the publisher is still reachable
-			// before propagating the record to a new node.  Skip caching if the
-			// publisher cannot be found in the routing table or fails the Ping.
+			// For sovereign records, verify the publisher is still alive before
+			// propagating to a new node.  Prefer the address declared in the record
+			// itself so hosted-agent AIDs (not in the routing table) are reachable.
+			// Ping failure is softened by a freshness check: a record whose age is
+			// less than TTL/2 implies the publisher renewed it recently enough.
 			for _, rec := range recs {
-				if protocol.RecordCategory(rec.RecType) == protocol.CategorySovereign {
-					var pubAddr a2al.Address
-					copy(pubAddr[:], rec.Address)
-					pubID := a2al.NodeIDFromAddress(pubAddr)
-					pAddr, ok := n.lookupPeerHealthAware(pubID)
-					if !ok {
-						pAddr, ok = n.lookupPeer(pubID)
+				if protocol.RecordCategory(rec.RecType) != protocol.CategorySovereign {
+					continue
+				}
+				var pubAddr net.Addr
+				if a := recordEndpointAddr(rec); a != nil {
+					pubAddr = a
+				} else {
+					var aid a2al.Address
+					copy(aid[:], rec.Address)
+					pubID := a2al.NodeIDFromAddress(aid)
+					if a2, ok := n.lookupPeerHealthAware(pubID); ok {
+						pubAddr = a2
+					} else if a2, ok = n.lookupPeer(pubID); ok {
+						pubAddr = a2
 					}
-					if !ok {
-						return // publisher not reachable from here; skip
-					}
-					if err := n.Ping(pctx, pAddr); err != nil {
-						return // publisher unreachable; don't spread potentially stale record
-					}
+				}
+				recordFresh := time.Since(time.Unix(int64(rec.Timestamp), 0)) < time.Duration(rec.TTL)*time.Second/2
+				if recordFresh {
+					continue // publisher renewed recently; treat as alive without consuming pctx
+				}
+				if pubAddr == nil {
+					return
+				}
+				if err := n.Ping(pctx, pubAddr); err != nil {
+					return
 				}
 			}
 
@@ -691,6 +730,30 @@ func (q *Query) Resolve(ctx context.Context, target a2al.NodeID) (*protocol.Endp
 		}
 		return nil, err
 	}
+	er, _, err := endpointFromRecords(recs)
+	return er, err
+}
+
+// ResolveNetwork is Resolve without the local-store fast path: it always
+// runs iterative FIND_VALUE. Network hits are written into the local store.
+func (q *Query) ResolveNetwork(ctx context.Context, target a2al.NodeID) (*protocol.EndpointRecord, protocol.SignedRecord, error) {
+	if q.n == nil {
+		return nil, protocol.SignedRecord{}, errors.New("dht: nil node")
+	}
+	recs, _, err := q.runIterQuery(ctx, target, true, protocol.RecTypeEndpoint, 1)
+	if err != nil {
+		if errors.Is(err, ErrNoMatchingRecords) {
+			return nil, protocol.SignedRecord{}, ErrNoEndpoint
+		}
+		return nil, protocol.SignedRecord{}, err
+	}
+	for _, rec := range recs {
+		_ = q.n.LocalStorePut(target, rec)
+	}
+	return endpointFromRecords(recs)
+}
+
+func endpointFromRecords(recs []protocol.SignedRecord) (*protocol.EndpointRecord, protocol.SignedRecord, error) {
 	now := time.Now()
 	for _, rec := range recs {
 		if rec.RecType != protocol.RecTypeEndpoint {
@@ -701,8 +764,8 @@ func (q *Query) Resolve(ctx context.Context, target a2al.NodeID) (*protocol.Endp
 		}
 		er, err := protocol.ParseEndpointRecord(rec)
 		if err == nil {
-			return &er, nil
+			return &er, rec, nil
 		}
 	}
-	return nil, ErrNoEndpoint
+	return nil, protocol.SignedRecord{}, ErrNoEndpoint
 }

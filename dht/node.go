@@ -911,7 +911,13 @@ func (n *Node) adaptNodeInfoForAsker(ni protocol.NodeInfo, id a2al.NodeID, asker
 		}
 	}
 	if len(ni.IP) > 0 && ni.Port != 0 {
-		return ni
+		// Only short-circuit when the stored IP family matches the asker.
+		// If ni.IP is v4 but the asker is v6 (or vice-versa), fall through to
+		// the peerAddrs lookup which knows about the peer's other-family address.
+		niIsV4 := net.IP(ni.IP).To4() != nil
+		if niIsV4 == askerIsV4 {
+			return ni
+		}
 	}
 	n.peerMu.Lock()
 	pa := n.peers[nodeIDKey(id)]
@@ -1856,8 +1862,10 @@ func (n *Node) onStore(from net.Addr, ch inboundChannel, dec *protocol.DecodedMe
 	}
 
 	// Path-cache registration for sovereign records (Direction B).
-	// Distinguish publisher's direct StoreAt from a querier's path-cache StoreAt
-	// by comparing the sender's NodeID with the record's publisher NodeID.
+	// Distinguish publisher's direct StoreAt from a querier's path-cache StoreAt.
+	// For self-publishing nodes: senderID == publisherID.
+	// For hosted agents: daemon NodeID ≠ agent AID, so the sender's IP is matched
+	// against the record's declared quic:// endpoints instead.
 	//   Publisher's STORE → clear soft expiry (record is now authoritative here).
 	//   Querier's STORE   → set soft expiry + async register with publisher so
 	//                       this node enters publisher's repSet for future updates.
@@ -1868,7 +1876,7 @@ func (n *Node) onStore(from net.Addr, ch inboundChannel, dec *protocol.DecodedMe
 		if storeKey == (a2al.NodeID{}) {
 			storeKey = publisherID
 		}
-		if senderID == publisherID {
+		if senderID == publisherID || n.senderIPIsPublisher(from, body.Record) {
 			n.store.ClearSoftExpiry(storeKey, body.Record.RecType)
 		} else if err == nil && !sovereignSlotOccupied {
 			// Freshly stored path-cached record into an empty slot: arm soft
@@ -1882,28 +1890,102 @@ func (n *Node) onStore(from net.Addr, ch inboundChannel, dec *protocol.DecodedMe
 	}
 }
 
-// registerWithPublisher sends a FindNode RPC directly to the record's publisher.
-// Receiving the RPC causes the publisher to add this node to its routing table,
-// so future renewBackground calls will discover this node and include it in
-// storeAndRecord — eventually promoting it to a full repSet member.
+// senderIPInRecordEndpoints reports whether from's IP matches any quic://
+// endpoint declared in an endpoint record.
+func senderIPInRecordEndpoints(from net.Addr, rec protocol.SignedRecord) bool {
+	udp, ok := from.(*net.UDPAddr)
+	if !ok || udp == nil || rec.RecType != protocol.RecTypeEndpoint {
+		return false
+	}
+	er, err := protocol.ParseEndpointRecord(rec)
+	if err != nil {
+		return false
+	}
+	for _, e := range er.Endpoints {
+		if len(e) > 7 && e[:7] == "quic://" {
+			ua, uaErr := net.ResolveUDPAddr("udp", e[7:])
+			if uaErr == nil && ua.IP.Equal(udp.IP) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// senderIPIsPublisher reports whether the sender is the authoritative publisher
+// of rec.  For endpoint records the record's own quic:// list is checked; for
+// other sovereign types the same AID's locally-stored endpoint record is used,
+// covering hosted agents whose daemon NodeID differs from the agent AID.
+func (n *Node) senderIPIsPublisher(from net.Addr, rec protocol.SignedRecord) bool {
+	if senderIPInRecordEndpoints(from, rec) {
+		return true
+	}
+	publisherID := recordKeyForSigned(rec)
+	for _, sr := range n.LocalStoreGet(publisherID, protocol.RecTypeEndpoint) {
+		if senderIPInRecordEndpoints(from, sr) {
+			return true
+		}
+	}
+	return false
+}
+
+// recordEndpointAddr returns the first dialable UDP address from an endpoint
+// record's quic:// list, or nil.  Used to reach hosted-agent publishers whose
+// AID NodeID is not in the routing table.
+func recordEndpointAddr(rec protocol.SignedRecord) net.Addr {
+	if rec.RecType != protocol.RecTypeEndpoint {
+		return nil
+	}
+	er, err := protocol.ParseEndpointRecord(rec)
+	if err != nil {
+		return nil
+	}
+	for _, e := range er.Endpoints {
+		if len(e) > 7 && e[:7] == "quic://" {
+			ua, err := net.ResolveUDPAddr("udp", e[7:])
+			if err == nil {
+				return ua
+			}
+		}
+	}
+	return nil
+}
+
+// registerWithPublisher contacts the record's publisher so it can add this node
+// to its routing table; the publisher's next renewBackground will then push the
+// latest record here, promoting this node into the authoritative repSet.
 // On success the soft expiry is cleared; if unreachable the expiry fires naturally.
 func (n *Node) registerWithPublisher(storeKey a2al.NodeID, rec protocol.SignedRecord) {
 	publisherID := recordKeyForSigned(rec)
-	addr, ok := n.lookupPeerHealthAware(publisherID)
-	if !ok {
-		addr, ok = n.lookupPeer(publisherID)
+	// For endpoint records use the address declared in the record itself.
+	// For other sovereign types look up the same AID's locally-stored endpoint
+	// record; the hosting daemon publishes both in the same cycle so it is
+	// almost always already present by the time this goroutine runs.
+	addr := recordEndpointAddr(rec)
+	if addr == nil {
+		for _, sr := range n.LocalStoreGet(publisherID, protocol.RecTypeEndpoint) {
+			if a := recordEndpointAddr(sr); a != nil {
+				addr = a
+				break
+			}
+		}
 	}
-	if !ok {
-		return // publisher not in routing table; soft expiry will handle cleanup
+	if addr == nil {
+		// Self-publishing node: fall back to routing-table lookup.
+		var ok bool
+		addr, ok = n.lookupPeerHealthAware(publisherID)
+		if !ok {
+			addr, ok = n.lookupPeer(publisherID)
+		}
+		if !ok {
+			return
+		}
 	}
 	ctx, cancel := context.WithTimeout(n.ctx, queryPeerTimeout)
 	defer cancel()
 	if _, err := n.FindNode(ctx, addr, storeKey); err != nil {
-		return // publisher unreachable; soft expiry stays
+		return
 	}
-	// FindNode succeeded: publisher has added this node to its routing table.
-	// Clear the soft expiry — the publisher's next renewBackground will push the
-	// latest record here, confirming this node as part of the authoritative repSet.
 	n.store.ClearSoftExpiry(storeKey, rec.RecType)
 }
 
