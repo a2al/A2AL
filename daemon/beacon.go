@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"log/slog"
+	"encoding/binary"
 	"net"
 	"sort"
 	"strings"
@@ -30,6 +31,26 @@ const (
 	// read path. Below this the DHT may not have enough density to cover all keys; above
 	// it the intersection can be computed reliably from DHT results alone.
 	beaconMultiServiceSizeThreshold = 500
+
+	// beaconResolveContactThreshold is the minimum number of distinct peers that
+	// must have replied (real response, not timeout) during a FIND_VALUE for the
+	// "no record" result to be treated as authoritative.
+	//
+	// Value = routing.K (16) + 4 convergence-path buffer = 20.
+	//   - K=16 covers the theoretical K-closest neighbourhood.
+	//   - +4 accounts for the intermediate nodes contacted along the iterative
+	//     convergence path that are not among the final K-closest but still
+	//     confirmed absence.  This margin also guards against the rare case where
+	//     a few of the K-closest nodes were unreachable (timeout) and their slots
+	//     were filled by slightly further nodes.
+	// Below this count the query was likely cut short (sparse routing table or
+	// early context cancellation) and beacon fallback is still attempted.
+	beaconResolveContactThreshold = 20
+
+	// beaconPerPeerTimeout is the per-beacon deadline for a single FindValue RPC.
+	// Keeping it short (3 s) prevents an offline beacon from stalling the fallback
+	// iteration; the caller's context provides the outer bound.
+	beaconPerPeerTimeout = 3 * time.Second
 )
 
 // beaconManager handles supplemental DHT store fan-out and last-resort read fallback
@@ -209,23 +230,43 @@ func (b *beaconManager) StoreAll(ctx context.Context, keys []a2al.NodeID) {
 	}
 }
 
-// FindRecords walks the well-known address set in RTT order (shuffledAddrs) and
-// returns results from the first peer that responds without error. Peers in
-// this set receive the same replication traffic, so a single successful read
-// suffices; ordering spreads load.
+// FindRecords walks the well-known address set and returns records from the
+// first beacon that supplies a non-empty response.
+//
+// Load distribution: the iteration start is derived from the first two bytes of
+// key, so different keys naturally spread across different beacons while RTT
+// ordering (from shuffledAddrs) is still preserved within the rotation.  Same
+// key always picks the same primary beacon (cache-friendly).
+//
+// Availability: each beacon is contacted with a short per-peer timeout so that
+// offline beacons cannot stall the fallback path.  Empty responses are not
+// treated as authoritative; iteration continues until a non-empty result is
+// found or all beacons are exhausted.
 func (b *beaconManager) FindRecords(ctx context.Context, key a2al.NodeID, recType uint8) ([]protocol.SignedRecord, error) {
 	addrs := b.shuffledAddrs()
 	if len(addrs) == 0 {
 		return nil, nil
 	}
+	// Rotate the RTT-sorted list by a key-derived offset for load distribution.
+	// binary.BigEndian.Uint16 gives a stable, cheap hash of the key prefix.
+	if n := len(addrs); n > 1 {
+		offset := int(binary.BigEndian.Uint16(key[:2])) % n
+		addrs = append(addrs[offset:], addrs[:offset]...)
+	}
 	now := time.Now()
+	seen := map[string]struct{}{}
 	for _, addr := range addrs {
-		recs, _, err := b.node.FindValueWithNodes(ctx, addr, key, recType, false)
+		if ctx.Err() != nil {
+			break
+		}
+		// Per-beacon timeout: avoid stalling on an offline node.
+		bctx, bcancel := context.WithTimeout(ctx, beaconPerPeerTimeout)
+		recs, _, err := b.node.FindValueWithNodes(bctx, addr, key, recType, false)
+		bcancel()
 		if err != nil {
 			b.log.Debug("aux-dht find", "addr", addr, "err", err)
-			continue // listed peer unreachable, try next
+			continue // offline / unreachable; try next beacon
 		}
-		seen := map[string]struct{}{}
 		var out []protocol.SignedRecord
 		for _, r := range recs {
 			if protocol.VerifySignedRecord(r, now) != nil {
@@ -240,8 +281,9 @@ func (b *beaconManager) FindRecords(ctx context.Context, key a2al.NodeID, recTyp
 		}
 		if len(out) > 0 {
 			b.queryHits.Add(1)
+			return out, nil // found records – return immediately
 		}
-		return out, nil // first successful contact; even empty is authoritative
+		// Empty response from this beacon (does not hold this key); try next.
 	}
 	return nil, nil
 }
@@ -354,6 +396,37 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// resolveTracked runs an iterative FIND_VALUE for aid and returns the endpoint
+// record together with the number of distinct DHT peers contacted during the
+// query.  The contact count is used by beaconShouldFallbackForResolve to decide
+// whether the query was thorough enough to treat "no record" as authoritative.
+func (d *Daemon) resolveTracked(ctx context.Context, aid a2al.Address) (*protocol.EndpointRecord, int, error) {
+	q := dht.NewQuery(d.h.Node())
+	er, err := q.Resolve(ctx, a2al.NodeIDFromAddress(aid))
+	return er, q.NodesContacted(), err
+}
+
+// beaconShouldFallbackForResolve reports whether a failed resolve call warrants
+// a beacon fallback, given the error and the number of distinct nodes that were
+// contacted during the iterative query.
+//
+// Design for "DHT sufficient":
+//   - ErrNoEndpoint means the query traversed K-closest nodes and found nothing.
+//     That result is authoritative only when contacted ≥ beaconResolveContactThreshold
+//     (20 = K+4): if 20 or more distinct peers replied (not just timed out) with
+//     no record, the target's neighbourhood was covered and repeating the question
+//     to a beacon adds nothing.
+//   - contacted < 20 means the query was cut short (sparse routing table,
+//     context deadline, etc.) — beacon fallback is appropriate.
+//   - Any other error (timeout, network error) means the query was incomplete;
+//     beacon is always tried regardless of contact count.
+func (d *Daemon) beaconShouldFallbackForResolve(err error, contacted int) bool {
+	if !errors.Is(err, dht.ErrNoEndpoint) {
+		return true // incomplete query; always try beacon
+	}
+	return contacted < beaconResolveContactThreshold
 }
 
 // resolveFromBeacon resolves an endpoint record through the optional DNS-announced

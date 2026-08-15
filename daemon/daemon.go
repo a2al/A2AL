@@ -283,11 +283,14 @@ func New(cfg Config) (*Daemon, error) {
 		beacon:          newBeaconManager(h.Node(), &nodeCfg, log),
 		demo:            newDemoManager(),
 	}
-	// connPool dial function: always uses ConnectFromRecordFor with the resolved
-	// local identity (nodeAddr is registered as an agent so this covers the default
-	// case too, while correctly forwarding noRelay for all callers).
-	d.connPool = newModeAConnPool(func(ctx context.Context, local, remote a2al.Address, er *protocol.EndpointRecord, noRelay bool) (quic.Connection, bool, error) {
-		return h.ConnectFromRecordFor(ctx, local, remote, er, host.DialOptions{DisableRelay: noRelay})
+	// connPool dial: user paths race impression∥network via ConnectUserFor;
+	// auto paths keep ConnectFromRecordFor. nodeAddr is a registered agent.
+	d.connPool = newModeAConnPool(func(ctx context.Context, local, remote a2al.Address, er *protocol.EndpointRecord, noRelay bool, user bool) (quic.Connection, bool, error) {
+		opts := host.DialOptions{DisableRelay: noRelay}
+		if user {
+			return h.ConnectUserFor(ctx, local, remote, er, opts)
+		}
+		return h.ConnectFromRecordFor(ctx, local, remote, er, opts)
 	}, log)
 	d.tunnels = newTunnelRegistry()
 	if tlsCfg, err := loadOrCreateTunnelTLS(cfg.DataDir); err != nil {

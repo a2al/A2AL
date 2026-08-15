@@ -44,10 +44,10 @@ func (dd *daemonDialer) Dial(ctx context.Context, remote a2al.Address) (io.ReadW
 
 	// Resolve remote endpoint (20 s budget; shares the caller's context).
 	rctx, rcancel := context.WithTimeout(ctx, 20*time.Second)
-	er, err := dd.d.h.Resolve(rctx, remote)
+	er, contacted, err := dd.d.resolveTracked(rctx, remote)
 	rcancel()
 	if err != nil {
-		if dd.d.beacon != nil {
+		if dd.d.beacon != nil && dd.d.beaconShouldFallbackForResolve(err, contacted) {
 			er, err = dd.d.resolveFromBeacon(ctx, remote)
 		}
 		if err != nil {
@@ -57,7 +57,7 @@ func (dd *daemonDialer) Dial(ctx context.Context, remote a2al.Address) (io.ReadW
 
 	// Acquire a pooled QUIC connection and open a new stream.
 	// Uses the node identity as the local AID (consistent with execFetch).
-	conn, _, err := dd.d.connPool.acquire(ctx, dd.d.nodeAddr, remote, er, false)
+	conn, _, err := dd.d.connPool.acquire(ctx, dd.d.nodeAddr, remote, er, false, true)
 	if err != nil {
 		return nil, errConnectQUIC
 	}

@@ -67,8 +67,9 @@ type connPoolEntry struct {
 
 // dialFunc is the dialing strategy injected at construction.
 // noRelay requests a direct-only connection (no TURN relay candidates).
+// user marks a user-initiated dial (impression∥network race, no backoff).
 // The pool does not import host directly, keeping the dependency direction clean.
-type dialFunc func(ctx context.Context, local, remote a2al.Address, er *protocol.EndpointRecord, noRelay bool) (quic.Connection, bool, error)
+type dialFunc func(ctx context.Context, local, remote a2al.Address, er *protocol.EndpointRecord, noRelay bool, user bool) (quic.Connection, bool, error)
 
 // modeAConnPool caches outbound data-plane QUIC connections for reuse across
 // execConnect, execFetch, and execTunnelOpen calls. Connections are established
@@ -100,14 +101,16 @@ func newModeAConnPool(dial dialFunc, log *slog.Logger) *modeAConnPool {
 
 // acquire returns a live QUIC connection for (local → remote).
 // noRelay=true requests a direct-only connection (relay candidates excluded).
+// user=true skips read/write of the failure backoff (user-initiated paths).
 // Returns the connection and whether it uses a relay path.
-// er must be a freshly resolved EndpointRecord for remote; the caller resolves
-// it so that any reconnect after a dead-connection eviction uses current data.
+// er is the caller's impression (typically a local Resolve); the dial func
+// may race it against a network refresh when user is true.
 //
-// On a network failure the entry is kept as a backoff record; subsequent calls
-// within the backoff window return immediately without dialing.
-// Context cancellation (caller hang-up) does NOT set a backoff record.
-func (p *modeAConnPool) acquire(ctx context.Context, local, remote a2al.Address, er *protocol.EndpointRecord, noRelay bool) (quic.Connection, bool, error) {
+// On a network failure the entry is kept as a backoff record unless user is
+// true; subsequent auto calls within the backoff window return immediately
+// without dialing. Context cancellation (caller hang-up) does NOT set a
+// backoff record.
+func (p *modeAConnPool) acquire(ctx context.Context, local, remote a2al.Address, er *protocol.EndpointRecord, noRelay bool, user bool) (quic.Connection, bool, error) {
 	key := connPoolKey{local, remote, noRelay}
 
 	// ── Fast path: return a cached live connection ────────────────────────
@@ -128,6 +131,10 @@ func (p *modeAConnPool) acquire(ctx context.Context, local, remote a2al.Address,
 			delete(p.pool, key)
 
 		case !ent.lastFailAt.IsZero():
+			if user {
+				delete(p.pool, key)
+				break
+			}
 			// Backoff entry: check whether the window has elapsed.
 			if time.Since(ent.lastFailAt) < connPoolBackoff(ent.failCount) {
 				p.mu.Unlock()
@@ -156,22 +163,23 @@ func (p *modeAConnPool) acquire(ctx context.Context, local, remote a2al.Address,
 	}
 	v, err, _ := p.flight.Do(key.String(), func() (any, error) {
 		defer dialCancel()
-		p.log.Debug("connpool: dialing", "local", local.String(), "remote", remote.String(), "no_relay", noRelay)
-		conn, isRelayed, dialErr := p.dial(dialCtx, local, remote, er, noRelay)
+		p.log.Debug("connpool: dialing", "local", local.String(), "remote", remote.String(), "no_relay", noRelay, "user", user)
+		conn, isRelayed, dialErr := p.dial(dialCtx, local, remote, er, noRelay, user)
 
 		p.mu.Lock()
 		defer p.mu.Unlock()
 
 		if dialErr != nil {
-			// Only record backoff for genuine network failures. Two cases are
-			// excluded from the backoff penalty:
+			// Only record backoff for genuine network failures on auto paths.
+			// Excluded from the backoff penalty:
+			//   user-initiated: caller is waiting; do not force a 15s wait.
 			//   context.Canceled: our own dialCancel fired after a successful
 			//     sibling, or an upstream cancel — not a network failure.
 			//   host.ErrControlExchangeIncomplete: QUIC+TLS succeeded (remote
 			//     is reachable) but B→A control exchange failed; the broken
 			//     connection has already been closed. Do not penalise future
 			//     dials — the remote should be retried immediately.
-			if !errors.Is(dialErr, context.Canceled) && !errors.Is(dialErr, host.ErrControlExchangeIncomplete) {
+			if !user && !errors.Is(dialErr, context.Canceled) && !errors.Is(dialErr, host.ErrControlExchangeIncomplete) {
 				ent := p.pool[key]
 				if ent == nil {
 					ent = &connPoolEntry{}

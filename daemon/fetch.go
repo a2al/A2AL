@@ -146,10 +146,10 @@ func (d *Daemon) execFetch(ctx context.Context, localAID, remoteAID a2al.Address
 
 	// Resolve remote endpoint (20 s budget; shares the caller's context).
 	rctx, rcancel := context.WithTimeout(ctx, 20*time.Second)
-	er, err := d.h.Resolve(rctx, remoteAID)
+	er, contacted, err := d.resolveTracked(rctx, remoteAID)
 	rcancel()
 	if err != nil {
-		if d.beacon != nil {
+		if d.beacon != nil && d.beaconShouldFallbackForResolve(err, contacted) {
 			er, err = d.resolveFromBeacon(ctx, remoteAID)
 		}
 		if err != nil {
@@ -161,7 +161,7 @@ func (d *Daemon) execFetch(ctx context.Context, localAID, remoteAID a2al.Address
 	// Returns errConnectQUIC when the connection appears dead so the caller can
 	// retry once.
 	doFetch := func() (fetchResp, error) {
-		conn, _, err := d.connPool.acquire(ctx, localAID, remoteAID, er, false)
+		conn, _, err := d.connPool.acquire(ctx, localAID, remoteAID, er, false, true)
 		if err != nil {
 			return fetchResp{}, errConnectQUIC
 		}

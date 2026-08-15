@@ -900,10 +900,9 @@ func (d *Daemon) execResolve(ctx context.Context, aidStr string) (map[string]any
 	if err != nil {
 		return nil, errBadAID
 	}
-	er, err := d.h.Resolve(ctx, aid)
+	er, contacted, err := d.resolveTracked(ctx, aid)
 	if err != nil {
-		// DHT returned empty — try supplemental bootstrap nodes as last resort.
-		if d.beacon != nil {
+		if d.beacon != nil && d.beaconShouldFallbackForResolve(err, contacted) {
 			er, err = d.resolveFromBeacon(ctx, aid)
 		}
 		if err != nil {
@@ -929,9 +928,9 @@ func (d *Daemon) execConnect(ctx context.Context, remoteAidStr string, body conn
 	if err != nil {
 		return "", err
 	}
-	er, err := d.h.Resolve(ctx, remote)
+	er, contacted, err := d.resolveTracked(ctx, remote)
 	if err != nil {
-		if d.beacon != nil {
+		if d.beacon != nil && d.beaconShouldFallbackForResolve(err, contacted) {
 			er, err = d.resolveFromBeacon(ctx, remote)
 		}
 		if err != nil {
@@ -948,7 +947,7 @@ func (d *Daemon) execConnect(ctx context.Context, remoteAidStr string, body conn
 	// Acquire a pooled QUIC connection. The connection is NOT closed when the
 	// tunnel ends — it returns to the pool for reuse by subsequent calls.
 	nr := resolveNoRelay(body.DisableRelay, d.cfg.DisableRelay)
-	qc, _, err := d.connPool.acquire(ctx, local, remote, er, nr)
+	qc, _, err := d.connPool.acquire(ctx, local, remote, er, nr, true)
 	if err != nil {
 		d.log.Warn("connect quic", "remote", remote.String(), "err", err)
 		if errors.Is(err, host.ErrRelayRequired) {
@@ -1028,7 +1027,7 @@ func (d *Daemon) execMailboxSend(ctx context.Context, localAidStr, recipientStr 
 		}
 		warmCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		conn, _, err := d.connPool.acquire(warmCtx, aid, recipient, er, false)
+		conn, _, err := d.connPool.acquire(warmCtx, aid, recipient, er, false, false)
 		if err == nil {
 			_ = sendMailboxQuic(warmCtx, conn, msgID, sr)
 		}

@@ -188,10 +188,10 @@ func (d *Daemon) execTunnelOpen(ctx context.Context, remoteAidStr string, req tu
 
 	// Resolve with 20 s cap, same as execFetch / execConnect.
 	rctx, rcancel := context.WithTimeout(ctx, 20*time.Second)
-	er, err := d.h.Resolve(rctx, remote)
+	er, contacted, err := d.resolveTracked(rctx, remote)
 	rcancel()
 	if err != nil {
-		if d.beacon != nil {
+		if d.beacon != nil && d.beaconShouldFallbackForResolve(err, contacted) {
 			er, err = d.resolveFromBeacon(ctx, remote)
 		}
 		if err != nil {
@@ -200,7 +200,7 @@ func (d *Daemon) execTunnelOpen(ctx context.Context, remoteAidStr string, req tu
 	}
 
 	nr := resolveNoRelay(req.DisableRelay, d.cfg.DisableRelay)
-	qc, isRelayed, err := d.connPool.acquire(ctx, local, remote, er, nr)
+	qc, isRelayed, err := d.connPool.acquire(ctx, local, remote, er, nr, true)
 	if err != nil {
 		if errors.Is(err, host.ErrRelayRequired) {
 			return nil, err
