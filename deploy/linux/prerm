@@ -1,0 +1,2 @@
+#!/bin/bash
+systemctl disable --now a2ald 2>/dev/null || true

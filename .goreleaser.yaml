@@ -79,6 +79,7 @@ nfpms:
 
     scripts:
       postinstall: deploy/linux/postinst
+      preremove: deploy/linux/prerm
       postremove: deploy/linux/postrm
 
     file_name_template: "a2al_{{ .Version }}_{{ .Arch }}"
