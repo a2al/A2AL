@@ -18,6 +18,12 @@ import (
 	"github.com/a2al/a2al/routing"
 )
 
+// replicaV6OnlyDirectCap is the maximum number of v6-only peers allowed in the
+// DirectSet.  v6-only replicas are inaccessible to v4-only consumers; capping
+// their proportion ensures v4 visibility without fully excluding v6-only peers.
+// The XorSet is uncapped (DHT distance semantics must not be distorted).
+const replicaV6OnlyDirectCap = nRep / 2 // 4 out of 8
+
 // Replication strategy parameters (节点行为策略 §2 and §3).
 const (
 	nRep              = 8                // soft replication target N_rep
@@ -65,6 +71,11 @@ type repNodeEntry struct {
 	isPunched   bool // node was reached via ICE hole-punch, not direct UDP
 	inXorSet    bool // member of the XOR-distance-closest N_rep set
 	inDirectSet bool // member of the directly-reachable N_rep set
+
+	// isV6Only is set when the peer has solid v6 evidence but no solid v4
+	// evidence at the time of replica confirmation.  Used by rebalanceRepSets
+	// to enforce the v6-only DirectSet cap (replicaV6OnlyDirectCap).
+	isV6Only bool
 }
 
 // repSet tracks confirmed remote replicas for one (storeKey, publisher) pair.
@@ -211,6 +222,7 @@ func (n *Node) processReplTask(ctx context.Context, task replTask) {
 	}
 
 	directPool := n.tabNearestHealthy(task.rk.storeKey, repHardCap)
+	n.sortByFamilyPref(directPool)
 	xorPool := n.tabNearest(task.rk.storeKey, repHardCap)
 	// Proactively fetch endpoint records for NAT candidates that are not yet
 	// cached locally (same as in renewBackground).  Only worthwhile while the
@@ -420,6 +432,9 @@ func (n *Node) renewBackground(rk repKey, rs *repSet) {
 
 	// Gap-fill new peers via dual-track plan (direct + punched XOR-near NAT).
 	directPool := n.tabNearestHealthy(rk.storeKey, repHardCap)
+	// Stable-sort by family preference so dual-stack/v4 peers are tried before
+	// v6-only peers.  XOR distance order within the same weight tier is preserved.
+	n.sortByFamilyPref(directPool)
 	xorPool := n.tabNearest(rk.storeKey, repHardCap)
 	if len(found) > 0 {
 		xorPool = found
@@ -514,16 +529,11 @@ func (n *Node) storeAndRecord(ctx context.Context, peers []protocol.NodeInfo, rk
 		if n.learnedPathFirst.Load() {
 			// warm=true for confirmed repSet members: prefer verified live over anchor.
 			warm := n.repSetContains(rs, id)
-			// Prefer v6 hint when the peer has a healthy v6 stable address.
-			// lookupPeerHealthAware is v4-first; this restores v6 participation
-			// for dual-stack peers on the L1 warm path without changing L0 semantics.
-			// If v6 is in back-off or has no known address, hint stays as the v4 addr.
-			hint := addr
-			if v6hint, ok := n.lookupFamilyHealthAware(id, true); ok {
-				hint = v6hint
-			}
-			n.maybeWaitRepSetPunch(ctx, id, rs, hint)
-			if planAddr := n.outboundPlan(id, hint, warm).addr; planAddr != nil {
+			// lookupPeerHealthAware already promotes v6 when fresh-verified evidence
+			// exists (see peerAddrs.preferred), so no separate v6-hint injection is
+			// needed here. addr carries the correct family from the health-aware lookup.
+			n.maybeWaitRepSetPunch(ctx, id, rs, addr)
+			if planAddr := n.outboundPlan(id, addr, warm).addr; planAddr != nil {
 				addr = planAddr
 			}
 		}
@@ -565,11 +575,31 @@ func (n *Node) storeAndRecord(ctx context.Context, peers []protocol.NodeInfo, rk
 					}
 				}
 			}
+			// Cross-family retry: if the current family (and its anchor fallback)
+			// both failed on direct UDP, try the other family's stable addr once.
+			// Skipped when the path was QUIC — Happy Eyeballs already tried both.
+			if !meta.viaQUIC {
+				curV6, curOK := addrIsV6(addr)
+				if curOK {
+					if altAddr := n.publicStableDialAddr(id, !curV6); altAddr != nil && altAddr.String() != addr.String() {
+						pctx3, cancel3 := context.WithTimeout(ctx, queryPeerTimeout)
+						stored, _, meta, reason, err = n.StoreAt(pctx3, altAddr, rk.storeKey, rec)
+						cancel3()
+						if err != nil {
+							n.log.Debug("replication StoreAt failed (alt-family fallback)",
+								"peer", altAddr,
+								"path", deliverPathLabel(meta),
+								"err", err,
+							)
+						}
+					}
+				}
+			}
 			if err != nil {
 				continue
 			}
 		}
-		if !stored {
+	if !stored {
 			// The peer is reachable but rejected the record.  Classify by reason:
 			//   RecordInvalid — the record itself was bad (peer is healthy).
 			//     Do not remove from repSet; the concurrent fresh-record publish
@@ -602,6 +632,8 @@ func (n *Node) storeAndRecord(ctx context.Context, peers []protocol.NodeInfo, rk
 		n.tabMu.RLock()
 		punched := n.table.IsPunched(id)
 		n.tabMu.RUnlock()
+		// Classify family before acquiring rs.mu to avoid holding two locks at once.
+		v6Only := n.replicaFamilyWeight(id) == 0
 
 		now := time.Now()
 		rs.mu.Lock()
@@ -613,6 +645,7 @@ func (n *Node) storeAndRecord(ctx context.Context, peers []protocol.NodeInfo, rk
 			e.badSince = time.Time{}
 			e.probeDeferred = false
 			e.isPunched = punched // refresh in case the node was promoted from punched
+			e.isV6Only = v6Only  // refresh; peer may have gained/lost v4 address
 		} else {
 			rs.nodes[k] = &repNodeEntry{
 				nodeID:         id,
@@ -621,6 +654,7 @@ func (n *Node) storeAndRecord(ctx context.Context, peers []protocol.NodeInfo, rk
 				nextProbeAt:    now.Add(probeInitDelay),
 				nextProbeDelay: probeInitDelay,
 				isPunched:      punched,
+				isV6Only:       v6Only,
 			}
 		}
 		// Phase 7: rebalance dual-set membership after each insertion/update.
@@ -842,6 +876,49 @@ func (n *Node) gapFillStoreNAT(ctx context.Context, rk repKey, rec protocol.Sign
 // rebalanceRepSets recomputes XOR-set and direct-set membership for every
 // entry in rs and removes nodes that belong to neither set (Phase 7).
 //
+// replicaFamilyWeight returns the preference weight for using id as a replica
+// holder.  Higher weight = preferred.
+//
+//	3 = dual-stack (v4+v6 solid evidence) — best availability for all consumers
+//	2 = single-stack (v4-only or v6-only) — reachable by their own family
+//	1 = unknown / no solid evidence on either family — neutral
+//
+// Both single-stack variants are intentionally equal so that the health ordering
+// established by tabNearestHealthy (Good→Unknown→Bad) is preserved within this
+// tier.  Separating them (v4>v6) caused sortByFamilyPref to promote Bad v4-only
+// nodes above Good v6-only nodes, blocking v6-only publishers from storing to
+// any reachable peer.  v6-only nodes are still limited in the DirectSet via
+// replicaV6OnlyDirectCap; that cap handles the v4-visibility concern.
+func (n *Node) replicaFamilyWeight(id a2al.NodeID) int {
+	n.peerMu.Lock()
+	pa := n.peers[nodeIDKey(id)]
+	n.peerMu.Unlock()
+	if pa == nil {
+		return 1
+	}
+	hasV4 := pa.v4.hasSolidEvidence()
+	hasV6 := pa.v6.hasSolidEvidence()
+	switch {
+	case hasV4 && hasV6:
+		return 3
+	case hasV4, hasV6:
+		return 2
+	default:
+		return 1
+	}
+}
+
+// sortByFamilyPref stable-sorts nodes so that v6-only peers sink to the bottom
+// within their existing health ordering.  Dual-stack > v4-only > unknown > v6-only.
+func (n *Node) sortByFamilyPref(nodes []protocol.NodeInfo) {
+	sort.SliceStable(nodes, func(i, j int) bool {
+		var ii, jj a2al.NodeID
+		copy(ii[:], nodes[i].NodeID)
+		copy(jj[:], nodes[j].NodeID)
+		return n.replicaFamilyWeight(ii) > n.replicaFamilyWeight(jj)
+	})
+}
+
 // Semantics (§8.2 dual-set):
 //
 //	XOR set   = top-nRep nodes by XOR distance (punched + direct)
@@ -883,17 +960,28 @@ func rebalanceRepSets(rs *repSet, key a2al.NodeID) {
 	}
 
 	// Assign direct-set membership: top-nRep among non-punched entries only.
+	// v6-only peers are capped at replicaV6OnlyDirectCap to prevent the direct
+	// set from converging on addresses unreachable by v4-only consumers.
+	// The XorSet is intentionally uncapped (distance semantics must not be altered).
 	directCount := 0
+	v6OnlyCount := 0
 	for i := range all {
 		if all[i].e.isPunched {
 			all[i].e.inDirectSet = false
 			continue
 		}
-		if directCount < nRep {
-			all[i].e.inDirectSet = true
-			directCount++
-		} else {
+		if directCount >= nRep {
 			all[i].e.inDirectSet = false
+			continue
+		}
+		if all[i].e.isV6Only && v6OnlyCount >= replicaV6OnlyDirectCap {
+			all[i].e.inDirectSet = false
+			continue
+		}
+		all[i].e.inDirectSet = true
+		directCount++
+		if all[i].e.isV6Only {
+			v6OnlyCount++
 		}
 	}
 

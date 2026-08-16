@@ -575,6 +575,12 @@ func (n *Node) lookupPeerHealthAware(id a2al.NodeID) (net.Addr, bool) {
 	v4ok := e == nil || !e.v4.everUsed || e.v4.nextRetryAt.IsZero() || now.After(e.v4.nextRetryAt)
 	v6ok := e == nil || !e.v6.everUsed || e.v6.nextRetryAt.IsZero() || now.After(e.v6.nextRetryAt)
 
+	// Prefer v6 when solid evidence exists and the family is healthy.
+	// Mirrors peerAddrs.preferred: anchor (signed endpoint, any peer version) or
+	// fresh verified live are both accepted. Hearsay-only v6 does not qualify.
+	if a := pa.v6.preferredStable(); a != nil && v6ok && pa.v6.hasSolidEvidence() {
+		return a, true
+	}
 	if a := pa.v4.preferredStable(); a != nil && v4ok {
 		return a, true
 	}

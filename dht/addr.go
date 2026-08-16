@@ -121,6 +121,22 @@ func (fa *familyAddrs) bestStable() *net.UDPAddr {
 	return fa.live
 }
 
+// hasSolidEvidence reports whether this family has a trustworthy outbound
+// address that justifies preferring it over the other family:
+//   - anchor: set from a signed endpoint record (peer declared reachability).
+//   - fresh verified live: written by a successful QUIC handshake within
+//     liveVerifiedFreshWindow ("my recent observation beats their claim").
+//
+// Hearsay live (rankHearsay, e.g. absorbed from a FIND_NODE response but never
+// directly tested) is intentionally excluded to prevent cold-start churn.
+func (fa *familyAddrs) hasSolidEvidence() bool {
+	if fa.anchor != nil {
+		return true
+	}
+	return fa.live != nil && fa.liveRank >= rankVerified &&
+		!fa.liveAt.IsZero() && time.Since(fa.liveAt) < liveVerifiedFreshWindow
+}
+
 // peerAddrs holds per-family dial addresses for a remote peer.
 type peerAddrs struct {
 	v4 familyAddrs
@@ -158,10 +174,22 @@ func (pa *peerAddrs) tryEphemeral(addr *net.UDPAddr) {
 }
 
 // preferred returns the best dial address available.
-// Priority: fallback (non-UDP) → v4 family → v6 family.
+//
+// Priority: fallback (non-UDP) → v6 with solid evidence → v4 → v6 fallback.
+//
+// v6 is promoted when hasSolidEvidence() is true for the v6 family: either an
+// anchor from a signed endpoint record (covers peers on any version) or a fresh
+// verified live from a recent QUIC handshake. This ensures we actively try v6
+// regardless of the order the remote published their endpoints. v4 remains the
+// fallback so v4-only nodes are unaffected.
 func (pa *peerAddrs) preferred() net.Addr {
 	if pa.fallback != nil {
 		return pa.fallback
+	}
+	if pa.v6.hasSolidEvidence() {
+		if a := pa.v6.preferred(); a != nil {
+			return a
+		}
 	}
 	if a := pa.v4.preferred(); a != nil {
 		return a

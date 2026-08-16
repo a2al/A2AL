@@ -58,15 +58,21 @@ func TestPeerAddrs_SetAndPrefer(t *testing.T) {
 
 	v6 := addrV6(4000)
 	pa.setStable(v6)
-	// v4 live is still preferred (v4 priority).
-	if got := pa.preferred(); got.String() != v4.String() {
-		t.Fatalf("preferred() should be v4, got %v", got)
+	// v6 has fresh verified live (setStable writes rankVerified) → v6 wins.
+	if got := pa.preferred(); got.String() != v6.String() {
+		t.Fatalf("preferred() should be v6 (fresh-verified), got %v", got)
 	}
 
-	// Remove v4; v6 should surface.
+	// Expire the v6 freshness window; v4 should lead again.
+	pa.v6.liveAt = time.Now().Add(-(liveVerifiedFreshWindow + time.Second))
+	if got := pa.preferred(); got.String() != v4.String() {
+		t.Fatalf("preferred() should be v4 after v6 window expires, got %v", got)
+	}
+
+	// Remove v4; v6 stale live surfaces as last resort.
 	pa.v4 = familyAddrs{}
-	if got := pa.preferred(); got != nil && got.String() != v6.String() {
-		t.Fatalf("preferred() should be v6 live, got %v", got)
+	if got := pa.preferred(); got == nil || got.String() != v6.String() {
+		t.Fatalf("preferred() should be v6 stale live when no v4, got %v", got)
 	}
 }
 
@@ -222,11 +228,11 @@ func TestLookupPeer_DualSlot(t *testing.T) {
 		t.Fatalf("after v4 bind: got %v, ok=%v", got, ok)
 	}
 
-	// Bind v6 ??v4 should still win (priority order).
+	// Bind v6: v6 has fresh verified live → v6 wins (solid evidence).
 	n.BindPeerAddr(peerID, v6)
 	got, ok = n.lookupPeer(peerID)
-	if !ok || got.String() != v4.String() {
-		t.Fatalf("after v4+v6 bind: expected v4 preferred, got %v", got)
+	if !ok || got.String() != v6.String() {
+		t.Fatalf("after v4+v6 bind: expected v6 preferred (solid evidence), got %v", got)
 	}
 }
 

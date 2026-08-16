@@ -134,8 +134,13 @@ func successDialAddr(peer net.Addr, meta deliverMeta) net.Addr {
 // bootstrapDialAddr picks a cold-start dial address for id, never using
 // ephemeral punch ports. Prefer anchor/advertised stable addresses for public
 // peers before routing-table hearsay.
+//
+// v6-first: publicStableDialAddr(id, true) returns the v6 anchor when one
+// exists and falls back to v4 automatically, so a single call covers both.
+// This ensures we actively try v6 on cold start regardless of what order the
+// remote published their endpoints (new or old peer version).
 func (n *Node) bootstrapDialAddr(id a2al.NodeID, ni protocol.NodeInfo) *net.UDPAddr {
-	if a := n.publicStableDialAddr(id, false); a != nil {
+	if a := n.publicStableDialAddr(id, true); a != nil {
 		if u, ok := a.(*net.UDPAddr); ok {
 			return u
 		}
@@ -144,9 +149,9 @@ func (n *Node) bootstrapDialAddr(id a2al.NodeID, ni protocol.NodeInfo) *net.UDPA
 	pa := n.peers[nodeIDKey(id)]
 	var stable *net.UDPAddr
 	if pa != nil {
-		stable = pa.v4.bestStable()
+		stable = pa.v6.bestStable() // v6-first in hearsay fallback too
 		if stable == nil {
-			stable = pa.v6.bestStable()
+			stable = pa.v4.bestStable()
 		}
 	}
 	n.peerMu.Unlock()
