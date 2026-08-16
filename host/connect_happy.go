@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"sort"
 	"sync"
 	"time"
 
@@ -87,14 +88,22 @@ func filterDirectTargets(addrs []*net.UDPAddr, er *protocol.EndpointRecord) []*n
 // dialTargets is the internal variant of QUICDialTargets that additionally
 // filters candidates by the host's local IP-family capability (hasV4/hasV6).
 // v4-only hosts silently skip v6 addresses and vice versa; both-capable hosts
-// receive the full list unchanged. Falls back to the full list when only one
-// family has entries, ensuring connectivity is never silently discarded.
+// receive the full list with v6 sorted before v4 so Happy Eyeballs tries GUA
+// first regardless of the order the remote peer published their endpoints.
+// Falls back to the full list when only one family has entries.
 func (h *Host) dialTargets(er *protocol.EndpointRecord) ([]*net.UDPAddr, error) {
 	all, err := QUICDialTargets(er)
 	if err != nil {
 		return nil, err
 	}
 	if h.hasV4 && h.hasV6 {
+		// Stable sort: v6 addresses before v4 so Happy Eyeballs gives GUA the
+		// head start. We do this regardless of the remote's endpoint order so
+		// that connecting to old-version peers with v4-first endpoints still
+		// tries v6 first from our side.
+		sort.SliceStable(all, func(i, j int) bool {
+			return all[i].IP.To4() == nil && all[j].IP.To4() != nil
+		})
 		return all, nil
 	}
 	var out []*net.UDPAddr

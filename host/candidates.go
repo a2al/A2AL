@@ -69,13 +69,17 @@ func appendCandidateUnique(seen map[string]struct{}, out *[]string, ep string) {
 
 // orderedQUICEndpointStrings builds Phase 2b multi-candidate endpoints (deduped).
 //
-// Priority order (v4 entries interleave with v6 at each tier — no family sorting):
+// Priority order — within each tier, IPv6 is listed before IPv4 so that remote
+// nodes attempting Happy Eyeballs will try v6 first (GUA is directly reachable
+// without NAT traversal). Both families are always published; v4 remains the
+// fallback for v6-only or v4-only peers.
 //
 //	① trusted observed_addr  (natsense consensus from DHT peers; all families)
-//	② STUN external IPv4     (NAT-mapped address of the shared UDP socket)
 //	② STUN external IPv6     (GUA from v6 STUN probe; only on dual-stack hosts)
+//	② STUN external IPv4     (NAT-mapped address of the shared UDP socket)
 //	③ QUIC bind IP           (only if already a public WAN IP, v4 or v6)
-//	④ outbound probe IP      (routing-table probe; valid only with direct WAN IP)
+//	④ outbound probe IPv6    (routing-table probe; valid only with direct WAN IP)
+//	④ outbound probe IPv4    (routing-table probe; valid only with direct WAN IP)
 //	⑤ FallbackHost           (explicit operator override; required for loopback/LAN tests)
 //	⑥ UPnP external URL      (IGD port-mapped address, IPv4 only)
 //
@@ -117,23 +121,23 @@ func (h *Host) orderedQUICEndpointStrings(extIPv4Snapshot, extIPv6Snapshot, upnp
 		appendCandidateUnique(seen, &out, "quic://"+net.JoinHostPort(observedHost, extPort))
 	}
 
-	// ② STUN external IP (IPv4 + IPv6, same tier)
+	// ② STUN external IP (IPv6 before IPv4, same tier)
 	// STUN returns the NAT-mapped address of an ephemeral probe socket, not the
 	// QUIC listener.  We only want the public IP; always pair with the actual
 	// QUIC port so we don't publish a stale port that may belong to a different
 	// host on the same NAT.  IPv6 has no HTTP fallback service; "" means the
 	// host has no IPv6 connectivity or dual-stack is disabled.
-	if extIPv4Snapshot != "" {
-		ipStr := extIPv4Snapshot
-		if host, _, err := net.SplitHostPort(extIPv4Snapshot); err == nil {
-			ipStr = host // strip STUN's ephemeral port
-		}
-		appendCandidateUnique(seen, &out, "quic://"+net.JoinHostPort(ipStr, portStr))
-	}
 	if extIPv6Snapshot != "" {
 		ipStr := extIPv6Snapshot
 		if host, _, err := net.SplitHostPort(extIPv6Snapshot); err == nil {
 			ipStr = host
+		}
+		appendCandidateUnique(seen, &out, "quic://"+net.JoinHostPort(ipStr, portStr))
+	}
+	if extIPv4Snapshot != "" {
+		ipStr := extIPv4Snapshot
+		if host, _, err := net.SplitHostPort(extIPv4Snapshot); err == nil {
+			ipStr = host // strip STUN's ephemeral port
 		}
 		appendCandidateUnique(seen, &out, "quic://"+net.JoinHostPort(ipStr, portStr))
 	}
@@ -147,14 +151,14 @@ func (h *Host) orderedQUICEndpointStrings(extIPv4Snapshot, extIPv6Snapshot, upnp
 		}
 	}
 
-	// ④ outbound probe (valid only when machine has a direct WAN IP, v4 or v6)
+	// ④ outbound probe (IPv6 before IPv4; valid only when machine has a direct WAN IP)
+	if ip6 := outboundIPv6(); ip6 != nil && isPlausibleWANIP(ip6) {
+		appendCandidateUnique(seen, &out, "quic://"+net.JoinHostPort(ip6.String(), portStr))
+	}
 	if ip := outboundIPv4(); ip != nil {
 		if ip4 := ip.To4(); ip4 != nil && isPlausibleWANIP(ip4) {
 			appendCandidateUnique(seen, &out, "quic://"+net.JoinHostPort(ip4.String(), portStr))
 		}
-	}
-	if ip6 := outboundIPv6(); ip6 != nil && isPlausibleWANIP(ip6) {
-		appendCandidateUnique(seen, &out, "quic://"+net.JoinHostPort(ip6.String(), portStr))
 	}
 
 	// ⑤ explicit FallbackHost override

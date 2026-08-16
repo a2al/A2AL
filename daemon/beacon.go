@@ -100,9 +100,9 @@ func (b *beaconManager) start(ctx context.Context, agentKeysFn func() []a2al.Nod
 // the well-known beacon address list. If so, enables the high-capacity local
 // store path (same behaviour as the operator high-capacity role in config).
 //
-// Hairpin detection and beacon self-identify are intentionally separate
+// Hairpin detection and self-identify are intentionally separate
 // concerns: SetSelfExtIP covers v4 hairpin detection (NAT peers); this
-// function covers beacon self-identify for both v4 and v6 GUA nodes.
+// function covers self-identify for both v4 and v6 GUA nodes.
 func (b *beaconManager) trySelfIdentify(addrs []net.Addr) {
 	selfIPv4 := b.node.SelfExtIP()
 	selfIPv6 := b.node.SelfExtIPv6()
