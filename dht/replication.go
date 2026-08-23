@@ -399,9 +399,11 @@ func (n *Node) renewBackground(rk repKey, rs *repSet) {
 	// Phase 6 (过程二, High priority): trigger ICE punch for each bad repSet
 	// member that has a signal URL.  These nodes are in the grace window and
 	// their record availability is directly at risk — punch is worth the cost.
+	// bypassBackoff=true: a node already in grace has confirmed UDP failure;
+	// the punchMinBackoff anti-jitter gate is not needed here.
 	for _, nid := range badRepNodes {
 		if er := n.lookupEndpointRecord(nid); er != nil {
-			n.triggerPunch(nid, er, PunchPriorityHigh)
+			n.triggerPunchWithOptions(nid, er, PunchPriorityHigh, true)
 		}
 	}
 
@@ -420,10 +422,13 @@ func (n *Node) renewBackground(rk repKey, rs *repSet) {
 		// failure within one tick (≤15 s) instead of waiting up to probeMaxDelay.
 		// Skipped nodes were removed from preRenewConfirmed above and will not
 		// appear here, so they are not mistaken for renewal failures.
+		// Nodes already in the 30-min grace window (badSince set) are excluded:
+		// resetting nextProbeAt = now would collapse the grace to a single
+		// probeTickInterval and cause immediate eviction before ICE can complete.
 		now := time.Now()
 		rs.mu.Lock()
 		for k, before := range preRenewConfirmed {
-			if e, ok := rs.nodes[k]; ok && e.confirmedAt == before {
+			if e, ok := rs.nodes[k]; ok && e.confirmedAt == before && e.badSince.IsZero() {
 				e.nextProbeAt = now
 			}
 		}
@@ -788,6 +793,11 @@ func (n *Node) pickGapFillPeers(storeKey a2al.NodeID, rs *repSet, directPool, xo
 			continue
 		}
 		if n.reachProfile(id).prefersICEOverColdUDP() {
+			continue
+		}
+		// Same gate as storeAndRecord / query addCand: no outbound path
+		// must not consume a gap-fill attempt slot.
+		if _, ok := n.lookupPeerHealthAware(id); !ok {
 			continue
 		}
 		if directNeed > 0 {
@@ -1354,11 +1364,15 @@ func (n *Node) applyRepProbeOutcome(ctx context.Context, rk repKey, rs *repSet, 
 		// Proactively look for a replacement while waiting.
 		n.enqueueReplication(rk, protocol.SignedRecord{})
 		// Phase 6 (过程三, Low priority): UDP has confirmed unreachable; try ICE.
+		// bypassBackoff=true: grace entry means UDP has persistently failed;
+		// the punchMinBackoff anti-jitter gate (5 min) is not applicable here —
+		// the node's backoff is typically only ~60 s at the time of grace entry
+		// and would otherwise block ICE for the entire 30-min grace window.
 		// Skip if already triggered above (triggerPunch deduplicates anyway, but
 		// avoid the lock overhead).
 		if !out.punchAttempted {
 			if er := n.lookupEndpointRecord(e.nodeID); er != nil {
-				n.triggerPunch(e.nodeID, er, PunchPriorityLow)
+				n.triggerPunchWithOptions(e.nodeID, er, PunchPriorityLow, true)
 			}
 		}
 

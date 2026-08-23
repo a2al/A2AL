@@ -195,3 +195,71 @@ func TestTabAdd_UDPDirectFrom_BindsEndpointAnchor(t *testing.T) {
 		t.Fatalf("lookupPeer = %v, want endpoint anchor %s", got, want)
 	}
 }
+
+func TestHearsayLoopbackNotDialTarget(t *testing.T) {
+	n := newHealthTestNode(t)
+	var peerID [32]byte
+	peerID[0] = 0x7F
+
+	discard := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9}
+	n.absorbNodeInfo(protocol.NodeInfo{
+		NodeID: append([]byte(nil), peerID[:]...),
+		IP:     net.IPv4(127, 0, 0, 1).To4(),
+		Port:   9,
+	}, [32]byte{})
+
+	if _, ok := n.lookupPeer(peerID); ok {
+		t.Fatal("hearsay 127.0.0.1:9 must not be a dial target")
+	}
+	if _, ok := n.lookupPeerHealthAware(peerID); ok {
+		t.Fatal("lookupPeerHealthAware must skip discard loopback")
+	}
+
+	n.BindPeerAnchor(peerID, discard)
+	if _, ok := n.lookupPeer(peerID); ok {
+		t.Fatal("loopback must not become an anchor")
+	}
+
+	local := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 4121}
+	n.BindPeerAddr(peerID, local)
+	got, ok := n.lookupPeerHealthAware(peerID)
+	if !ok || got.String() != local.String() {
+		t.Fatalf("verified loopback dial = %v ok=%v, want %v", got, ok, local)
+	}
+}
+
+func TestHearsayLoopbackDoesNotBeatVerifiedV6(t *testing.T) {
+	n := newHealthTestNode(t)
+	var peerID [32]byte
+	peerID[0] = 0x76
+	v6 := addrV6(4121)
+	n.BindPeerAddr(peerID, v6)
+
+	n.absorbNodeInfo(protocol.NodeInfo{
+		NodeID: append([]byte(nil), peerID[:]...),
+		IP:     net.IPv4(127, 0, 0, 1).To4(),
+		Port:   9,
+	}, [32]byte{})
+
+	got, ok := n.lookupPeerHealthAware(peerID)
+	if !ok || got.String() != v6.String() {
+		t.Fatalf("got %v ok=%v, want verified v6 %v", got, ok, v6)
+	}
+}
+
+func TestTryLiveRejectsUnverifiedScopeLocal(t *testing.T) {
+	pa := &peerAddrs{}
+	loop := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 4121}
+	if pa.tryLive(loop, rankHearsay) {
+		t.Fatal("hearsay loopback must not fill live")
+	}
+	if !pa.tryLive(loop, rankVerified) {
+		t.Fatal("verified loopback must fill live")
+	}
+	if pa.tryAnchor(loop) {
+		t.Fatal("loopback must not become anchor")
+	}
+	if pa.tryLive(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9}, rankVerified) {
+		t.Fatal("discard port must not fill live")
+	}
+}

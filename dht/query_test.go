@@ -284,3 +284,26 @@ func TestBootstrapAddrs_mem(t *testing.T) {
 		t.Fatalf("want [quic://10.0.0.1:1234], got %v", er.Endpoints)
 	}
 }
+
+func TestBootstrapAddrs_skipNeverDialable(t *testing.T) {
+	netw := transport.NewMemNetwork()
+	tr, _ := netw.NewTransport("boot-skip")
+	defer tr.Close()
+	n, err := NewNode(Config{Transport: tr, Keystore: newMemKS(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer n.Close()
+	n.Start()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	start := time.Now()
+	err = n.BootstrapAddrs(ctx, []net.Addr{&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9}})
+	if err == nil {
+		t.Fatal("want unreachable error for discard-port seed")
+	}
+	if time.Since(start) > time.Second {
+		t.Fatalf("took %v, should skip without pinging", time.Since(start))
+	}
+}

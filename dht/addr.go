@@ -31,6 +31,54 @@ const (
 	rankVerified addrRank = 3
 )
 
+// discardPort is IANA Discard (TCP/UDP 9). Never a control-plane listen.
+const discardPort = 9
+
+func udpAddrOf(addr net.Addr) *net.UDPAddr {
+	u, ok := addr.(*net.UDPAddr)
+	if !ok || u == nil {
+		return nil
+	}
+	return u
+}
+
+// isNeverDialableUDP reports addresses that must not be used as a control-plane
+// dial target at any evidence rank (unspecified, multicast, port 0, discard).
+func isNeverDialableUDP(addr net.Addr) bool {
+	u := udpAddrOf(addr)
+	if u == nil {
+		return false
+	}
+	if u.Port == 0 || u.Port == discardPort {
+		return true
+	}
+	ip := u.IP
+	return ip == nil || ip.IsUnspecified() || ip.IsMulticast()
+}
+
+// isScopeLocalUDP reports loopback / link-local addresses. These are meaningful
+// only as a path on this host (observed or operator-verified), never as hearsay
+// about a remote DHT coordinate.
+func isScopeLocalUDP(addr net.Addr) bool {
+	u := udpAddrOf(addr)
+	if u == nil || u.IP == nil {
+		return false
+	}
+	return u.IP.IsLoopback() || u.IP.IsLinkLocalUnicast()
+}
+
+// stableDialOK reports whether addr may be used for outbound control-plane dial
+// given this family's stored evidence. Hearsay/declared scope-local is not a path.
+func stableDialOK(addr *net.UDPAddr, fa *familyAddrs) bool {
+	if addr == nil || isNeverDialableUDP(addr) {
+		return false
+	}
+	if !isScopeLocalUDP(addr) {
+		return true
+	}
+	return fa != nil && fa.live != nil && addrsEqual(fa.live, addr) && fa.liveRank >= rankVerified
+}
+
 // familyAddrs holds dial candidates for one IP family (v4 or v6).
 //
 // Anchor: long-lived advertised/infra address (endpoint quic://, DNS bootstrap).
@@ -51,7 +99,7 @@ type familyAddrs struct {
 }
 
 func (fa *familyAddrs) tryAnchor(addr *net.UDPAddr) bool {
-	if addr == nil {
+	if addr == nil || isNeverDialableUDP(addr) || isScopeLocalUDP(addr) {
 		return false
 	}
 	fa.anchor = cloneUDPAddr(addr)
@@ -59,7 +107,10 @@ func (fa *familyAddrs) tryAnchor(addr *net.UDPAddr) bool {
 }
 
 func (fa *familyAddrs) tryLive(addr *net.UDPAddr, rank addrRank) bool {
-	if addr == nil || rank < rankHearsay {
+	if addr == nil || rank < rankHearsay || isNeverDialableUDP(addr) {
+		return false
+	}
+	if isScopeLocalUDP(addr) && rank < rankVerified {
 		return false
 	}
 	if fa.live != nil && rank < fa.liveRank {
@@ -72,7 +123,7 @@ func (fa *familyAddrs) tryLive(addr *net.UDPAddr, rank addrRank) bool {
 }
 
 func (fa *familyAddrs) tryEphemeral(addr *net.UDPAddr) {
-	if addr == nil {
+	if addr == nil || isNeverDialableUDP(addr) {
 		return
 	}
 	fa.ephemeral = cloneUDPAddr(addr)
@@ -92,7 +143,8 @@ func (fa *familyAddrs) preferred() *net.UDPAddr {
 	if a := fa.preferredStable(); a != nil {
 		return a
 	}
-	if fa.ephemeral != nil && time.Since(fa.ephemeralAt) < peerAddrEphemeralTTL {
+	if fa.ephemeral != nil && time.Since(fa.ephemeralAt) < peerAddrEphemeralTTL &&
+		!isNeverDialableUDP(fa.ephemeral) {
 		return fa.ephemeral
 	}
 	return nil
@@ -102,13 +154,13 @@ func (fa *familyAddrs) preferred() *net.UDPAddr {
 // Select (query/replication) must not treat ICE punch ports as a stable dial.
 func (fa *familyAddrs) preferredStable() *net.UDPAddr {
 	if fa.live != nil && fa.liveRank >= rankVerified && !fa.liveAt.IsZero() &&
-		time.Since(fa.liveAt) < liveVerifiedFreshWindow {
+		time.Since(fa.liveAt) < liveVerifiedFreshWindow && stableDialOK(fa.live, fa) {
 		return fa.live
 	}
-	if fa.anchor != nil {
+	if fa.anchor != nil && stableDialOK(fa.anchor, fa) {
 		return fa.anchor
 	}
-	if fa.live != nil {
+	if fa.live != nil && stableDialOK(fa.live, fa) {
 		return fa.live
 	}
 	return nil
@@ -130,11 +182,12 @@ func (fa *familyAddrs) bestStable() *net.UDPAddr {
 // Hearsay live (rankHearsay, e.g. absorbed from a FIND_NODE response but never
 // directly tested) is intentionally excluded to prevent cold-start churn.
 func (fa *familyAddrs) hasSolidEvidence() bool {
-	if fa.anchor != nil {
+	if fa.anchor != nil && !isNeverDialableUDP(fa.anchor) && !isScopeLocalUDP(fa.anchor) {
 		return true
 	}
 	return fa.live != nil && fa.liveRank >= rankVerified &&
-		!fa.liveAt.IsZero() && time.Since(fa.liveAt) < liveVerifiedFreshWindow
+		!fa.liveAt.IsZero() && time.Since(fa.liveAt) < liveVerifiedFreshWindow &&
+		!isNeverDialableUDP(fa.live)
 }
 
 // peerAddrs holds per-family dial addresses for a remote peer.

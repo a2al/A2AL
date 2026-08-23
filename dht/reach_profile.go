@@ -102,26 +102,41 @@ func (n *Node) publicStableDialAddr(id a2al.NodeID, v6 bool) net.Addr {
 	pa := n.peers[nodeIDKey(id)]
 	n.peerMu.Unlock()
 	if pa != nil {
-		if v6 && pa.v6.anchor != nil && n.familyContactOK(id, true) {
+		if v6 && pa.v6.anchor != nil && n.familyContactOK(id, true) && stableDialOK(pa.v6.anchor, &pa.v6) {
 			return pa.v6.anchor
 		}
-		if !v6 && pa.v4.anchor != nil && n.familyContactOK(id, false) {
+		if !v6 && pa.v4.anchor != nil && n.familyContactOK(id, false) && stableDialOK(pa.v4.anchor, &pa.v4) {
 			return pa.v4.anchor
 		}
-		if !v6 && pa.v6.anchor != nil && n.familyContactOK(id, true) {
+		if !v6 && pa.v6.anchor != nil && n.familyContactOK(id, true) && stableDialOK(pa.v6.anchor, &pa.v6) {
 			return pa.v6.anchor
 		}
-		if v6 && pa.v4.anchor != nil && n.familyContactOK(id, false) {
+		if v6 && pa.v4.anchor != nil && n.familyContactOK(id, false) && stableDialOK(pa.v4.anchor, &pa.v4) {
 			return pa.v4.anchor
 		}
 	}
-	if addr := n.advertisedStableAddr(id, v6); addr != nil {
+	if addr := n.advertisedStableAddr(id, v6); addr != nil &&
+		!isNeverDialableUDP(addr) && (!isScopeLocalUDP(addr) || n.hasVerifiedLiveAddr(id, addr)) {
 		return addr
 	}
 	if addr, ok := n.lookupPeerHealthAware(id); ok {
 		return addr
 	}
 	return nil
+}
+
+func (n *Node) hasVerifiedLiveAddr(id a2al.NodeID, addr *net.UDPAddr) bool {
+	if addr == nil {
+		return false
+	}
+	n.peerMu.Lock()
+	pa := n.peers[nodeIDKey(id)]
+	n.peerMu.Unlock()
+	if pa == nil {
+		return false
+	}
+	fa := pa.familyFor(addr)
+	return fa.live != nil && addrsEqual(fa.live, addr) && fa.liveRank >= rankVerified
 }
 
 func successDialAddr(peer net.Addr, meta deliverMeta) net.Addr {

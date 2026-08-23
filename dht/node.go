@@ -664,13 +664,19 @@ func (n *Node) remember(from net.Addr, ch inboundChannel, dec *protocol.DecodedM
 	// stable anchor (M6). HasConn is authoritative for outbound on that path.
 	if ch != inboundChannelQUIC {
 		if udp, ok := from.(*net.UDPAddr); ok {
-			pa.tryLive(udp, liveRank)
+			rank := liveRank
+			if isScopeLocalUDP(udp) && !isNeverDialableUDP(udp) {
+				rank = rankVerified // inbound from loopback is observation, not hearsay
+			}
+			pa.tryLive(udp, rank)
 		} else {
 			pa.fallback = from
 		}
 	}
 	n.peerMu.Unlock()
-	n.addrToID.Store(from.String(), id)
+	if !isNeverDialableUDP(from) {
+		n.addrToID.Store(from.String(), id)
+	}
 	// Inbound message = direct-contact evidence; set VerifiedAt now.
 	n.tabAdd(nodeInfoFromMessage(dec, from), routing.EntryMeta{VerifiedAt: time.Now()}, from)
 }
@@ -686,6 +692,21 @@ func (n *Node) tabAdd(ni protocol.NodeInfo, meta routing.EntryMeta, directFrom n
 		return
 	}
 	copy(nid[:], ni.NodeID)
+
+	// Binding check: NodeID must equal SHA-256(Address).  This is a protocol
+	// invariant (address.go NodeIDFromAddress).  A mismatch means the NodeInfo
+	// was either malformed or tampered in transit; drop it silently so the
+	// routing table is never polluted with inconsistent entries.
+	// Direct-contact NodeInfos (built by nodeInfoFromMessage) already satisfy
+	// this because NodeID is recomputed locally from SenderAddr; the check is
+	// most valuable for hearsay contacts arriving via FIND_NODE responses.
+	if len(ni.Address) == len(a2al.Address{}) {
+		var addr a2al.Address
+		copy(addr[:], ni.Address)
+		if a2al.NodeIDFromAddress(addr) != nid {
+			return
+		}
+	}
 
 	// P0: only record verified (direct) contact in seenPeers statistics.
 	if !meta.VerifiedAt.IsZero() {
@@ -1023,6 +1044,30 @@ func (n *Node) recordSuccess(id a2al.NodeID, addr net.Addr, rtt time.Duration) {
 		fh.rtt = rtt
 	}
 	n.healthMu.Unlock()
+
+	// Outage recovery: reset repSet grace state so that entries whose badSince
+	// was set before the outage are not immediately evicted on first post-wake
+	// probe. Grace timing is wall-clock; sleeping for hours consumes the entire
+	// 30-min window without the node actually failing. Re-start their probe
+	// schedule from probeInitDelay — genuine dead nodes will re-enter grace and
+	// be evicted after a real 30-min window on the new network.
+	if wasSuspect {
+		nextProbeAt := now.Add(probeInitDelay)
+		n.repMu.RLock()
+		for _, rs := range n.repSets {
+			rs.mu.Lock()
+			for _, e := range rs.nodes {
+				if !e.badSince.IsZero() {
+					e.badSince = time.Time{}
+					e.failCount = 0
+					e.probeDeferred = false
+					e.nextProbeAt = nextProbeAt
+				}
+			}
+			rs.mu.Unlock()
+		}
+		n.repMu.RUnlock()
+	}
 
 	if udp, ok := addr.(*net.UDPAddr); ok {
 		n.bindPeerLive(id, udp, rankVerified)
@@ -1514,7 +1559,10 @@ func (n *Node) absorbNodeInfo(ni protocol.NodeInfo, learnedFrom a2al.NodeID) {
 	}
 
 	// Opportunistic single probe for routing-critical hearsay nodes.
-	if routing.BucketIndex(n.nid, id) >= hearsayProbeBucketThreshold {
+	// Skip never-dialable and scope-local: probing 127.0.0.1 would hit this
+	// host, not the claimed remote coordinate.
+	if !isNeverDialableUDP(udp) && !isScopeLocalUDP(udp) &&
+		routing.BucketIndex(n.nid, id) >= hearsayProbeBucketThreshold {
 		n.healthMu.RLock()
 		hasHistory := n.health[nodeIDKey(id)] != nil
 		n.healthMu.RUnlock()
@@ -1537,7 +1585,10 @@ func (n *Node) bindPeerLive(id a2al.NodeID, addr net.Addr, rank addrRank) {
 		n.peers[nodeIDKey(id)] = pa
 	}
 	if udp, ok := addr.(*net.UDPAddr); ok {
-		pa.tryLive(udp, rank)
+		if !pa.tryLive(udp, rank) {
+			n.peerMu.Unlock()
+			return
+		}
 	} else {
 		pa.fallback = addr
 	}
@@ -1560,8 +1611,15 @@ func (n *Node) BindPeerAddr(id a2al.NodeID, addr net.Addr) {
 // addr should be the actual remote address observed on the connection
 // (e.g. conn.RemoteAddr()), which may differ from the dialled address due to NAT.
 // rtt is the round-trip time of the handshake; pass 0 if unknown.
+//
+// id may be the NodeID of an application-layer AID rather than a routing-layer
+// node identity (e.g. when the caller dials a hosted agent).  resolveRoutingPeer
+// maps id back to the correct routing-layer NodeID before any state is written,
+// so health counters and the addrToID index always refer to DHT nodes only.
 func (n *Node) NotePeerDialSuccess(id a2al.NodeID, addr net.Addr, rtt time.Duration) {
-	n.recordSuccess(id, addr, rtt)
+	if rid, ok := n.resolveRoutingPeer(id, addr); ok {
+		n.recordSuccess(rid, addr, rtt)
+	}
 }
 
 // NotePeerDialFailure records a failed direct connection attempt to addr.
@@ -1571,7 +1629,45 @@ func (n *Node) NotePeerDialSuccess(id a2al.NodeID, addr net.Addr, rtt time.Durat
 // Callers MUST only invoke this for genuine transport failures, not for context
 // cancellations caused by a competing dial winning (happy eyeballs).
 func (n *Node) NotePeerDialFailure(id a2al.NodeID, addr net.Addr) {
-	n.recordFailure(id, addr)
+	if rid, ok := n.resolveRoutingPeer(id, addr); ok {
+		n.recordFailure(rid, addr)
+	}
+}
+
+// resolveRoutingPeer maps an upper-layer NodeID (which may belong to an
+// application AID rather than a DHT node) to the correct routing-layer NodeID
+// for the given network address.  Returns (id, true) when a routing-layer peer
+// can be identified; returns (zero, false) when no routing peer is known for
+// this address and the claimed id is not itself in the routing table.
+//
+// Resolution order (no outbound RPCs):
+//  1. lookupPeerID(addr): if the address is already mapped to a NodeID that is
+//     present in the routing table, use it.  This handles the common case where
+//     the remote is a DHT node and we have had prior DHT contact.
+//  2. table.Contains(id): if the claimed id is itself a routing-table entry,
+//     use it directly.  This handles the case where id already is a node AID.
+//
+// If neither check succeeds (e.g. connecting to a hosted agent on a node we
+// have not yet discovered via DHT), the connection event carries no routing
+// credit — the remote node's first DHT message will establish the mapping.
+func (n *Node) resolveRoutingPeer(id a2al.NodeID, addr net.Addr) (a2al.NodeID, bool) {
+	// Step 1: address → known routing peer.
+	if existing, ok := n.lookupPeerID(addr); ok {
+		n.tabMu.RLock()
+		inTable := n.table.Contains(existing)
+		n.tabMu.RUnlock()
+		if inTable {
+			return existing, true
+		}
+	}
+	// Step 2: claimed id is itself a routing peer.
+	n.tabMu.RLock()
+	inTable := n.table.Contains(id)
+	n.tabMu.RUnlock()
+	if inTable {
+		return id, true
+	}
+	return a2al.NodeID{}, false
 }
 
 // BindPeerAnchor registers a long-lived advertised/infra dial address.
@@ -1584,7 +1680,10 @@ func (n *Node) BindPeerAnchor(id a2al.NodeID, addr net.Addr) {
 		n.peers[nodeIDKey(id)] = pa
 	}
 	if udp, ok := addr.(*net.UDPAddr); ok {
-		pa.tryAnchor(udp)
+		if !pa.tryAnchor(udp) {
+			n.peerMu.Unlock()
+			return
+		}
 	} else {
 		pa.fallback = addr
 	}
@@ -1640,7 +1739,7 @@ func (n *Node) isSelfReflectedAddr(addr net.Addr) bool {
 // DHT control-plane reachability learning or outbound selection (hairpin NAT
 // reflection, self bind address). Does not apply to Mode A business paths.
 func (n *Node) isUnusableControlPlaneReachAddr(addr net.Addr) bool {
-	return n.isHairpinAddr(addr) || n.isSelfReflectedAddr(addr)
+	return isNeverDialableUDP(addr) || n.isHairpinAddr(addr) || n.isSelfReflectedAddr(addr)
 }
 
 // isControlPlaneSelfExcitation reports inbound evidence that must not drive
@@ -1877,12 +1976,12 @@ func (n *Node) onStore(from net.Addr, ch inboundChannel, dec *protocol.DecodedMe
 	//                       this node enters publisher's repSet for future updates.
 	if (err == nil || alreadyHad) && protocol.RecordCategory(body.Record.RecType) == protocol.CategorySovereign {
 		senderID := a2al.NodeIDFromAddress(dec.SenderAddr)
-		publisherID := recordKeyForSigned(body.Record)
+		ownerKey := recordKeyForSigned(body.Record)
 		storeKey := key
 		if storeKey == (a2al.NodeID{}) {
-			storeKey = publisherID
+			storeKey = ownerKey
 		}
-		if senderID == publisherID || n.senderIPIsPublisher(from, body.Record) {
+		if senderID == ownerKey || n.senderIPIsPublisher(from, body.Record) {
 			n.store.ClearSoftExpiry(storeKey, body.Record.RecType)
 		} else if err == nil && !sovereignSlotOccupied {
 			// Freshly stored path-cached record into an empty slot: arm soft
@@ -1926,8 +2025,8 @@ func (n *Node) senderIPIsPublisher(from net.Addr, rec protocol.SignedRecord) boo
 	if senderIPInRecordEndpoints(from, rec) {
 		return true
 	}
-	publisherID := recordKeyForSigned(rec)
-	for _, sr := range n.LocalStoreGet(publisherID, protocol.RecTypeEndpoint) {
+	ownerKey := recordKeyForSigned(rec)
+	for _, sr := range n.LocalStoreGet(ownerKey, protocol.RecTypeEndpoint) {
 		if senderIPInRecordEndpoints(from, sr) {
 			return true
 		}
@@ -1962,14 +2061,17 @@ func recordEndpointAddr(rec protocol.SignedRecord) net.Addr {
 // latest record here, promoting this node into the authoritative repSet.
 // On success the soft expiry is cleared; if unreachable the expiry fires naturally.
 func (n *Node) registerWithPublisher(storeKey a2al.NodeID, rec protocol.SignedRecord) {
-	publisherID := recordKeyForSigned(rec)
+	// ownerKey is the DHT store key for the record's publishing agent (AID-derived).
+	// It is NOT necessarily a routing-table peer: hosted agents are not in the
+	// routing table.  All peer lookups use endpoint addresses from the record itself.
+	ownerKey := recordKeyForSigned(rec)
 	// For endpoint records use the address declared in the record itself.
 	// For other sovereign types look up the same AID's locally-stored endpoint
 	// record; the hosting daemon publishes both in the same cycle so it is
 	// almost always already present by the time this goroutine runs.
 	addr := recordEndpointAddr(rec)
 	if addr == nil {
-		for _, sr := range n.LocalStoreGet(publisherID, protocol.RecTypeEndpoint) {
+		for _, sr := range n.LocalStoreGet(ownerKey, protocol.RecTypeEndpoint) {
 			if a := recordEndpointAddr(sr); a != nil {
 				addr = a
 				break
@@ -1977,15 +2079,11 @@ func (n *Node) registerWithPublisher(storeKey a2al.NodeID, rec protocol.SignedRe
 		}
 	}
 	if addr == nil {
-		// Self-publishing node: fall back to routing-table lookup.
-		var ok bool
-		addr, ok = n.lookupPeerHealthAware(publisherID)
-		if !ok {
-			addr, ok = n.lookupPeer(publisherID)
-		}
-		if !ok {
-			return
-		}
+		// No endpoint address available — cannot reach the publisher.
+		// The soft expiry will fire naturally; no routing-table lookup is
+		// attempted because ownerKey may belong to a hosted agent that is
+		// not a DHT node and therefore absent from the routing table.
+		return
 	}
 	ctx, cancel := context.WithTimeout(n.ctx, queryPeerTimeout)
 	defer cancel()
@@ -2389,7 +2487,7 @@ func (n *Node) StoreAt(ctx context.Context, peer net.Addr, storeKey a2al.NodeID,
 }
 
 // rememberStoreSuccess registers dial→nodeID mapping after a successful outbound
-// STORE. Anchor binding is handled by tabAdd (UDP inbound) or explicit beacon paths;
+// STORE. Anchor binding is handled by tabAdd (UDP inbound) or explicit well-known paths;
 // do not write Anchor here from outbound dial evidence alone.
 func (n *Node) rememberStoreSuccess(id a2al.NodeID, dial net.Addr) {
 	if dial == nil {
@@ -2487,6 +2585,13 @@ func (n *Node) AddContact(addr net.Addr, ni protocol.NodeInfo) {
 	copy(peerID[:], ni.NodeID)
 	n.BindPeerAddr(peerID, addr)
 	n.tabAdd(ni, routing.EntryMeta{VerifiedAt: time.Now()}, addr)
+}
+
+// AbsorbContact seeds the routing table from an unverified FIND_NODE contact
+// (hearsay). Unlike AddContact it does not mark VerifiedAt or pin a dial
+// address that has not been observed by this node.
+func (n *Node) AbsorbContact(ni protocol.NodeInfo) {
+	n.absorbNodeInfo(ni, a2al.NodeID{})
 }
 
 // LocalAddr returns the underlying transport address.

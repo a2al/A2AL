@@ -82,7 +82,7 @@ type Config struct {
 
 	// LearnedPathFirst enables learned-path outbound selection in the DHT layer
 	// (lastInbound, skipCold DeferICE). Default true; set false to fall back to
-	// legacy L0-only blind UDP for emergency rollback.
+	// legacy direct-UDP for emergency rollback.
 	LearnedPathFirst bool `toml:"learned_path_first" json:"learned_path_first"`
 
 	// DisableRelay is the node-level default for relay usage on outbound connections.

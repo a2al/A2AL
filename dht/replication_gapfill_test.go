@@ -138,3 +138,45 @@ func TestPickGapFillPeers_qualityDisplacement(t *testing.T) {
 		t.Fatalf("direct=%d, want 1 (quality-displacement candidate should be included when XOR-closer than worst punched member)", len(direct))
 	}
 }
+
+// TestPickGapFillPeers_skipsUndialableDirect ensures a NodeID with no outbound
+// path does not consume a directNeed slot ahead of a dialable candidate.
+func TestPickGapFillPeers_skipsUndialableDirect(t *testing.T) {
+	netw := transport.NewMemNetwork()
+	tr, _ := netw.NewTransport("gapfill-undial")
+	defer tr.Close()
+	n := newTestNode(t, tr, &mockPunch{})
+	n.Start()
+	defer n.Close()
+
+	var key a2al.NodeID
+	rs := makeRepSet(key)
+	for i := 0; i < nRep-1; i++ {
+		var id a2al.NodeID
+		id[31] = byte(50 + i)
+		rs.nodes[nodeIDKey(id)] = &repNodeEntry{nodeID: id, isPunched: false}
+	}
+
+	var undialID a2al.NodeID
+	undialID[31] = 10
+	undialNI := protocol.NodeInfo{NodeID: append([]byte(nil), undialID[:]...)}
+
+	_, dialID, _ := makeSignedEndpointRecord(t, "")
+	n.BindPeerAnchor(dialID, &net.UDPAddr{IP: net.IPv4(10, 0, 0, 1), Port: 4121})
+	dialNI := protocol.NodeInfo{NodeID: append([]byte(nil), dialID[:]...)}
+
+	direct, _ := n.pickGapFillPeers(key, rs, []protocol.NodeInfo{undialNI, dialNI}, nil, nil)
+	if len(direct) != 1 {
+		t.Fatalf("direct=%d, want 1", len(direct))
+	}
+	got := a2al.NodeID{}
+	copy(got[:], direct[0].NodeID)
+	if got != dialID {
+		t.Fatalf("picked undialable NodeID, want dialable candidate")
+	}
+
+	onlyUndial, _ := n.pickGapFillPeers(key, rs, []protocol.NodeInfo{undialNI}, nil, nil)
+	if len(onlyUndial) != 0 {
+		t.Fatalf("undialable-only pool picked %d, want 0", len(onlyUndial))
+	}
+}

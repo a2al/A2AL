@@ -570,21 +570,29 @@ mainLoop:
 			// itself so hosted-agent AIDs (not in the routing table) are reachable.
 			// Ping failure is softened by a freshness check: a record whose age is
 			// less than TTL/2 implies the publisher renewed it recently enough.
+			//
+			// Endpoint lookup is endpoint-record-only: ownerKey (NodeID of the
+			// publishing AID) is not looked up in the routing table because hosted
+			// agents are absent from it.  If no endpoint is known and the record is
+			// stale, skip path-caching for this record rather than pinging blindly.
 			for _, rec := range recs {
 				if protocol.RecordCategory(rec.RecType) != protocol.CategorySovereign {
 					continue
 				}
+				ownerKey := a2al.NodeIDFromAddress(func() a2al.Address {
+					var a a2al.Address
+					copy(a[:], rec.Address)
+					return a
+				}())
 				var pubAddr net.Addr
 				if a := recordEndpointAddr(rec); a != nil {
 					pubAddr = a
 				} else {
-					var aid a2al.Address
-					copy(aid[:], rec.Address)
-					pubID := a2al.NodeIDFromAddress(aid)
-					if a2, ok := n.lookupPeerHealthAware(pubID); ok {
-						pubAddr = a2
-					} else if a2, ok = n.lookupPeer(pubID); ok {
-						pubAddr = a2
+					for _, sr := range n.LocalStoreGet(ownerKey, protocol.RecTypeEndpoint) {
+						if a := recordEndpointAddr(sr); a != nil {
+							pubAddr = a
+							break
+						}
 					}
 				}
 				recordFresh := time.Since(time.Unix(int64(rec.Timestamp), 0)) < time.Duration(rec.TTL)*time.Second/2

@@ -578,3 +578,27 @@ func TestUsableExplicitHintRejectsEphemeral(t *testing.T) {
 		t.Fatal("stable UDP hint should be usable")
 	}
 }
+
+func TestUsableExplicitHintRejectsDiscardAndUnverifiedLoopback(t *testing.T) {
+	n := newHealthTestNode(t)
+	var peerID a2al.NodeID
+	peerID[0] = 0xB4
+	discard := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9}
+	loop := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 4121}
+
+	if n.usableExplicitHint(peerID, discard) {
+		t.Fatal("discard port must not be an explicit hint")
+	}
+	if n.usableExplicitHint(peerID, loop) {
+		t.Fatal("unverified loopback must not be an explicit hint")
+	}
+	n.BindPeerAddr(peerID, loop)
+	if !n.usableExplicitHint(peerID, loop) {
+		t.Fatal("verified loopback hint should be usable")
+	}
+
+	got := n.legacyDialAddr(peerID, discard)
+	if got != nil && got.String() == discard.String() {
+		t.Fatal("legacyDialAddr must not fall back to discard hint")
+	}
+}

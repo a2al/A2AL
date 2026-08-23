@@ -131,7 +131,7 @@ func (n *Node) deliver(ctx context.Context, peerID a2al.NodeID, addrHint net.Add
 	}
 
 	// Send: caller already chose a concrete control-plane address. Do not
-	// re-Select onto a stale Anchor (beacon/bootstrap IP change).
+	// re-Select onto a stale Anchor (well-known/bootstrap IP change).
 	if n.usableExplicitHint(peerID, addrHint) {
 		meta.dialAddr = addrHint
 		meta.reason = "l0_explicit_hint"
@@ -279,9 +279,6 @@ func (n *Node) legacyDialAddr(peerID a2al.NodeID, addrHint net.Addr) net.Addr {
 	if addr, ok := n.lookupPeerHealthAware(peerID); ok {
 		return addr
 	}
-	if addrHint != nil {
-		return addrHint
-	}
 	if addr, ok := n.lookupPeer(peerID); ok {
 		return addr
 	}
@@ -310,6 +307,11 @@ func (n *Node) usableExplicitHint(peerID a2al.NodeID, hint net.Addr) bool {
 			!fa.ephemeralAt.IsZero() && time.Since(fa.ephemeralAt) < peerAddrEphemeralTTL {
 			return false
 		}
+		if isScopeLocalUDP(udp) && !stableDialOK(udp, fa) {
+			return false
+		}
+	} else if isScopeLocalUDP(udp) {
+		return false
 	}
 	return true
 }

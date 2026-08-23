@@ -31,6 +31,20 @@ func (n *Node) BootstrapAddrs(ctx context.Context, addrs []net.Addr) error {
 	}
 	n.Start()
 
+	origN := len(addrs)
+	dialable := make([]net.Addr, 0, len(addrs))
+	for _, a := range addrs {
+		if isNeverDialableUDP(a) {
+			n.log.Debug("bootstrap skip never-dialable", "addr", a)
+			continue
+		}
+		dialable = append(dialable, a)
+	}
+	if origN > 0 && len(dialable) == 0 {
+		return errors.New("dht: all bootstrap seeds unreachable")
+	}
+	addrs = dialable
+
 	type pingResult struct {
 		addr net.Addr
 		ok   bool
