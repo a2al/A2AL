@@ -15,6 +15,7 @@ import { ed25519 } from '@noble/curves/ed25519.js';
 import { encode as cborEncode } from 'cborg';
 import { encrypt, decrypt, isEnvelope } from '../crypto.js';
 import { openProfileModal } from '../profile-modal.js';
+import { openACLModal } from '../acl-modal.js';
 import { openPublishModal } from '../publish-modal.js';
 
 // ---------------------------------------------------------------------------
@@ -390,7 +391,10 @@ export async function renderAgents(mount, ctx) {
           </div>
         </div>
         <div class="ag2-badges">
-          <span class="badge ${esc(st.cls)}" data-aid-badge="${esc(ag.aid)}">● ${esc(t(st.key))}</span>
+          <div class="ag2-badge-row">
+            <span class="badge ${esc(st.cls)}" data-aid-badge="${esc(ag.aid)}">● ${esc(t(st.key))}</span>
+            <span class="badge ${(ag.acl && ag.acl.default === 'deny') ? 'b-yellow' : 'b-green'}">${esc((ag.acl && ag.acl.paid && ag.acl.default === 'deny') ? t('acl.badge.billing') : (ag.acl && ag.acl.default === 'deny') ? t('acl.badge.restricted') : t('acl.badge.public'))}</span>
+          </div>
           <span class="badge b-blue">${esc(agentKind(ag.aid))}</span>
         </div>
       </div>
@@ -399,11 +403,12 @@ export async function renderAgents(mount, ctx) {
           ${esc(t('agent.last_refresh', { ago: ag.last_publish_at ? relTime(ag.last_publish_at) : '—' }))}
           &nbsp;·&nbsp;
           ${esc(t('agent.next_refresh', { eta: ag.next_republish_estimate ? relTime(ag.next_republish_estimate) : '—' }))}
-          ${ag.dht_local_replicas != null ? `&nbsp;·&nbsp;${esc(t('agent.dht_replicas', { n: ag.dht_local_replicas, target: 8 }))}` : ''}
+          ${ag.dht_local_replicas != null ? `&nbsp;·&nbsp;<span data-replicas="${esc(ag.aid)}">${esc(t('agent.dht_replicas', { n: ag.dht_local_replicas, target: 8 }))}</span>` : ''}
         </span>
         <div class="ag2-actions">
           ${!ag.published_to_dht ? `<button type="button" class="btn btn-primary btn-sm" data-pub-now>${esc(t('agent.action.publish'))}</button>` : ''}
           <button type="button" class="btn btn-secondary btn-sm" data-edit-profile>${esc(t('agent.action.edit_profile'))}</button>
+          <button type="button" class="btn btn-secondary btn-sm" data-edit-acl>${esc(t('agent.action.acl'))}</button>
           <button type="button" class="btn btn-secondary btn-sm" data-pub>${esc(t('agent.action.republish'))}</button>
           <button type="button" class="btn btn-ghost btn-sm" data-export>${esc(t('agent.action.export'))}</button>
           <button type="button" class="btn btn-danger btn-sm" data-del>${esc(t('agent.action.delete'))}</button>
@@ -519,6 +524,7 @@ export async function renderAgents(mount, ctx) {
 
     infoDiv.querySelector('[data-export]').onclick = () => openExportModal(ag.aid);
     infoDiv.querySelector('[data-edit-profile]').onclick = () => openProfileModal(ctx, ag);
+    infoDiv.querySelector('[data-edit-acl]').onclick = () => openACLModal(ctx, ag);
 
     card.appendChild(infoDiv);
 
@@ -818,8 +824,13 @@ export async function renderAgents(mount, ctx) {
             el.textContent = t('discover.ping.ok', { ms: Math.round(performance.now() - t0) });
             el.style.color = 'var(--success)';
           } catch (e) {
-            el.textContent = e.status === 412 ? t('connect.no_direct_path') : t('connect.peer_offline');
-            el.style.color = 'var(--error)';
+            if (e.status === 403 || /access denied/i.test(e.message || '')) {
+              el.textContent = t('discover.ping.ok', { ms: Math.round(performance.now() - t0) });
+              el.style.color = 'var(--success)';
+            } else {
+              el.textContent = e.status === 412 ? t('connect.no_direct_path') : t('connect.peer_offline');
+              el.style.color = 'var(--error)';
+            }
           } finally {
             setLoading(b, false);
           }
@@ -1452,10 +1463,15 @@ export async function renderAgents(mount, ctx) {
           }
         }
         const badge = mount.querySelector(`[data-aid-badge="${ag.aid}"]`);
-        if (!badge) continue;
-        const st = agentStatus(ag);
-        badge.className = `badge ${st.cls}`;
-        badge.textContent = `● ${t(st.key)}`;
+        if (badge) {
+          const st = agentStatus(ag);
+          badge.className = `badge ${st.cls}`;
+          badge.textContent = `● ${t(st.key)}`;
+        }
+        const rep = mount.querySelector(`[data-replicas="${CSS.escape(ag.aid)}"]`);
+        if (rep && ag.dht_local_replicas != null) {
+          rep.textContent = t('agent.dht_replicas', { n: ag.dht_local_replicas, target: 8 });
+        }
       }
       if (dhtChanged) _saveDhtConfirmed();
     } catch (_) {}

@@ -796,7 +796,7 @@ func cmdGet(c *Client, g globalOpts, args []string) {
 	}
 	localAID, rest := extractLocalAID(args[2:])
 	headers := parseHeaders(rest)
-	doHTTPFetch(c, g, http.MethodGet, remote, path, nil, headers, localAID)
+	doHTTPFetch(c, g, http.MethodGet, remote, path, nil, headers, localAID, flagString(args[2:], "--access-token"))
 }
 
 func cmdPost(c *Client, g globalOpts, args []string) {
@@ -833,7 +833,7 @@ func cmdPost(c *Client, g globalOpts, args []string) {
 	}
 	localAID, hdrArgs2 := extractLocalAID(hdrArgs)
 	headers := parseHeaders(hdrArgs2)
-	doHTTPFetch(c, g, http.MethodPost, remote, path, body, headers, localAID)
+	doHTTPFetch(c, g, http.MethodPost, remote, path, body, headers, localAID, flagString(args[2:], "--access-token"))
 }
 
 func parseHeaders(args []string) http.Header {
@@ -882,7 +882,7 @@ func resolveLocalIdentityLabel(c *Client, localAID string) string {
 // doHTTPFetch sends an HTTP request to a remote agent via the daemon's
 // POST /fetch/{aid} endpoint. The daemon handles QUIC negotiation and NAT
 // traversal; the CLI never touches the transport layer directly.
-func doHTTPFetch(c *Client, g globalOpts, method, remoteAID, path string, body io.Reader, extra http.Header, localAID string) {
+func doHTTPFetch(c *Client, g globalOpts, method, remoteAID, path string, body io.Reader, extra http.Header, localAID, accessToken string) {
 	if !g.Quiet && !g.JSON {
 		label := resolveLocalIdentityLabel(c, localAID)
 		fmt.Fprintf(os.Stderr, "Connecting as %s → %s\n", label, shortAID(remoteAID))
@@ -894,6 +894,9 @@ func doHTTPFetch(c *Client, g globalOpts, method, remoteAID, path string, body i
 	}
 	if localAID != "" {
 		req["local_aid"] = localAID
+	}
+	if accessToken != "" {
+		req["access_token"] = accessToken
 	}
 	if len(extra) > 0 {
 		hdrs := make(map[string][]string)

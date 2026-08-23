@@ -1,12 +1,21 @@
+import { getAliases, setAliasInBook } from './address-book.js';
+
 export function shortAid(aid) {
   if (!aid || aid.length < 14) return aid || '';
   return aid.slice(0, 7) + '…' + aid.slice(-4);
 }
 
-const ALIASES_KEY = 'a2al_aliases';
-const ALIASES_MIGRATED_KEY = 'a2al_aliases_v1';
-const FAV_KEY = 'a2al_favorites';
-const OLD_ALIAS_PREFIX = 'a2al_alias_';
+/** Clickable short AID that toggles to the full string. */
+export function aidExpandHTML(full) {
+  if (!full) return '';
+  return `<button type="button" class="aid-expand mono" data-full-aid="${esc(full)}">${esc(shortAid(full))}</button>`;
+}
+
+export function toggleAidExpand(el) {
+  const full = el?.dataset?.fullAid;
+  if (!full) return;
+  el.textContent = el.textContent === full ? shortAid(full) : full;
+}
 
 function aliasLangPrefix() {
   const lang = localStorage.getItem('a2al_lang') || 'en';
@@ -15,114 +24,29 @@ function aliasLangPrefix() {
   return 'Agent ';
 }
 
-function loadAliasMapRaw() {
-  try {
-    const raw = localStorage.getItem(ALIASES_KEY);
-    if (!raw) return {};
-    const map = JSON.parse(raw);
-    return map && typeof map === 'object' ? map : {};
-  } catch {
-    return {};
-  }
-}
-
-function saveAliasMap(map) {
-  localStorage.setItem(ALIASES_KEY, JSON.stringify(map));
-}
-
 function usedAliasValuesLower(map) {
   return new Set(Object.values(map).map((v) => String(v).toLowerCase()));
 }
 
-function isGeneratedDefaultAlias(alias) {
-  return /^(Agent|AI智能体|AIエージェント) \d+$/i.test(String(alias || '').trim());
-}
-
 /** Next locale-aware default alias unique across all AIDs. */
 export function nextUniqueDefaultAlias() {
-  migrateAliasesOnce();
-  const used = usedAliasValuesLower(loadAliasMapRaw());
+  const used = usedAliasValuesLower(getAliases());
   const prefix = aliasLangPrefix();
   let n = 1;
   while (used.has(`${prefix}${n}`.toLowerCase())) n++;
   return `${prefix}${n}`;
 }
 
-function migrateAliasesOnce() {
-  if (localStorage.getItem(ALIASES_MIGRATED_KEY)) return;
-
-  const map = { ...loadAliasMapRaw() };
-
-  for (let i = 0; i < localStorage.length; i++) {
-    const k = localStorage.key(i);
-    if (!k || !k.startsWith(OLD_ALIAS_PREFIX)) continue;
-    const aid = k.slice(OLD_ALIAS_PREFIX.length);
-    const v = (localStorage.getItem(k) || '').trim();
-    if (aid && v && !map[aid]) map[aid] = v;
-  }
-
-  let favsChanged = false;
-  try {
-    const favs = JSON.parse(localStorage.getItem(FAV_KEY) || '[]');
-    if (Array.isArray(favs)) {
-      const cleaned = favs.map((f) => {
-        if (!f || !f.aid) return f;
-        const a = String(f.alias || '').trim();
-        if (a && !map[f.aid]) map[f.aid] = a;
-        if ('alias' in f) {
-          favsChanged = true;
-          const { alias: _drop, ...rest } = f;
-          return rest;
-        }
-        return f;
-      });
-      if (favsChanged) localStorage.setItem(FAV_KEY, JSON.stringify(cleaned));
-    }
-  } catch (_) {}
-
-  const seen = new Map();
-  for (const aid of Object.keys(map)) {
-    const alias = map[aid];
-    const low = String(alias).toLowerCase();
-    if (seen.has(low)) {
-      if (isGeneratedDefaultAlias(alias)) {
-        delete map[aid];
-        const used = usedAliasValuesLower(map);
-        const prefix = aliasLangPrefix();
-        let n = 1;
-        while (used.has(`${prefix}${n}`.toLowerCase())) n++;
-        map[aid] = `${prefix}${n}`;
-        used.add(map[aid].toLowerCase());
-      }
-    } else {
-      seen.set(low, aid);
-    }
-  }
-
-  saveAliasMap(map);
-  localStorage.setItem(ALIASES_MIGRATED_KEY, '1');
-}
-
-function loadAliasMap() {
-  migrateAliasesOnce();
-  return loadAliasMapRaw();
-}
-
-/** Returns the locally stored alias for this AID, or '' if none set. */
+/** Returns the stored alias for this AID, or '' if none set. */
 export function aliasOf(aid) {
   if (!aid) return '';
-  return loadAliasMap()[aid] || '';
+  return getAliases()[aid] || '';
 }
 
-/** Persist an alias for an AID to localStorage. */
+/** Persist an alias for an AID on the connected node. */
 export function setAliasOf(aid, alias) {
   if (!aid) return;
-  migrateAliasesOnce();
-  const map = loadAliasMapRaw();
-  const trimmed = String(alias || '').trim();
-  if (trimmed) map[aid] = trimmed;
-  else delete map[aid];
-  saveAliasMap(map);
+  setAliasInBook(aid, alias);
 }
 
 /** Ensure aid has an alias; assign a globally unique default if missing. */

@@ -46,7 +46,7 @@ func newTestDaemon(t *testing.T) *Daemon {
 		t.Fatal(err)
 	}
 	cfg := config.Default()
-	return &Daemon{
+	d := &Daemon{
 		dataDir:          dir,
 		cfgPath:          filepath.Join(dir, "config.toml"),
 		cfg:              &cfg,
@@ -62,6 +62,11 @@ func newTestDaemon(t *testing.T) *Daemon {
 		bus:              NewEventBus(slog.New(slog.NewTextHandler(io.Discard, nil))),
 		tunnels:          newTunnelRegistry(),
 	}
+	d.initRemoteAdmin()
+	d.initAddressBook()
+	d.aclIP = newACLIPGate()
+	h.SetDecideAccess(d.decideAccess)
+	return d
 }
 
 func TestAPI_health(t *testing.T) {
@@ -353,6 +358,133 @@ func TestAPI_register_emptyServiceTCP(t *testing.T) {
 	}
 	if _, ok := ag["service_tcp_ok"]; ok {
 		t.Fatalf("service_tcp_ok should not appear in list response, got %#v", ag["service_tcp_ok"])
+	}
+}
+
+func TestAPI_acl_crud(t *testing.T) {
+	d := newTestDaemon(t)
+	aid := newTestAgent(t, d)
+	visitor := newTestAgent(t, d)
+	blocked := newTestAgent(t, d)
+	srv := httptest.NewServer(d.routes())
+	defer srv.Close()
+	client := &http.Client{Timeout: 10 * time.Second}
+	base := srv.URL + "/agents/" + aid.String()
+
+	getJSON := func(t *testing.T, path string) map[string]any {
+		t.Helper()
+		resp, err := client.Get(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("GET %s: %d %s", path, resp.StatusCode, body)
+		}
+		var m map[string]any
+		if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+	doJSON := func(t *testing.T, method, path string, body any) (int, map[string]any) {
+		t.Helper()
+		var rdr io.Reader
+		if body != nil {
+			b, _ := json.Marshal(body)
+			rdr = bytes.NewReader(b)
+		}
+		req, _ := http.NewRequest(method, path, rdr)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		raw, _ := io.ReadAll(resp.Body)
+		var m map[string]any
+		_ = json.Unmarshal(raw, &m)
+		return resp.StatusCode, m
+	}
+
+	acl := getJSON(t, base+"/acl")
+	if acl["default"] != "public" {
+		t.Fatalf("default %#v", acl["default"])
+	}
+	ag := getJSON(t, base)
+	if ag["acl"] == nil {
+		t.Fatal("GET agent missing acl")
+	}
+
+	if st, _ := doJSON(t, http.MethodPatch, base+"/acl", map[string]string{"default": "deny"}); st != http.StatusOK {
+		t.Fatalf("patch default %d", st)
+	}
+	acl = getJSON(t, base+"/acl")
+	if acl["default"] != "deny" {
+		t.Fatalf("after patch %#v", acl["default"])
+	}
+
+	st, created := doJSON(t, http.MethodPost, base+"/acl/allow", map[string]string{"aid": visitor.String()})
+	if st != http.StatusCreated {
+		t.Fatalf("allow post %d %#v", st, created)
+	}
+	allowID, _ := created["id"].(string)
+	if allowID == "" {
+		t.Fatal("missing allow id")
+	}
+
+	st, _ = doJSON(t, http.MethodPost, base+"/acl/deny", map[string]string{"aid": ""})
+	if st != http.StatusBadRequest {
+		t.Fatalf("empty deny aid want 400 got %d", st)
+	}
+	if st, _ = doJSON(t, http.MethodPost, base+"/acl/deny", map[string]string{"aid": visitor.String()}); st != http.StatusBadRequest {
+		t.Fatalf("deny overlapping allow want 400 got %d", st)
+	}
+	st, denied := doJSON(t, http.MethodPost, base+"/acl/deny", map[string]string{"aid": blocked.String()})
+	if st != http.StatusCreated {
+		t.Fatalf("deny post %d %#v", st, denied)
+	}
+	denyID, _ := denied["id"].(string)
+
+	st, join := doJSON(t, http.MethodPost, base+"/acl/allow", map[string]string{"secret": "s3cret"})
+	if st != http.StatusCreated {
+		t.Fatalf("join password post %d %#v", st, join)
+	}
+	if join["secret"] != "s3cret" {
+		t.Fatalf("create should echo secret %#v", join)
+	}
+	if st, _ = doJSON(t, http.MethodPost, base+"/acl/allow", map[string]string{}); st != http.StatusBadRequest {
+		t.Fatalf("empty join want 400 got %d", st)
+	}
+	acl = getJSON(t, base+"/acl")
+	foundSecret := false
+	for _, item := range acl["allow"].([]any) {
+		m := item.(map[string]any)
+		if m["secret_set"] == true {
+			if m["secret"] != "s3cret" {
+				t.Fatalf("editor GET should return join secret %#v", m)
+			}
+			if m["aid"] != nil {
+				t.Fatal("join password should have no aid")
+			}
+			foundSecret = true
+		}
+	}
+	if !foundSecret {
+		t.Fatal("secret entry missing")
+	}
+	ag = getJSON(t, base)
+	raw, _ := json.Marshal(ag)
+	if strings.Contains(string(raw), "s3cret") {
+		t.Fatal("secret leaked on GET agent")
+	}
+
+	if st, _ = doJSON(t, http.MethodDelete, base+"/acl/allow/"+allowID, nil); st != http.StatusOK {
+		t.Fatalf("del allow %d", st)
+	}
+	if st, _ = doJSON(t, http.MethodDelete, base+"/acl/deny/"+denyID, nil); st != http.StatusOK {
+		t.Fatalf("del deny %d", st)
 	}
 }
 

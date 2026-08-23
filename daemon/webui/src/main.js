@@ -4,10 +4,11 @@ import { api, getToken, setToken } from './api.js';
 import { vaultLoad, vaultUnlock, vaultClear, vaultSave, vaultIsLocked, vaultHasStored,
          shadowHas, shadowSave, shadowClear, shadowVerify } from './vault.js';
 import { toast } from './toast.js';
-import { shortAid, esc, setLoading } from './util.js';
+import { shortAid, esc, setLoading, aidExpandHTML, toggleAidExpand } from './util.js';
 import { renderAgents } from './views/agents.js';
 import { renderDiscover } from './views/discover.js';
 import { renderNode } from './views/node.js';
+import { hydrateAddressBook } from './address-book.js';
 
 let tab = 'agents';
 let _ver = ''; // cached version string, populated by refreshHeader()
@@ -83,7 +84,12 @@ async function refreshHeader() {
       d.innerHTML = `<span class="meta-label">${esc(label)}</span> ${esc(text)}`;
       meta.appendChild(d);
     };
-    add(t('node.aid'), shortAid(host.address));
+    const aidItem = document.createElement('div');
+    aidItem.className = 'meta-item';
+    aidItem.innerHTML = `<span class="meta-label">${esc(t('node.aid'))}</span> ${aidExpandHTML(host.address)} <button type="button" class="btn btn-ghost btn-xs" data-copy-node-aid title="Copy AID">\u29c9</button>`;
+    aidItem.querySelector('.aid-expand').onclick = (ev) => toggleAidExpand(ev.currentTarget);
+    aidItem.querySelector('[data-copy-node-aid]').onclick = () => copyText(host.address);
+    meta.appendChild(aidItem);
     add('Tangled', host.dht_addr || '—');
     add('QUIC', host.quic_addr || '—');
     add(t('node.peers'), String(stats.total_peers ?? 0));
@@ -418,6 +424,7 @@ function _buildGateModal({ title, hint, onUnlock, onForgot, confirmKey, clearedK
     }
   }
 
+  await hydrateAddressBook();
   renderShell();
 })();
 

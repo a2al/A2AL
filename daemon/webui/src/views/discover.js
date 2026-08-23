@@ -1,4 +1,4 @@
-import { esc, shortAid, setLoading, base64ToUtf8, aliasOf, setAliasOf, ensureAlias, nextUniqueDefaultAlias } from '../util.js';
+import { esc, shortAid, aidExpandHTML, toggleAidExpand, setLoading, base64ToUtf8, aliasOf, setAliasOf, ensureAlias, nextUniqueDefaultAlias } from '../util.js';
 import { loadFavs, addFav, removeFav, isFaved } from './favorites.js';
 
 const NAT_TYPE_KEYS = {
@@ -11,6 +11,36 @@ const NAT_TYPE_KEYS = {
 function natLabel(t, n) {
   if (n == null) return '—';
   return t(NAT_TYPE_KEYS[n] ?? 'node.nat.unknown');
+}
+
+function isAccessDenied(e) {
+  return e && (e.status === 403 || /access denied/i.test(e.message || ''));
+}
+
+function accessRetryHTML(t, requesterAid) {
+  const hint = t('connect.access_denied_hint', { aid: '\u0001' }).split('\u0001').map(esc).join(aidExpandHTML(requesterAid));
+  return `<p style="color:var(--error);margin:0">${esc(t('connect.access_denied'))}</p><p class="muted" style="margin:.2rem 0 0;font-size:.83rem">${hint}</p>
+      <div class="acl-join-retry">
+        <input type="password" data-join-secret autocomplete="off" placeholder="${esc(t('discover.access_token'))}" />
+        <button type="button" class="btn btn-secondary btn-sm" data-join-retry>${esc(t('discover.access_retry'))}</button>
+      </div>`;
+}
+
+function actionFailHTML(e, t, requesterAid) {
+  if (isAccessDenied(e)) {
+    return accessRetryHTML(t, requesterAid);
+  }
+  const is412 = e.status === 412;
+  return `<p style="color:var(--error);margin:0">${esc(is412 ? t('connect.no_direct_path') : t('connect.peer_offline'))}</p><p class="muted" style="margin:.2rem 0 0;font-size:.83rem">${esc(is412 ? t('connect.relay_required_hint') : t('connect.unreachable_hint'))}</p>`;
+}
+
+function bindAccessRetry(root, e, onRetry) {
+  if (!isAccessDenied(e)) return;
+  const btn = root.querySelector('[data-join-retry]');
+  const inp = root.querySelector('[data-join-secret]');
+  if (!btn) return;
+  btn.onclick = () => onRetry((inp?.value || '').trim());
+  inp?.focus();
 }
 
 function utf8ToBase64(s) {
@@ -97,9 +127,14 @@ function metaSummary(meta) {
 export async function renderDiscover(mount, ctx) {
   const { t, api, toast, copyText, isStale } = ctx;
   let agents = [];
+  let nodeAid = '';
   try {
     const r = await api('/agents');
     agents = r.agents || [];
+  } catch (_) {}
+  try {
+    const st = await api('/status');
+    nodeAid = st.node_aid || '';
   } catch (_) {}
 
   const agentOpts = agents.length === 0
@@ -220,7 +255,7 @@ export async function renderDiscover(mount, ctx) {
 
         <div id="dQueryStrip" class="discover-query-strip hidden" aria-hidden="true"></div>
 
-        <div style="display:flex;flex-wrap:wrap;gap:.4rem">
+        <div style="display:flex;flex-wrap:wrap;gap:.4rem;align-items:center">
           <button type="button" class="btn btn-secondary btn-sm" id="dTunnel">${esc(t('discover.tunnel.btn2'))}</button>
           <button type="button" class="btn btn-secondary btn-sm" id="dOneshot">${esc(t('discover.oneshot.btn'))}</button>
           <button type="button" class="btn btn-secondary btn-sm" id="dShowReq">${esc(t('discover.req.title'))}</button>
@@ -315,6 +350,11 @@ export async function renderDiscover(mount, ctx) {
   let lastProfile     = null;
   const favTunnels    = new Map();
 
+  wrap.addEventListener('click', (ev) => {
+    const el = ev.target.closest('.aid-expand');
+    if (el) toggleAidExpand(el);
+  });
+
   function queryStale(gen) {
     return gen !== queryGen || isStale?.();
   }
@@ -386,14 +426,15 @@ export async function renderDiscover(mount, ctx) {
   }
 
   /* ── Helpers ───────────────────────────────────────────── */
-  async function findOrOpenTunnel(remoteAid) {
+  async function findOrOpenTunnel(remoteAid, token) {
     const aidNorm = remoteAid.toLowerCase();
     try {
       const { tunnels = [] } = await api('/tunnel');
       const existing = tunnels.find((t) => (t.remote_aid || '').toLowerCase() === aidNorm);
       if (existing) return existing;
     } catch (_) {}
-    return api(`/tunnel/${encodeURIComponent(remoteAid)}`, { method: 'POST', body: '{}' });
+    const body = token ? { access_token: token } : {};
+    return api(`/tunnel/${encodeURIComponent(remoteAid)}`, { method: 'POST', body: JSON.stringify(body) });
   }
 
   function fmtEndpoints(ep) {
@@ -681,7 +722,7 @@ export async function renderDiscover(mount, ctx) {
       setStatus(null, ttlValid, lastSeenStr);
       api(`/connect/${encodeURIComponent(currentAid)}`, { method: 'POST', body: '{}' })
         .then(() => { if (!queryStale(gen)) setStatus(true, ttlValid, lastSeenStr); })
-        .catch((e) => { if (!queryStale(gen)) setStatus(e.status === 412 ? true : false, ttlValid, lastSeenStr); });
+        .catch((e) => { if (!queryStale(gen)) setStatus(e.status === 412 || isAccessDenied(e) ? true : false, ttlValid, lastSeenStr); });
       loadProfileAndServices(currentAid, gen);
     } else {
       setQuerying(false);
@@ -744,75 +785,97 @@ export async function renderDiscover(mount, ctx) {
       el.textContent = t('discover.ping.ok', { ms: Math.round(performance.now() - t0) });
       el.style.color = 'var(--success)';
     } catch (e) {
-      el.textContent = e.status === 412 ? t('connect.no_direct_path') : t('connect.peer_offline');
-      el.style.color = 'var(--error)';
+      if (isAccessDenied(e)) {
+        el.textContent = t('discover.ping.ok', { ms: Math.round(performance.now() - t0) });
+        el.style.color = 'var(--success)';
+      } else {
+        el.textContent = e.status === 412 ? t('connect.no_direct_path') : t('connect.peer_offline');
+        el.style.color = 'var(--error)';
+      }
     } finally {
       setLoading(btn, false);
     }
   };
+
+  function paintMainTunnel(tr, onDeniedRetry) {
+    if (tr.allowed === false) {
+      currentTunnelId = null;
+      actionOut.innerHTML = `
+      <p style="color:var(--success);margin:0 0 .35rem;font-size:.9rem">${esc(t('discover.tunnel.connected'))}</p>
+      ${accessRetryHTML(t, nodeAid)}`;
+      bindAccessRetry(actionOut, { status: 403 }, onDeniedRetry);
+      return;
+    }
+    currentTunnelId = tr.id;
+    const relayBadge = tr.is_relayed ? `<span class="badge b-yellow" style="font-size:.75rem">${esc(t('tunnel.relayed'))}</span>` : '';
+    actionOut.innerHTML = `
+      <p style="color:var(--success);margin:0 0 .35rem;font-size:.9rem">${esc(t('discover.tunnel.ok'))} ${relayBadge}</p>
+      <div style="display:flex;align-items:center;gap:.4rem;flex-wrap:wrap;margin-bottom:.4rem">
+        <code class="mono" style="font-size:.87rem">${esc(tr.listen)}</code>
+        <button type="button" class="btn btn-ghost btn-sm" id="dTunnelCp">\u29c9</button>
+        <button type="button" class="btn btn-ghost btn-sm" id="dTunnelClose">${esc(t('discover.tunnel.close'))}</button>
+        <button type="button" class="btn btn-ghost btn-sm" id="dTunnelReset">${esc(t('discover.tunnel.reset'))}</button>
+      </div>
+      <div style="display:flex;gap:.4rem;flex-wrap:wrap;align-items:center">
+        <button type="button" class="btn btn-secondary btn-sm" id="dTunnelOpen">${esc(t('discover.tunnel.open'))}</button>
+        ${tr.https_url ? `<button type="button" class="btn btn-ghost btn-sm" id="dTunnelOpenHttps">${esc(t('discover.tunnel.open_https'))}</button><span class="muted" style="font-size:.79rem">${esc(t('discover.tunnel.open_hint'))}</span>` : ''}
+      </div>`;
+    actionOut.querySelector('#dTunnelCp').onclick = () => copyText(tr.listen);
+    actionOut.querySelector('#dTunnelOpen').onclick = () => window.open('http://' + tr.listen, '_blank', 'noopener');
+    if (tr.https_url) actionOut.querySelector('#dTunnelOpenHttps').onclick = () => window.open(tr.https_url, '_blank', 'noopener');
+    actionOut.querySelector('#dTunnelClose').onclick = async () => {
+      if (!currentTunnelId) return;
+      try { await api(`/tunnel/${encodeURIComponent(currentTunnelId)}`, { method: 'DELETE' }); } catch (_) {}
+      currentTunnelId = null;
+      actionOut.innerHTML = `<p class="muted" style="margin:0">${esc(t('discover.tunnel.closed'))}</p>`;
+      deactivateActions();
+    };
+    actionOut.querySelector('#dTunnelReset').onclick = async () => {
+      if (!currentTunnelId) return;
+      try {
+        await api(`/tunnel/${encodeURIComponent(currentTunnelId)}/reset`, { method: 'POST', body: '{}' });
+        currentTunnelId = null;
+        actionOut.innerHTML = `<p class="muted" style="margin:0">${esc(t('discover.tunnel.reset_ok'))}</p>`;
+        deactivateActions();
+      } catch (e) {
+        toast(t('common.error', { msg: e.message }), 'err');
+      }
+    };
+  }
+
+  async function runMainTunnel(btn, token) {
+    setLoading(btn, true);
+    actionOut.innerHTML = `<p class="muted">${esc(t('common.loading'))}</p>`;
+    try {
+      paintMainTunnel(await findOrOpenTunnel(currentAid, token), (tok) => runMainTunnel(btn, tok));
+    } catch (e) {
+      actionOut.innerHTML = actionFailHTML(e, t, nodeAid);
+      bindAccessRetry(actionOut, e, (tok) => runMainTunnel(btn, tok));
+    } finally {
+      setLoading(btn, false);
+    }
+  }
 
   /* ── Business: tunnel ──────────────────────────────────── */
   tunnelBtn.onclick = async (ev) => {
     if (!currentAid) return;
     if (!activateAction(tunnelBtn)) return;
-    const btn = ev.currentTarget;
-    setLoading(btn, true);
-    actionOut.innerHTML = `<p class="muted">${esc(t('common.loading'))}</p>`;
-    try {
-      const tr = await findOrOpenTunnel(currentAid);
-      currentTunnelId = tr.id;
-      const relayBadge = tr.is_relayed ? `<span class="badge b-yellow" style="font-size:.75rem">${esc(t('tunnel.relayed'))}</span>` : '';
-      actionOut.innerHTML = `
-        <p style="color:var(--success);margin:0 0 .35rem;font-size:.9rem">${esc(t('discover.tunnel.ok'))} ${relayBadge}</p>
-        <div style="display:flex;align-items:center;gap:.4rem;flex-wrap:wrap;margin-bottom:.4rem">
-          <code class="mono" style="font-size:.87rem">${esc(tr.listen)}</code>
-          <button type="button" class="btn btn-ghost btn-sm" id="dTunnelCp">\u29c9</button>
-          <button type="button" class="btn btn-ghost btn-sm" id="dTunnelClose">${esc(t('discover.tunnel.close'))}</button>
-          <button type="button" class="btn btn-ghost btn-sm" id="dTunnelReset">${esc(t('discover.tunnel.reset'))}</button>
-        </div>
-        <div style="display:flex;gap:.4rem;flex-wrap:wrap;align-items:center">
-          <button type="button" class="btn btn-secondary btn-sm" id="dTunnelOpen">${esc(t('discover.tunnel.open'))}</button>
-          ${tr.https_url ? `<button type="button" class="btn btn-ghost btn-sm" id="dTunnelOpenHttps">${esc(t('discover.tunnel.open_https'))}</button><span class="muted" style="font-size:.79rem">${esc(t('discover.tunnel.open_hint'))}</span>` : ''}
-        </div>`;
-      actionOut.querySelector('#dTunnelCp').onclick = () => copyText(tr.listen);
-      actionOut.querySelector('#dTunnelOpen').onclick = () => window.open('http://' + tr.listen, '_blank', 'noopener');
-      if (tr.https_url) actionOut.querySelector('#dTunnelOpenHttps').onclick = () => window.open(tr.https_url, '_blank', 'noopener');
-      actionOut.querySelector('#dTunnelClose').onclick = async () => {
-        if (!currentTunnelId) return;
-        try { await api(`/tunnel/${encodeURIComponent(currentTunnelId)}`, { method: 'DELETE' }); } catch (_) {}
-        currentTunnelId = null;
-        actionOut.innerHTML = `<p class="muted" style="margin:0">${esc(t('discover.tunnel.closed'))}</p>`;
-        deactivateActions();
-      };
-      actionOut.querySelector('#dTunnelReset').onclick = async () => {
-        if (!currentTunnelId) return;
-        try {
-          await api(`/tunnel/${encodeURIComponent(currentTunnelId)}/reset`, { method: 'POST', body: '{}' });
-          currentTunnelId = null;
-          actionOut.innerHTML = `<p class="muted" style="margin:0">${esc(t('discover.tunnel.reset_ok'))}</p>`;
-          deactivateActions();
-        } catch (e) {
-          toast(t('common.error', { msg: e.message }), 'err');
-        }
-      };
-    } catch (e) {
-      const _is412 = e.status === 412;
-      actionOut.innerHTML = `<p style="color:var(--error);margin:0">${esc(_is412 ? t('connect.no_direct_path') : t('connect.peer_offline'))}</p><p class="muted" style="margin:.2rem 0 0;font-size:.83rem">${esc(_is412 ? t('connect.relay_required_hint') : t('connect.unreachable_hint'))}</p>`;
-    } finally {
-      setLoading(btn, false);
-    }
+    await runMainTunnel(ev.currentTarget);
   };
 
-  /* ── Business: oneshot ─────────────────────────────────── */
-  oneshotBtn.onclick = async (ev) => {
-    if (!currentAid) return;
-    if (!activateAction(oneshotBtn)) return;
-    const btn = ev.currentTarget;
+  async function runOneshot(btn, token) {
     setLoading(btn, true);
     actionOut.innerHTML = `<p class="muted">${esc(t('common.loading'))}</p>`;
     if (oneshotTimer) { clearInterval(oneshotTimer); oneshotTimer = null; }
     try {
-      const cr = await api(`/connect/${encodeURIComponent(currentAid)}`, { method: 'POST', body: '{}' });
+      const cr = await api(`/connect/${encodeURIComponent(currentAid)}`, { method: 'POST', body: JSON.stringify(token ? { access_token: token } : {}) });
+      if (cr.allowed === false) {
+        actionOut.innerHTML = `
+        <p style="color:var(--success);margin:0 0 .35rem;font-size:.9rem">${esc(t('discover.tunnel.connected'))}</p>
+        ${accessRetryHTML(t, nodeAid)}`;
+        bindAccessRetry(actionOut, { status: 403 }, (tok) => runOneshot(btn, tok));
+        return;
+      }
       let remaining = 30;
       actionOut.innerHTML = `
         <p style="color:var(--success);margin:0 0 .2rem;font-size:.9rem">${esc(t('discover.oneshot.ok'))}</p>
@@ -834,11 +897,16 @@ export async function renderDiscover(mount, ctx) {
         if (cd) cd.textContent = t('discover.oneshot.countdown', { n: remaining });
       }, 1000);
     } catch (e) {
-      const _is412 = e.status === 412;
-      actionOut.innerHTML = `<p style="color:var(--error);margin:0">${esc(_is412 ? t('connect.no_direct_path') : t('connect.peer_offline'))}</p><p class="muted" style="margin:.2rem 0 0;font-size:.83rem">${esc(_is412 ? t('connect.relay_required_hint') : t('connect.unreachable_hint'))}</p>`;
+      actionOut.innerHTML = actionFailHTML(e, t, nodeAid);
+      bindAccessRetry(actionOut, e, (tok) => runOneshot(btn, tok));
     } finally {
       setLoading(btn, false);
     }
+  }
+  oneshotBtn.onclick = async (ev) => {
+    if (!currentAid) return;
+    if (!activateAction(oneshotBtn)) return;
+    await runOneshot(ev.currentTarget);
   };
 
   /* ── Business: AID direct ──────────────────────────────── */
@@ -890,9 +958,9 @@ export async function renderDiscover(mount, ctx) {
     actionOut.querySelector('#rqP').addEventListener('input', updateProxyHint);
     updateProxyHint();
     m.onchange = () => bw.classList.toggle('hidden', !['POST', 'PUT', 'PATCH'].includes(m.value));
-    actionOut.querySelector('#rqGo').onclick = async (ev) => {
+    async function sendReq(token) {
       if (!currentAid) return;
-      const btn = ev.currentTarget;
+      const btn = actionOut.querySelector('#rqGo');
       setLoading(btn, true);
       const path = actionOut.querySelector('#rqP').value.trim() || '/';
       const method = m.value;
@@ -901,6 +969,7 @@ export async function renderDiscover(mount, ctx) {
       try {
         const fetchBody = { method, path };
         if (localAid) fetchBody.local_aid = localAid;
+        if (token) fetchBody.access_token = token;
         if (['POST', 'PUT', 'PATCH'].includes(method)) {
           fetchBody.body_base64 = utf8ToBase64(actionOut.querySelector('#rqB').value || '{}');
           fetchBody.headers = { 'Content-Type': ['application/json'] };
@@ -917,12 +986,18 @@ export async function renderDiscover(mount, ctx) {
         actionOut.querySelector('#rqMeta').innerHTML =
           `<span style="color:${statusColor};font-weight:600">${r.status}</span>  &bull;  ${Math.round(performance.now() - t0)} ms${truncNote}`;
       } catch (e) {
-        actionOut.querySelector('#rqOut').textContent = e.message;
-        actionOut.querySelector('#rqMeta').textContent = '';
+        actionOut.querySelector('#rqOut').textContent = isAccessDenied(e) ? t('connect.access_denied') : e.message;
+        if (isAccessDenied(e)) {
+          actionOut.querySelector('#rqMeta').innerHTML = actionFailHTML(e, t, localAid || nodeAid);
+          bindAccessRetry(actionOut, e, (tok) => sendReq(tok));
+        } else {
+          actionOut.querySelector('#rqMeta').textContent = '';
+        }
       } finally {
         setLoading(btn, false);
       }
-    };
+    }
+    actionOut.querySelector('#rqGo').onclick = () => sendReq();
   }
   reqBtn.onclick = () => { if (!currentAid) return; if (!activateAction(reqBtn)) return; mountReq(); };
 
@@ -1152,10 +1227,17 @@ export async function renderDiscover(mount, ctx) {
     return rowWrap;
   }
 
-  async function setupFavTunnel(fav, panel, deactivateFavBtns) {
+  async function setupFavTunnel(fav, panel, deactivateFavBtns, token) {
     panel.innerHTML = `<p class="muted" style="font-size:.87rem">${esc(t('common.loading'))}</p>`;
     try {
-      const tr = await findOrOpenTunnel(fav.aid);
+      const tr = await findOrOpenTunnel(fav.aid, token);
+      if (tr.allowed === false) {
+        panel.innerHTML = `
+        <p style="color:var(--success);margin:0 0 .3rem;font-size:.88rem">${esc(t('discover.tunnel.connected'))}</p>
+        ${accessRetryHTML(t, nodeAid)}`;
+        bindAccessRetry(panel, { status: 403 }, (tok) => setupFavTunnel(fav, panel, deactivateFavBtns, tok));
+        return;
+      }
       favTunnels.set(fav.id, tr.id);
       const relayBadge = tr.is_relayed ? `<span class="badge b-yellow" style="font-size:.72rem">${esc(t('tunnel.relayed'))}</span>` : '';
       panel.innerHTML = `
@@ -1191,8 +1273,8 @@ export async function renderDiscover(mount, ctx) {
         }
       };
     } catch (e) {
-      const _is412 = e.status === 412;
-      panel.innerHTML = `<p style="color:var(--error);margin:0;font-size:.86rem">${esc(_is412 ? t('connect.no_direct_path') : t('connect.peer_offline'))}</p><p class="muted" style="margin:.2rem 0 0;font-size:.82rem">${esc(_is412 ? t('connect.relay_required_hint') : t('connect.unreachable_hint'))}</p>`;
+      panel.innerHTML = actionFailHTML(e, t, nodeAid);
+      bindAccessRetry(panel, e, (tok) => setupFavTunnel(fav, panel, deactivateFavBtns, tok));
     }
   }
 

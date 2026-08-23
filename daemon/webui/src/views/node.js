@@ -2,6 +2,7 @@ import { setLoading } from '../util.js';
 import { getToken, setToken, api } from '../api.js';
 import { vaultSave, vaultIsLocked, vaultHasStored, vaultUnlock, vaultClear,
          shadowHas, shadowSave, shadowClear, shadowVerify } from '../vault.js';
+import { lampHTML, mountRemoteAdmin } from '../remote-admin-panel.js';
 
 const RESTART_FIELDS = new Set([
   'listen_addr',
@@ -68,11 +69,13 @@ export async function renderNode(mount, ctx) {
   let host = null;
   let stats = null;
   let status = null;
+  let ra = { enabled: false };
   try {
-    [host, stats, status] = await Promise.all([
+    [host, stats, status, ra] = await Promise.all([
       api('/debug/host'),
       api('/debug/stats'),
       api('/status'),
+      api('/node/remote-admin').catch(() => ({ enabled: false })),
     ]);
   } catch (e) {
     root.innerHTML = `<p style="color:var(--error)">${esc(t('common.error', { msg: e.message }))}</p>`;
@@ -85,11 +88,16 @@ export async function renderNode(mount, ctx) {
   card.innerHTML = `
     <div class="card-h">${esc(t('node.title'))}</div>
     <div class="card-b">
-      <div class="meta-item" style="margin-bottom:.5rem">
-        <span class="meta-label">${esc(t('node.aid'))}</span>
-        <span class="mono">${esc(shortAid(host.address))}</span>
-        <button type="button" class="btn btn-ghost btn-sm" data-copy-node>⧉</button>
-        <button type="button" class="btn btn-ghost btn-sm" id="showFullAid">${esc(t('node.full_aid'))}</button>
+      <div class="meta-item" style="margin-bottom:.5rem;justify-content:space-between;gap:.6rem">
+        <div style="display:flex;align-items:center;gap:.35rem;flex-wrap:wrap;min-width:0">
+          <span class="meta-label">${esc(t('node.aid'))}</span>
+          <span class="mono">${esc(shortAid(host.address))}</span>
+          <button type="button" class="btn btn-ghost btn-sm" data-copy-node>⧉</button>
+          <button type="button" class="btn btn-ghost btn-sm" id="showFullAid">${esc(t('node.full_aid'))}</button>
+        </div>
+        <button type="button" class="btn btn-secondary btn-sm" id="raOpen" style="flex-shrink:0">
+          ${lampHTML(!!ra.enabled, esc)} ${esc(t('node.ra.btn'))}
+        </button>
       </div>
       <pre id="fullAid" class="hidden mono" style="font-size:.75rem;white-space:pre-wrap">${esc(host.address)}</pre>
       <div style="display:grid;gap:.35rem;font-size:.85rem">
@@ -106,6 +114,7 @@ export async function renderNode(mount, ctx) {
           ${esc(t('node.last_refresh', { ago: status.node_last_publish_at ? relTime(status.node_last_publish_at) : '—' }))}
           · ${esc(t('node.next_refresh', { eta: status.node_next_republish_estimate ? relTime(status.node_next_republish_estimate) : '—' }))}
         </div>
+        <div id="raMount" class="ra-inline hidden"></div>
       </div>
     </div>`;
   root.appendChild(card);
@@ -131,6 +140,15 @@ export async function renderNode(mount, ctx) {
       setLoading(b, false);
     }
   };
+
+  const raMount = card.querySelector('#raMount');
+  const raPanel = mountRemoteAdmin(raMount, ctx, ra);
+  const raBtn = card.querySelector('#raOpen');
+  const syncRaLamp = (st) => {
+    raBtn.innerHTML = `${lampHTML(!!(st && st.enabled), esc)} ${esc(t('node.ra.btn'))}`;
+  };
+  raPanel.setOnChange(syncRaLamp);
+  raBtn.onclick = () => raMount.classList.toggle('hidden');
 
   const cfgCard = document.createElement('div');
   cfgCard.className = 'card';

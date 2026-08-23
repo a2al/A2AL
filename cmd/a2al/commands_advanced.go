@@ -105,8 +105,103 @@ func cmdAgents(c *Client, g globalOpts, args []string) {
 		cmdAgentsImport(c, g, rest)
 	case "topic":
 		cmdAgentsTopic(c, g, rest)
+	case "acl":
+		cmdAgentsACL(c, g, rest)
+	case "acl-default":
+		cmdAgentsACLDefault(c, g, rest)
+	case "acl-allow":
+		cmdAgentsACLAdd(c, g, rest, "allow")
+	case "acl-deny":
+		cmdAgentsACLAdd(c, g, rest, "deny")
+	case "acl-del":
+		cmdAgentsACLDel(c, g, rest)
 	default:
 		fatalf("unknown agents subcommand: %s", sub)
+	}
+}
+
+func cmdAgentsACL(c *Client, g globalOpts, args []string) {
+	if len(args) != 1 {
+		fatalf("usage: a2al agents acl <aid>")
+	}
+	var m map[string]any
+	if _, _, err := c.DoRequest(http.MethodGet, "/agents/"+url.PathEscape(args[0])+"/acl", nil, &m); err != nil {
+		fatal(err)
+	}
+	if g.JSON || g.Quiet {
+		printJSON(true, m)
+		return
+	}
+	b, _ := json.MarshalIndent(m, "", "  ")
+	fmt.Println(string(b))
+}
+
+func cmdAgentsACLDefault(c *Client, g globalOpts, args []string) {
+	if len(args) != 2 || (args[1] != "public" && args[1] != "deny") {
+		fatalf("usage: a2al agents acl-default <aid> public|deny")
+	}
+	var out map[string]any
+	if _, _, err := c.DoRequest(http.MethodPatch, "/agents/"+url.PathEscape(args[0])+"/acl", map[string]any{"default": args[1]}, &out); err != nil {
+		fatal(err)
+	}
+	if g.JSON {
+		printJSON(true, out)
+		return
+	}
+	if !g.Quiet {
+		fmt.Println("acl default", args[1])
+	}
+}
+
+func cmdAgentsACLAdd(c *Client, g globalOpts, args []string, list string) {
+	secret := flagString(args, "--secret")
+	if list == "allow" && secret != "" && len(args) >= 1 {
+		var out map[string]any
+		if _, _, err := c.DoRequest(http.MethodPost, "/agents/"+url.PathEscape(args[0])+"/acl/allow", map[string]any{"secret": secret}, &out); err != nil {
+			fatal(err)
+		}
+		if g.JSON {
+			printJSON(true, out)
+			return
+		}
+		if !g.Quiet {
+			fmt.Printf("acl allow join-password id=%v\n", out["id"])
+		}
+		return
+	}
+	if len(args) != 2 {
+		if list == "allow" {
+			fatalf("usage: a2al agents acl-allow <aid> <visitor-aid>\n       a2al agents acl-allow <aid> --secret <password>")
+		}
+		fatalf("usage: a2al agents acl-%s <aid> <visitor-aid>", list)
+	}
+	var out map[string]any
+	if _, _, err := c.DoRequest(http.MethodPost, "/agents/"+url.PathEscape(args[0])+"/acl/"+list, map[string]any{"aid": args[1]}, &out); err != nil {
+		fatal(err)
+	}
+	if g.JSON {
+		printJSON(true, out)
+		return
+	}
+	if !g.Quiet {
+		fmt.Printf("acl %s %s id=%v\n", list, args[1], out["id"])
+	}
+}
+
+func cmdAgentsACLDel(c *Client, g globalOpts, args []string) {
+	if len(args) != 3 || (args[1] != "allow" && args[1] != "deny") {
+		fatalf("usage: a2al agents acl-del <aid> allow|deny <id>")
+	}
+	var out map[string]any
+	if _, _, err := c.DoRequest(http.MethodDelete, "/agents/"+url.PathEscape(args[0])+"/acl/"+args[1]+"/"+url.PathEscape(args[2]), nil, &out); err != nil {
+		fatal(err)
+	}
+	if g.JSON {
+		printJSON(true, out)
+		return
+	}
+	if !g.Quiet {
+		fmt.Println("deleted", args[1], args[2])
 	}
 }
 
@@ -175,9 +270,11 @@ func cmdAgentsExport(c *Client, g globalOpts, args []string) {
 	for i := 1; i < len(args); i++ {
 		switch {
 		case args[i] == "-o" && i+1 < len(args):
-			i++; outPath = args[i]
+			i++
+			outPath = args[i]
 		case args[i] == "--password" && i+1 < len(args):
-			i++; password = args[i]
+			i++
+			password = args[i]
 		case strings.HasPrefix(args[i], "--password="):
 			password = strings.TrimPrefix(args[i], "--password=")
 		}
@@ -227,7 +324,8 @@ func cmdAgentsImport(c *Client, g globalOpts, args []string) {
 	for i := 1; i < len(args); i++ {
 		switch {
 		case args[i] == "--password" && i+1 < len(args):
-			i++; password = args[i]
+			i++
+			password = args[i]
 		case strings.HasPrefix(args[i], "--password="):
 			password = strings.TrimPrefix(args[i], "--password=")
 		}
@@ -407,23 +505,35 @@ func cmdResolve(c *Client, g globalOpts, args []string) {
 
 func cmdConnect(c *Client, g globalOpts, args []string) {
 	if len(args) < 1 {
-		fatalf("usage: a2al connect <remote-aid> [--local-aid …]")
+		fatalf("usage: a2al connect <remote-aid> [--local-aid …] [--access-token …]")
 	}
 	remote := args[0]
 	la := flagString(args[1:], "--local-aid")
+	tok := flagString(args[1:], "--access-token")
 	body := map[string]any{}
 	if la != "" {
 		body["local_aid"] = la
+	}
+	if tok != "" {
+		body["access_token"] = tok
 	}
 	if !g.Quiet && !g.JSON {
 		label := resolveLocalIdentityLabel(c, la)
 		fmt.Fprintf(os.Stderr, "Connecting as %s → %s\n", label, shortAID(remote))
 	}
-	var tun map[string]string
+	var tun map[string]any
 	if _, _, err := c.DoRequest(http.MethodPost, "/connect/"+remote, body, &tun); err != nil {
 		fatal(err)
 	}
-	addr := tun["tunnel"]
+	if allowed, ok := tun["allowed"].(bool); ok && !allowed {
+		if g.JSON {
+			printJSON(true, tun)
+		} else {
+			fmt.Fprintln(os.Stderr, "connected, access denied")
+		}
+		os.Exit(1)
+	}
+	addr, _ := tun["tunnel"].(string)
 	if g.JSON {
 		printJSON(true, tun)
 		return
@@ -446,7 +556,7 @@ func cmdTunnel(c *Client, g globalOpts, args []string) {
 	switch args[0] {
 	case "open":
 		if len(args) < 2 {
-			fatalf("usage: a2al tunnel open <remote-aid> [--local-aid …] [--idle-timeout N]")
+			fatalf("usage: a2al tunnel open <remote-aid> [--local-aid …] [--idle-timeout N] [--access-token …]")
 		}
 		tunnelOpen(c, g, args[1:])
 	case "close":
@@ -504,10 +614,14 @@ func tunnelOpen(c *Client, g globalOpts, args []string) {
 	remote := args[0]
 	la := flagString(args[1:], "--local-aid")
 	idleStr := flagString(args[1:], "--idle-timeout")
+	tok := flagString(args[1:], "--access-token")
 
 	body := map[string]any{}
 	if la != "" {
 		body["local_aid"] = la
+	}
+	if tok != "" {
+		body["access_token"] = tok
 	}
 	if idleStr != "" {
 		var n int
@@ -524,6 +638,14 @@ func tunnelOpen(c *Client, g globalOpts, args []string) {
 	var tun map[string]any
 	if _, _, err := c.DoRequest(http.MethodPost, "/tunnel/"+url.PathEscape(remote), body, &tun); err != nil {
 		fatal(err)
+	}
+	if allowed, ok := tun["allowed"].(bool); ok && !allowed {
+		if g.JSON {
+			printJSON(true, tun)
+		} else if !g.Quiet {
+			fmt.Fprintln(os.Stderr, "connected, access denied")
+		}
+		os.Exit(1)
 	}
 	if g.JSON {
 		printJSON(true, tun)
@@ -731,6 +853,192 @@ func cmdUpdate(c *Client, g globalOpts, args []string) {
 	fmt.Println("Update check initiated. Run 'a2al update --check' to see status.")
 }
 
+func adminUsage() string {
+	return "Usage:\n  a2al admin\n  a2al admin on\n  a2al admin off\n  a2al admin password <secret>\n  a2al admin password off\n  a2al admin allow <visitor-aid>\n  a2al admin deny <visitor-aid>\n  a2al admin del allow|deny <id>"
+}
+
+func cmdAdmin(c *Client, g globalOpts, args []string) {
+	if len(args) == 0 {
+		cmdAdminShow(c, g)
+		return
+	}
+	switch args[0] {
+	case "on":
+		cmdAdminSet(c, g, true)
+	case "off":
+		cmdAdminSet(c, g, false)
+	case "password":
+		if len(args) != 2 {
+			fatalf("usage: a2al admin password <secret>\n       a2al admin password off")
+		}
+		if args[1] == "off" {
+			cmdAdminPasswordOff(c, g)
+			return
+		}
+		cmdAdminPasswordSet(c, g, args[1])
+	case "allow":
+		if len(args) != 2 {
+			fatalf("usage: a2al admin allow <visitor-aid>")
+		}
+		cmdAdminListAdd(c, g, "allow", args[1])
+	case "deny":
+		if len(args) != 2 {
+			fatalf("usage: a2al admin deny <visitor-aid>")
+		}
+		cmdAdminListAdd(c, g, "deny", args[1])
+	case "del":
+		if len(args) != 3 || (args[1] != "allow" && args[1] != "deny") {
+			fatalf("usage: a2al admin del allow|deny <id>")
+		}
+		cmdAdminListDel(c, g, args[1], args[2])
+	default:
+		fatalf("unknown admin subcommand: %s\n\n%s", args[0], adminUsage())
+	}
+}
+
+func cmdAdminShow(c *Client, g globalOpts) {
+	var m map[string]any
+	if _, _, err := c.DoRequest(http.MethodGet, "/node/remote-admin", nil, &m); err != nil {
+		fatal(err)
+	}
+	if g.JSON || g.Quiet {
+		printJSON(true, m)
+		return
+	}
+	on := "off"
+	if m["enabled"] == true {
+		on = "on"
+	}
+	fmt.Println(on)
+	if adminJoinID(m) != "" {
+		fmt.Println("password  set")
+	} else {
+		fmt.Println("password  off")
+	}
+	acl, _ := m["acl"].(map[string]any)
+	printAdminEntries("allow", acl["allow"])
+	printAdminEntries("deny", acl["deny"])
+}
+
+func printAdminEntries(list string, raw any) {
+	arr, _ := raw.([]any)
+	for _, item := range arr {
+		e, _ := item.(map[string]any)
+		aid, _ := e["aid"].(string)
+		id, _ := e["id"].(string)
+		if aid == "" {
+			continue
+		}
+		fmt.Printf("%s  %s  %s\n", list, id, aid)
+	}
+}
+
+func adminJoinID(m map[string]any) string {
+	acl, _ := m["acl"].(map[string]any)
+	arr, _ := acl["allow"].([]any)
+	for _, item := range arr {
+		e, _ := item.(map[string]any)
+		aid, _ := e["aid"].(string)
+		if aid != "" {
+			continue
+		}
+		if e["secret_set"] == true || e["secret"] != nil && e["secret"] != "" {
+			id, _ := e["id"].(string)
+			return id
+		}
+	}
+	return ""
+}
+
+func cmdAdminSet(c *Client, g globalOpts, on bool) {
+	var out map[string]any
+	if _, _, err := c.DoRequest(http.MethodPatch, "/node/remote-admin", map[string]any{"enabled": on}, &out); err != nil {
+		fatal(err)
+	}
+	if g.JSON {
+		printJSON(true, out)
+		return
+	}
+	if !g.Quiet {
+		if on {
+			fmt.Println("admin on")
+		} else {
+			fmt.Println("admin off")
+		}
+	}
+}
+
+func cmdAdminPasswordSet(c *Client, g globalOpts, secret string) {
+	var out map[string]any
+	if _, _, err := c.DoRequest(http.MethodPost, "/node/remote-admin/allow", map[string]any{"secret": secret}, &out); err != nil {
+		fatal(err)
+	}
+	if g.JSON {
+		printJSON(true, out)
+		return
+	}
+	if !g.Quiet {
+		fmt.Printf("password set id=%v\n", out["id"])
+	}
+}
+
+func cmdAdminPasswordOff(c *Client, g globalOpts) {
+	var m map[string]any
+	if _, _, err := c.DoRequest(http.MethodGet, "/node/remote-admin", nil, &m); err != nil {
+		fatal(err)
+	}
+	id := adminJoinID(m)
+	if id == "" {
+		if g.JSON {
+			printJSON(true, map[string]any{"ok": true, "password": "off"})
+			return
+		}
+		if !g.Quiet {
+			fmt.Println("password off")
+		}
+		return
+	}
+	var out map[string]any
+	if _, _, err := c.DoRequest(http.MethodDelete, "/node/remote-admin/allow/"+url.PathEscape(id), map[string]any{}, &out); err != nil {
+		fatal(err)
+	}
+	if g.JSON {
+		printJSON(true, out)
+		return
+	}
+	if !g.Quiet {
+		fmt.Println("password off")
+	}
+}
+
+func cmdAdminListAdd(c *Client, g globalOpts, list, aid string) {
+	var out map[string]any
+	if _, _, err := c.DoRequest(http.MethodPost, "/node/remote-admin/"+list, map[string]any{"aid": aid}, &out); err != nil {
+		fatal(err)
+	}
+	if g.JSON {
+		printJSON(true, out)
+		return
+	}
+	if !g.Quiet {
+		fmt.Printf("admin %s %s id=%v\n", list, aid, out["id"])
+	}
+}
+
+func cmdAdminListDel(c *Client, g globalOpts, list, id string) {
+	var out map[string]any
+	if _, _, err := c.DoRequest(http.MethodDelete, "/node/remote-admin/"+list+"/"+url.PathEscape(id), map[string]any{}, &out); err != nil {
+		fatal(err)
+	}
+	if g.JSON {
+		printJSON(true, out)
+		return
+	}
+	if !g.Quiet {
+		fmt.Println("deleted", list, id)
+	}
+}
+
 func cmdHelp() {
 	fmt.Print(`a2al — A2AL daemon CLI
 
@@ -761,6 +1069,7 @@ Commands (advanced):
   tunnel          Manage persistent multiplexed encrypted tunnels
   note            Send / poll encrypted offline messages
   config          Get or set daemon configuration
+  admin           Enable remote admin and manage who may connect
   update          Check for or apply a2al updates
   help            Show this help
 
@@ -776,5 +1085,8 @@ Examples:
   a2al tunnel open <aid>
   a2al tunnel
   a2al tunnel close <id>
+  a2al admin on
+  a2al admin allow <visitor-aid>
+  a2al admin password <secret>
 `)
 }

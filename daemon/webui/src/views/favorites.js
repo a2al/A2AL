@@ -1,13 +1,8 @@
 import { setAliasOf, ensureAlias } from '../util.js';
-
-const KEY = 'a2al_favorites';
+import { getFavorites, setFavorites } from '../address-book.js';
 
 export function loadFavs() {
-  try { return JSON.parse(localStorage.getItem(KEY) || '[]'); } catch { return []; }
-}
-
-function saveFavs(list) {
-  localStorage.setItem(KEY, JSON.stringify(list));
+  return getFavorites();
 }
 
 export function isFaved(aid) {
@@ -20,7 +15,7 @@ export function isFaved(aid) {
  * Alias is stored in the central map (util.js), not on the fav entry.
  */
 export function addFav(aid, alias, skill, protocols) {
-  const list = loadFavs();
+  const list = loadFavs().slice();
   if (list.some((f) => f.aid === aid)) return { added: false, reason: 'dup' };
   if (alias) setAliasOf(aid, alias);
   else ensureAlias(aid);
@@ -32,10 +27,10 @@ export function addFav(aid, alias, skill, protocols) {
     protocols: Array.isArray(protocols) ? protocols : [],
     addedAt: Date.now(),
   });
-  saveFavs(list);
+  setFavorites(list);
   return { added: true };
 }
 
 export function removeFav(id) {
-  saveFavs(loadFavs().filter((f) => f.id !== id));
+  setFavorites(loadFavs().filter((f) => f.id !== id));
 }

@@ -49,6 +49,12 @@ func (d *Daemon) routes() http.Handler {
 	mux.HandleFunc("DELETE /agents/{aid}/services/{service...}", d.withAgentMiddleware(d.handleAgentsTopicsDelete))
 	mux.HandleFunc("POST /agents/{aid}/profile", d.withAgentMiddleware(d.handleAgentsProfilePost))
 	mux.HandleFunc("DELETE /agents/{aid}/profile", d.withAgentMiddleware(d.handleAgentsProfileDelete))
+	mux.HandleFunc("GET /agents/{aid}/acl", d.withAgentMiddleware(d.handleACLGet))
+	mux.HandleFunc("PATCH /agents/{aid}/acl", d.withAgentMiddleware(d.handleACLPatch))
+	mux.HandleFunc("POST /agents/{aid}/acl/allow", d.withAgentMiddleware(d.handleACLAllowPost))
+	mux.HandleFunc("POST /agents/{aid}/acl/deny", d.withAgentMiddleware(d.handleACLDenyPost))
+	mux.HandleFunc("DELETE /agents/{aid}/acl/allow/{id}", d.withAgentMiddleware(d.handleACLAllowDelete))
+	mux.HandleFunc("DELETE /agents/{aid}/acl/deny/{id}", d.withAgentMiddleware(d.handleACLDenyDelete))
 	mux.HandleFunc("POST /discover", d.handleDiscover)
 	mux.HandleFunc("DELETE /agents/{aid}", d.withAgentMiddleware(d.handleAgentsDelete))
 	mux.HandleFunc("GET /resolve/{aid}/records", d.handleResolveRecords)
@@ -69,6 +75,14 @@ func (d *Daemon) routes() http.Handler {
 	mux.HandleFunc("GET /events", d.handleGlobalEvents)
 	mux.HandleFunc("GET /update/status", d.handleUpdateStatus)
 	mux.HandleFunc("POST /update/apply", d.handleUpdateApply)
+	mux.HandleFunc("GET /node/remote-admin", d.handleRemoteAdminGet)
+	mux.HandleFunc("PATCH /node/remote-admin", d.handleRemoteAdminPatch)
+	mux.HandleFunc("POST /node/remote-admin/allow", d.handleRemoteAdminAllowPost)
+	mux.HandleFunc("POST /node/remote-admin/deny", d.handleRemoteAdminDenyPost)
+	mux.HandleFunc("DELETE /node/remote-admin/allow/{id}", d.handleRemoteAdminAllowDelete)
+	mux.HandleFunc("DELETE /node/remote-admin/deny/{id}", d.handleRemoteAdminDenyDelete)
+	mux.HandleFunc("GET /node/address-book", d.handleAddressBookGet)
+	mux.HandleFunc("PUT /node/address-book", d.handleAddressBookPut)
 
 	// Mount Web UI assets and the AID proxy outside withMiddleware:
 	// - Web UI HTML/JS/CSS contain no sensitive data; auth happens at the API call level.
@@ -240,20 +254,20 @@ func (d *Daemon) handleGetConfig(w http.ResponseWriter, _ *http.Request) {
 }
 
 type patchConfigReq struct {
-	ListenAddr       *string                     `json:"listen_addr,omitempty"`
-	QUICListenAddr   *string                     `json:"quic_listen_addr,omitempty"`
-	Bootstrap        *[]string                   `json:"bootstrap,omitempty"`
-	DisableUPnP      *bool                       `json:"disable_upnp,omitempty"`
-	FallbackHost     *string                     `json:"fallback_host,omitempty"`
-	MinObservedPeers *int                        `json:"min_observed_peers,omitempty"`
-	APIAddr          *string                     `json:"api_addr,omitempty"`
-	APIToken         *string                     `json:"api_token,omitempty"`
-	KeyDir           *string                     `json:"key_dir,omitempty"`
-	LogFormat        *string                     `json:"log_format,omitempty"`
-	LogLevel         *string                     `json:"log_level,omitempty"`
-	AutoPublish      *bool                       `json:"auto_publish,omitempty"`
-	TURNServers      *[]config.TURNServerConfig  `json:"turn_servers,omitempty"`
-	DisableRelay     *bool                       `json:"disable_relay,omitempty"`
+	ListenAddr       *string                    `json:"listen_addr,omitempty"`
+	QUICListenAddr   *string                    `json:"quic_listen_addr,omitempty"`
+	Bootstrap        *[]string                  `json:"bootstrap,omitempty"`
+	DisableUPnP      *bool                      `json:"disable_upnp,omitempty"`
+	FallbackHost     *string                    `json:"fallback_host,omitempty"`
+	MinObservedPeers *int                       `json:"min_observed_peers,omitempty"`
+	APIAddr          *string                    `json:"api_addr,omitempty"`
+	APIToken         *string                    `json:"api_token,omitempty"`
+	KeyDir           *string                    `json:"key_dir,omitempty"`
+	LogFormat        *string                    `json:"log_format,omitempty"`
+	LogLevel         *string                    `json:"log_level,omitempty"`
+	AutoPublish      *bool                      `json:"auto_publish,omitempty"`
+	TURNServers      *[]config.TURNServerConfig `json:"turn_servers,omitempty"`
+	DisableRelay     *bool                      `json:"disable_relay,omitempty"`
 }
 
 func (d *Daemon) handlePatchConfig(w http.ResponseWriter, r *http.Request) {
@@ -965,6 +979,7 @@ func (d *Daemon) handleResolve(w http.ResponseWriter, r *http.Request) {
 
 type connectReq struct {
 	LocalAID     string `json:"local_aid,omitempty"`
+	AccessToken  string `json:"access_token,omitempty"`
 	DisableRelay *bool  `json:"disable_relay,omitempty"` // nil = use node default
 }
 
@@ -981,7 +996,7 @@ func (d *Daemon) handleConnect(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewDecoder(r.Body).Decode(&body)
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
-	tun, err := d.execConnect(ctx, r.PathValue("aid"), body)
+	res, err := d.execConnect(ctx, r.PathValue("aid"), body)
 	if err != nil {
 		switch {
 		case errors.Is(err, errBadAID):
@@ -999,7 +1014,7 @@ func (d *Daemon) handleConnect(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	writeJSON(w, map[string]string{"tunnel": tun})
+	writeJSON(w, res)
 }
 
 // ── Tunnel handlers ────────────────────────────────────────────────────────
@@ -1009,7 +1024,7 @@ func (d *Daemon) handleTunnelOpen(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewDecoder(r.Body).Decode(&req)
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
-	entry, err := d.execTunnelOpen(ctx, r.PathValue("aid"), req)
+	entry, _, err := d.execTunnelOpen(ctx, r.PathValue("aid"), req)
 	if err != nil {
 		switch {
 		case errors.Is(err, errBadAID):
