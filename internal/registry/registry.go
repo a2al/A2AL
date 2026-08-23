@@ -8,10 +8,23 @@ import (
 	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"os"
+	"strings"
 	"sync"
 
 	"github.com/a2al/a2al"
+)
+
+var (
+	ErrBadACLDefault   = errors.New("acl default must be public or deny")
+	ErrDenyNeedsAID    = errors.New("acl deny entry requires aid")
+	ErrBadACLAID       = errors.New("acl entry has bad aid")
+	ErrJoinNeedsSecret = errors.New("acl join password requires secret")
+	ErrNamedNoSecret   = errors.New("acl named allow entry cannot have secret")
+	ErrDupJoinPassword = errors.New("acl allows only one join password")
+	ErrDupACLAID       = errors.New("acl aid already listed")
+	ErrACLBothLists    = errors.New("acl aid cannot be in allow and deny")
 )
 
 // ProfileOverride holds user-supplied agent profile fields.
@@ -55,17 +68,141 @@ type Entry struct {
 	// Set by demo start; cleared by demo stop. On daemon restart, any entry with
 	// DemoActive=true is recovered by re-starting the demo server automatically.
 	DemoActive bool
+	// ACL is the local data-plane policy for service_tcp. Nil means public.
+	ACL *ACLPolicy
+}
+
+// ACLDefault is the fallback when neither deny nor allow matches.
+type ACLDefault string
+
+const (
+	ACLDefaultPublic ACLDefault = "public"
+	ACLDefaultDeny   ACLDefault = "deny"
+)
+
+// ACLEntry is one allow/deny rule.
+// Empty AID + Secret is the single join password (allow only).
+// Named AID entries do not carry a secret. BindOnUse is stored but unused.
+type ACLEntry struct {
+	ID        string `json:"id"`
+	AID       string `json:"aid,omitempty"`
+	Secret    string `json:"secret,omitempty"`
+	ExpiresAt int64  `json:"expires_at,omitempty"`
+	MaxUses   int    `json:"max_uses,omitempty"`
+	BindOnUse bool   `json:"bind_on_use,omitempty"`
+}
+
+// ACLPolicy is the per-agent access policy. Decision order is fixed:
+// deny hit → reject; else allow hit → permit; else Paid+auth (later); else Default.
+type ACLPolicy struct {
+	Default ACLDefault `json:"default,omitempty"`
+	Paid    bool       `json:"paid,omitempty"` // reserved; not a third default
+	Deny    []ACLEntry `json:"deny,omitempty"`
+	Allow   []ACLEntry `json:"allow,omitempty"`
+}
+
+// Allows reports whether remote may use service_tcp.
+// secret is the join password from AccessToken; ignored unless an allow entry has Secret set.
+func (p *ACLPolicy) Allows(remote a2al.Address, secret string) bool {
+	if p == nil {
+		return true
+	}
+	for _, e := range p.Deny {
+		if e.matchesAID(remote) {
+			return false
+		}
+	}
+	for _, e := range p.Allow {
+		if e.matches(remote, secret) {
+			return true
+		}
+	}
+	return p.Default != ACLDefaultDeny
+}
+
+func (e ACLEntry) matchesAID(remote a2al.Address) bool {
+	if e.AID == "" {
+		return true
+	}
+	aid, err := a2al.ParseAddress(e.AID)
+	return err == nil && aid == remote
+}
+
+func (e ACLEntry) matches(remote a2al.Address, secret string) bool {
+	if e.AID != "" && !e.matchesAID(remote) {
+		return false
+	}
+	if e.Secret != "" && e.Secret != secret {
+		return false
+	}
+	return true
+}
+
+// Validate checks policy constraints. Empty/nil policy is valid (public).
+func (p *ACLPolicy) Validate() error {
+	if p == nil {
+		return nil
+	}
+	switch p.Default {
+	case "", ACLDefaultPublic, ACLDefaultDeny:
+	default:
+		return ErrBadACLDefault
+	}
+	seenDeny := map[string]struct{}{}
+	for _, e := range p.Deny {
+		if e.AID == "" {
+			return ErrDenyNeedsAID
+		}
+		if _, err := a2al.ParseAddress(e.AID); err != nil {
+			return ErrBadACLAID
+		}
+		k := strings.ToLower(e.AID)
+		if _, ok := seenDeny[k]; ok {
+			return ErrDupACLAID
+		}
+		seenDeny[k] = struct{}{}
+	}
+	seenAllow := map[string]struct{}{}
+	joinN := 0
+	for _, e := range p.Allow {
+		if e.AID == "" {
+			if e.Secret == "" {
+				return ErrJoinNeedsSecret
+			}
+			joinN++
+			if joinN > 1 {
+				return ErrDupJoinPassword
+			}
+			continue
+		}
+		if e.Secret != "" {
+			return ErrNamedNoSecret
+		}
+		if _, err := a2al.ParseAddress(e.AID); err != nil {
+			return ErrBadACLAID
+		}
+		k := strings.ToLower(e.AID)
+		if _, ok := seenAllow[k]; ok {
+			return ErrDupACLAID
+		}
+		if _, ok := seenDeny[k]; ok {
+			return ErrACLBothLists
+		}
+		seenAllow[k] = struct{}{}
+	}
+	return nil
 }
 
 type diskAgent struct {
-	AID                string          `json:"aid"`
-	ServiceTCP         string          `json:"service_tcp"`
-	OpPrivateKeyHex    string          `json:"op_private_key_hex"`
-	DelegationProofHex string          `json:"delegation_proof_hex"`
-	Seq                uint64          `json:"seq"`
+	AID                string           `json:"aid"`
+	ServiceTCP         string           `json:"service_tcp"`
+	OpPrivateKeyHex    string           `json:"op_private_key_hex"`
+	DelegationProofHex string           `json:"delegation_proof_hex"`
+	Seq                uint64           `json:"seq"`
 	Services           []ServiceRecord  `json:"services,omitempty"`
 	Profile            *ProfileOverride `json:"profile,omitempty"`
 	DemoActive         bool             `json:"demo_active,omitempty"`
+	ACL                *ACLPolicy       `json:"acl,omitempty"`
 	// Topics is a legacy field (pre-v1.1); loaded for migration, never written.
 	Topics []string `json:"topics,omitempty"`
 }
@@ -132,6 +269,7 @@ func Load(path string) (*Registry, error) {
 			Services:       svcs,
 			Profile:        da.Profile,
 			DemoActive:     da.DemoActive,
+			ACL:            da.ACL,
 		}
 	}
 	return r, nil
@@ -191,6 +329,7 @@ func (r *Registry) Save() error {
 			Services:           append([]ServiceRecord(nil), e.Services...),
 			Profile:            e.Profile,
 			DemoActive:         e.DemoActive,
+			ACL:                e.ACL,
 		})
 	}
 	b, err := json.MarshalIndent(df, "", "  ")

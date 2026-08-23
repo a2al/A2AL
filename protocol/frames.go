@@ -14,6 +14,17 @@ import (
 // MagicMailboxFrame identifies a QUIC-stream mailbox direct-delivery frame.
 const MagicMailboxFrame = "a2mb"
 
+// MagicServiceStream identifies a QUIC stream that admits into service_tcp (a2s1).
+const MagicServiceStream = "a2s1"
+
+// StreamErrAccessDenied is the QUIC application error code for a data-plane
+// stream refused by ACL. Dialers that understand it map this to "access denied";
+// old peers just see a reset stream.
+const StreamErrAccessDenied uint64 = 0x41
+
+// ErrAccessDenied is returned by Mode A callers when the peer refused the data plane.
+var ErrAccessDenied = fmt.Errorf("access denied")
+
 // EncodeSignedRecord CBOR-encodes a SignedRecord.
 func EncodeSignedRecord(sr SignedRecord) ([]byte, error) {
 	return cbor.Marshal(sr)
