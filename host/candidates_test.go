@@ -48,6 +48,34 @@ func TestIsPlausibleWANIP(t *testing.T) {
 	}
 }
 
+func TestV6ObservedSnap(t *testing.T) {
+	stun := net.ParseIP("2001:db8::1")
+	gua := net.ParseIP("2606:4700::1")
+	ula := net.ParseIP("fd00::1")
+
+	if got := v6ObservedSnap(stun, 19302, gua, 4121); got != "[2001:db8::1]:19302" {
+		t.Errorf("STUN wins: got %q", got)
+	}
+	if got := v6ObservedSnap(nil, 0, gua, 4121); got != "[2606:4700::1]:4121" {
+		t.Errorf("GUA fallback: got %q", got)
+	}
+	if got := v6ObservedSnap(nil, 0, ula, 4121); got != "" {
+		t.Errorf("ULA rejected: got %q", got)
+	}
+	if got := v6ObservedSnap(nil, 0, gua, 0); got != "" {
+		t.Errorf("listenPort 0: got %q", got)
+	}
+	if got := v6ObservedSnap(nil, 0, nil, 4121); got != "" {
+		t.Errorf("empty: got %q", got)
+	}
+}
+
+func TestFirstInterfaceGUA_plausible(t *testing.T) {
+	if ip := firstInterfaceGUA(); ip != nil && !isPlausibleWANIP(ip) {
+		t.Errorf("firstInterfaceGUA returned non-WAN %v", ip)
+	}
+}
+
 func TestAppendCandidateUnique_dedupes(t *testing.T) {
 	seen := make(map[string]struct{})
 	var out []string
@@ -143,4 +171,118 @@ func TestOrderedQUICEndpointStrings_v6Paths(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestUpnpIPMatchesPublicV4 verifies the IP-equality helper used for UPnP promotion.
+func TestUpnpIPMatchesPublicV4(t *testing.T) {
+	tests := []struct {
+		upnp  string
+		ext   string
+		match bool
+	}{
+		{"quic://203.0.113.5:4122", "203.0.113.5:1234", true},
+		{"quic://203.0.113.5:4122", "203.0.113.5", true},
+		{"quic://203.0.113.6:4122", "203.0.113.5:1234", false},
+		{"quic://10.0.0.1:4122", "10.0.0.1:1234", true}, // private (both), still equal
+		{"", "203.0.113.5:1234", false},
+		{"quic://203.0.113.5:4122", "", false},
+	}
+	for _, tt := range tests {
+		got := upnpIPMatchesPublicV4(tt.upnp, tt.ext)
+		if got != tt.match {
+			t.Errorf("upnpIPMatchesPublicV4(%q, %q) = %v, want %v", tt.upnp, tt.ext, got, tt.match)
+		}
+	}
+}
+
+// TestOrderedQUICEndpointStrings_upnpPromotion verifies that when UPnP
+// ExternalIP matches the STUN public v4, UPnP appears before the v4 STUN
+// candidate (but after v6) in the output slice.
+func TestOrderedQUICEndpointStrings_upnpPromotion(t *testing.T) {
+	ks := newMemKS(t)
+	h, err := New(Config{
+		KeyStore: ks, ListenAddr: "127.0.0.1:0", QUICListenAddr: "127.0.0.1:0",
+		PrivateKey: ks.priv, MinObservedPeers: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { h.Close() })
+
+	port := strconv.Itoa(h.QUICLocalAddr().Port)
+	upnpURL := "quic://203.0.113.5:4122"
+	extV4 := "203.0.113.5:9999"
+	extV6 := "[2001:db8::1]:5432"
+	wantUpnp := upnpURL
+	wantV4 := "quic://203.0.113.5:" + port
+	wantV6 := "quic://[2001:db8::1]:" + port
+
+	eps, err := h.orderedQUICEndpointStrings(extV4, extV6, upnpURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	idxUpnp, idxV4, idxV6 := -1, -1, -1
+	for i, ep := range eps {
+		switch ep {
+		case wantUpnp:
+			idxUpnp = i
+		case wantV4:
+			idxV4 = i
+		case wantV6:
+			idxV6 = i
+		}
+	}
+	if idxUpnp < 0 || idxV4 < 0 {
+		t.Fatalf("UPnP or v4 candidate missing: eps=%v", eps)
+	}
+	// v6 before UPnP (Happy Eyeballs)
+	if idxV6 >= 0 && idxV6 > idxUpnp {
+		t.Errorf("v6 (%d) should appear before UPnP (%d): %v", idxV6, idxUpnp, eps)
+	}
+	// UPnP before v4 STUN
+	if idxUpnp > idxV4 {
+		t.Errorf("UPnP (%d) should appear before v4 STUN (%d): %v", idxUpnp, idxV4, eps)
+	}
+}
+
+// TestOrderedQUICEndpointStrings_upnpNoPromotionMismatch verifies that when
+// UPnP ExternalIP does NOT match public v4, UPnP stays at the end.
+func TestOrderedQUICEndpointStrings_upnpNoPromotionMismatch(t *testing.T) {
+	ks := newMemKS(t)
+	h, err := New(Config{
+		KeyStore: ks, ListenAddr: "127.0.0.1:0", QUICListenAddr: "127.0.0.1:0",
+		PrivateKey: ks.priv, MinObservedPeers: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { h.Close() })
+
+	upnpURL := "quic://10.0.0.1:4122"   // private/CGNAT — different from public
+	extV4 := "203.0.113.5:9999"          // real public
+	wantUpnp := upnpURL
+	wantV4 := "quic://203.0.113.5:" + strconv.Itoa(h.QUICLocalAddr().Port)
+
+	eps, err := h.orderedQUICEndpointStrings(extV4, "", upnpURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	idxUpnp, idxV4 := -1, -1
+	for i, ep := range eps {
+		switch ep {
+		case wantUpnp:
+			idxUpnp = i
+		case wantV4:
+			idxV4 = i
+		}
+	}
+	if idxUpnp < 0 || idxV4 < 0 {
+		t.Fatalf("UPnP or v4 candidate missing: eps=%v", eps)
+	}
+	// Mismatch: UPnP must come after v4
+	if idxUpnp < idxV4 {
+		t.Errorf("UPnP (%d) should appear after v4 (%d) when IP mismatch: %v", idxUpnp, idxV4, eps)
+	}
 }

@@ -418,3 +418,55 @@ func TestHasMultiPortEvidence_sameIPTrue(t *testing.T) {
 		t.Error("same public IP with two ports should trigger HasMultiPortEvidence")
 	}
 }
+
+// TestPublishNatType_passiveMultiPortDoesNotTriggerSymmetric verifies that
+// passive double-port evidence (e.g. UPnP alias + DHT reflected port on the
+// same public IP) does NOT cause PublishNatType to return NATSymmetric.
+// Only an active mapping probe may assert Symmetric for publishing.
+func TestPublishNatType_passiveMultiPortDoesNotTriggerSymmetric(t *testing.T) {
+	s := NewSense(2)
+	var r1, r2, r3, r4, r5 a2al.NodeID
+	r1[0], r2[0], r3[0], r4[0], r5[0] = 1, 2, 3, 4, 5
+
+	// DHT reflected port (5 reporters — well above consensus threshold).
+	p1, _ := protocol.FormatObservedUDP(net.ParseIP("203.0.113.9"), 1095)
+	s.Record(r1, p1)
+	s.Record(r2, p1)
+	s.Record(r3, p1)
+	s.Record(r4, p1)
+	s.Record(r5, p1)
+
+	// UPnP alias port on the same public IP (2 reporters — via QUIC control stream).
+	p2, _ := protocol.FormatObservedUDP(net.ParseIP("203.0.113.9"), 4122)
+	s.Record(r1, p2)
+	s.Record(r2, p2)
+
+	// HasMultiPortEvidence should still fire (used for punch spray — intentional).
+	if !s.HasMultiPortEvidence() {
+		t.Error("HasMultiPortEvidence should still fire for punch spray")
+	}
+
+	// But PublishNatType must NOT return Symmetric: no mapping probe was run.
+	got := s.PublishNatType()
+	if got == NATSymmetric {
+		t.Errorf("PublishNatType = NATSymmetric, want non-Symmetric (passive double-port must not drive published type)")
+	}
+}
+
+// TestPublishNatType_mappingProbeSymmetricIsPublished verifies that an active
+// mapping probe confirming Symmetric DOES cause PublishNatType to return NATSymmetric.
+func TestPublishNatType_mappingProbeSymmetricIsPublished(t *testing.T) {
+	s := NewSense(2)
+	var r1, r2, r3 a2al.NodeID
+	r1[0], r2[0], r3[0] = 1, 2, 3
+	p1, _ := protocol.FormatObservedUDP(net.ParseIP("203.0.113.9"), 1095)
+	s.Record(r1, p1)
+	s.Record(r2, p1)
+	s.Record(r3, p1)
+
+	s.RecordMappingProbeV4(true) // active probe confirms symmetric
+
+	if got := s.PublishNatType(); got != NATSymmetric {
+		t.Errorf("PublishNatType = %d, want NATSymmetric when mapping probe confirms symmetric", got)
+	}
+}

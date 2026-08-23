@@ -670,17 +670,21 @@ func (s *Sense) InferNATType() uint8 {
 }
 
 // PublishNatType returns the NAT capability value to embed in a published
-// DHT endpoint record. It differs from InferNATType in two ways:
+// DHT endpoint record. It differs from InferNATType in three ways:
 //
 //  1. Symmetric detection is restricted to the STUN-confirmed v4 path
 //     (trustedV4IPLocked).  Other paths (VPN, private) are excluded so that
 //     a stable public endpoint is not mis-classified as Symmetric because of
 //     an unrelated path's NAT behaviour.
 //
-//  2. A fresh active mapping probe is authoritative for the STUN path: when
-//     one is available it overrides the passive vote analysis (which may be
-//     contaminated by UPnP session reuse).  Without a fresh probe the passive
-//     analysis acts as a fallback.
+//  2. Only an active mapping probe (RecordMappingProbeV4) can assert Symmetric
+//     for publishing.  Passive multi-port evidence is intentionally ignored:
+//     VPN churn, UPnP alias on the same public IP, and QUIC control-stream
+//     observations can all produce a spurious second port.  A false Symmetric
+//     causes peers to skip cold UDP to a perfectly reachable anchor, which is
+//     more costly than the one extra UDP failure a missed Symmetric incurs.
+//     The mapping probe runs every 20 min (below the 30 min TTL), so true
+//     Symmetric nodes are correctly classified within one probe cycle.
 //
 //  3. When passive evidence is sufficient but the active probe has not yet
 //     completed, InferNATType returns NATRestricted; PublishNatType returns
@@ -701,16 +705,18 @@ func (s *Sense) PublishNatType() uint8 {
 	primaryIP := s.trustedV4IPLocked(cutoff)
 	sym := s.detectSymmetricV4(cutoff, primaryIP)
 
-	// ② Symmetric: mapping probe is authoritative for the STUN path when fresh.
-	// It overrides a passive symmetric conclusion that may be UPnP-session-
-	// polluted.  Without a fresh probe, fall back to the (filtered) passive result.
+	// ② Symmetric: only the active mapping probe is authoritative here.
+	// Passive multi-port evidence (sym.isSymmetric) is intentionally ignored for
+	// publishing: VPN churn, UPnP alias on the same public IP, and QUIC control-
+	// stream observations can all produce a false second port without the NAT
+	// actually assigning different ports per destination.  A misclassified
+	// Symmetric causes peers to skip cold UDP to a perfectly reachable anchor,
+	// which is more costly than the one extra UDP failure a missed Symmetric incurs.
 	if s.mappingProbeResultV4 != nil && time.Since(s.mappingProbeAtV4) < probeResultTTL {
 		if *s.mappingProbeResultV4 {
 			return NATSymmetric
 		}
 		// Mapping probe says non-symmetric on the STUN path: trust it.
-	} else if sym.isSymmetric {
-		return NATSymmetric
 	}
 
 	// ③ Insufficient passive evidence.

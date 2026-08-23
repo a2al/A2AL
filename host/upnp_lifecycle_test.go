@@ -41,6 +41,9 @@ func TestInvalidateNetworkCaches_forcesUPnPRenew(t *testing.T) {
 		t.Fatalf("Invalidate must clear fail backoff: streak=%d retryAfter=%v",
 			h.upnpFailStreak, h.upnpFailRetryAfter)
 	}
+	if h.hasV4 != (outboundIPv4() != nil) || h.hasV6 != (outboundIPv6() != nil) {
+		t.Fatalf("Invalidate must refresh family caps: hasV4=%v hasV6=%v", h.hasV4, h.hasV6)
+	}
 }
 
 func TestUpnpFailDelay(t *testing.T) {
