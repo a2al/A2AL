@@ -27,6 +27,8 @@ import (
 	"time"
 
 	"github.com/a2al/a2al"
+	"github.com/a2al/a2al/protocol"
+	"github.com/quic-go/quic-go"
 )
 
 // Resolver maps an address string to an [a2al.Address].
@@ -160,6 +162,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	dialCancel()
 	if dialErr != nil {
 		h.log.Debug("aidproxy: dial failed", "remote", remote.String(), "err", dialErr)
+		if isAccessDenied(dialErr) {
+			http.Error(w, "access denied", http.StatusForbidden)
+			return
+		}
 		http.Error(w, "connect failed", http.StatusBadGateway)
 		return
 	}
@@ -201,6 +207,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	resp, err := http.ReadResponse(bufio.NewReaderSize(stream, 32*1024), outReq)
 	if err != nil {
 		h.log.Debug("aidproxy: upstream read failed", "remote", remote.String(), "err", err)
+		if isAccessDenied(err) {
+			http.Error(w, "access denied", http.StatusForbidden)
+			return
+		}
 		http.Error(w, "upstream read failed", http.StatusBadGateway)
 		return
 	}
@@ -222,4 +232,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Stream response body directly — no buffering, no size limit.
 	_, _ = io.Copy(w, resp.Body)
+}
+
+func isAccessDenied(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, protocol.ErrAccessDenied) {
+		return true
+	}
+	var se *quic.StreamError
+	return errors.As(err, &se) && uint64(se.ErrorCode) == protocol.StreamErrAccessDenied
 }

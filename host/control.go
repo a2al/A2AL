@@ -21,6 +21,10 @@ package host
 //	0x01  ObservedAddr   acceptor → dialer   wire-encoded UDP source addr (6 or 18 B)
 //	0x02  AgentInfoHint  dialer  → acceptor  target AID (21 B) + max held seq (8 B BE)
 //	0x03  AgentInfo      acceptor → dialer   CBOR-encoded SignedRecord (topic record)
+//	0x04  AccessToken    dialer  → acceptor  UTF-8 join password (a2s1 keys; also skipped on Stream 0)
+//	0x05  AccessResult   acceptor → dialer   allowed (1B) + reason (optional UTF-8); a2s1
+//	0x06  ServiceStream  acceptor → dialer   empty: peer accepts a2s1 on service streams
+//	0x07  KeysDone       dialer  → acceptor  a2s1: no more keys; remainder is business bytes
 //
 // Unknown message types are skipped by consuming the declared length, ensuring
 // forward compatibility without a new magic number.
@@ -42,6 +46,12 @@ const (
 	ctrlMsgObservedAddr  uint8 = 0x01 // acceptor → dialer
 	ctrlMsgAgentInfoHint uint8 = 0x02 // dialer → acceptor
 	ctrlMsgAgentInfo     uint8 = 0x03 // acceptor → dialer
+	ctrlMsgAccessToken   uint8 = 0x04 // dialer → acceptor (a2s1 key)
+	ctrlMsgAccessResult  uint8 = 0x05 // acceptor → dialer (a2s1 result)
+	ctrlMsgServiceStream uint8 = 0x06 // acceptor → dialer (Stream 0 capability)
+	ctrlMsgKeysDone      uint8 = 0x07 // dialer → acceptor (a2s1 keys finished)
+
+	maxAccessToken = 256
 
 	// ctrlMaxPayload caps the payload of a single control message.
 	// Topic SignedRecord CBOR is ≤512 B payload + ~200 B overhead = well under 4 KiB.
@@ -121,22 +131,32 @@ func sendAcceptorMsgs(w io.WriteCloser, remoteAddr net.Addr, localRecs []protoco
 		_ = writeCtrlMsg(w, ctrlMsgAgentInfo, b) // best-effort
 	}
 
+	// Capability: extra payload bytes (if any) are ignored by this version.
+	_ = writeCtrlMsg(w, ctrlMsgServiceStream, nil)
+
 	return w.Close() // FIN: no more acceptor messages
 }
 
 // readDialerMsgs drains the dialer's control messages until FIN.
 // Returns the max held_seq from an AgentInfoHint message (0 if none received).
-func readDialerMsgs(r io.Reader) (heldSeq uint64, err error) {
+func readDialerMsgs(r io.Reader) (heldSeq uint64, accessToken string, err error) {
 	for {
 		msgType, payload, rerr := readCtrlMsg(r)
 		if rerr == io.EOF {
-			return heldSeq, nil
+			return heldSeq, accessToken, nil
 		}
 		if rerr != nil {
-			return heldSeq, rerr
+			return heldSeq, accessToken, rerr
 		}
-		if msgType == ctrlMsgAgentInfoHint && len(payload) >= 29 {
-			heldSeq = binary.BigEndian.Uint64(payload[21:29])
+		switch msgType {
+		case ctrlMsgAgentInfoHint:
+			if len(payload) >= 29 {
+				heldSeq = binary.BigEndian.Uint64(payload[21:29])
+			}
+		case ctrlMsgAccessToken:
+			if len(payload) > 0 && len(payload) <= maxAccessToken {
+				accessToken = string(payload)
+			}
 		}
 		// Unknown types: payload already consumed; skip silently.
 	}
@@ -145,15 +165,15 @@ func readDialerMsgs(r io.Reader) (heldSeq uint64, err error) {
 // readAcceptorMsgs drains the acceptor's control messages until FIN.
 // Returns the observed-address wire bytes and any SignedRecords received.
 // Ignores malformed or expired records rather than failing.
-func readAcceptorMsgs(r io.Reader) (observedWire []byte, records []protocol.SignedRecord, err error) {
+func readAcceptorMsgs(r io.Reader) (observedWire []byte, records []protocol.SignedRecord, serviceStream bool, err error) {
 	now := time.Now()
 	for {
 		msgType, payload, rerr := readCtrlMsg(r)
 		if rerr == io.EOF {
-			return observedWire, records, nil
+			return observedWire, records, serviceStream, nil
 		}
 		if rerr != nil {
-			return observedWire, records, rerr
+			return observedWire, records, serviceStream, rerr
 		}
 		switch msgType {
 		case ctrlMsgObservedAddr:
@@ -167,6 +187,8 @@ func readAcceptorMsgs(r io.Reader) (observedWire []byte, records []protocol.Sign
 					records = append(records, rec)
 				}
 			}
+		case ctrlMsgServiceStream:
+			serviceStream = true
 		}
 		// Unknown types: consumed, skipped.
 	}

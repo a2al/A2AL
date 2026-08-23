@@ -210,6 +210,14 @@ type Host struct {
 	agentsMu sync.RWMutex
 	agents   map[a2al.Address]*agentEntry
 
+	// decideAccess, when set, answers whether remote may use local's service_tcp.
+	// secret is the join password from AccessToken (empty if none).
+	// src is the QUIC remote address (for holder-side logging / rate limits).
+	// Nil means allow (tests / hosts without a registry).
+	decideAccess func(local, remote a2al.Address, secret string, src net.Addr) bool
+	svcMu        sync.Mutex
+	svcStream    map[quic.Connection]struct{}
+
 	// peerPubkeys caches the Ed25519 identity public key for each peer AID
 	// observed via verified incoming mailbox records.  A given AID always maps
 	// to the same key (the key is the AID's preimage), so no TTL is needed.
@@ -252,7 +260,8 @@ type Host struct {
 
 	natProbeMu sync.Mutex // guards RunNATProbe (only one probe at a time)
 
-	// Local IP-family capability, determined once at Host creation.
+	// Local IP-family capability. Set at New and refreshed by
+	// InvalidateNetworkCaches after a confirmed network change.
 	// Used by dialTargets to skip addresses the local stack cannot reach.
 	hasV4 bool
 	hasV6 bool
@@ -395,6 +404,7 @@ func New(cfg Config) (*Host, error) {
 		hasV4:     outboundIPv4() != nil,
 		hasV6:     !cfg.DisableIPv6 && outboundIPv6() != nil,
 		punchPool: punchPool,
+		svcStream: make(map[quic.Connection]struct{}),
 		agents: map[a2al.Address]*agentEntry{
 			myAddr: {addr: myAddr, priv: priv, cert: defaultCert},
 		},
@@ -646,9 +656,19 @@ func (h *Host) runNATProbeV6(ctx context.Context) {
 		return // IPv4-only (or v6 unreachable); v6 track is a no-op
 	}
 
-	// ② Claimed external v6 address: natsense consensus preferred, STUN fallback.
+	// ② Claimed external v6: natsense, then local GUA (no NAT66), then STUN.
+	// GUA before STUN so a blocked public STUN does not skip the echo probe.
 	claimedWire, ok := h.sense.TrustedWireV6()
 	if !ok {
+		port := uint16(0)
+		if qa := h.QUICLocalAddr(); qa != nil {
+			port = uint16(qa.Port)
+		}
+		if b, err := protocol.FormatObservedUDP(v6IP, port); err == nil {
+			claimedWire = b
+		}
+	}
+	if len(claimedWire) == 0 {
 		sctx, cancel := context.WithTimeout(ctx, 4*time.Second)
 		stunIP, stunPort := probeSTUNViaMux(sctx, h.stunProber, "udp6")
 		cancel()
@@ -719,6 +739,8 @@ func (h *Host) InvalidateNetworkCaches() {
 	h.upnpFailStreak = 0
 	h.upnpFailRetryAfter = time.Time{}
 	h.upnpMu.Unlock()
+	h.hasV4 = outboundIPv4() != nil
+	h.hasV6 = !h.cfg.DisableIPv6 && outboundIPv6() != nil
 }
 
 // selectNATProbeTargets returns up to n UDP addresses of routing-table peers
@@ -911,9 +933,19 @@ func (h *Host) BuildEndpointPayload(ctx context.Context) (protocol.EndpointPaylo
 	if len(signals) > 0 {
 		signal = signals[0]
 	}
+
+	// When the UPnP ExternalIP equals the STUN-confirmed public IPv4, the IGD
+	// mapping is on the true WAN — any peer can reach it regardless of their
+	// source address.  Override the passive NatType with Full Cone so peers
+	// attempt direct UDP to the promoted UPnP candidate instead of going
+	// straight to ICE.
+	natType := h.sense.PublishNatType()
+	if up != "" && upnpIPMatchesPublicV4(up, ext) {
+		natType = protocol.NATFullCone
+	}
 	return protocol.EndpointPayload{
 		Endpoints: eps,
-		NatType:   h.sense.PublishNatType(),
+		NatType:   natType,
 		Signal:    signal,
 		Signals:   signals,
 	}, nil
@@ -1176,10 +1208,15 @@ func (h *Host) ensureExternalIPv6(ctx context.Context) string {
 	stunIP, stunPort := probeSTUNViaMux(sctx, h.stunProber, "udp6")
 	scancel()
 
-	var snap string
-	if stunIP != nil && isPlausibleWANIP(stunIP) {
-		snap = net.JoinHostPort(stunIP.String(), strconv.Itoa(int(stunPort)))
+	var gua net.IP
+	listenPort := 0
+	if stunIP == nil || !isPlausibleWANIP(stunIP) {
+		gua = outboundIPv6()
+		if qa := h.QUICLocalAddr(); qa != nil {
+			listenPort = qa.Port
+		}
 	}
+	snap := v6ObservedSnap(stunIP, stunPort, gua, listenPort)
 
 	h.extip6Mu.Lock()
 	h.extip6Snap = snap // cache negative result too (avoids repeated probes on v4-only machines)
@@ -1487,7 +1524,7 @@ func (h *Host) doDialerControlStream(ctx context.Context, conn quic.Connection, 
 		str.CancelWrite(0) // reset stream so acceptor unblocks from readDialerMsgs
 		return nil
 	}
-	observedWire, receivedRecs, err := readAcceptorMsgs(str)
+	observedWire, receivedRecs, serviceStream, err := readAcceptorMsgs(str)
 
 	// Apply whatever DHT data was received regardless of err — best-effort.
 	// readAcceptorMsgs returns partial results even on error, and discarding
@@ -1510,7 +1547,52 @@ func (h *Host) doDialerControlStream(ctx context.Context, conn quic.Connection, 
 		_ = conn.CloseWithError(1, "control exchange incomplete")
 		return &controlStreamError{cause: fmt.Errorf("%w: %w", ErrControlExchangeIncomplete, err)}
 	}
+	if serviceStream {
+		h.noteServiceStream(conn)
+	}
 	return nil
+}
+
+// SetDecideAccess installs the local ACL callback. Gateway uses the daemon's
+// decideAccess on each service stream; Stream 0 does not consult this.
+func (h *Host) SetDecideAccess(fn func(local, remote a2al.Address, secret string, src net.Addr) bool) {
+	h.decideAccess = fn
+}
+
+type ctxAccessToken struct{}
+
+// WithAccessToken attaches a join password for outbound a2s1 AccessToken.
+// Stream 0 no longer carries the token; callers pass it to AdmitServiceStream.
+func WithAccessToken(ctx context.Context, token string) context.Context {
+	if token == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, ctxAccessToken{}, token)
+}
+
+func accessTokenFromCtx(ctx context.Context) string {
+	s, _ := ctx.Value(ctxAccessToken{}).(string)
+	return s
+}
+
+// PeerServiceStream reports whether the peer advertised a2s1 on Stream 0.
+func (h *Host) PeerServiceStream(conn quic.Connection) bool {
+	h.svcMu.Lock()
+	defer h.svcMu.Unlock()
+	_, ok := h.svcStream[conn]
+	return ok
+}
+
+func (h *Host) noteServiceStream(conn quic.Connection) {
+	h.svcMu.Lock()
+	h.svcStream[conn] = struct{}{}
+	h.svcMu.Unlock()
+	go func() {
+		<-conn.Context().Done()
+		h.svcMu.Lock()
+		delete(h.svcStream, conn)
+		h.svcMu.Unlock()
+	}()
 }
 
 // ErrControlExchangeIncomplete is wrapped inside errors returned when the
@@ -1587,11 +1669,11 @@ func (h *Host) Accept(ctx context.Context) (*AgentConn, error) {
 		state := conn.ConnectionState().TLS
 		if remote, rErr := peerAddrFromTLSState(state); rErr == nil {
 			if v, ok := h.punchExpect.Load(remote); ok {
-			// Notify the DHT subsystem of the confirmed punch path so health
-			// counters are updated alongside the peer-face address cache.
-			if udpRemote, ok2 := conn.RemoteAddr().(*net.UDPAddr); ok2 && udpRemote != nil {
-				h.node.NotePeerDialSuccess(a2al.NodeIDFromAddress(remote), udpRemote, 0)
-			}
+				// Notify the DHT subsystem of the confirmed punch path so health
+				// counters are updated alongside the peer-face address cache.
+				if udpRemote, ok2 := conn.RemoteAddr().(*net.UDPAddr); ok2 && udpRemote != nil {
+					h.node.NotePeerDialSuccess(a2al.NodeIDFromAddress(remote), udpRemote, 0)
+				}
 				ch := v.(chan quic.Connection)
 				select {
 				case ch <- conn:
@@ -1711,7 +1793,7 @@ func (h *Host) doAcceptorControlStream(ctx context.Context, conn quic.Connection
 	case string(agentRouteMagicV2): // a2r2: full control exchange
 
 		// Read dialer's control messages (blocks until dialer FIN).
-		heldSeq, rerr := readDialerMsgs(str)
+		heldSeq, _, rerr := readDialerMsgs(str)
 		if rerr != nil {
 			h.log.Debug("control: read dialer msgs", "err", rerr)
 			heldSeq = 0 // assume dialer has nothing; push all records
@@ -1721,7 +1803,6 @@ func (h *Host) doAcceptorControlStream(ctx context.Context, conn quic.Connection
 		// See dialer-side comment: only 0x10 is in use; extend when 0x11–0x1F land.
 		localRecs := h.node.LocalStoreGetByAddress(addr, protocol.RecTypeTopic)
 
-		// Send acceptor's control messages and FIN.
 		if serr := sendAcceptorMsgs(str, conn.RemoteAddr(), localRecs, heldSeq); serr != nil {
 			h.log.Debug("control: send acceptor msgs", "err", serr)
 		}
@@ -1814,22 +1895,54 @@ func outboundIPv4() net.IP {
 	return conn.LocalAddr().(*net.UDPAddr).IP
 }
 
-// outboundIPv6 returns the preferred IPv6 outbound address without sending any
-// packets, by connecting a UDP socket to a public IPv6 address and reading the
-// local address the OS assigned. Returns nil if the host has no IPv6
-// connectivity (ENETUNREACH) or no global unicast outbound route.
-func outboundIPv6() net.IP {
-	conn, err := net.Dial("udp6", "[2001:4860:4860::8888]:80")
+// firstInterfaceGUA returns the first globally-routable IPv6 address on an
+// up, non-loopback interface.
+func firstInterfaceGUA() net.IP {
+	ifaces, err := net.Interfaces()
 	if err != nil {
 		return nil
 	}
-	defer conn.Close()
-	ip := conn.LocalAddr().(*net.UDPAddr).IP
-	// Discard link-local and loopback — we want only GUA / ULA.
-	if ip.IsLinkLocalUnicast() || ip.IsLoopback() {
-		return nil
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			var ip net.IP
+			switch v := a.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			if ip == nil || ip.To4() != nil {
+				continue
+			}
+			if isPlausibleWANIP(ip) {
+				return ip.To16()
+			}
+		}
 	}
-	return ip
+	return nil
+}
+
+// outboundIPv6 returns the preferred IPv6 outbound address without sending any
+// packets, by connecting a UDP socket to a public IPv6 address and reading the
+// local address the OS assigned. If that route-probe fails (or yields only
+// link-local/loopback), falls back to the first interface GUA.
+func outboundIPv6() net.IP {
+	conn, err := net.Dial("udp6", "[2001:4860:4860::8888]:80")
+	if err == nil {
+		defer conn.Close()
+		ip := conn.LocalAddr().(*net.UDPAddr).IP
+		if !ip.IsLinkLocalUnicast() && !ip.IsLoopback() {
+			return ip
+		}
+	}
+	return firstInterfaceGUA()
 }
 
 // listenUDP4 resolves addr as IPv4 UDP and opens an IPv4-only socket.

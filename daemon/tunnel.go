@@ -29,6 +29,7 @@ type tunnelEntry struct {
 	httpsURL  string // "https://127.0.0.1:PORT" when TLS is available, else ""
 	isRelayed bool   // whether the underlying QUIC connection uses a relay path
 	noRelay   bool   // whether relay was disabled for this tunnel
+	token     string
 	openedAt  time.Time
 
 	// liveness tracking
@@ -55,6 +56,8 @@ type tunnelStatus struct {
 	Listen         string    `json:"listen"`
 	HTTPSURL       string    `json:"https_url,omitempty"`
 	IsRelayed      bool      `json:"is_relayed"`
+	Connected      bool      `json:"connected"`
+	Allowed        bool      `json:"allowed"`
 	OpenedAt       time.Time `json:"opened_at"`
 	LastActivity   time.Time `json:"last_activity,omitempty"`
 	ActiveConns    int32     `json:"active_conns"`
@@ -71,6 +74,8 @@ func (e *tunnelEntry) status() tunnelStatus {
 		Listen:      e.listen,
 		HTTPSURL:    e.httpsURL,
 		IsRelayed:   e.isRelayed,
+		Connected:   true,
+		Allowed:     e.listen != "",
 		OpenedAt:    e.openedAt,
 		ActiveConns: e.activeConns.Load(),
 		BytesUp:     e.bytesUp.Load(),
@@ -161,6 +166,7 @@ const tunnelDefaultIdleTimeout = 6 * time.Minute
 // tunnelOpenReq is the body for POST /tunnel/{aid}.
 type tunnelOpenReq struct {
 	LocalAID       string `json:"local_aid,omitempty"`
+	AccessToken    string `json:"access_token,omitempty"`
 	IdleTimeoutSec int    `json:"idle_timeout_sec,omitempty"` // 0 = default (6 min), -1 = no timeout
 	DisableRelay   *bool  `json:"disable_relay,omitempty"`    // nil = use node default
 }
@@ -176,14 +182,14 @@ func randomID() string {
 // Each accepted TCP connection gets its own QUIC stream (up to the gateway's
 // maxStreamsPerConn=100 limit). The tunnel holds a retain on the QUIC connection
 // for its lifetime; the connection is released (not closed) when the tunnel exits.
-func (d *Daemon) execTunnelOpen(ctx context.Context, remoteAidStr string, req tunnelOpenReq) (*tunnelEntry, error) {
+func (d *Daemon) execTunnelOpen(ctx context.Context, remoteAidStr string, req tunnelOpenReq) (*tunnelEntry, bool, error) {
 	remote, err := a2al.ParseAddress(remoteAidStr)
 	if err != nil {
-		return nil, errBadAID
+		return nil, false, errBadAID
 	}
 	local, err := d.pickLocalAgent(req.LocalAID)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	// Resolve with 20 s cap, same as execFetch / execConnect.
@@ -195,7 +201,7 @@ func (d *Daemon) execTunnelOpen(ctx context.Context, remoteAidStr string, req tu
 			er, err = d.resolveFromBeacon(ctx, remote)
 		}
 		if err != nil {
-			return nil, errResolve
+			return nil, false, errResolve
 		}
 	}
 
@@ -203,18 +209,30 @@ func (d *Daemon) execTunnelOpen(ctx context.Context, remoteAidStr string, req tu
 	qc, isRelayed, err := d.connPool.acquire(ctx, local, remote, er, nr, true)
 	if err != nil {
 		if errors.Is(err, host.ErrRelayRequired) {
-			return nil, err
+			return nil, false, err
 		}
-		return nil, errConnectQUIC
+		return nil, false, errConnectQUIC
 	}
-	// Hold a reference so the idle evictor does not close this connection
-	// while the tunnel is active. Released in the accept loop's defer.
+	allowed, err := d.probeServiceAdmission(ctx, qc, req.AccessToken)
+	if err != nil {
+		return nil, false, errConnectQUIC
+	}
+	if !allowed {
+		return &tunnelEntry{
+			id:        randomID(),
+			localAID:  local,
+			remoteAID: remote,
+			isRelayed: isRelayed,
+			noRelay:   nr,
+			openedAt:  time.Now(),
+		}, false, nil
+	}
 	d.connPool.retain(local, remote, nr)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		d.connPool.release(local, remote, nr)
-		return nil, errListen
+		return nil, false, errListen
 	}
 
 	tctx, cancel := context.WithCancel(context.Background())
@@ -225,7 +243,7 @@ func (d *Daemon) execTunnelOpen(ctx context.Context, remoteAidStr string, req tu
 		idleTimeout = time.Duration(req.IdleTimeoutSec) * time.Second
 	case req.IdleTimeoutSec == 0:
 		idleTimeout = tunnelDefaultIdleTimeout
-	// req.IdleTimeoutSec < 0: no idle timeout (idleTimeout stays 0)
+		// req.IdleTimeoutSec < 0: no idle timeout (idleTimeout stays 0)
 	}
 
 	listenAddr := ln.Addr().String()
@@ -241,6 +259,7 @@ func (d *Daemon) execTunnelOpen(ctx context.Context, remoteAidStr string, req tu
 		httpsURL:  httpsURL,
 		isRelayed: isRelayed,
 		noRelay:   nr,
+		token:     req.AccessToken,
 		openedAt:  time.Now(),
 		cancel:    cancel,
 		done:      done,
@@ -284,10 +303,10 @@ func (d *Daemon) execTunnelOpen(ctx context.Context, remoteAidStr string, req tu
 					case <-tick.C:
 						idle := time.Since(time.Unix(0, entry.lastActivity.Load()))
 						if entry.activeConns.Load() == 0 && idle >= idleTimeout {
-					d.log.Debug("tunnel: idle timeout", "id", entry.id, "idle", idle)
-						cancel()
-						_ = ln.Close() // unblock Accept()
-						return
+							d.log.Debug("tunnel: idle timeout", "id", entry.id, "idle", idle)
+							cancel()
+							_ = ln.Close() // unblock Accept()
+							return
 						}
 					}
 				}
@@ -310,7 +329,7 @@ func (d *Daemon) execTunnelOpen(ctx context.Context, remoteAidStr string, req tu
 				defer entry.connDone()
 				openCtx, openCancel := context.WithTimeout(tctx, 30*time.Second)
 				defer openCancel()
-				qs, err := qc.OpenStreamSync(openCtx)
+				qs, err := d.openAdmittedStream(openCtx, qc, entry.token)
 				if err != nil {
 					d.log.Warn("tunnel: open stream failed", "id", entry.id, "err", err)
 					_ = tcpConn.Close()
@@ -326,7 +345,7 @@ func (d *Daemon) execTunnelOpen(ctx context.Context, remoteAidStr string, req tu
 		}
 	}()
 
-	return entry, nil
+	return entry, true, nil
 }
 
 // closeTunnel cancels and waits for the tunnel accept loop to exit.

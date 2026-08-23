@@ -154,6 +154,15 @@ type Daemon struct {
 
 	// upd handles periodic version checks, binary replacement, and rollback watchdog.
 	upd *updater.Updater
+
+	// ra is node-identity remote admin (Web UI over service_tcp). Nil-safe.
+	ra *remoteAdminRuntime
+
+	// aclIP rate-limits ordinary agent ACL failures by source IP (S3).
+	// Process-local; nil-safe. Node remote admin does not use this.
+	aclIP *aclIPGate
+
+	book *addressBookRuntime
 }
 
 // APIAddr returns the REST API / Web UI listen address from the loaded config.
@@ -283,6 +292,10 @@ func New(cfg Config) (*Daemon, error) {
 		beacon:          newBeaconManager(h.Node(), &nodeCfg, log),
 		demo:            newDemoManager(),
 	}
+	d.initRemoteAdmin()
+	d.initAddressBook()
+	d.aclIP = newACLIPGate()
+	h.SetDecideAccess(d.decideAccess)
 	// connPool dial: user paths race impression∥network via ConnectUserFor;
 	// auto paths keep ConnectFromRecordFor. nodeAddr is a registered agent.
 	d.connPool = newModeAConnPool(func(ctx context.Context, local, remote a2al.Address, er *protocol.EndpointRecord, noRelay bool, user bool) (quic.Connection, bool, error) {

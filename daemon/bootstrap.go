@@ -78,9 +78,9 @@ func runBootstrapChain(ctx context.Context, h *host.Host, cfg *config.Config, da
 //	               with peers.cache when set; skips public DNS (full operator control).
 //	DNS TXT      — public infra; resolved in parallel with peers.cache when cfg.Bootstrap
 //	               is empty; heals stale caches without requiring a config change.
-//	beacon       — last resort when all other sources fail.
+	// auxiliary       — last resort when all other sources fail.
 //
-// All sources (except beacon) are tried concurrently; the first successful contact
+// All sources (except auxiliary) are tried concurrently; the first successful contact
 // starts FindNode immediately without waiting for slower seeds.
 func bootstrapDHT(ctx context.Context, h *host.Host, cfg *config.Config, dataDir string, log *slog.Logger, bm *beaconManager) bool {
 	// Collect seeds: peers.cache is always included; the second source is either
@@ -154,7 +154,7 @@ func bootstrapDHT(ctx context.Context, h *host.Host, cfg *config.Config, dataDir
 		storeDNSTXTResult(secondTXT)
 	}
 
-	// Last resort: public beacon infrastructure — only when all other sources failed
+	// Last resort: public auxiliary infrastructure — only when all other sources failed
 	// AND no operator-supplied bootstrap is configured. A private deployment that
 	// explicitly set cfg.Bootstrap must not silently widen to public infra when its
 	// seeds are temporarily unreachable.
@@ -360,7 +360,7 @@ func (d *Daemon) maybeRebootstrap(ctx context.Context) {
 
 // trustedSeedAddrs returns the set of trusted bootstrap seed addresses to retry
 // during a cold start. Only infrastructure-controlled sources are included:
-// config seeds, DNS TXT, or beacon. peers.cache is intentionally excluded because
+// config seeds, DNS TXT, or well-known addresses. peers.cache is intentionally excluded because
 // it is a snapshot of the routing table (may contain unverified hearsay addresses)
 // and is only suitable for the one-shot fast-start attempt in bootstrapDHT.
 func trustedSeedAddrs(cfg *config.Config, bm *beaconManager, log *slog.Logger) []net.Addr {
@@ -379,7 +379,7 @@ func trustedSeedAddrs(cfg *config.Config, bm *beaconManager, log *slog.Logger) [
 
 	if len(cfg.Bootstrap) > 0 {
 		add(resolveBootstrapAddrs(cfg.Bootstrap, log))
-		return out // operator-controlled seeds: do not widen to public DNS/beacon
+		return out // operator-controlled seeds: do not widen to public DNS/well-known
 	}
 	if txt := lookupBootstrapTXT(dnsBootstrapName); len(txt) > 0 {
 		add(resolveBootstrapAddrs(txt, log))
@@ -550,8 +550,7 @@ func bootstrapViaHub(ctx context.Context, h *host.Host, hubBase string, findNode
 		if len(ni.IP) != 4 && len(ni.IP) != 16 {
 			continue
 		}
-		udpAddr := &net.UDPAddr{IP: ni.IP, Port: int(ni.Port)}
-		node.AddContact(udpAddr, ni)
+		node.AbsorbContact(ni)
 		count++
 		if len(ni.NodeID) == len(a2al.NodeID{}) {
 			var nid a2al.NodeID

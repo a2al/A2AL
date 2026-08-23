@@ -500,6 +500,7 @@ func (d *Daemon) execAgentsList() []map[string]any {
 		if e.Profile != nil {
 			m["profile"] = e.Profile
 		}
+		m["acl"] = redactACL(e.ACL)
 		if hbT, ok := hbSnap[e.AID]; ok {
 			m["heartbeat_seconds_ago"] = time.Since(hbT).Seconds()
 		} else {
@@ -545,6 +546,7 @@ func (d *Daemon) execAgentGet(ctx context.Context, aidStr string) (map[string]an
 	if e.Profile != nil {
 		out["profile"] = e.Profile
 	}
+	out["acl"] = redactACL(e.ACL)
 	d.heartbeatMu.Lock()
 	hbT, hbOK := d.heartbeatAt[e.AID]
 	d.heartbeatMu.Unlock()
@@ -919,14 +921,20 @@ func (d *Daemon) execResolve(ctx context.Context, aidStr string) (map[string]any
 	}, nil
 }
 
-func (d *Daemon) execConnect(ctx context.Context, remoteAidStr string, body connectReq) (string, error) {
+type connectResult struct {
+	Tunnel    string `json:"tunnel,omitempty"`
+	Connected bool   `json:"connected"`
+	Allowed   bool   `json:"allowed"`
+}
+
+func (d *Daemon) execConnect(ctx context.Context, remoteAidStr string, body connectReq) (connectResult, error) {
 	remote, err := a2al.ParseAddress(remoteAidStr)
 	if err != nil {
-		return "", errBadAID
+		return connectResult{}, errBadAID
 	}
 	local, err := d.pickLocalAgent(body.LocalAID)
 	if err != nil {
-		return "", err
+		return connectResult{}, err
 	}
 	er, contacted, err := d.resolveTracked(ctx, remote)
 	if err != nil {
@@ -934,7 +942,7 @@ func (d *Daemon) execConnect(ctx context.Context, remoteAidStr string, body conn
 			er, err = d.resolveFromBeacon(ctx, remote)
 		}
 		if err != nil {
-			return "", errResolve
+			return connectResult{}, errResolve
 		}
 	}
 	d.log.Debug("connect resolve",
@@ -951,15 +959,24 @@ func (d *Daemon) execConnect(ctx context.Context, remoteAidStr string, body conn
 	if err != nil {
 		d.log.Warn("connect quic", "remote", remote.String(), "err", err)
 		if errors.Is(err, host.ErrRelayRequired) {
-			return "", err
+			return connectResult{}, err
 		}
-		return "", errConnectQUIC
+		return connectResult{}, errConnectQUIC
+	}
+	allowed, err := d.probeServiceAdmission(ctx, qc, body.AccessToken)
+	if err != nil {
+		return connectResult{}, errConnectQUIC
+	}
+	if !allowed {
+		d.log.Debug("connect quic ok, service denied", "local_aid", local.String(), "remote_aid", remote.String())
+		return connectResult{Connected: true, Allowed: false}, nil
 	}
 	d.log.Debug("connect quic ok", "local_aid", local.String(), "remote_aid", remote.String())
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		return "", errListen
+		return connectResult{}, errListen
 	}
+	token := body.AccessToken
 	go func() {
 		defer ln.Close()
 		_ = ln.(*net.TCPListener).SetDeadline(time.Now().Add(30 * time.Second))
@@ -971,7 +988,7 @@ func (d *Daemon) execConnect(ctx context.Context, remoteAidStr string, body conn
 		}
 		qctx, qcancel := context.WithTimeout(context.Background(), 120*time.Second)
 		defer qcancel()
-		qs, err := qc.OpenStreamSync(qctx)
+		qs, err := d.openAdmittedStream(qctx, qc, token)
 		if err != nil {
 			d.log.Warn("tunnel open stream failed", "local_aid", local.String(), "remote_aid", remote.String(), "err", err)
 			_ = tcpConn.Close()
@@ -981,7 +998,7 @@ func (d *Daemon) execConnect(ctx context.Context, remoteAidStr string, body conn
 		bridgeTCPQUICStream(qs, tcpConn, nil, nil, nil)
 		d.log.Debug("tunnel bridge done", "local_aid", local.String(), "remote_aid", remote.String())
 	}()
-	return ln.Addr().String(), nil
+	return connectResult{Tunnel: ln.Addr().String(), Connected: true, Allowed: true}, nil
 }
 
 func (d *Daemon) execMailboxSend(ctx context.Context, localAidStr, recipientStr string, msgType uint8, body []byte) error {
@@ -1069,7 +1086,7 @@ func (d *Daemon) execMailboxPoll(ctx context.Context, aidStr string) ([]map[stri
 		return nil, err
 	}
 
-	// Beacon fallback: supplement when DHT returned nothing.
+	// Auxiliary fallback: supplement when DHT returned nothing.
 	if d.beacon != nil && len(recs) == 0 {
 		if beaconRecs, _ := d.beacon.FindRecords(ctx, a2al.NodeIDFromAddress(aid), protocol.RecTypeMailbox); len(beaconRecs) > 0 {
 			now2 := time.Now()

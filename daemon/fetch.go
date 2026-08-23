@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/a2al/a2al"
+	"github.com/a2al/a2al/protocol"
 )
 
 const (
@@ -31,21 +32,22 @@ const (
 type fetchReq struct {
 	// LocalAID selects which registered agent identity to dial from.
 	// Defaults to the node identity when omitted.
-	LocalAID   string              `json:"local_aid,omitempty"`
-	Method     string              `json:"method,omitempty"`    // default GET
-	Path       string              `json:"path"`                // e.g. "/api/status"
-	Headers    map[string][]string `json:"headers,omitempty"`
-	BodyBase64 string              `json:"body_base64,omitempty"`
+	LocalAID    string              `json:"local_aid,omitempty"`
+	AccessToken string              `json:"access_token,omitempty"`
+	Method      string              `json:"method,omitempty"` // default GET
+	Path        string              `json:"path"`             // e.g. "/api/status"
+	Headers     map[string][]string `json:"headers,omitempty"`
+	BodyBase64  string              `json:"body_base64,omitempty"`
 }
 
 // fetchResp is the structured response returned by execFetch.
 type fetchResp struct {
-	Status    int                 `json:"status"`
-	Headers   map[string][]string `json:"headers,omitempty"`
+	Status  int                 `json:"status"`
+	Headers map[string][]string `json:"headers,omitempty"`
 	// Body is the response body, base64-encoded.
-	Body      string              `json:"body"`
+	Body string `json:"body"`
 	// Truncated is true when the body exceeded fetchMaxBody and was cut off.
-	Truncated bool                `json:"truncated,omitempty"`
+	Truncated bool `json:"truncated,omitempty"`
 }
 
 // preparedFetch holds the normalised values derived from a fetchReq.
@@ -169,8 +171,11 @@ func (d *Daemon) execFetch(ctx context.Context, localAID, remoteAID a2al.Address
 		sctx, scancel := context.WithTimeout(ctx, fetchStreamTimeout)
 		defer scancel()
 
-		stream, err := conn.OpenStreamSync(sctx)
+		stream, err := d.openAdmittedStream(sctx, conn, req.AccessToken)
 		if err != nil {
+			if isAccessDeniedErr(err) {
+				return fetchResp{}, protocol.ErrAccessDenied
+			}
 			d.log.Debug("fetch: open stream failed (dead conn?)", "remote", remoteAID.String(), "err", err)
 			return fetchResp{}, errConnectQUIC
 		}
@@ -315,6 +320,8 @@ func (d *Daemon) handleFetch(w http.ResponseWriter, r *http.Request) {
 			writeJSONStatus(w, http.StatusBadGateway, map[string]string{"error": "resolve failed"})
 		case errors.Is(err, errConnectQUIC):
 			writeJSONStatus(w, http.StatusBadGateway, map[string]string{"error": "connect failed"})
+		case isAccessDeniedErr(err):
+			writeJSONStatus(w, http.StatusForbidden, map[string]string{"error": "access denied"})
 		default:
 			writeJSONStatus(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 		}

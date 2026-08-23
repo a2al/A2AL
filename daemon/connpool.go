@@ -314,6 +314,15 @@ func (p *modeAConnPool) retain(local, remote a2al.Address, noRelay bool) {
 	p.mu.Unlock()
 }
 
+// forget evicts a cached connection without closing it.
+// Used when the peer already rejected the data plane and will close the QUIC.
+func (p *modeAConnPool) forget(local, remote a2al.Address, noRelay bool) {
+	key := connPoolKey{local, remote, noRelay}
+	p.mu.Lock()
+	delete(p.pool, key)
+	p.mu.Unlock()
+}
+
 // invalidate closes and evicts the cached QUIC connection for (local → remote, noRelay).
 // Unlike a dial failure, invalidate does not write a backoff record — the caller
 // explicitly requested the reset, so the next acquire re-dials immediately.

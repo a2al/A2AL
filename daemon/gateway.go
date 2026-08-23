@@ -9,6 +9,7 @@ import (
 	"crypto/ed25519"
 	"crypto/tls"
 	"encoding/base64"
+	"fmt"
 	"io"
 	"net"
 	"strings"
@@ -74,13 +75,13 @@ type sessionInfo struct {
 
 // sessionSnapshot is the JSON-serialisable view of sessionInfo.
 type sessionSnapshot struct {
-	CallerAID        string    `json:"caller_aid"`
-	CallerPubkey     string    `json:"caller_pubkey"`
-	LocalAID         string    `json:"local_aid"`
-	ConnectedAt      time.Time `json:"connected_at"`
-	BytesUp          int64     `json:"bytes_up"`
-	BytesDown        int64     `json:"bytes_down"`
-	LastProgressAt   time.Time `json:"last_progress_at,omitempty"`
+	CallerAID      string    `json:"caller_aid"`
+	CallerPubkey   string    `json:"caller_pubkey"`
+	LocalAID       string    `json:"local_aid"`
+	ConnectedAt    time.Time `json:"connected_at"`
+	BytesUp        int64     `json:"bytes_up"`
+	BytesDown      int64     `json:"bytes_down"`
+	LastProgressAt time.Time `json:"last_progress_at,omitempty"`
 }
 
 func (s *sessionInfo) snapshot() sessionSnapshot {
@@ -235,12 +236,14 @@ func (d *Daemon) serveResolvedGatewayConn(ctx context.Context, ac *host.AgentCon
 		return
 	}
 
-	// Application-layer service address: empty for the node AID (no service_tcp).
-	// dispatchInboundStream handles probe and mailbox frames without service_tcp;
-	// bridgeInboundStream rejects plain TCP-bridge streams when service_tcp is empty.
+	// Application-layer service address: empty for the node AID unless remote
+	// admin is on (then the Web UI listen address). Mailbox / DHT fallback
+	// still run without crossing this door.
 	serviceTCP := ""
 	if reg != nil {
 		serviceTCP = reg.ServiceTCP
+	} else if ac.Local == d.nodeAddr && d.remoteAdminEnabled() {
+		serviceTCP = d.remoteAdminServiceTCP()
 	}
 
 	defer ac.CloseWithError(0, "gateway closed")
@@ -279,9 +282,48 @@ func (d *Daemon) dispatchInboundStream(ac *host.AgentConn, str quic.Stream, serv
 		_ = str.Close()
 		return
 	}
-	// Default: wrap the buffered reader back for the bridge path.
-	// Since we only peeked (not consumed), the bridge sees the full stream.
-	d.bridgeInboundStream(ac, &peekStream{Reader: br, Stream: str}, serviceTCP)
+	ps := &peekStream{Reader: br, Stream: str}
+	// Node remote-admin has a service_tcp. Misrouted DHT is CBOR, not HTTP;
+	// recover it before ACL/bridge so enabling the door does not starve DHT.
+	if ac.Local == d.nodeAddr && serviceTCP != "" {
+		if b, err := br.Peek(1); err == nil && len(b) == 1 && (b[0] < 'A' || b[0] > 'Z') {
+			if string(magic) != protocol.MagicServiceStream {
+				if d.tryHandleAsDHTFallback(ac, ps) {
+					return
+				}
+				return
+			}
+		}
+	}
+	if err == nil && string(magic) == protocol.MagicServiceStream {
+		_, _ = br.Discard(4)
+		_ = str.SetDeadline(time.Now().Add(5 * time.Second))
+		token, aerr := host.ReadServiceAdmission(ps)
+		if aerr != nil {
+			d.log.Debug("gateway: a2s1 admission read", "err", aerr)
+			_ = str.Close()
+			return
+		}
+		allowed := d.decideAccess(ac.Local, ac.Remote, token, ac.RemoteAddr())
+		reason := ""
+		if !allowed {
+			reason = "denied"
+		}
+		if werr := host.WriteAccessResult(ps, allowed, reason); werr != nil {
+			_ = str.Close()
+			return
+		}
+		_ = str.SetDeadline(time.Time{})
+		if !allowed {
+			d.log.Warn("gateway: access denied", "local_aid", ac.Local.String(), "remote_aid", ac.Remote.String())
+			_ = str.Close()
+			return
+		}
+		d.bridgeInboundStream(ac, ps, serviceTCP, true)
+		return
+	}
+	allowed := d.decideAccess(ac.Local, ac.Remote, "", ac.RemoteAddr())
+	d.bridgeInboundStream(ac, ps, serviceTCP, allowed)
 }
 
 // peekStream wraps a bufio.Reader over a quic.Stream so that already-buffered
@@ -327,13 +369,18 @@ func (d *Daemon) tryHandleAsDHTFallback(ac *host.AgentConn, str quic.Stream) boo
 	return true
 }
 
-func (d *Daemon) bridgeInboundStream(ac *host.AgentConn, str quic.Stream, serviceTCP string) {
+func (d *Daemon) bridgeInboundStream(ac *host.AgentConn, str quic.Stream, serviceTCP string, aclOK bool) {
 	if serviceTCP == "" {
 		if d.tryHandleAsDHTFallback(ac, str) {
 			return
 		}
 		d.log.Warn("gateway: empty service_tcp", "local_aid", ac.Local.String(), "remote_aid", ac.Remote.String())
 		_ = str.Close()
+		return
+	}
+	if !aclOK {
+		d.log.Warn("gateway: access denied", "local_aid", ac.Local.String(), "remote_aid", ac.Remote.String())
+		rejectAccessStream(str)
 		return
 	}
 	dialCtx, dialCancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -343,6 +390,9 @@ func (d *Daemon) bridgeInboundStream(ac *host.AgentConn, str quic.Stream, servic
 		d.log.Warn("gateway: tcp dial", "local_aid", ac.Local.String(), "remote_aid", ac.Remote.String(), "target", serviceTCP, "err", err)
 		_ = str.Close()
 		return
+	}
+	if ac.Local == d.nodeAddr && d.ra != nil {
+		d.ra.noteOK(fmt.Sprintf("%p", ac.Connection), ac.Remote.String(), addrIP(ac.RemoteAddr()))
 	}
 
 	// Register session so backends can query caller identity via GET /sessions/{port}.

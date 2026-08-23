@@ -10,6 +10,7 @@ import (
 
 	"github.com/a2al/a2al"
 	"github.com/a2al/a2al/daemon/aidproxy"
+	"github.com/a2al/a2al/protocol"
 )
 
 // daemonDialer implements [aidproxy.Dialer] using the daemon's connPool and
@@ -61,8 +62,11 @@ func (dd *daemonDialer) Dial(ctx context.Context, remote a2al.Address) (io.ReadW
 	if err != nil {
 		return nil, errConnectQUIC
 	}
-	stream, err := conn.OpenStreamSync(ctx)
+	stream, err := dd.d.openAdmittedStream(ctx, conn, "")
 	if err != nil {
+		if isAccessDeniedErr(err) {
+			return nil, protocol.ErrAccessDenied
+		}
 		return nil, errConnectQUIC
 	}
 	return stream, nil

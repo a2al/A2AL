@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/a2al/a2al"
+	"github.com/a2al/a2al/protocol"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -383,18 +384,23 @@ func (d *Daemon) mcpResolve(ctx context.Context, _ *mcp.ServerSession, params *m
 }
 
 type mcpConnectArgs struct {
-	RemoteAID string `json:"remote_aid"`
-	LocalAID  string `json:"local_aid,omitempty"`
+	RemoteAID   string `json:"remote_aid"`
+	LocalAID    string `json:"local_aid,omitempty"`
+	AccessToken string `json:"access_token,omitempty"`
 }
 
 func (d *Daemon) mcpConnect(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[mcpConnectArgs]) (*mcp.CallToolResultFor[map[string]any], error) {
 	cctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
-	tun, err := d.execConnect(cctx, params.Arguments.RemoteAID, connectReq{LocalAID: params.Arguments.LocalAID})
+	res, err := d.execConnect(cctx, params.Arguments.RemoteAID, connectReq{LocalAID: params.Arguments.LocalAID, AccessToken: params.Arguments.AccessToken})
 	if err != nil {
 		return nil, err
 	}
-	return &mcp.CallToolResultFor[map[string]any]{StructuredContent: map[string]any{"tunnel": tun}}, nil
+	m, err := structToMap(res)
+	if err != nil {
+		return nil, err
+	}
+	return &mcp.CallToolResultFor[map[string]any]{StructuredContent: m}, nil
 }
 
 type mcpMailboxSendArgs struct {
@@ -431,8 +437,8 @@ func (d *Daemon) mcpMailboxPoll(ctx context.Context, _ *mcp.ServerSession, param
 }
 
 type mcpTopicRegisterArgs struct {
-	AID      string         `json:"aid"`
-	Services []string       `json:"services"`
+	AID       string         `json:"aid"`
+	Services  []string       `json:"services"`
 	Name      string         `json:"name"`
 	Protocols []string       `json:"protocols"`
 	Tags      []string       `json:"tags"`
@@ -532,6 +538,8 @@ func (d *Daemon) mcpFetch(ctx context.Context, _ *mcp.ServerSession, params *mcp
 			return nil, errors.New("resolve failed: remote agent not found on the network — try a2al_discover to search by capability, or a2al_mailbox_send for deferred delivery")
 		case errors.Is(err, errConnectQUIC):
 			return nil, errors.New("connect failed: remote agent is unreachable right now — try a2al_mailbox_send for deferred async delivery")
+		case isAccessDeniedErr(err):
+			return nil, protocol.ErrAccessDenied
 		default:
 			return nil, err
 		}
@@ -548,14 +556,16 @@ func (d *Daemon) mcpFetch(ctx context.Context, _ *mcp.ServerSession, params *mcp
 type mcpTunnelOpenArgs struct {
 	RemoteAID      string `json:"remote_aid"`
 	LocalAID       string `json:"local_aid,omitempty"`
+	AccessToken    string `json:"access_token,omitempty"`
 	IdleTimeoutSec int    `json:"idle_timeout_sec,omitempty"`
 }
 
 func (d *Daemon) mcpTunnelOpen(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[mcpTunnelOpenArgs]) (*mcp.CallToolResultFor[map[string]any], error) {
 	tctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
-	entry, err := d.execTunnelOpen(tctx, params.Arguments.RemoteAID, tunnelOpenReq{
+	entry, _, err := d.execTunnelOpen(tctx, params.Arguments.RemoteAID, tunnelOpenReq{
 		LocalAID:       params.Arguments.LocalAID,
+		AccessToken:    params.Arguments.AccessToken,
 		IdleTimeoutSec: params.Arguments.IdleTimeoutSec,
 	})
 	if err != nil {
