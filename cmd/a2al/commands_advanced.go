@@ -1053,6 +1053,7 @@ Global flags:
 
 Commands (everyday use):
   status          Show daemon and registered agents
+  doctor          Local observations on this daemon (not a network verdict)
   register        Register a new agent identity
   publish         Publish a service to the Tangled Network
   unpublish       Remove a service from the Tangled Network
@@ -1060,6 +1061,7 @@ Commands (everyday use):
   info            Fetch agent info and card from a remote AID
   get             HTTP GET to a remote agent (encrypted, NAT-traversing)
   post            HTTP POST to a remote agent (encrypted, NAT-traversing)
+  inbound bind    Attach a local HTTP listen to an AID so others can fetch it
 
 Commands (advanced):
   agents          Manage local agents
@@ -1068,6 +1070,7 @@ Commands (advanced):
   connect         Open a one-shot encrypted tunnel to a remote agent
   tunnel          Manage persistent multiplexed encrypted tunnels
   note            Send / poll encrypted offline messages
+  chat            One-to-one messages between AIDs
   config          Get or set daemon configuration
   admin           Enable remote admin and manage who may connect
   update          Check for or apply a2al updates
@@ -1082,6 +1085,7 @@ Examples:
   a2al info <aid>
   a2al get <aid> /.well-known/agent.json
   a2al post <aid> /tasks -d '{"text":"hello"}'
+  a2al inbound bind --addr 127.0.0.1:18789
   a2al tunnel open <aid>
   a2al tunnel
   a2al tunnel close <id>

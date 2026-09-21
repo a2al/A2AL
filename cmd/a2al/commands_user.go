@@ -107,20 +107,56 @@ func cmdStatus(c *Client, g globalOpts, args []string) {
 	} else {
 		fmt.Printf("Node:    %s  (%s)\n", node, online)
 	}
+	if dd, _ := st["data_dir"].(string); dd != "" {
+		fmt.Printf("Data:    %s\n", dd)
+	}
+	if fr, _ := st["files_root"].(string); fr == "" {
+		fmt.Printf("Files:   (no files_root; object put falls back to inline upload only if configured)\n")
+	} else if ready, _ := st["files_root_ready"].(bool); ready {
+		fmt.Printf("Files:   %s  (ready)\n", fr)
+	} else {
+		fmt.Printf("Files:   %s  (UNUSABLE: missing or not writable by a2ald)\n", fr)
+	}
 	fmt.Printf("Agents:  %d registered\n", len(agWrap.Agents))
 	for _, a := range agWrap.Agents {
 		aid, _ := a["aid"].(string)
-		var lp string
+		var notes []string
 		if v, ok := a["last_publish_at"].(string); ok && v != "" {
 			if t, err := time.Parse(time.RFC3339, v); err == nil {
-				lp = formatAgo(t)
+				notes = append(notes, "published "+formatAgo(t))
 			}
 		}
-		if lp != "" {
-			fmt.Printf("  %s  (published %s)\n", aid, lp)
+		if n := pendingHitchCount(st, aid, "mailbox"); n > 0 {
+			notes = append(notes, fmt.Sprintf("%d mail waiting", n))
+		}
+		if n := pendingHitchCount(st, aid, "chat_invites"); n > 0 {
+			notes = append(notes, fmt.Sprintf("%d chat invites", n))
+		}
+		if n := pendingHitchCount(st, aid, "chat_unread"); n > 0 {
+			notes = append(notes, fmt.Sprintf("%d chat unread", n))
+		}
+		if len(notes) > 0 {
+			fmt.Printf("  %s  (%s)\n", aid, strings.Join(notes, ", "))
 		} else {
 			fmt.Printf("  %s\n", aid)
 		}
+	}
+}
+
+// pendingHitchCount reads one key from the pending hitch /status carries.
+// Absent means nothing waiting for that key.
+func pendingHitchCount(st map[string]any, aid, key string) int {
+	pending, _ := st["pending"].(map[string]any)
+	per, _ := pending[aid].(map[string]any)
+	switch v := per[key].(type) {
+	case float64:
+		return int(v)
+	case int:
+		return v
+	case int64:
+		return int(v)
+	default:
+		return 0
 	}
 }
 

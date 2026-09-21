@@ -14,11 +14,11 @@ let tab = 'agents';
 let _ver = ''; // cached version string, populated by refreshHeader()
 
 /** Open a modal. onMount receives (modalEl, { close }). */
-function openModal({ title, body, footer, wide, noBackdropClose, onMount }) {
+function openModal({ title, body, footer, wide, cls, noBackdropClose, onMount, onClose }) {
   const backdrop = document.createElement('div');
   backdrop.className = 'modal-backdrop';
   const modal = document.createElement('div');
-  modal.className = wide ? 'modal modal-wide' : 'modal';
+  modal.className = cls || (wide ? 'modal modal-wide' : 'modal');
 
   const head = document.createElement('div');
   head.className = 'modal-h';
@@ -41,6 +41,7 @@ function openModal({ title, body, footer, wide, noBackdropClose, onMount }) {
   document.body.appendChild(backdrop);
 
   function close() {
+    onClose?.();
     document.removeEventListener('keydown', onKey);
     backdrop.remove();
   }

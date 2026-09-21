@@ -17,6 +17,7 @@ import { encrypt, decrypt, isEnvelope } from '../crypto.js';
 import { openProfileModal } from '../profile-modal.js';
 import { openACLModal } from '../acl-modal.js';
 import { openPublishModal } from '../publish-modal.js';
+import { openGroupBubble } from './group-bubble.js';
 
 // ---------------------------------------------------------------------------
 // Local delegation signing — master private key never leaves the browser.
@@ -407,6 +408,7 @@ export async function renderAgents(mount, ctx) {
         </span>
         <div class="ag2-actions">
           ${!ag.published_to_dht ? `<button type="button" class="btn btn-primary btn-sm" data-pub-now>${esc(t('agent.action.publish'))}</button>` : ''}
+          <button type="button" class="btn btn-secondary btn-sm" data-room>${esc(t('group.bubble.action'))}</button>
           <button type="button" class="btn btn-secondary btn-sm" data-edit-profile>${esc(t('agent.action.edit_profile'))}</button>
           <button type="button" class="btn btn-secondary btn-sm" data-edit-acl>${esc(t('agent.action.acl'))}</button>
           <button type="button" class="btn btn-secondary btn-sm" data-pub>${esc(t('agent.action.republish'))}</button>
@@ -523,6 +525,7 @@ export async function renderAgents(mount, ctx) {
     };
 
     infoDiv.querySelector('[data-export]').onclick = () => openExportModal(ag.aid);
+    infoDiv.querySelector('[data-room]').onclick = () => openGroupBubble(ctx, ag);
     infoDiv.querySelector('[data-edit-profile]').onclick = () => openProfileModal(ctx, ag);
     infoDiv.querySelector('[data-edit-acl]').onclick = () => openACLModal(ctx, ag);
 

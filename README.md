@@ -9,7 +9,7 @@
 
 A2AL is a networking protocol that enables AI agents to publish themselves, discover each other, and establish secure connections — without relying on any central infrastructure.
 
-Each agent receives a globally unique, cryptographic address (AID). Once publsished to the network, any agent worldwide can resolve that AID and initiate an authenticated, encrypted connection — regardless of network topology, NAT boundaries, or IP changes.
+Each agent receives a globally unique, cryptographic address (AID). Once published to the network, any agent worldwide can resolve that AID and initiate an authenticated, encrypted connection — on a public server or a laptop, regardless of topology, NAT, or IP changes.
 
 A2AL ships as a standalone daemon with a built-in **MCP server** — giving AI assistants like Claude, Cursor, and Windsurf direct networking capabilities without writing any code.
 
@@ -23,9 +23,9 @@ Your Agent  ──publish──▶  A2AL Network  ◀──discover──  Remot
 
 AI agent interoperability protocols (MCP, A2A, ANP) define how agents communicate, but assume you already know where the other agent is. In practice:
 
-- No standard, open mechanism exists for agents to announce their availability or discover peers — whether deployed in data centers, on edge infrastructure, or on personal devices
-- Agent connectivity depends on pre-configured endpoints, platform-specific registries, or manual coordination — none of which scale across organizational and network boundaries
-- Agents behind NAT or with dynamic IPs face additional reachability barriers that existing protocols do not address
+- No standard, open mechanism exists for agents to announce their availability or discover peers — in a datacenter, on the edge, or on a personal device
+- Connectivity depends on pre-configured endpoints, platform-specific registries, or manual coordination — none of which survive a move or a private network
+- There is no shared, permanent address that a person, an AI assistant, and a worker can all use without a vendor account
 
 A2AL addresses the missing infrastructure layer: **agent-level addressing, discovery, and connectivity**.
 
@@ -35,11 +35,11 @@ A2AL addresses the missing infrastructure layer: **agent-level addressing, disco
 
 **Discover** — Resolve any agent by its AID, or search by capability (e.g. "translation agents supporting zh-en legal domain"). Discovery is fully decentralized — no registry to operate or depend on. Offline agents can receive encrypted notes delivered through the network.
 
-**Connect** — Establish a direct, end-to-end encrypted connection with mutual identity verification. A2AL handles NAT traversal transparently, ensuring agents behind firewalls and home networks are as reachable as cloud-hosted services.
+**Connect** — Establish a direct, end-to-end encrypted connection with mutual identity verification. The same addressing works on a datacenter server and a home machine; NAT traversal is used where the path needs it.
 
 ## Getting Started
 
-**For agent operators** — Install `a2ald` and open `http://localhost:2121`. The web UI lets you manage identities, publish agents, and discover services — no port forwarding, domain names, or cloud infrastructure required.
+**For people** — Install `a2ald` and open `http://localhost:2121`. The web UI lets you create an identity, publish if others must find you, and look up a known AID. Persistent service is optional (`a2ald service install -user`). A known AID is also `http://127.0.0.1:2121/aid/{AID}/…`.
 
 **For developers** — A2AL integrates into your existing stack:
 
@@ -55,20 +55,19 @@ A2AL addresses the missing infrastructure layer: **agent-level addressing, disco
 
 As an MCP Server, A2AL exposes 25+ tools that any MCP-compatible agent can invoke directly — enabling agents to acquire networking capabilities without code-level integration.
 
-**Claude Desktop / Cursor / Windsurf / Cline** — add to your MCP config:
+**Claude Desktop / Cursor / Windsurf / Cline** — `npx -y a2ald mcp add`, or point the host at HTTP:
 
 ```json
 {
   "mcpServers": {
     "a2al": {
-      "command": "a2ald",
-      "args": ["--mcp-stdio"]
+      "url": "http://127.0.0.1:2121/mcp/"
     }
   }
 }
 ```
 
-See [`doc/mcp-setup.md`](doc/mcp-setup.md) for platform-specific paths and full tool list.
+Hosts that only spawn a process: `"command": "a2ald", "args": ["--mcp-stdio"]` (proxies to a running daemon). See [`doc/mcp-setup.md`](doc/mcp-setup.md).
 
 ### CLI
 
@@ -77,7 +76,7 @@ a2al status                         # node and agent status
 a2al register                       # create and register a new agent
 a2al search <service>               # discover agents by capability
 a2al info <aid>                     # fetch agent info and card
-a2al get  <aid> /path               # HTTP GET to a remote agent (encrypted, NAT-traversing)
+a2al get  <aid> /path               # HTTP GET to a remote agent (encrypted QUIC)
 a2al post <aid> /path -d '{}'       # HTTP POST to a remote agent
 a2al tunnel open <aid>              # open a persistent local port for sustained access
 a2al tunnel                         # list active tunnels
@@ -103,7 +102,7 @@ conn, err := agent.Connect(targetAID)
 
 **Mutual Authentication** — Every connection cryptographically verifies both parties' identities. You always know the agent on the other end is who it claims to be.
 
-**Network-agnostic** — A2AL works across NAT, firewalls, and dynamic IPs. Agents on home machines, mobile devices, and corporate networks are first-class participants alongside cloud-hosted services.
+**Network-agnostic** — The same addressing applies on a public server as on a laptop. NAT, firewalls, and dynamic IPs are where that is most visible, not a product boundary.
 
 **Direct Communication** — A2AL resolves addresses and brokers the initial connection, then steps aside. Application data flows directly between agents, not through the protocol.
 

@@ -2,6 +2,16 @@
 
 > Part of the Tangled Network. https://a2al.org
 
+## Setting it up (agents: this is the whole procedure)
+
+The user said they want to use A2AL, or to connect or collaborate with an agent on another machine. Three steps:
+
+1. `npx -y a2ald mcp add` — starts a background daemon if none is running, registers the MCP server with the hosts on this machine. If it reports it does not know this host, it wrote nothing: run `npx -y a2ald mcp print` and place that entry in this host's MCP config yourself. What must hold is only the endpoint (`http://127.0.0.1:2121/mcp/`), the transport, and a running daemon — see https://github.com/a2al/a2al/blob/main/doc/mcp-entry.md
+2. Reload the host, and confirm `a2al_*` tools appear in your own tool list. `a2al doctor` is optional — use it only if you may be talking to the wrong daemon. It reports local observations, not a network verdict, and cannot see whether the host loaded the config.
+3. If tools are present, act on the goal: fetch, leave a note, or rooms. If there is no AID: `a2al_identity_generate` → `a2al_agent_register`. Call `a2al_agent_publish` only if others on this network must resolve you — skip it for outbound-only or local-only use. Empty bootstrap joins the public network; set `bootstrap` to isolate (loopback = this machine only). A second node needs a new `-data-dir` plus matching `-api-addr`/`-listen`, then `a2al --api …`. An AID stays resolvable only while that daemon runs (`a2ald service install -user` keeps it across logins, no elevation).
+
+Everything after that — rooms, mail, fetch, tunnels — is carried by the MCP server's own instructions and tool descriptions. Full skill: https://github.com/a2al/a2al/raw/main/skills/a2al/SKILL.md
+
 ## What it is
 Decentralized address resolution protocol for AI agents.
 Publish your agent → discoverable worldwide. Resolve any AID → direct encrypted connection.

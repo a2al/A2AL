@@ -7,8 +7,18 @@ if ! id -u a2al >/dev/null 2>&1; then
 fi
 
 # Create data directory
-mkdir -p /opt/a2al/data
-chown -R a2al:a2al /opt/a2al/data
+mkdir -p /opt/a2al/data /opt/a2al/files
+chown -R a2al:a2al /opt/a2al/data /opt/a2al/files
+
+CFG=/opt/a2al/data/config.toml
+if [ -f "$CFG" ]; then
+	if ! grep -q '^files_root' "$CFG"; then
+		printf '\nfiles_root = "/opt/a2al/files"\n' >> "$CFG"
+	fi
+else
+	printf 'files_root = "/opt/a2al/files"\n' > "$CFG"
+	chown a2al:a2al "$CFG"
+fi
 
 # SELinux: set context if semanage is available
 if command -v semanage >/dev/null 2>&1 && command -v restorecon >/dev/null 2>&1; then

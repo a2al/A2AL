@@ -1,38 +1,124 @@
 # User Guide
 
-This guide is for anyone who wants to make their AI agent discoverable, connectable, and collaborative — using the Web UI, CLI, or by simply asking your AI assistant to handle it.
+A2AL is the ready-to-use layer that lets **people, AI assistants, and agents** find each other, talk, coordinate, and leave work for later — without a vendor account, a domain, or a shared chat product.
 
-If you haven't run `a2ald` yet, start with the [Quick Start](quickstart.md).
-
----
-
-## The AI Agent Networking Problem
-
-AI agents are increasingly capable. The harder problem is getting them to work *together*.
-
-Today's AI ecosystem has a structural gap: protocols like MCP, A2A, and ANP define how agents communicate once they're connected, but assume you already know where the other agent is. In practice, agents run on laptops, home machines, cloud VMs, containers — with dynamic IPs, behind NAT, across organizational boundaries. That assumption almost never holds.
-
-**"Where is the other agent?"** — There's no standard, open way to announce availability or discover peers. What exists today: pre-configured endpoint lists that break when anything moves, platform-specific directories that lock you into one ecosystem, and manual coordination that doesn't scale.
-
-**"Is this actually the agent I think it is?"** — Without a shared certificate authority, verifying you're talking to the right agent requires trusting the platform. A2AL replaces this with cryptographic identity: the agent's address *is* its public key fingerprint. Verification is built in, no CA required.
-
-**"My agent is behind a firewall / NAT."** — Most agents aren't on public servers. NAT traversal is a solved problem at the infrastructure level, but nothing in the current AI stack handles it transparently for agents.
-
-**"I need agents to find each other dynamically."** — Hardcoded endpoints are configuration debt. Every deployment is a coordination problem. Every endpoint change cascades into broken integrations.
-
-A2AL is the missing layer:
-
-| Problem | A2AL's answer |
-|---------|--------------|
-| No global discovery | Every AID is resolvable from anywhere, without a registry |
-| Hardcoded endpoints | Agents publish current endpoints; the network always has the latest |
-| NAT and firewalls | Built-in NAT traversal — no configuration, no VPN, no manual setup |
-| No identity verification | Every connection cryptographically verifies both sides |
-| Platform lock-in | Open protocol, no operator, no permission required |
+If `a2ald` is not running yet, start with the [Quick Start](quickstart.md). Agents in an MCP host: [MCP Setup](mcp-setup.md).
 
 ---
 
-## Core Concepts
+## What you actually get
+
+The increment is not “another API.” It is that the same identity works for a human in a browser, an AI in an editor, and a worker on a server — and that this keeps working when machines move, sleep, or sit on a private network.
+
+**Open and use.** One local daemon is the whole runtime. People open `http://localhost:2121`. An AI assistant gets MCP tools (`npx -y a2ald mcp add`). Scripts use the CLI or REST. No cloud signup, no DNS, no certificate authority, no reverse-proxy tenant.
+
+**Connect, coordinate, interact.** With someone’s **AID** (their contact card) you can fetch their HTTP, open a tunnel, leave a note they will see when they are back, or join a room. Humans use the UI; agents use the same daemon’s tools. You do not need a third-party IM to introduce two machines.
+
+**Permanent identity.** An AID is yours for as long as you hold the key. IP, hostname, laptop, and cloud VM can all change; contacts keep using the same string. Reachability still needs a live daemon while others should find you now (records expire on TTL). The identity does not.
+
+**Strong privacy, no third party in the data path.** After connect, application bytes go peer-to-peer. The network stores *where to find me now*, not your payloads. Notes are encrypted to the recipient’s key. There is no tenant that can read the session. Isolation is first-class: point `bootstrap` at your own seeds and the same fetch / notes / rooms work with nobody else on the net.
+
+**No extra stack.** You do not rent ngrok, run a directory, or put agents behind a company VPN just so they can address each other. Empty config joins the public Tangled Network. The same commands apply on a rack server and on a home machine.
+
+---
+
+## When it is worth it
+
+AID is a contact, not the product. Use A2AL when the job below is yours and the usual tools are the wrong shape.
+
+| Job | You’d otherwise | Why A2AL |
+|-----|-----------------|----------|
+| Reach an agent on someone else’s laptop or home box | VPN both sides, ask for a public IP, or an ngrok URL that dies | They send an AID once. You fetch. Wi-Fi and IP can change; the contact does not |
+| Let another agent call *your* local HTTP (OpenClaw, n8n, LLM API, A2A) | Domain+TLS, or a tunnel tenant whose hostname you must redistribute | `inbound bind` + AID. Peers keep the same address; no tenant in the data path |
+| Your editor’s AI must talk to an agent that isn’t a public SaaS URL | Paste `localhost` (only this PC) or put the specialist on the internet with API keys | `mcp add` here; fetch their AID from any machine that has a daemon |
+| Leave work for a machine that is asleep, offline, or powered off | Slack/email the human, or hit a webhook that 404s | Encrypted note to their AID; only their key opens it; they see it when back |
+| Keep a shared log without a company chat or a Google doc | Slack (vendor, must be online), a git repo (humans), a shared folder (no identity) | A room: each AID has a signed replica; people watch in the UI; late joiners catch up |
+| These machines must not show up on a public network | Tailscale/ZeroTier (still a coordinator), a VPN concentrator, a private MQTT | Your own `bootstrap`. Same fetch / notes / rooms; public DHT never sees you |
+| A worker moved (home GPU → cloud, or the reverse) | Edit every client’s base URL, DNS, ngrok dashboard | Same AID; it republishes. Callers do not change |
+| Two local AIs coordinating without a shared folder | One JSON file / pipe they both clobber | Each AID has its own notes and rooms; that AID can later leave this machine |
+
+Skip rooms for 1:1 fetch. Skip publish if you only call others. Skip inbound bind if this process has no HTTP to serve (typical IDE assistant).
+
+NAT, sleep, and changing IPs are where this is *most visible*. They are not the product boundary. A well-connected VM uses the same addressing — and still skips the account and the round of URL edits when it moves.
+
+---
+
+## Scenarios
+
+Each story is a job you already have. AID is how you point at the other side — getting one is [Start here](#start-here), not the payoff.
+
+### Call the agent on their machine — no VPN, no tunnel account
+
+A teammate (or your other computer) runs an agent at home. You need to fetch it from the office tonight, and again next month after they’ve changed Wi-Fi.
+
+Slack does not open a socket to their process. A public IP needs their router. ngrok gives a hostname you must rediscover when it rotates, and the tenant sits on the path.
+
+They send you an **AID** once (UI or chat, like a phone number). You `a2al_fetch` / `a2al get` / open `http://127.0.0.1:2121/aid/{AID}/…`. Identity is checked on both sides. After they move, they republish; you still use the same string.
+
+### Your local HTTP should be callable — without buying a domain or renting ngrok
+
+OpenClaw, n8n, a local LLM `/v1`, an A2A or MCP HTTP server — it already listens on this machine. Another agent should POST to it, including from outside this LAN.
+
+```bash
+a2al inbound bind --addr 127.0.0.1:8080
+```
+
+Publish, keep `a2ald` running, hand them the printed envelope (AID + fetch; they fill in **their** path). Never bind the daemon’s API address.
+
+Unlike a tunnel URL, the address they keep is the AID. Unlike “just listen on 0.0.0.0”, you are not opening a raw port to the world — peers connect through A2AL and prove who they are. Skip this if the process is only an IDE assistant with nothing to serve.
+
+### The AI in your editor should use a specialist that is not a SaaS URL
+
+Cursor / Claude / … is on your laptop. The code-review or research agent is on a lab box (or a colleague’s). `localhost` only works on one PC. Putting that specialist on the public internet means API keys and a hostname you will edit later.
+
+`npx -y a2ald mcp add` on the laptop. The assistant fetches the specialist’s AID (or discovers a capability name). No networking code in the project. The specialist can live on a GPU box at home; the assistant does not care.
+
+### They’re asleep — still leave the work (and not in Slack)
+
+The other daemon is down, the laptop lid is closed, the VM is stopped. A webhook 404s. Asking a human in Slack puts the body on a vendor’s disk, and it is still not a message *to the agent*.
+
+Leave a **note** to their AID (UI, `a2al_mailbox_send`, or `a2al note send`). Encrypted to their key; they see it when the daemon is back. That is store-and-forward, not a live reply. In MCP, a waiting note is attached to a successful tool result when there is one — do not poll the mailbox every turn.
+
+### A shared board that is not Slack and not a Google doc
+
+Three agents (and maybe a human watching) need one history: who wrote what, in order, with no operator. Slack needs a workspace and everyone online. A shared folder has no identity. Git is for people.
+
+A **room**: invite by AID; a join link only if you don’t have everyone’s AID. Each AID holds its own signed replica and catches up after being offline. People open the UI to watch (watching ≠ that AID is “in session”). 1:1 fetch does not need a room.
+
+### These machines must not appear on any public directory
+
+A privacy cluster, an air-gapped lab, or “only the agents on this PC.” Tailscale still has a coordination plane. A homemade VPN is another product to run.
+
+Non-empty `-bootstrap` **skips public DNS**. Loopback keeps it on this host. Same fetch, notes, and rooms.
+
+```bash
+a2ald --bootstrap 192.168.1.10:4121          # your seeds
+a2ald --bootstrap 127.0.0.1:4121             # this machine only
+```
+
+Use a **new** data directory so an old `peers.cache` does not still dial the public net.
+
+### The box moved. Nobody edits a URL
+
+Last week the researcher ran on a home GPU; this week it is a cloud VM (or the reverse). Every ngrok/DNS/base-URL setup is a round of “update the clients.”
+
+The AID does not change. Republish from the new machine (register the same keys). Planners that already have the AID keep calling it. Optional: publish a capability name (`reason.analyze`) so *new* callers discover whoever is up, without a spreadsheet.
+
+---
+
+## Start here
+
+**A person.** Install `a2ald` (or `npx -y a2ald`), open `http://localhost:2121`, create an identity. Publish only if others on this network must resolve you. Give them the **AID**. Persistent service is optional (`a2ald service install -user`) — use it when this machine should stay findable after logout.
+
+**An AI assistant.** If `a2al_*` tools are already in the session, act on the goal. If not: `npx -y a2ald mcp add`, reload, confirm the tools, then fetch / leave a note / use rooms. `a2al doctor` is optional — only if you may be talking to the wrong daemon.
+
+**Be reachable as HTTP.** If this agent already listens locally: `a2al inbound bind --addr host:port` (never the daemon’s API address). Share the printed envelope: AID + how to fetch, and let the peer fill in *their* path. Unreachable now and they can wait → leave a note.
+
+A known AID is also `http://127.0.0.1:2121/aid/{AID}/…` on a machine that has a daemon (or `https://tngld.net/aid/{AID}/…` with no local daemon).
+
+---
+
+## Core concepts
 
 ### AID — identity and address unified
 
@@ -43,35 +129,31 @@ a2alEKFspDoevpFxLHiagvdBFqMVFq3sZ1JDsFdJKP    ← Ed25519 (native)
 0x3a7fc8f294b4e53e91a5b7a4f2c9d0e1b3c8a2f9    ← Ethereum wallet address
 ```
 
-What makes an AID different from a URL or IP address:
+- **Self-sovereign.** No one assigns it. The private key is the proof of ownership.
+- **Permanent.** The AID does not change when IP, host, or cloud vendor does.
+- **Verifiable.** Anyone can confirm the peer holds the matching key — no CA.
+- **Portable.** The same AID on a laptop, a VM, a home network, or a private cluster.
 
-- **Self-sovereign.** No one assigns it to you. You generate the key pair; the AID is derived from the public key. The private key is the sole proof of ownership.
-- **Permanent.** The AID never changes, even as your agent's IP, network, or machine changes. It's a stable identity anchor.
-- **Verifiable.** Anyone can confirm that an entity claiming an AID holds the corresponding private key — no intermediary needed.
-- **Portable.** The same AID works from a laptop, a cloud VM, a home network, or behind a corporate firewall.
-
-An AID is both who your agent *is* and how others *address* it. There's no separation between identity and reachability. Share your AID like you'd share a contact — whoever has it can reach you, anywhere, anytime.
+Share an AID the way you would share a contact. Whoever has it can reach you (while your daemon is published and alive). Rooms and invite links are for *groups*, not the default way to introduce two identities.
 
 ### The Tangled Network
 
-When you publish an agent, a signed record — mapping its AID to its current endpoints — is distributed across a peer-to-peer network. This is the **Tangled Network**.
+Publishing writes a signed record — AID → current endpoints — onto a peer-to-peer network.
 
-Key properties:
+- **No central server** to operate, depend on, or get blocked by.
+- **Not in the data path.** It stores “where to find me now.” Your application data does not flow through it.
+- **Self-healing.** New endpoints are published; old records expire by TTL.
+- **Open participation.** Any `a2ald` is a node. Empty `bootstrap` joins the public net; a non-empty list is *your* net.
 
-- **No central server.** Records are stored across participating nodes worldwide. No registry to operate, depend on, or get blocked by.
-- **Not in the data path.** The Tangled Network only stores "where to find me now." Your application data never flows through it.
-- **Self-healing.** If your IP changes, you publish a new record. Old records expire by TTL. The network converges to your new endpoints automatically.
-- **Open participation.** Any `a2ald` instance is a node. Running `a2ald` means you contribute to and benefit from the same network.
+### a2ald — local runtime, not a proxy
 
-### a2ald — your local daemon
+`a2ald` is the process on this machine: identities, DHT, connections, MCP, REST, and the Web UI. It resolves and connects, then steps aside. After the link is up, bytes go directly between peers.
 
-`a2ald` is a background process that runs on your machine and handles everything network-related: DHT participation, NAT traversal, QUIC connection negotiation, and cryptographic signing. You interact with it through the Web UI, CLI, REST API, or MCP tools.
-
-`a2ald` is a *gateway*, not a *proxy*. It resolves addresses and establishes connections, then steps aside. Your application data flows directly between agents — `a2ald` is never in the data path after the connection is established.
+People, agents, and scripts all talk to **this** daemon. A second copy on the default data directory is an accident (lock). A second *node* is intentional: new `-data-dir`, new `-api-addr` / `-listen`, and point CLI/MCP at that API.
 
 ### Running as a persistent service
 
-For reliable daily use, install `a2ald` as a system service. It starts automatically on login, stays connected 24/7, and is immediately network-ready when any AI session starts — no 60–120 second cold-start per session.
+Install a service when this machine should stay findable across logins. Published records expire after the process stops (TTL; default 1 hour). You can work immediately after a cold start; if a call fails, wait 10–30 seconds and retry the same call — do not wait for a peer count.
 
 ```bash
 a2ald service install          # register + start
@@ -85,55 +167,43 @@ a2ald service uninstall        # remove service registration
 
 | Flag | Description |
 |------|-------------|
-| `-data-dir <path>` | Data directory to use (default: platform config dir). Baked in at install time — service and direct CLI always use the same directory. |
-| `-user` | No-admin install (Windows only): uses Task Scheduler instead of SCM. Service stops at logout; does not require an elevated prompt. |
+| `-data-dir <path>` | Data directory (default: platform config dir). Baked in at install time. |
+| `-user` | No-admin install (Windows): Task Scheduler instead of SCM. Stops at logout. |
 
-> **Windows:** just run `a2ald service install` from any terminal. If admin rights are needed, an interactive menu appears:
-> - **[1] System Service** — triggers a UAC prompt; registered with SCM, survives reboot, recommended.
-> - **[2] Task Scheduler** — no elevation needed; stops when you log out.
->
-> Pass `-user` directly to skip the menu and always install via Task Scheduler.
+> **Windows:** `a2ald service install` from any terminal. If admin rights are needed, an interactive menu appears: **[1] System Service** (UAC; survives reboot) or **[2] Task Scheduler** (no elevation; stops at logout). Pass `-user` to skip the menu.
 
-If you prefer not to use the built-in CLI, platform-specific configuration files (systemd unit, launchd plist, Task Scheduler XML) are available in [`deploy/`](../deploy/).
+Platform unit files: [`deploy/`](../deploy/).
 
 ### Delegated identity — the master key stays offline
 
-When you register an agent, A2AL generates two keys:
+Registering an agent creates two keys:
 
-- **Master key**: derives the AID. This is the permanent identity. Keep it offline or in a hardware wallet — you only need it to prove ownership or issue new credentials.
-- **Operational key**: what `a2ald` uses day-to-day to sign endpoint records and authenticate connections. It carries a cryptographic delegation proof from the master key.
+- **Master key**: derives the AID. Keep it offline or in a hardware wallet. Needed to prove ownership or issue new credentials.
+- **Operational key**: what `a2ald` uses day-to-day. It carries a delegation proof from the master key.
 
-This separation means your agent's permanent identity is never exposed to the network or held by the daemon. If an operational key is compromised, revoke it and issue a new one — the AID stays the same, and so do all your existing contacts.
-
-For most users this is transparent — `a2al register` handles the key generation and delegation automatically. But it's why your AID remains safe even if your machine is compromised.
+If an operational key is compromised, revoke it and issue a new one — the AID and existing contacts stay. `a2al register` does this automatically for most users.
 
 ---
 
-## The Three Operations
+## The three operations
 
 ### Publish — announcing your agent
 
-Publishing writes a signed record to the Tangled Network containing:
+A signed record contains:
 
-- Your AID and current network endpoints (including NAT-traversed and UPnP-mapped addresses)
-- A service declaration (optional): what capability you offer, under what service name and tags
-- A TTL — how long the record is valid
+- AID and current endpoints (whatever paths the daemon can observe)
+- Optional service declaration (capability name, description, tags)
+- A TTL
 
-`a2ald` handles signing, endpoint detection, and automatic re-publication before TTL expiry. You don't manage any of this manually.
+`a2ald` signs, refreshes endpoints, and republishes before expiry. Publishing is not a promise to be online forever: go offline and the record expires; come back, republish, contacts still have the same AID.
 
-**Service publishing** adds a layer on top: alongside your endpoint record, you register what your agent *does* — a service name like `lang.translate` or `reason.plan`, a description, and optional tags. This is what makes capability-based discovery possible.
-
-Publishing is not a commitment to be permanently online. If your agent goes offline, its record expires naturally. When it comes back and republishes, the network is updated.
+**Service publishing** is how others find you by *what you do* (`lang.translate`, `reason.plan`, …) when they do not already have your AID.
 
 ### Discover — finding agents
 
-Two modes:
+**Resolve by AID** — you already have the contact. Deterministic.
 
-**Resolve by AID** — If you have an agent's AID, look up its current endpoints directly. Deterministic, fast, exact.
-
-**Search by service** — If you know what you need but not who has it, search by service name. Results include name, description, tags, and AID for every agent currently publishing that capability.
-
-Service names follow a `category.function` convention:
+**Search by service** — you know the capability, not the AID. Filter with tags: `a2al search reason.analyze --filter-tag finance`. Taxonomy: [Service Categories](service-categories.md).
 
 | Service | Capability |
 |---------|-----------|
@@ -147,106 +217,33 @@ Service names follow a `category.function` convention:
 | `gen.image` | Image generation |
 | `tool.browser` | Browser automation |
 
-You can narrow results by tag: `a2al search reason.analyze --filter-tag finance`. See [Service Categories](service-categories.md) for the full taxonomy.
-
 ### Connect — direct encrypted link
 
-Once you have an AID, `a2ald` negotiates a direct QUIC connection with the remote agent. Both sides verify each other's identity cryptographically before the connection is established — no trusted third party involved.
+Once you have an AID, `a2ald` opens a direct QUIC connection. Both sides verify identity. No trusted third party.
 
-There are three ways to use a connection, depending on your use case:
+**Fetch** (HTTP) — the daemon sends the request and returns `{status, headers, body}`. No local port. `a2al get` / `a2al post` / `a2al_fetch`.
 
-**Fetch (recommended for HTTP calls)** — `a2ald` sends the HTTP request internally and returns the response. No local port is allocated. This is what `a2al get` and `a2al post` use under the hood (`POST /fetch/{aid}`).
+**One-shot tunnel** — `127.0.0.1:<port>` for one TCP session (SSH, etc.). Released when that TCP connection closes.
 
-**One-shot tunnel** — `a2ald` returns `127.0.0.1:<port>` and your application connects to that port for a single TCP session. From your application's perspective, it's a plain TCP socket. The tunnel is released when the TCP connection closes (`POST /connect/{aid}`).
+**Persistent tunnel** — a long-lived local listener, many connections over one QUIC link (`a2al tunnel`).
 
-**Persistent tunnel** — a long-lived local TCP listener that accepts any number of concurrent connections, each forwarded over the same QUIC connection. Suitable for sustained access or when multiple clients need to reach the same remote agent simultaneously (`POST /tunnel/{aid}`, managed via `a2al tunnel`).
-
-All three modes handle encryption, NAT traversal, and identity verification transparently.
+Encryption and identity checks are always on. Extra paths (UPnP, ICE, relay) race in parallel where the network needs them; they are not a separate product mode.
 
 ---
 
-## Scenarios
+## Runtime behavior
 
-### Making your agent globally reachable
+### How a connection finds a path
 
-Start `a2ald`, open `http://localhost:2121`, click **New Agent**. An AID is generated. Fill in your agent's service name and description, click **Publish**. Your agent is now discoverable worldwide — no port forwarding, domain registration, or cloud account required.
+`a2ald` gathers candidates and dials them in parallel (not “try NAT first, then something else”):
 
-Share your AID with anyone who should be able to reach you directly. They resolve it and connect without needing anything else from you.
+- **Peer reflection** — what address others see
+- **UPnP** — on routers that support it
+- **ICE / hole-punching** — when a direct candidate is not enough
 
-### An AI agent discovers and calls a specialized service
+Most home, office, and cloud paths succeed this way. Symmetric NAT on *both* sides may need a relay; the UI warns if that condition is detected.
 
-Your AI coding assistant (running in Cursor, Claude, or any MCP-compatible tool) needs code review capability. Instead of being hardcoded to a specific endpoint, it:
-
-1. Calls `a2al_discover` with service `code.review`
-2. Gets back a list of available agents — name, description, AID
-3. Picks one, calls `a2al_fetch` to send code and receive a review in one call
-
-The assistant never knew the reviewer's IP, port, or network location. The entire flow — discovery, identity verification, NAT traversal — was handled by A2AL. This is the core value proposition for AI agents: *capability-based discovery replaces hardcoded dependencies.*
-
-### Acquiring networking via MCP — no code required
-
-If your AI uses an MCP-compatible tool (Claude Desktop, Cursor, Windsurf, Cline), install `a2ald` and add it to your MCP config. Your AI immediately has 20+ networking tools available as natural tool calls:
-
-- *"Register an agent and publish it to the network"* → the AI calls `a2al_identity_generate`, `a2al_agent_register`, `a2al_agent_publish`
-- *"Find me a translation agent that supports legal documents"* → calls `a2al_discover` with `lang.translate` and a tag filter
-- *"Fetch the status page from agent `0x3a7f...`"* → calls `a2al_fetch`, gets the HTTP response directly
-- *"Open a tunnel to agent `0x3a7f...` for SSH access"* → calls `a2al_tunnel_open`, gets a local port
-
-Your agent is live, discoverable, and connected — without writing a single line of networking code.
-
-See [MCP Setup](mcp-setup.md) for platform-specific configuration.
-
-### Zero-configuration agent pipeline
-
-You're building a pipeline: Planner → Researcher → Writer → Fact-checker. Each agent runs independently, possibly on different machines, possibly behind NAT.
-
-Traditional setup: manually configure endpoints, write connection logic for each step, update everything whenever any agent moves.
-
-With A2AL: each agent publishes under a service name (`reason.plan`, `data.search`, `lang.write`, `reason.evaluate`). The Planner searches for each capability at runtime, discovers whatever is currently available, and builds the pipeline dynamically. If the Researcher migrates to a new server, it republishes — the Planner reconnects automatically. No configuration files. No manual endpoint management.
-
-### Agent swarm: dynamic discovery and parallel consultation
-
-A Planner agent evaluates a business expansion strategy. Rather than routing through a fixed pipeline, it assembles a swarm:
-
-1. Searches for available specialists: `reason.analyze`, `data.search`, `reason.evaluate`, `reason.recommend`
-2. Discovers multiple available agents — with varying expertise, descriptions, and tags
-3. Calls `a2al_fetch` in parallel to each of them with a relevant sub-question
-4. Collects responses concurrently — no local ports required
-5. Synthesizes a final recommendation
-
-The composition of the swarm is determined at runtime by what's discoverable — not by what's pre-wired. Agents can join or leave the network freely; the Planner handles partial availability gracefully. This is the Tangled Network as a live capability marketplace.
-
-### Making a NAT-hosted agent reachable
-
-Your agent runs on a home machine, behind a router you don't control. `a2ald` handles this automatically: it requests a UPnP port mapping, probes its own external IP via peer reflection, and includes all viable endpoint candidates in the published record. Remote agents trying to connect dial all candidates in parallel (Happy Eyeballs) and succeed on whichever path works.
-
-You configure nothing. The reachability just works.
-
-### Offline messaging — notes
-
-Agents don't have to be online simultaneously. To reach an agent that may be offline:
-
-1. Send a note: `a2al note <aid> "please process this when you're back"`
-2. The note is encrypted with the recipient's public key and stored in the DHT
-3. When the recipient's `a2ald` comes online, it retrieves and decrypts the note
-
-Notes are end-to-end encrypted — only the holder of the recipient's private key can read them. This enables asynchronous agent collaboration for agents on intermittent schedules, mobile devices, or sleep-mode machines.
-
----
-
-## Runtime Behavior
-
-### NAT and firewalls
-
-`a2ald` uses three techniques in combination:
-
-- **Peer reflection**: peers report what external address they see your packets from, giving `a2ald` its likely public endpoint
-- **UPnP**: on supporting routers, `a2ald` requests a port mapping automatically
-- **ICE / hole-punching**: when direct connection isn't possible, `a2ald` attempts coordinated hole-punching through a signaling channel
-
-This works transparently for most environments: home routers, corporate NAT, cloud instances. The one case that may not work without a relay is symmetric NAT on both sides simultaneously — `a2ald` will warn you in the Web UI if it detects this condition.
-
-When direct connection and hole-punching both fail, `a2ald` can fall back to a TURN relay if one is configured. Relay is transparent to applications; the connection API is identical. To enable relay, add one or more `[[turn_servers]]` entries to your config:
+If direct paths fail, a configured TURN relay is last resort. The application API is the same. Example:
 
 ```toml
 # Static credentials
@@ -270,23 +267,15 @@ credential_url = "https://api.twilio.com/.../Tokens.json"
 credential = "Basic <base64(AccountSID:AuthToken)>"
 ```
 
-Relay is the last-resort fallback — direct paths are always attempted first. To disable relay entirely, set `disable_relay = true` in your config. Individual connections can also override this via the `disable_relay` field on connect/tunnel requests; when relay is available but explicitly disabled and direct connection fails, the API returns HTTP 412 with `"relay_required"` so the caller can retry with relay enabled.
+Disable relay with `disable_relay = true`, or per request. If relay exists but was disabled and the direct path failed, the API returns HTTP 412 `"relay_required"`.
 
 ### Endpoint refresh
 
-If your machine's IP changes — laptop switching networks, container restart, VM migration — `a2ald` detects the change and republishes before the previous record expires. From a caller's perspective, the AID is always resolvable. The underlying endpoints are an implementation detail.
+IP change (new Wi-Fi, container restart, VM migrate): `a2ald` republishes before the old record expires. Callers keep using the AID.
 
-### Bootstrap and network joining
+### Bootstrap
 
-When `a2ald` starts, it contacts built-in public bootstrap nodes to join the Tangled Network. No configuration needed under normal conditions.
-
-In isolated environments (local testing, air-gapped networks), specify bootstrap addresses explicitly:
-
-```bash
-a2ald --bootstrap 192.168.1.10:4121
-```
-
-Once joined, `a2ald` builds its own routing table and no longer depends on the bootstrap node.
+Default: public bootstrap, no config. Isolated / private: non-empty `--bootstrap`. After join, the node builds its own table and does not keep depending on the seed.
 
 ---
 
@@ -294,24 +283,26 @@ Once joined, `a2ald` builds its own routing table and no longer depends on the b
 
 | Term | Definition |
 |------|-----------|
-| **AID** | Agent Identifier. A cryptographic address derived from a key pair. Permanent, self-issued, globally unique. |
-| **Tangled Network** | The global peer-to-peer DHT network that stores and resolves AID endpoint records. |
-| **a2ald** | The A2AL daemon. Runs locally; handles DHT, NAT traversal, QUIC connections, and identity signing. |
-| **Publish** | Write a signed endpoint record for an AID to the Tangled Network. |
-| **Resolve** | Look up the current endpoints for a given AID. |
-| **Discover** | Search for agents by service capability name. |
-| **Connect** | Negotiate a direct encrypted QUIC connection to a remote agent. |
-| **Fetch** | Send an HTTP request to a remote agent through the daemon; the daemon handles the QUIC connection internally and returns the HTTP response. No local TCP port required. |
-| **One-shot tunnel** | A local TCP address (`127.0.0.1:<port>`) for a single TCP session to a remote agent. Released when the TCP connection closes. |
-| **Persistent tunnel** | A long-lived local TCP listener that accepts multiple concurrent connections to the same remote agent over a shared QUIC connection. |
-| **Service** | A declared capability published alongside an endpoint record (e.g. `lang.translate`, `code.review`). |
-| **Note** | An encrypted asynchronous message stored on the DHT for an offline recipient to retrieve later. |
-| **Master key** | The private key that derives the AID. Keep offline. Proof of permanent identity ownership. |
-| **Operational key** | The key `a2ald` uses day-to-day. Carries a delegation proof from the master key. Rotatable without changing the AID. |
-| **Delegation proof** | A cryptographic statement from the master key authorizing an operational key to publish on its behalf. |
-| **Endpoint record** | The signed, TTL-bound record in the DHT mapping an AID to its current network endpoints. |
-| **DHT** | Distributed Hash Table. The data structure underlying the Tangled Network's routing and storage. |
-| **Bootstrap** | A known Tangled Network node used to join the network on first start. |
-| **NAT traversal** | Techniques (UPnP, ICE, peer reflection) that allow agents behind routers and firewalls to accept inbound connections. |
-| **TTL** | Time-to-live. How long a published record remains valid before expiring. |
-| **MCP** | Model Context Protocol. A2AL exposes networking capabilities as MCP tools, letting AI agents use them via natural tool calls. |
+| **AID** | Agent Identifier. Cryptographic address from a key pair. Permanent, self-issued. The contact card. |
+| **Tangled Network** | Peer-to-peer DHT that stores and resolves AID endpoint records. |
+| **a2ald** | Local daemon: DHT, connections, identity, UI, MCP, REST. |
+| **Publish** | Write a signed, TTL-bound endpoint record for an AID. |
+| **Resolve** | Look up current endpoints for an AID. |
+| **Discover** | Search by service capability name. |
+| **Connect** | Direct encrypted QUIC to a remote agent, with mutual identity check. |
+| **Fetch** | HTTP to a remote agent through the daemon; response returned locally. |
+| **Inbound bind** | Attach a local HTTP listen to an AID (`service_tcp`) so others can fetch it. |
+| **AID URL** | `http://127.0.0.1:2121/aid/{AID}/…` — same fetch, as a normal HTTP URL. |
+| **One-shot tunnel** | Local TCP for a single session to a remote agent. |
+| **Persistent tunnel** | Long-lived local listener; many TCP sessions over one QUIC link. |
+| **Service** | Capability published with an endpoint record (e.g. `lang.translate`). |
+| **Note** | Encrypted store-and-forward for an AID that is not reachable now. Not a live reply. |
+| **Room** | Shared signed log; each AID has its own replica. Invite by AID; link when needed. |
+| **Master key** | Derives the AID. Keep offline. |
+| **Operational key** | Day-to-day key with a delegation proof. Rotatable without changing the AID. |
+| **Delegation proof** | Master-key statement authorizing an operational key to publish. |
+| **Endpoint record** | Signed, TTL-bound DHT record: AID → current endpoints. |
+| **DHT** | Distributed hash table under the Tangled Network. |
+| **Bootstrap** | Seeds used to join. Empty = public net. Non-empty = your net (skips public DNS). |
+| **TTL** | How long a published record stays valid. Renewed only while `a2ald` runs. |
+| **MCP** | Model Context Protocol. A2AL exposes networking as tools for AI hosts. |

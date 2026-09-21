@@ -77,6 +77,38 @@ func (c *Client) DoRequest(method, path string, body any, out any) (status int, 
 	return resp.StatusCode, bodyText, nil
 }
 
+// PostStream uploads body as raw octets and decodes the JSON reply.
+//
+// It bypasses the shared client's request timeout: that timeout covers the
+// whole exchange, which is right for control-plane calls but would abort a
+// large object partway through. Transfer progress is bounded by the connection
+// itself, not by a clock started before the first byte.
+func (c *Client) PostStream(path string, body io.Reader, out any) error {
+	req, err := http.NewRequest(http.MethodPost, c.Base+path, body)
+	if err != nil {
+		return err
+	}
+	c.authHeader(req)
+	req.Header.Set("Content-Type", "application/octet-stream")
+
+	streamer := &http.Client{Transport: c.HTTP.Transport}
+	resp, err := streamer.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return &httpStatusError{code: resp.StatusCode, body: string(raw)}
+	}
+	if out != nil && len(raw) > 0 {
+		if err := json.Unmarshal(raw, out); err != nil {
+			return fmt.Errorf("decode json: %w", err)
+		}
+	}
+	return nil
+}
+
 type httpStatusError struct {
 	code int
 	body string

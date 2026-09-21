@@ -70,6 +70,18 @@ func isRunningAsService() bool {
 	return err == nil && ok
 }
 
+func defaultSCMFilesRoot() string {
+	base := os.Getenv("ProgramData")
+	if base == "" {
+		base = `C:\ProgramData`
+	}
+	return filepath.Join(base, "A2AL", "files")
+}
+
+func grantUsersWrite(dir string) {
+	_ = exec.Command("icacls", dir, "/grant", "Users:(OI)(CI)M").Run()
+}
+
 // a2alSvc wraps a Daemon to satisfy the svc.Handler interface.
 type a2alSvc struct{ d *daemon.Daemon }
 
@@ -223,9 +235,13 @@ func elevateAndRun(exePath string, subcmdArgs []string) error {
 //  6. sc stop → sc start (tunnel drops briefly, recovers after start)
 //
 // Fresh-install path (no SCM service):
+//
 //  4. Clean up any Task Scheduler residue, wait for binary lock release
+//
 //  5. Copy binaries
+//
 //  6. sc create + description + failure policy
+//
 //  7. sc start (rollback on failure)
 //
 //  8. PATH + success output (both paths)
@@ -265,6 +281,12 @@ func svcInstallSCM(exePath, dataDir string) error {
 	}
 
 	binPath := fmt.Sprintf(`"%s" -data-dir "%s"`, destExe, dataDir)
+
+	filesRoot := defaultSCMFilesRoot()
+	if err := ensureFilesRootConfig(dataDir, filesRoot); err != nil {
+		return fmt.Errorf("files_root: %w", err)
+	}
+	grantUsersWrite(filesRoot)
 
 	if hasSCM {
 		// ── Reinstall: all fallible steps run while service is still up ───────
@@ -359,6 +381,7 @@ func svcInstallSCM(exePath, dataDir string) error {
 	fmt.Println("a2ald: installed and started as Windows Service.")
 	fmt.Printf("  Installed at: %s\n", installDir)
 	fmt.Printf("  Data:         %s\n", dataDir)
+	fmt.Printf("  Files:        %s\n", filesRoot)
 	fmt.Println("  Manage:       services.msc  or  a2ald service stop/start/status")
 	fmt.Println("  Web UI:       http://127.0.0.1:2121/")
 	fmt.Println("  MCP:          http://127.0.0.1:2121/mcp/")

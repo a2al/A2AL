@@ -29,6 +29,8 @@ func main() {
 		cmdHelp()
 	case "status":
 		cmdStatus(cli, g, args)
+	case "doctor":
+		cmdDoctor(cli, g, args)
 	case "register":
 		cmdRegister(cli, g, args)
 	case "publish":
@@ -57,10 +59,16 @@ func main() {
 		cmdNote(cli, g, args)
 	case "config":
 		cmdConfig(cli, g, args)
+	case "group":
+		cmdGroup(cli, g, args)
+	case "chat":
+		cmdChat(cli, g, args)
 	case "admin":
 		cmdAdmin(cli, g, args)
 	case "update":
 		cmdUpdate(cli, g, args)
+	case "inbound":
+		cmdInbound(cli, g, args)
 	default:
 		fmt.Fprintf(os.Stderr, "a2al: unknown command %q (try a2al help)\n", cmd)
 		os.Exit(1)

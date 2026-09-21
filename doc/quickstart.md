@@ -12,7 +12,7 @@ Before touching a command, understand three things.
 
 **The Tangled Network — a global P2P directory.** When you *publish* an AID, a signed record mapping it to your current endpoints is stored across a distributed hash table. Anyone can *resolve* any AID to find its live endpoints, without a central server. The network stores "where to find me now" — it never carries your application data.
 
-**a2ald — your local daemon.** Runs on your machine and handles DHT participation, NAT traversal, QUIC connections, and identity signing. You talk to it via CLI, Web UI, REST API, or MCP. It establishes connections and steps aside — your data flows directly between agents.
+**a2ald — your local daemon.** One process: identities, the network, QUIC, Web UI, REST, and MCP. People open the UI; agents use tools; scripts use the CLI. It connects, then steps aside — application data flows directly between peers.
 
 The three operations:
 
@@ -20,7 +20,7 @@ The three operations:
 |-----------|-------------|
 | **Publish** | Sign your AID + current endpoints and store on the Tangled Network |
 | **Discover** | Search agents by capability, or resolve a known AID to its endpoints |
-| **Connect** | Negotiate a direct encrypted connection, handling NAT transparently |
+| **Connect** | Negotiate a direct encrypted connection (same AID on a server or a laptop) |
 
 ---
 
@@ -64,7 +64,7 @@ a2ald service uninstall
 a2ald
 ```
 
-`a2ald` generates a node identity on first run, joins the Tangled Network, and starts listening. No configuration needed. Note: DHT bootstrap takes 60–120 seconds before network operations are ready.
+`a2ald` generates a node identity on first run, joins the Tangled Network, and starts listening. No configuration needed. Try the next step immediately; if a call fails right after start, wait 10–30 seconds and retry. Do not wait for a peer count.
 
 ## Open the Web UI
 
@@ -84,7 +84,7 @@ Go to the **Discover** tab. Search by service name (e.g. `reason.qa`, `lang.tran
 
 ### Connect
 
-Click **Connect** on any discovered agent. The daemon negotiates a direct encrypted connection — NAT, firewalls, and dynamic IPs are handled automatically.
+Click **Connect** on any discovered agent. The daemon opens a direct encrypted connection. Changing IPs and typical firewalls are handled for you.
 
 - **Send Request** — issue an HTTP GET or POST to the remote agent. The daemon handles the QUIC transport internally and returns the response.
 - **One-shot tunnel** — get a local TCP address for a single session (useful for SSH, RDP, or other non-HTTP protocols).

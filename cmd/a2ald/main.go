@@ -64,6 +64,12 @@ func main() {
 		return
 	}
 
+	// "mcp" subcommand: print the MCP server entry for this machine.
+	if len(os.Args) > 1 && os.Args[1] == "mcp" {
+		handleMCPCmd(os.Args[2:])
+		return
+	}
+
 	// "update" subcommand: check or apply updates via the running daemon API.
 	if len(os.Args) > 1 && os.Args[1] == "update" {
 		handleUpdateCmd(os.Args[2:])
@@ -125,6 +131,9 @@ func main() {
 	// Suppress the banner when running as a Windows SCM service (no console).
 	if !isRunningAsService() {
 		fmt.Fprintln(os.Stderr, version.Banner("a2ald", "A2AL Daemon"))
+		if !*mcpStdio {
+			fmt.Fprintf(os.Stderr, "people : open %s\nagents : a2ald mcp add  — then reload the host and use a2al_* tools\n", apiURL)
+		}
 	}
 
 	if webCfg.OpenBrowser && !*noBrowser && !*mcpStdio && !isRunningAsService() {
@@ -233,14 +242,4 @@ func handleUpdateCmd(args []string) {
 }
 
 // resolveAPIURL reads the config file from dd to determine the daemon API address.
-func resolveAPIURL(dd string) string {
-	if dd == "" {
-		base, _ := os.UserConfigDir()
-		dd = base + "/a2al"
-	}
-	cfg := config.Default()
-	if c, err := config.LoadFile(filepath.Join(dd, "config.toml")); err == nil {
-		cfg = c
-	}
-	return "http://" + cfg.APIAddr
-}
+func resolveAPIURL(dd string) string { return "http://" + resolveAPIAddr(dd) }

@@ -40,8 +40,8 @@ sudo chmod +x /opt/a2al/bin/a2ald /opt/a2al/bin/a2al
 
 ```bash
 sudo useradd -r -s /bin/false -M -d /opt/a2al a2al
-sudo mkdir -p /opt/a2al/data
-sudo chown -R a2al:a2al /opt/a2al/data
+sudo mkdir -p /opt/a2al/data /opt/a2al/files
+sudo chown -R a2al:a2al /opt/a2al/data /opt/a2al/files
 ```
 
 Note: only the data directory is owned by the service user. Binaries remain owned by root.
@@ -61,7 +61,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now a2ald
 ```
 
-On first start, `a2ald` writes a default `config.toml` to `/opt/a2al/data/`.
+On first start, `a2ald` writes a default `config.toml` to `/opt/a2al/data/`. Package install also sets `files_root = "/opt/a2al/files"` (object path sandbox).
 
 ---
 
@@ -155,7 +155,7 @@ Once the service is running, point MCP clients at the HTTP endpoint instead of u
 }
 ```
 
-Call `a2al_status` and confirm `network_ready: true` (usually within 60–120 seconds of daemon start).
+Try a call (`a2al status`, resolve, or fetch). Neighbor count and `network_ready` are local signals, not a go/no-go. If a call fails right after start, wait 10–30 seconds and retry.
 
 ---
 

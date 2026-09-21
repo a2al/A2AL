@@ -21,9 +21,23 @@ python/src/a2al.egg-info/
 # local goreleaser / release output
 dist/
 
-# local build binary
-a2ald
-a2ald.exe
+# local build binary at repo root (do not ignore cmd/a2ald/)
+/a2ald
+/a2ald.exe
 
 # local Go build cache
 .gocache/
+
+# local test coverage output
+cover
+
+# AI/IDE local files
+.cursor/
+.r2_*.py
+.r2_*.json
+__pycache__/
+*.pyc
+
+# local agent guidance files
+AGENTS.md
+ORIENT.md

@@ -1,0 +1,77 @@
+{
+  "version": 1,
+  "hosts": [
+    {
+      "name": "claude-code",
+      "display": "Claude Code",
+      "cli": ["claude", "mcp", "add", "--scope", "user", "--transport", "http", "{NAME}", "{URL}"],
+      "verified": true
+    },
+    {
+      "name": "vscode",
+      "display": "VS Code",
+      "cli": ["code", "--add-mcp", "{JSON}"],
+      "http_type": "http",
+      "verified": true
+    },
+    {
+      "name": "cursor",
+      "display": "Cursor",
+      "detect": ["{HOME}/.cursor"],
+      "paths": ["{HOME}/.cursor/mcp.json"],
+      "wrapper": ["mcpServers"],
+      "verified": true
+    },
+    {
+      "name": "claude-desktop",
+      "display": "Claude Desktop",
+      "detect": [
+        "{APPDATA}/Claude",
+        "{HOME}/Library/Application Support/Claude"
+      ],
+      "paths": [
+        "{APPDATA}/Claude/claude_desktop_config.json",
+        "{HOME}/Library/Application Support/Claude/claude_desktop_config.json"
+      ],
+      "wrapper": ["mcpServers"],
+      "stdio": true,
+      "verified": true
+    },
+    {
+      "name": "windsurf",
+      "display": "Windsurf",
+      "detect": ["{HOME}/.codeium/windsurf"],
+      "paths": ["{HOME}/.codeium/windsurf/mcp_config.json"],
+      "wrapper": ["mcpServers"],
+      "url_field": "serverUrl",
+      "verified": true
+    },
+    {
+      "name": "openclaw",
+      "display": "OpenClaw",
+      "cli": ["openclaw", "mcp", "add", "{NAME}", "--url", "{URL}", "--transport", "streamable-http"],
+      "detect": ["{HOME}/.openclaw"],
+      "verified": true
+    },
+    {
+      "name": "hermes",
+      "display": "Hermes",
+      "cli": ["hermes", "mcp", "add", "--url", "{URL}", "{NAME}"],
+      "interactive": true,
+      "detect": ["{HOME}/.hermes"],
+      "paths": ["{HOME}/.hermes/config.yaml"],
+      "wrapper": ["mcp_servers"],
+      "format": "yaml",
+      "verified": true
+    },
+    {
+      "name": "deepseek-harness",
+      "display": "DeepSeek Harness",
+      "aliases": ["dsh"],
+      "detect": ["{DSH_HOME}", "{HOME}/.dsh"],
+      "paths": ["{DSH_HOME}/cordis.patch.yml", "{HOME}/.dsh/cordis.patch.yml"],
+      "format": "dsh-cordis",
+      "verified": true
+    }
+  ]
+}

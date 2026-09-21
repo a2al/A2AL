@@ -46,7 +46,7 @@ schtasks /run /tn "A2AL Daemon"
 schtasks /query /tn "A2AL Daemon" /fo LIST
 ```
 
-Or call `a2al_status` via MCP and confirm `network_ready: true` (takes ~60–120 s on first run while DHT peers connect).
+Or try a call via MCP (`a2al_status`, resolve, or fetch). Neighbor count and `network_ready` are local signals, not a go/no-go. If a call fails right after start, wait 10–30 seconds and retry.
 
 Logs go to `%USERPROFILE%\.a2al\a2ald.log` by default (check `config.toml` for the exact path).
 
