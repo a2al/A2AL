@@ -4,7 +4,6 @@
 package daemon
 
 import (
-	"crypto/sha256"
 	"log/slog"
 	"os"
 	"sync"
@@ -33,25 +32,7 @@ type MailboxStoreEntry struct {
 // MsgIDFromRecord computes a stable deduplication key: SHA-256(SignedRecord.Payload).
 // When Payload is empty (legacy entry), it falls back to SHA-256(Address + Seq CBOR).
 func MsgIDFromRecord(sr protocol.SignedRecord) [32]byte {
-	if len(sr.Payload) > 0 {
-		return sha256.Sum256(sr.Payload)
-	}
-	// Fallback for empty-record entries stored during transitional M2 period.
-	h := sha256.New()
-	h.Write(sr.Address)
-	var seq [8]byte
-	seq[0] = byte(sr.Seq >> 56)
-	seq[1] = byte(sr.Seq >> 48)
-	seq[2] = byte(sr.Seq >> 40)
-	seq[3] = byte(sr.Seq >> 32)
-	seq[4] = byte(sr.Seq >> 24)
-	seq[5] = byte(sr.Seq >> 16)
-	seq[6] = byte(sr.Seq >> 8)
-	seq[7] = byte(sr.Seq)
-	h.Write(seq[:])
-	var out [32]byte
-	copy(out[:], h.Sum(nil))
-	return out
+	return protocol.RecordID(sr)
 }
 
 type mailboxStore struct {
@@ -140,6 +121,35 @@ func (s *mailboxStore) GetUnconsumed(aid a2al.Address) ([]*MailboxStoreEntry, er
 		}
 	}
 	return out, nil
+}
+
+// PendingCounts returns the unconsumed entry count per recipient AID, omitting
+// AIDs with nothing pending.
+//
+// Deliberately counts rather than reusing GetUnconsumed: this runs on every MCP
+// tool result, and GetUnconsumed allocates a slice per AID. The predicate must
+// stay identical to the one execMailboxPoll iterates, otherwise the red dot
+// would advertise records the agent's own poll cannot return.
+func (s *mailboxStore) PendingCounts() map[a2al.Address]int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var out map[a2al.Address]int
+	for aid, entries := range s.byAID {
+		n := 0
+		for _, e := range entries {
+			if e.ConsumedAt == 0 {
+				n++
+			}
+		}
+		if n == 0 {
+			continue
+		}
+		if out == nil {
+			out = make(map[a2al.Address]int)
+		}
+		out[aid] = n
+	}
+	return out
 }
 
 // MarkConsumed sets ConsumedAt for msgID to now.

@@ -58,7 +58,9 @@ func buildLockError(dataDir, pid string) error {
 			"  To stop it:\n"+
 			"    a2ald service stop        (if installed as a service)\n"+
 			"    kill %s                    (manual)\n"+
-			"  Or use a separate data directory: -data-dir <path>",
+			"  Or start a second node (new NodeID): -data-dir <path> -api-addr 127.0.0.1:<port> -listen :<udp>\n"+
+			"  then point CLI/MCP at that API (a2al --api http://127.0.0.1:<port>).\n"+
+			"  Empty bootstrap still joins the public network; set -bootstrap to isolate.",
 		dataDir, pidInfo, pidOrPlaceholder(pid),
 	)
 }

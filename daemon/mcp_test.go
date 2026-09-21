@@ -5,6 +5,8 @@ package daemon
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -39,6 +41,31 @@ var allExpectedTools = []string{
 	"a2al_tunnel_open",
 	"a2al_tunnel_close",
 	"a2al_tunnel_list",
+	"group_create",
+	"group_list",
+	"group_invite",
+	"group_append",
+	"group_read",
+	"group_head",
+	"group_sync",
+	"group_join",
+	"group_members",
+	"group_mark_read",
+	"group_object_put",
+	"group_object_get",
+	"group_object_locate",
+	"group_get_link",
+	"group_retract",
+	"chat_request",
+	"chat_accept",
+	"chat_refuse",
+	"chat_remove",
+	"chat_block",
+	"chat_send",
+	"chat_read",
+	"chat_mark_read",
+	"chat_contacts",
+	"a2al_events_poll",
 }
 
 // newMCPClientSession returns a ClientSession connected to the given server
@@ -213,5 +240,54 @@ func TestMCP_agentDelete_notRegistered(t *testing.T) {
 	}
 	if !res.IsError {
 		t.Fatal("expected tool error for unregistered agent, got success")
+	}
+}
+
+func TestMCP_objectPutLocateGet(t *testing.T) {
+	d := newTestDaemon(t)
+	cs := newMCPClientSession(t, buildMCPServer(d))
+	src := filepath.Join(t.TempDir(), "blob.txt")
+	if err := os.WriteFile(src, []byte("object-bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	aid := d.nodeAddr.String()
+	put, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "group_object_put",
+		Arguments: map[string]any{"aid": aid, "path": src},
+	})
+	if err != nil || put.IsError {
+		t.Fatalf("put: err=%v isError=%v %v", err, put != nil && put.IsError, put)
+	}
+	sc := put.StructuredContent.(map[string]any)
+	oid, _ := sc["object_id"].(string)
+	if oid == "" || sc["name"] != "blob.txt" {
+		t.Fatalf("put result %#v", sc)
+	}
+
+	loc, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "group_object_locate",
+		Arguments: map[string]any{"aid": aid, "object_id": oid},
+	})
+	if err != nil || loc.IsError {
+		t.Fatalf("locate: %v", err)
+	}
+	lsc := loc.StructuredContent.(map[string]any)
+	if lsc["status"] != "available" {
+		t.Fatalf("status %#v", lsc)
+	}
+
+	dest := filepath.Join(t.TempDir(), "out.txt")
+	got, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name: "group_object_get",
+		Arguments: map[string]any{
+			"aid": aid, "object_id": oid, "dest": dest, "register": true,
+		},
+	})
+	if err != nil || got.IsError {
+		t.Fatalf("get: %v %#v", err, got)
+	}
+	b, err := os.ReadFile(dest)
+	if err != nil || string(b) != "object-bytes" {
+		t.Fatalf("dest %q err=%v", b, err)
 	}
 }

@@ -335,6 +335,11 @@ func (d *Daemon) handleNetworkChangeCascade(ctx context.Context) {
 	//   readiness so the published record includes live hub URLs.
 	d.forcePublishNodeOnce(ctx)
 
+	// ⑥ Our endpoints moved, so pushes aimed at us during the outage went
+	//   nowhere. Re-align every live AID's groups rather than waiting for the
+	//   15-minute sweep.
+	d.alignAliveAIDs(ctx)
+
 	d.log.Info("network change handled",
 		"observed_peers", observed,
 		"elapsed", d.now().Sub(start).Truncate(time.Millisecond),

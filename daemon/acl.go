@@ -18,7 +18,20 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
-func (d *Daemon) decideAccess(local, remote a2al.Address, secret string, src net.Addr) bool {
+type accessClass string
+
+const (
+	accessService  accessClass = "service"
+	accessCAS      accessClass = "cas"
+	accessEnvelope accessClass = "envelope"
+)
+
+func (d *Daemon) decideAccess(local, remote a2al.Address, secret string, src net.Addr, class accessClass) bool {
+	if class == accessEnvelope {
+		// mTLS already bound the AIDs. This door is not service_tcp: skip
+		// ACL.allow/deny and the join-password IP gate.
+		return true
+	}
 	if local == d.nodeAddr {
 		return d.decideNodeAdminAccess(remote, secret, src)
 	}

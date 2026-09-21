@@ -4,13 +4,19 @@
 package daemon
 
 import (
+	"bufio"
 	"context"
 	"io"
+	"net/http"
+	"strings"
 	"time"
 
 	"github.com/a2al/a2al"
 	"github.com/a2al/a2al/daemon/aidproxy"
+	"github.com/a2al/a2al/group"
+	"github.com/a2al/a2al/host"
 	"github.com/a2al/a2al/protocol"
+	"github.com/quic-go/quic-go"
 )
 
 // daemonDialer implements [aidproxy.Dialer] using the daemon's connPool and
@@ -62,7 +68,9 @@ func (dd *daemonDialer) Dial(ctx context.Context, remote a2al.Address) (io.ReadW
 	if err != nil {
 		return nil, errConnectQUIC
 	}
-	stream, err := dd.d.openAdmittedStream(ctx, conn, "")
+	_, stream, _, err := dd.d.openPooled(ctx, dd.d.nodeAddr, remote, er, false, true, conn, func(ctx context.Context, c quic.Connection) (quic.Stream, error) {
+		return dd.d.openAdmittedStream(ctx, c, "")
+	})
 	if err != nil {
 		if isAccessDeniedErr(err) {
 			return nil, protocol.ErrAccessDenied
@@ -75,9 +83,102 @@ func (dd *daemonDialer) Dial(ctx context.Context, remote a2al.Address) (io.ReadW
 // newAIDProxy constructs the aidproxy.Handler wired to this daemon.
 // Called once from routes() during startup.
 func (d *Daemon) newAIDProxy() *aidproxy.Handler {
-	return aidproxy.New(
+	h := aidproxy.New(
 		aidproxy.NewChain(aidproxy.RawAIDResolver{}),
 		&daemonDialer{d},
 		d.log,
 	)
+	h.LocalCAS = d.serveAIDProxyCAS
+	return h
+}
+
+func (d *Daemon) serveAIDProxyCAS(w http.ResponseWriter, r *http.Request, aid a2al.Address, resourcePath string) bool {
+	path := resourcePath
+	if i := strings.IndexByte(path, '?'); i >= 0 {
+		path = path[:i]
+	}
+	id, ok := group.ParseCASPath(path)
+	if !ok {
+		return false
+	}
+	if d.casLocalHolder(aid) {
+		d.serveCASFile(w, aid, id, r.Method)
+		return true
+	}
+	d.proxyRemoteCAS(w, r, aid, id)
+	return true
+}
+
+func (d *Daemon) proxyRemoteCAS(w http.ResponseWriter, r *http.Request, remote a2al.Address, id [32]byte) {
+	dialCtx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	stream, err := d.dialCAS(dialCtx, d.nodeAddr, remote, "")
+	cancel()
+	if err != nil {
+		if isAccessDeniedErr(err) {
+			http.Error(w, "access denied", http.StatusForbidden)
+			return
+		}
+		http.Error(w, "connect failed", http.StatusBadGateway)
+		return
+	}
+	defer stream.Close()
+
+	outReq, err := http.NewRequest(r.Method, "http://cas"+group.CASPath(id), nil)
+	if err != nil {
+		http.Error(w, "bad request", http.StatusInternalServerError)
+		return
+	}
+	outReq.Header.Set("Connection", "close")
+	if err := outReq.Write(stream); err != nil {
+		http.Error(w, "upstream write failed", http.StatusBadGateway)
+		return
+	}
+	resp, err := http.ReadResponse(bufio.NewReaderSize(stream, 32*1024), outReq)
+	if err != nil {
+		if isAccessDeniedErr(err) {
+			http.Error(w, "access denied", http.StatusForbidden)
+			return
+		}
+		http.Error(w, "upstream read failed", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	for k, vals := range resp.Header {
+		for _, v := range vals {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, resp.Body)
+}
+
+func (d *Daemon) dialCAS(ctx context.Context, local, remote a2al.Address, token string) (io.ReadWriteCloser, error) {
+	rctx, rcancel := context.WithTimeout(ctx, 20*time.Second)
+	er, contacted, err := d.resolveTracked(rctx, remote)
+	rcancel()
+	if err != nil {
+		if d.beacon != nil && d.beaconShouldFallbackForResolve(err, contacted) {
+			er, err = d.resolveFromBeacon(ctx, remote)
+		}
+		if err != nil {
+			return nil, errResolve
+		}
+	}
+	if local == (a2al.Address{}) {
+		local = d.nodeAddr
+	}
+	conn, _, err := d.connPool.acquire(ctx, local, remote, er, false, true)
+	if err != nil {
+		return nil, errConnectQUIC
+	}
+	_, stream, _, err := d.openPooled(ctx, local, remote, er, false, true, conn, func(ctx context.Context, c quic.Connection) (quic.Stream, error) {
+		return host.AdmitCASStream(ctx, c, token)
+	})
+	if err != nil {
+		if isAccessDeniedErr(err) {
+			return nil, protocol.ErrAccessDenied
+		}
+		return nil, errConnectQUIC
+	}
+	return stream, nil
 }

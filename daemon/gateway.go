@@ -5,6 +5,7 @@ package daemon
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/tls"
@@ -266,64 +267,123 @@ func (d *Daemon) serveResolvedGatewayConn(ctx context.Context, ac *host.AgentCon
 	}
 }
 
-// dispatchInboundStream peeks the first 4 bytes to detect the frame type, then
-// dispatches to the appropriate handler.  Unrecognised (or no) magic falls
-// through to bridgeInboundStream, preserving backward compatibility for all
-// existing stream types (fetch, connect, tunnel, plain TCP bridge).
-func (d *Daemon) dispatchInboundStream(ac *host.AgentConn, str quic.Stream, serviceTCP string) {
-	br := bufio.NewReaderSize(str, 4)
-	magic, err := br.Peek(4)
-	if err == nil && string(magic) == protocol.MagicMailboxFrame {
-		// Consume the magic bytes we peeked.
-		_, _ = br.Discard(4)
-		// peekStream satisfies io.ReadWriter: reads from the buffered reader,
-		// writes (ACK) directly to the underlying QUIC stream.
-		d.acceptMailboxFrame(ac, &peekStream{Reader: br, Stream: str})
-		_ = str.Close()
-		return
+const streamMagicLen = 4
+
+type inboundMagicHandler func(ac *host.AgentConn, str quic.Stream, serviceTCP string)
+
+func (d *Daemon) initStreamTable() {
+	d.streamByMagic = map[string]inboundMagicHandler{
+		protocol.MagicMailboxFrame: func(ac *host.AgentConn, str quic.Stream, _ string) {
+			d.acceptMailboxFrame(ac, str)
+			_ = str.Close()
+		},
+		protocol.MagicGroupSync: func(ac *host.AgentConn, str quic.Stream, _ string) {
+			d.acceptGroupSync(ac, str)
+		},
+		protocol.MagicServiceStream: func(ac *host.AgentConn, str quic.Stream, serviceTCP string) {
+			d.acceptServiceAdmission(ac, str, serviceTCP)
+		},
+		protocol.MagicCAS: func(ac *host.AgentConn, str quic.Stream, _ string) {
+			d.acceptCAS(ac, str)
+		},
+		protocol.MagicEnvelope: func(ac *host.AgentConn, str quic.Stream, _ string) {
+			d.acceptEnvelope(ac, str)
+		},
 	}
+}
+
+func (d *Daemon) streamHandler(magic string) inboundMagicHandler {
+	d.streamOnce.Do(d.initStreamTable)
+	return d.streamByMagic[magic]
+}
+
+// looksLikeA2Magic reports a 4-byte prefix of the form "a2??". Unknown such
+// magics must not be restored and bridged into service_tcp.
+func looksLikeA2Magic(magic [4]byte, n int) bool {
+	return n == streamMagicLen && magic[0] == 'a' && magic[1] == '2'
+}
+
+// takeStreamMagic reads at most 4 bytes from r. Unlike bufio.Peek — whose
+// buffer is at least 16 bytes and will over-read a coalesced QUIC STREAM
+// payload — this never consumes more than 4 bytes from the underlying reader.
+func takeStreamMagic(r io.Reader) (magic [4]byte, n int, err error) {
+	n, err = io.ReadFull(r, magic[:])
+	return magic, n, err
+}
+
+// restorePrefix prepends prefix in front of r so a handler that did not
+// recognise the 4-byte magic still sees the original stream start.
+func restorePrefix(prefix []byte, r io.Reader) io.Reader {
+	if len(prefix) == 0 {
+		return r
+	}
+	return io.MultiReader(bytes.NewReader(bytes.Clone(prefix)), r)
+}
+
+// dispatchInboundStream reads the first 4 bytes to detect the frame type, then
+// looks up the magic table. Unrecognised (or short) prefixes that are not
+// "a2??" fall through to bridgeInboundStream (HTTP / DHT / TCP). Unknown a2*
+// magics are closed; they must not be bridged into service_tcp.
+func (d *Daemon) dispatchInboundStream(ac *host.AgentConn, str quic.Stream, serviceTCP string) {
+	magic, n, err := takeStreamMagic(str)
+	if n == streamMagicLen && err == nil {
+		if h := d.streamHandler(string(magic[:])); h != nil {
+			h(ac, str, serviceTCP)
+			return
+		}
+		if looksLikeA2Magic(magic, n) {
+			_ = str.Close()
+			return
+		}
+	}
+
+	rest := restorePrefix(magic[:n], str)
+	br := bufio.NewReader(rest)
 	ps := &peekStream{Reader: br, Stream: str}
+
 	// Node remote-admin has a service_tcp. Misrouted DHT is CBOR, not HTTP;
 	// recover it before ACL/bridge so enabling the door does not starve DHT.
 	if ac.Local == d.nodeAddr && serviceTCP != "" {
-		if b, err := br.Peek(1); err == nil && len(b) == 1 && (b[0] < 'A' || b[0] > 'Z') {
-			if string(magic) != protocol.MagicServiceStream {
-				if d.tryHandleAsDHTFallback(ac, ps) {
-					return
-				}
+		if b, perr := br.Peek(1); perr == nil && len(b) == 1 && (b[0] < 'A' || b[0] > 'Z') {
+			if d.tryHandleAsDHTFallback(ac, ps) {
 				return
 			}
+			return
 		}
 	}
-	if err == nil && string(magic) == protocol.MagicServiceStream {
-		_, _ = br.Discard(4)
-		_ = str.SetDeadline(time.Now().Add(5 * time.Second))
-		token, aerr := host.ReadServiceAdmission(ps)
-		if aerr != nil {
-			d.log.Debug("gateway: a2s1 admission read", "err", aerr)
-			_ = str.Close()
-			return
-		}
-		allowed := d.decideAccess(ac.Local, ac.Remote, token, ac.RemoteAddr())
-		reason := ""
-		if !allowed {
-			reason = "denied"
-		}
-		if werr := host.WriteAccessResult(ps, allowed, reason); werr != nil {
-			_ = str.Close()
-			return
-		}
-		_ = str.SetDeadline(time.Time{})
-		if !allowed {
-			d.log.Warn("gateway: access denied", "local_aid", ac.Local.String(), "remote_aid", ac.Remote.String())
-			_ = str.Close()
-			return
-		}
-		d.bridgeInboundStream(ac, ps, serviceTCP, true)
+	allowed := d.decideAccess(ac.Local, ac.Remote, "", ac.RemoteAddr(), accessService)
+	d.bridgeInboundStream(ac, ps, serviceTCP, allowed)
+}
+
+// acceptServiceAdmission handles a stream whose a2s1 magic has already been
+// consumed. Semantics match the previous inline a2s1 path: admission, ACL,
+// then TCP bridge.
+func (d *Daemon) acceptServiceAdmission(ac *host.AgentConn, str quic.Stream, serviceTCP string) {
+	_ = str.SetDeadline(time.Now().Add(5 * time.Second))
+	token, aerr := host.ReadServiceAdmission(str)
+	if aerr != nil {
+		d.log.Debug("gateway: a2s1 admission read", "err", aerr)
+		_ = str.Close()
 		return
 	}
-	allowed := d.decideAccess(ac.Local, ac.Remote, "", ac.RemoteAddr())
-	d.bridgeInboundStream(ac, ps, serviceTCP, allowed)
+	allowed := d.decideAccess(ac.Local, ac.Remote, token, ac.RemoteAddr(), accessService)
+	reason := ""
+	if !allowed {
+		reason = "denied"
+	}
+	if werr := host.WriteAccessResult(str, allowed, reason); werr != nil {
+		_ = str.Close()
+		return
+	}
+	_ = str.SetDeadline(time.Time{})
+	if !allowed {
+		d.log.Warn("gateway: access denied", "local_aid", ac.Local.String(), "remote_aid", ac.Remote.String())
+		_ = str.Close()
+		return
+	}
+	br := bufio.NewReader(str)
+	ps := &peekStream{Reader: br, Stream: str}
+	d.bridgeInboundStream(ac, ps, serviceTCP, true)
 }
 
 // peekStream wraps a bufio.Reader over a quic.Stream so that already-buffered

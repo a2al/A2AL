@@ -102,15 +102,15 @@ func TestDecideAccess_agentIPLockSkipsPassword(t *testing.T) {
 	remote := newTestAddr(t)
 	src := testUDP("10.3.0.1")
 	for i := 0; i < aclIPShortMax; i++ {
-		if d.decideAccess(aid, remote, "nope", src) {
+		if d.decideAccess(aid, remote, "nope", src, accessService) {
 			t.Fatalf("wrong password allowed at %d", i)
 		}
 	}
-	if d.decideAccess(aid, remote, "pw", src) {
+	if d.decideAccess(aid, remote, "pw", src, accessService) {
 		t.Fatal("correct password must not be evaluated while IP is locked")
 	}
 	other := testUDP("10.3.0.2")
-	if !d.decideAccess(aid, remote, "pw", other) {
+	if !d.decideAccess(aid, remote, "pw", other, accessService) {
 		t.Fatal("other IP with correct password must pass")
 	}
 }
@@ -126,9 +126,9 @@ func TestDecideAccess_nodeAdminBypassesAgentIPGate(t *testing.T) {
 	remote := newTestAddr(t)
 	src := testUDP("10.3.0.9")
 	for i := 0; i < aclIPShortMax+2; i++ {
-		d.decideAccess(d.nodeAddr, newTestAddr(t), "nope", src)
+		d.decideAccess(d.nodeAddr, newTestAddr(t), "nope", src, accessService)
 	}
-	if !d.decideAccess(d.nodeAddr, remote, "pw", src) {
+	if !d.decideAccess(d.nodeAddr, remote, "pw", src, accessService) {
 		t.Fatal("remote-admin correct password must still work; agent IP gate must not apply")
 	}
 }

@@ -38,7 +38,7 @@ func newTestAddr(t *testing.T) a2al.Address {
 func TestRemoteAdmin_decideOffIsOpen(t *testing.T) {
 	d := newTestDaemon(t)
 	remote := newTestAddr(t)
-	if !d.decideAccess(d.nodeAddr, remote, "", testUDP("10.0.0.1")) {
+	if !d.decideAccess(d.nodeAddr, remote, "", testUDP("10.0.0.1"), accessService) {
 		t.Fatal("disabled remote admin must allow (control plane / mailbox)")
 	}
 }
@@ -49,7 +49,7 @@ func TestRemoteAdmin_denyDefault(t *testing.T) {
 		t.Fatal(err)
 	}
 	remote := newTestAddr(t)
-	if d.decideAccess(d.nodeAddr, remote, "", testUDP("10.0.0.2")) {
+	if d.decideAccess(d.nodeAddr, remote, "", testUDP("10.0.0.2"), accessService) {
 		t.Fatal("enabled + empty allow must deny")
 	}
 }
@@ -63,7 +63,7 @@ func TestRemoteAdmin_allowList(t *testing.T) {
 	if _, err := d.ra.addEntry("allow", aclEntryReq{AID: remote.String()}); err != nil {
 		t.Fatal(err)
 	}
-	if !d.decideAccess(d.nodeAddr, remote, "", testUDP("10.0.0.3")) {
+	if !d.decideAccess(d.nodeAddr, remote, "", testUDP("10.0.0.3"), accessService) {
 		t.Fatal("allow-listed AID must pass")
 	}
 }
@@ -77,10 +77,10 @@ func TestRemoteAdmin_joinPassword(t *testing.T) {
 		t.Fatal(err)
 	}
 	remote := newTestAddr(t)
-	if d.decideAccess(d.nodeAddr, remote, "wrong", testUDP("10.0.0.4")) {
+	if d.decideAccess(d.nodeAddr, remote, "wrong", testUDP("10.0.0.4"), accessService) {
 		t.Fatal("wrong password must fail")
 	}
-	if !d.decideAccess(d.nodeAddr, remote, "s3cret", testUDP("10.0.0.4")) {
+	if !d.decideAccess(d.nodeAddr, remote, "s3cret", testUDP("10.0.0.4"), accessService) {
 		t.Fatal("correct password must pass")
 	}
 	if !d.ra.allows(remote, "") {
@@ -99,7 +99,7 @@ func TestRemoteAdmin_fiveFailsBan(t *testing.T) {
 	remote := newTestAddr(t)
 	src := testUDP("10.0.1.5")
 	for i := 0; i < raAIDFailBan; i++ {
-		if d.decideAccess(d.nodeAddr, remote, "nope", src) {
+		if d.decideAccess(d.nodeAddr, remote, "nope", src, accessService) {
 			t.Fatalf("attempt %d should fail", i)
 		}
 	}
@@ -133,7 +133,7 @@ func TestRemoteAdmin_fifteenFailsRevokeJoin(t *testing.T) {
 	remote := newTestAddr(t)
 	src := testUDP("10.0.1.6")
 	for i := 0; i < raJoinFailRevoke; i++ {
-		d.decideAccess(d.nodeAddr, remote, "nope", src)
+		d.decideAccess(d.nodeAddr, remote, "nope", src, accessService)
 	}
 	if !d.ra.enabled() {
 		t.Fatal("wrong passwords must not disable remote admin")
@@ -161,13 +161,13 @@ func TestRemoteAdmin_successClearsJoinFailStreak(t *testing.T) {
 	attacker := newTestAddr(t)
 	src := testUDP("10.0.1.7")
 	for i := 0; i < raJoinFailRevoke-1; i++ {
-		d.decideAccess(d.nodeAddr, attacker, "nope", src)
+		d.decideAccess(d.nodeAddr, attacker, "nope", src, accessService)
 	}
-	if !d.decideAccess(d.nodeAddr, keeper, "", testUDP("10.0.1.8")) {
+	if !d.decideAccess(d.nodeAddr, keeper, "", testUDP("10.0.1.8"), accessService) {
 		t.Fatal("allow-listed access should succeed")
 	}
 	for i := 0; i < raJoinFailRevoke-1; i++ {
-		d.decideAccess(d.nodeAddr, attacker, "nope", src)
+		d.decideAccess(d.nodeAddr, attacker, "nope", src, accessService)
 	}
 	if !joinPasswordSet(d.ra.snapshot().ACL) {
 		t.Fatal("successful access must reset the wrong-password streak")

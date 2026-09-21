@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -66,6 +67,13 @@ type Daemon struct {
 	mcpOnce sync.Once
 	mcpSrv  *mcp.Server
 
+	// mcpLocal is a persistent in-process ClientSession used by POST /mcp/call.
+	mcpLocalOnce sync.Once
+	mcpLocalSess *mcp.ClientSession
+
+	// casMapMu serializes load-modify-save of per-AID cas-map.json.
+	casMapMu sync.Mutex
+
 	// mboxStore is the persistent mailbox store (cross-restart dedup, TTL cleanup).
 	mboxStore *mailboxStore
 	// mboxStoreStop signals the background flush/cleanup goroutine to stop.
@@ -73,6 +81,11 @@ type Daemon struct {
 
 	// bus is the daemon-internal event bus (mailbox.received, etc.).
 	bus *EventBus
+
+	// evtLog is the per-AID persistent (in-memory ring) event log.
+	// All EventBus events are mirrored here with a monotonic seq so
+	// consumers can catch up after disconnect without missing events.
+	evtLog *EventLog
 
 	// subMgr manages per-AID backoff poll timers for SSE subscribers.
 	subMgr *subscriptionManager
@@ -87,6 +100,25 @@ type Daemon struct {
 
 	heartbeatMu sync.Mutex
 	heartbeatAt map[a2al.Address]time.Time
+
+	// hitchMu guards the debounce state for hitchhiked mailbox refreshes.
+	hitchMu       sync.Mutex
+	hitchLast     map[a2al.Address]time.Time
+	hitchInFlight map[a2al.Address]struct{}
+
+	streamOnce    sync.Once
+	streamByMagic map[string]inboundMagicHandler
+
+	envConsumers   hookTable[EnvelopeConsumer]
+	pendingSources hookTable[func(a2al.Address) int]
+
+	// alignMu guards alignGroups and alignPeers.
+	alignMu     sync.Mutex
+	alignGroups map[alignGroupKey]*alignGroupState
+	alignPeers  map[alignPeerKey]*alignPeerState
+	// centerBuckets rate-limits center-initiated pushes per local AID,
+	// across every room that AID is a center of.
+	centerBuckets map[a2al.Address]*tokenBucket
 
 	iceRegNotify chan struct{} // ICE /signal registration refresh (buffered)
 
@@ -163,6 +195,17 @@ type Daemon struct {
 	aclIP *aclIPGate
 
 	book *addressBookRuntime
+
+	// groups manages local Group (Comm) replicas.
+	groups *GroupManager
+
+	chats *chatManager
+
+	// chatDeliverHook, if set, replaces chatDeliver (tests).
+	chatDeliverHook func(ctx context.Context, local, remote a2al.Address, kind string, body []byte, persist bool) (EnvelopeResult, error)
+
+	joinProbeMu sync.Mutex
+	joinProbes  map[alignGroupKey]*joinProbe
 }
 
 // APIAddr returns the REST API / Web UI listen address from the loaded config.
@@ -283,8 +326,13 @@ func New(cfg Config) (*Daemon, error) {
 		lockFile:         lockFile,
 		agentLastPublish: make(map[a2al.Address]time.Time),
 		heartbeatAt:      make(map[a2al.Address]time.Time),
+		hitchLast:        make(map[a2al.Address]time.Time),
+		hitchInFlight:    make(map[a2al.Address]struct{}),
+		alignGroups:      make(map[alignGroupKey]*alignGroupState),
+		alignPeers:       make(map[alignPeerKey]*alignPeerState),
 		mboxStoreStop:    make(chan struct{}),
 		bus:              NewEventBus(log),
+		evtLog:           NewEventLog(),
 		// subMgr is initialised in Run() after mboxStore is ready.
 		iceRegNotify:    make(chan struct{}, 1),
 		netChangeNotify: make(chan struct{}, 1),
@@ -294,8 +342,12 @@ func New(cfg Config) (*Daemon, error) {
 	}
 	d.initRemoteAdmin()
 	d.initAddressBook()
+	d.groups = newGroupManager(cfg.DataDir, log)
+	d.initChat()
 	d.aclIP = newACLIPGate()
-	h.SetDecideAccess(d.decideAccess)
+	h.SetDecideAccess(func(local, remote a2al.Address, secret string, src net.Addr) bool {
+		return d.decideAccess(local, remote, secret, src, accessService)
+	})
 	// connPool dial: user paths race impression∥network via ConnectUserFor;
 	// auto paths keep ConnectFromRecordFor. nodeAddr is a registered agent.
 	d.connPool = newModeAConnPool(func(ctx context.Context, local, remote a2al.Address, er *protocol.EndpointRecord, noRelay bool, user bool) (quic.Connection, bool, error) {
@@ -405,14 +457,44 @@ func (d *Daemon) Run(ctx context.Context, mcpStdio bool) error {
 	// nodes are dispatched by the DHT node's recvLoop to the push handler.
 	d.registerDHTPushHandler()
 
-	// Initialise the subscription manager; pollFn executes an in-process mailbox poll.
+	// Initialise the subscription manager. Its timer only refreshes the local
+	// store from the DHT; it must never consume, or the agent's own poll would
+	// come back empty for messages the daemon already read and threw away.
 	d.subMgr = newSubscriptionManager(func(aid a2al.Address) {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		if _, err := d.execMailboxPoll(ctx, aid.String()); err != nil {
-			d.log.Debug("subMgr poll", "aid", aid.String(), "err", err)
+		if _, err := d.refreshMailbox(ctx, aid); err != nil {
+			d.log.Debug("subMgr refresh", "aid", aid.String(), "err", err)
 		}
 	})
+
+	// Mirror all EventBus events into the per-AID ring log.
+	// The ring log survives transient SSE disconnects and is the source
+	// of truth for a2al_events_poll and SSE ?last_event_id= replay.
+	{
+		ch, cancel := d.bus.Subscribe(Filter{})
+		go func() {
+			defer cancel()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case evt, ok := <-ch:
+					if !ok {
+						return
+					}
+					if evt.AID == (a2al.Address{}) {
+						continue // global / non-AID events not logged per-AID
+					}
+					d.evtLog.Append(evt.AID, LoggedEvent{
+						Type: evt.Type,
+						Data: evt.Data,
+						Ts:   evt.At.UnixMilli(),
+					})
+				}
+			}
+		}()
+	}
 
 	d.log.Info("a2ald starting",
 		"node_aid", d.nodeAddr.String(),
@@ -481,6 +563,7 @@ func (d *Daemon) Run(ctx context.Context, mcpStdio bool) error {
 		d.autoPublishMainLoop(netCtx)
 	}()
 	go d.runNetworkMonitor(netCtx)
+	go d.runGroupAlignSweep(netCtx)
 
 	go d.gatewayAcceptLoop(netCtx)
 	go d.connPool.startIdleEvictor(netCtx)

@@ -5,8 +5,11 @@ package daemon
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
+	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -19,7 +22,8 @@ import (
 	"github.com/a2al/a2al/host"
 	"github.com/a2al/a2al/internal/nodeks"
 	"github.com/a2al/a2al/internal/registry"
-	"log/slog"
+	"github.com/a2al/a2al/protocol"
+	"github.com/quic-go/quic-go"
 )
 
 func newTestDaemon(t *testing.T) *Daemon {
@@ -57,6 +61,8 @@ func newTestDaemon(t *testing.T) *Daemon {
 		startedAt:        time.Now(),
 		agentLastPublish: make(map[a2al.Address]time.Time),
 		heartbeatAt:      make(map[a2al.Address]time.Time),
+		hitchLast:        make(map[a2al.Address]time.Time),
+		hitchInFlight:    make(map[a2al.Address]struct{}),
 		mboxStore:        newMailboxStore(filepath.Join(dir, "mailbox_store.cbor"), slog.New(slog.NewTextHandler(io.Discard, nil))),
 		mboxStoreStop:    make(chan struct{}),
 		bus:              NewEventBus(slog.New(slog.NewTextHandler(io.Discard, nil))),
@@ -65,7 +71,13 @@ func newTestDaemon(t *testing.T) *Daemon {
 	d.initRemoteAdmin()
 	d.initAddressBook()
 	d.aclIP = newACLIPGate()
-	h.SetDecideAccess(d.decideAccess)
+	h.SetDecideAccess(func(local, remote a2al.Address, secret string, src net.Addr) bool {
+		return d.decideAccess(local, remote, secret, src, accessService)
+	})
+	d.connPool = newModeAConnPool(func(context.Context, a2al.Address, a2al.Address, *protocol.EndpointRecord, bool, bool) (quic.Connection, bool, error) {
+		return nil, false, errEnvelopeUnavailable
+	}, d.log)
+	d.initChat()
 	return d
 }
 

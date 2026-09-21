@@ -191,6 +191,7 @@ func (d *Daemon) execTunnelOpen(ctx context.Context, remoteAidStr string, req tu
 	if err != nil {
 		return nil, false, err
 	}
+	d.noteActingAgent(local)
 
 	// Resolve with 20 s cap, same as execFetch / execConnect.
 	rctx, rcancel := context.WithTimeout(ctx, 20*time.Second)
@@ -213,9 +214,13 @@ func (d *Daemon) execTunnelOpen(ctx context.Context, remoteAidStr string, req tu
 		}
 		return nil, false, errConnectQUIC
 	}
-	allowed, err := d.probeServiceAdmission(ctx, qc, req.AccessToken)
+	orig := qc
+	qc, newRelayed, allowed, err := d.probeServiceAdmission(ctx, local, remote, er, nr, qc, req.AccessToken)
 	if err != nil {
 		return nil, false, errConnectQUIC
+	}
+	if qc != orig {
+		isRelayed = newRelayed
 	}
 	if !allowed {
 		return &tunnelEntry{

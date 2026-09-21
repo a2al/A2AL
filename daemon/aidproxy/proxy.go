@@ -92,6 +92,9 @@ type Handler struct {
 	resolver Resolver
 	dialer   Dialer
 	log      *slog.Logger
+	// LocalCAS, if set, is tried after resolve and before Dial.
+	// resourcePath is "/cas/{hash}" (and query). Return true if fully handled.
+	LocalCAS func(w http.ResponseWriter, r *http.Request, aid a2al.Address, resourcePath string) bool
 }
 
 // New creates a [Handler] with the given resolver, dialer, and logger.
@@ -151,6 +154,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		h.log.Debug("aidproxy: resolve failed", "address", addrStr, "err", err)
 		http.Error(w, "bad aid address", http.StatusBadRequest)
+		return
+	}
+
+	if h.LocalCAS != nil && h.LocalCAS(w, r, remote, resourcePath) {
 		return
 	}
 

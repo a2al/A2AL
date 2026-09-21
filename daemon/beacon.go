@@ -44,11 +44,11 @@ const (
 	//     a few of the K-closest nodes were unreachable (timeout) and their slots
 	//     were filled by slightly further nodes.
 	// Below this count the query was likely cut short (sparse routing table or
-	// early context cancellation) and auxiliary fallback is still attempted.
+	// early context cancellation) and beacon fallback is still attempted.
 	beaconResolveContactThreshold = 20
 
-	// beaconPerPeerTimeout is the per-node deadline for a single FindValue RPC.
-	// Keeping it short (3 s) prevents an offline node from stalling the fallback
+	// beaconPerPeerTimeout is the per-beacon deadline for a single FindValue RPC.
+	// Keeping it short (3 s) prevents an offline beacon from stalling the fallback
 	// iteration; the caller's context provides the outer bound.
 	beaconPerPeerTimeout = 3 * time.Second
 )
@@ -97,12 +97,12 @@ func (b *beaconManager) start(ctx context.Context, agentKeysFn func() []a2al.Nod
 }
 
 // trySelfIdentify checks whether this node's public IP (v4 or v6) appears in
-// the well-known address list. If so, enables the high-capacity local
+// the well-known beacon address list. If so, enables the high-capacity local
 // store path (same behaviour as the operator high-capacity role in config).
 //
-// Hairpin detection and self-identify are intentionally separate
+// Hairpin detection and auxiliary node self-identification are intentionally separate
 // concerns: SetSelfExtIP covers v4 hairpin detection (NAT peers); this
-// function covers self-identify for both v4 and v6 GUA nodes.
+// function covers self-identification for both v4 and v6 GUA nodes.
 func (b *beaconManager) trySelfIdentify(addrs []net.Addr) {
 	selfIPv4 := b.node.SelfExtIP()
 	selfIPv6 := b.node.SelfExtIPv6()
@@ -231,17 +231,17 @@ func (b *beaconManager) StoreAll(ctx context.Context, keys []a2al.NodeID) {
 }
 
 // FindRecords walks the well-known address set and returns records from the
-// first node that supplies a non-empty response.
+// first beacon that supplies a non-empty response.
 //
 // Load distribution: the iteration start is derived from the first two bytes of
-// key, so different keys naturally spread across different nodes while RTT
+// key, so different keys naturally spread across different beacons while RTT
 // ordering (from shuffledAddrs) is still preserved within the rotation.  Same
-// key always picks the same primary node (cache-friendly).
+// key always picks the same primary beacon (cache-friendly).
 //
-// Availability: each node is contacted with a short per-peer timeout so that
-// offline nodes cannot stall the fallback path.  Empty responses are not
+// Availability: each beacon is contacted with a short per-peer timeout so that
+// offline beacons cannot stall the fallback path.  Empty responses are not
 // treated as authoritative; iteration continues until a non-empty result is
-// found or all nodes are exhausted.
+// found or all beacons are exhausted.
 func (b *beaconManager) FindRecords(ctx context.Context, key a2al.NodeID, recType uint8) ([]protocol.SignedRecord, error) {
 	addrs := b.shuffledAddrs()
 	if len(addrs) == 0 {
@@ -259,13 +259,13 @@ func (b *beaconManager) FindRecords(ctx context.Context, key a2al.NodeID, recTyp
 		if ctx.Err() != nil {
 			break
 		}
-		// Per-node timeout: avoid stalling on an offline node.
+		// Per-beacon timeout: avoid stalling on an offline node.
 		bctx, bcancel := context.WithTimeout(ctx, beaconPerPeerTimeout)
 		recs, _, err := b.node.FindValueWithNodes(bctx, addr, key, recType, false)
 		bcancel()
 		if err != nil {
 			b.log.Debug("aux-dht find", "addr", addr, "err", err)
-			continue // offline / unreachable; try next
+			continue // offline / unreachable; try next beacon
 		}
 		var out []protocol.SignedRecord
 		for _, r := range recs {
@@ -283,7 +283,7 @@ func (b *beaconManager) FindRecords(ctx context.Context, key a2al.NodeID, recTyp
 			b.queryHits.Add(1)
 			return out, nil // found records – return immediately
 		}
-		// Empty response from this node (does not hold this key); try next.
+		// Empty response from this beacon (does not hold this key); try next.
 	}
 	return nil, nil
 }
@@ -409,7 +409,7 @@ func (d *Daemon) resolveTracked(ctx context.Context, aid a2al.Address) (*protoco
 }
 
 // beaconShouldFallbackForResolve reports whether a failed resolve call warrants
-// an auxiliary fallback, given the error and the number of distinct nodes that were
+// a beacon fallback, given the error and the number of distinct nodes that were
 // contacted during the iterative query.
 //
 // Design for "DHT sufficient":
@@ -417,14 +417,14 @@ func (d *Daemon) resolveTracked(ctx context.Context, aid a2al.Address) (*protoco
 //     That result is authoritative only when contacted ≥ beaconResolveContactThreshold
 //     (20 = K+4): if 20 or more distinct peers replied (not just timed out) with
 //     no record, the target's neighbourhood was covered and repeating the question
-//     to an auxiliary node adds nothing.
+//     to a beacon adds nothing.
 //   - contacted < 20 means the query was cut short (sparse routing table,
-//     context deadline, etc.) — auxiliary fallback is appropriate.
+//     context deadline, etc.) — beacon fallback is appropriate.
 //   - Any other error (timeout, network error) means the query was incomplete;
-//     auxiliary fallback is always tried regardless of contact count.
+//     beacon is always tried regardless of contact count.
 func (d *Daemon) beaconShouldFallbackForResolve(err error, contacted int) bool {
 	if !errors.Is(err, dht.ErrNoEndpoint) {
-		return true // incomplete query; always try auxiliary fallback
+		return true // incomplete query; always try beacon
 	}
 	return contacted < beaconResolveContactThreshold
 }

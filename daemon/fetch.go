@@ -9,15 +9,21 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/a2al/a2al"
+	"github.com/a2al/a2al/group"
+	"github.com/a2al/a2al/host"
 	"github.com/a2al/a2al/protocol"
+	"github.com/quic-go/quic-go"
 )
 
 const (
@@ -136,6 +142,11 @@ func readBody(r io.Reader) ([]byte, bool, error) {
 // On a dead-connection error the pool evicts the entry automatically; execFetch
 // retries once with a fresh connection before returning an error.
 func (d *Daemon) execFetch(ctx context.Context, localAID, remoteAID a2al.Address, req fetchReq) (fetchResp, error) {
+	d.noteActingAgent(localAID)
+	if _, ok := group.ParseCASPath(req.Path); ok {
+		return d.execFetchCAS(ctx, localAID, remoteAID, req)
+	}
+
 	// Local short-circuit: if remoteAID is a locally registered agent with a
 	// known service_tcp, skip QUIC entirely. d.reg only contains agents
 	// explicitly registered with this daemon, so there are no false positives.
@@ -171,7 +182,10 @@ func (d *Daemon) execFetch(ctx context.Context, localAID, remoteAID a2al.Address
 		sctx, scancel := context.WithTimeout(ctx, fetchStreamTimeout)
 		defer scancel()
 
-		stream, err := d.openAdmittedStream(sctx, conn, req.AccessToken)
+		open := func(ctx context.Context, c quic.Connection) (quic.Stream, error) {
+			return d.openAdmittedStream(ctx, c, req.AccessToken)
+		}
+		_, stream, _, err := d.openPooled(sctx, localAID, remoteAID, er, false, true, conn, open)
 		if err != nil {
 			if isAccessDeniedErr(err) {
 				return fetchResp{}, protocol.ErrAccessDenied
@@ -198,6 +212,108 @@ func (d *Daemon) execFetch(ctx context.Context, localAID, remoteAID a2al.Address
 		resp, err = doFetch()
 	}
 	return resp, err
+}
+
+func (d *Daemon) casLocalHolder(aid a2al.Address) bool {
+	if aid == d.nodeAddr {
+		return true
+	}
+	d.regMu.RLock()
+	defer d.regMu.RUnlock()
+	return d.reg.Get(aid) != nil
+}
+
+// execFetchCAS answers GET/HEAD /cas/{hash} on the a2cs HTTP stream.
+// Local holders never go to service_tcp.
+func (d *Daemon) execFetchCAS(ctx context.Context, localAID, remoteAID a2al.Address, req fetchReq) (fetchResp, error) {
+	id, ok := group.ParseCASPath(req.Path)
+	if !ok {
+		return fetchResp{}, errors.New("invalid cas path")
+	}
+	method := strings.ToUpper(req.Method)
+	if method == "" {
+		method = http.MethodGet
+	}
+	if d.casLocalHolder(remoteAID) {
+		return d.execFetchCASLocal(remoteAID, id, method)
+	}
+
+	rctx, rcancel := context.WithTimeout(ctx, 20*time.Second)
+	er, contacted, err := d.resolveTracked(rctx, remoteAID)
+	rcancel()
+	if err != nil {
+		if d.beacon != nil && d.beaconShouldFallbackForResolve(err, contacted) {
+			er, err = d.resolveFromBeacon(ctx, remoteAID)
+		}
+		if err != nil {
+			return fetchResp{}, errResolve
+		}
+	}
+
+	doFetch := func() (fetchResp, error) {
+		conn, _, err := d.connPool.acquire(ctx, localAID, remoteAID, er, false, true)
+		if err != nil {
+			return fetchResp{}, errConnectQUIC
+		}
+		sctx, scancel := context.WithTimeout(ctx, fetchStreamTimeout)
+		defer scancel()
+		open := func(ctx context.Context, c quic.Connection) (quic.Stream, error) {
+			return host.AdmitCASStream(ctx, c, req.AccessToken)
+		}
+		_, stream, _, err := d.openPooled(sctx, localAID, remoteAID, er, false, true, conn, open)
+		if err != nil {
+			if isAccessDeniedErr(err) {
+				return fetchResp{}, protocol.ErrAccessDenied
+			}
+			d.log.Debug("fetch: cas stream failed", "remote", remoteAID.String(), "err", err)
+			return fetchResp{}, errConnectQUIC
+		}
+		defer func() {
+			stream.CancelRead(0)
+			_ = stream.Close()
+		}()
+		if dl, ok := sctx.Deadline(); ok {
+			_ = stream.SetDeadline(dl)
+		}
+		return doHTTPOverStream(stream, req)
+	}
+
+	resp, err := doFetch()
+	if errors.Is(err, errConnectQUIC) {
+		d.log.Debug("fetch: cas retry after dead connection", "remote", remoteAID.String())
+		resp, err = doFetch()
+	}
+	return resp, err
+}
+
+func (d *Daemon) execFetchCASLocal(aid a2al.Address, id [32]byte, method string) (fetchResp, error) {
+	path, size, ok := d.lookupLocalObject(aid, id)
+	if !ok {
+		return fetchResp{Status: http.StatusNotFound}, nil
+	}
+	headers := map[string][]string{
+		"Content-Type":   {"application/octet-stream"},
+		"ETag":           {`"` + hex.EncodeToString(id[:]) + `"`},
+		"Content-Length": {strconv.FormatInt(size, 10)},
+	}
+	if method == http.MethodHead {
+		return fetchResp{Status: http.StatusOK, Headers: headers}, nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return fetchResp{Status: http.StatusNotFound}, nil
+	}
+	defer f.Close()
+	body, truncated, err := readBody(f)
+	if err != nil {
+		return fetchResp{}, err
+	}
+	return fetchResp{
+		Status:    http.StatusOK,
+		Headers:   headers,
+		Body:      base64.StdEncoding.EncodeToString(body),
+		Truncated: truncated,
+	}, nil
 }
 
 // execFetchDirect makes an HTTP request directly to a local service_tcp address,

@@ -17,12 +17,15 @@ import (
 
 // sendMailboxQuic sends a MailboxFrame over an existing QUIC connection.
 // Opens a new stream, writes the frame, waits for a 1-byte ACK (5s timeout).
-func sendMailboxQuic(ctx context.Context, conn quic.Connection, msgID [32]byte, sr protocol.SignedRecord) error {
+func (d *Daemon) sendMailboxQuic(ctx context.Context, conn quic.Connection, msgID [32]byte, sr protocol.SignedRecord) error {
 	sendCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
 	str, err := conn.OpenStreamSync(sendCtx)
 	if err != nil {
+		if d.connPool != nil {
+			d.connPool.evictUnheld(conn)
+		}
 		return fmt.Errorf("mailbox quic: open stream: %w", err)
 	}
 	defer str.Close()
@@ -89,20 +92,14 @@ func (d *Daemon) acceptMailboxFrame(ac *host.AgentConn, rw io.ReadWriter) {
 		return
 	}
 
-	ttlExpires := now.Unix() + int64(sr.TTL)
-	inserted := d.mboxStore.Put(msgID, MailboxStoreEntry{
-		RecipientAID: ac.Local,
-		Record:       sr,
-		ReceivedAt:   now.Unix(),
-		TTLExpires:   ttlExpires,
-	})
+	_, doorbell := d.fileMailbox(ac.Local, sr)
 
 	// ACK regardless of whether the record was new (duplicate = sender can stop retrying).
 	if _, err := rw.Write([]byte{0x01}); err != nil {
 		d.log.Debug("mailbox quic: ack write", "err", err)
 	}
 
-	if inserted {
+	if doorbell {
 		if d.bus != nil {
 			d.bus.Publish(Event{
 				Type: "mailbox.received",
@@ -115,4 +112,3 @@ func (d *Daemon) acceptMailboxFrame(ac *host.AgentConn, rw io.ReadWriter) {
 		}
 	}
 }
-

@@ -39,7 +39,19 @@ const (
 	// connPoolBackoffBase / Max bound the exponential backoff after a network failure.
 	connPoolBackoffBase = 15 * time.Second
 	connPoolBackoffMax  = 5 * time.Minute
+
+	// connPoolOpenProbeTimeout caps OpenStream on a pooled connection.
+	// A live path opens in milliseconds; this only separates "usable" from
+	// "object still there". The second open after a redial uses the same cap.
+	connPoolOpenProbeTimeout = 8 * time.Second
+
+	// connPoolRepairWait is how long the caller that found a bad cached
+	// connection waits for the replacement dial. The dial itself still runs
+	// for connPoolDialTimeout and is cached for the next caller.
+	connPoolRepairWait = 15 * time.Second
 )
+
+var errConnRepairWait = errors.New("a2al/daemon: reconnect still in progress")
 
 // connPoolKey identifies a cached outbound connection.
 type connPoolKey struct {
@@ -146,22 +158,22 @@ func (p *modeAConnPool) acquire(ctx context.Context, local, remote a2al.Address,
 	}
 	p.mu.Unlock()
 
-	// ── Slow path: dial, deduplicated via singleflight ────────────────────
-	//
-	// The dial context is intentionally decoupled from the caller's ctx:
-	//   1. A caller hang-up must not abort the dial for other singleflight
-	//      waiters that share the same in-flight attempt.
-	//   2. A caller-cancelled context must not be mistaken for a network
-	//      failure and written as a backoff record.
-	// We use context.WithoutCancel so that the dial inherits values (e.g.
-	// trace spans) but not the cancellation signal, and cap it independently.
-	dialCtx, dialCancel := context.WithTimeout(context.WithoutCancel(ctx), connPoolDialTimeout)
+	res := <-p.startDial(ctx, key, local, remote, er, noRelay, user)
+	return unpackDial(res)
+}
 
-	type dialResult struct {
-		conn      quic.Connection
-		isRelayed bool
-	}
-	v, err, _ := p.flight.Do(key.String(), func() (any, error) {
+type dialResult struct {
+	conn      quic.Connection
+	isRelayed bool
+}
+
+// startDial runs one dial per key. The dial context is decoupled from the
+// caller: a hang-up must not abort other waiters or be stored as backoff.
+// Callers that only need a bounded wait use DoChan and may return early;
+// the dial still finishes and fills the pool.
+func (p *modeAConnPool) startDial(ctx context.Context, key connPoolKey, local, remote a2al.Address, er *protocol.EndpointRecord, noRelay, user bool) <-chan singleflight.Result {
+	return p.flight.DoChan(key.String(), func() (any, error) {
+		dialCtx, dialCancel := context.WithTimeout(context.WithoutCancel(ctx), connPoolDialTimeout)
 		defer dialCancel()
 		p.log.Debug("connpool: dialing", "local", local.String(), "remote", remote.String(), "no_relay", noRelay, "user", user)
 		conn, isRelayed, dialErr := p.dial(dialCtx, local, remote, er, noRelay, user)
@@ -173,8 +185,8 @@ func (p *modeAConnPool) acquire(ctx context.Context, local, remote a2al.Address,
 			// Only record backoff for genuine network failures on auto paths.
 			// Excluded from the backoff penalty:
 			//   user-initiated: caller is waiting; do not force a 15s wait.
-			//   context.Canceled: our own dialCancel fired after a successful
-			//     sibling, or an upstream cancel — not a network failure.
+			//   context.Canceled: our dial was superseded, or an upstream
+			//     cancel — not a network failure.
 			//   host.ErrControlExchangeIncomplete: QUIC+TLS succeeded (remote
 			//     is reachable) but B→A control exchange failed; the broken
 			//     connection has already been closed. Do not penalise future
@@ -199,15 +211,57 @@ func (p *modeAConnPool) acquire(ctx context.Context, local, remote a2al.Address,
 		p.log.Debug("connpool: connection cached", "key", key.String(), "is_relayed", isRelayed)
 		return dialResult{conn, isRelayed}, nil
 	})
-	if err != nil {
-		// dialCancel may already have been called inside the flight func;
-		// calling it again is a no-op.
-		dialCancel()
+}
+
+func unpackDial(res singleflight.Result) (quic.Connection, bool, error) {
+	if res.Err != nil {
+		return nil, false, res.Err
+	}
+	dr := res.Val.(dialResult)
+	return dr.conn, dr.isRelayed, nil
+}
+
+// acquireRepair is acquire for the caller that just dropped a cached
+// connection. This caller waits at most connPoolRepairWait (and not past
+// its own deadline). The dial keeps the full connPoolDialTimeout.
+func (p *modeAConnPool) acquireRepair(ctx context.Context, local, remote a2al.Address, er *protocol.EndpointRecord, noRelay, user bool) (quic.Connection, bool, error) {
+	if err := ctx.Err(); err != nil {
 		return nil, false, err
 	}
-	dialCancel()
-	dr := v.(dialResult)
-	return dr.conn, dr.isRelayed, nil
+	key := connPoolKey{local, remote, noRelay}
+	if conn, relayed, ok := p.cachedLive(key); ok {
+		return conn, relayed, nil
+	}
+	wait := connPoolRepairWait
+	if dl, ok := ctx.Deadline(); ok {
+		if rem := time.Until(dl); rem < wait {
+			wait = rem
+		}
+	}
+	if wait <= 0 {
+		return nil, false, ctx.Err()
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case res := <-p.startDial(ctx, key, local, remote, er, noRelay, user):
+		return unpackDial(res)
+	case <-timer.C:
+		return nil, false, errConnRepairWait
+	case <-ctx.Done():
+		return nil, false, ctx.Err()
+	}
+}
+
+func (p *modeAConnPool) cachedLive(key connPoolKey) (quic.Connection, bool, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	ent, ok := p.pool[key]
+	if !ok || ent.conn == nil || ent.conn.Context().Err() != nil {
+		return nil, false, false
+	}
+	ent.lastUsed = time.Now()
+	return ent.conn, ent.isRelayed, true
 }
 
 // evictIfFull removes the least-recently-used evictable entry when at capacity.
@@ -344,6 +398,34 @@ func (p *modeAConnPool) invalidate(local, remote a2al.Address, noRelay bool) {
 	if toClose != nil {
 		_ = toClose.CloseWithError(0, "reconnect requested")
 	}
+}
+
+// evictUnheld closes and removes the pool entry whose conn is this object.
+// Matches by connection identity so getLive's noRelay=true/false keys both
+// work. refs>0 (a live tunnel) is left alone. No backoff is written.
+func (p *modeAConnPool) evictUnheld(conn quic.Connection) bool {
+	if p == nil || conn == nil {
+		return false
+	}
+	p.mu.Lock()
+	var key connPoolKey
+	var found *connPoolEntry
+	for k, ent := range p.pool {
+		if ent != nil && ent.conn == conn {
+			key = k
+			found = ent
+			break
+		}
+	}
+	if found == nil || found.refs > 0 {
+		p.mu.Unlock()
+		return false
+	}
+	delete(p.pool, key)
+	p.log.Debug("connpool: evicting unusable connection", "key", key.String())
+	p.mu.Unlock()
+	_ = conn.CloseWithError(0, "reconnect requested")
+	return true
 }
 
 // release decrements the active-user count. When refs reaches zero the

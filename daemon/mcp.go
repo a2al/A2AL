@@ -29,29 +29,51 @@ func (d *Daemon) mcpInstance() *mcp.Server {
 	return d.mcpSrv
 }
 
+// mcpInstructions is the session-initialisation text: the L4 tier of the
+// semantics guideline. It is injected into every session, so it carries only
+// what the tool signatures, defaults and errors cannot — written as decision
+// rules, not field glossaries. Named rather than inlined so that the V1
+// anti-drift check can verify the identifiers it mentions still exist.
+const mcpInstructions = `a2ald is the A2AL peer-to-peer daemon (DHT + QUIC).
+
+Call a2al_status to see current conditions. dht_peers is who is in view — a signal, not a permission to proceed.
+
+Same daemon: group_* and local tools need no wait.
+
+Another machine: try resolve/fetch. If they are not reachable now and you can wait, leave a note. If a call fails and a2ald just started, wait 10–30 seconds and retry. Do not wait for a peer count.
+
+If the public network was intended and after about a minute nothing works, check connectivity. Local-only and private clusters are fine with no public neighbors; agents on this daemon still work.
+
+Publish (a2al_agent_publish) only if other machines must find this AID. Skip it for outbound-only or same-machine use. After publishing, keep a2ald running (records expire after it stops): a2ald service install -user.
+
+MCP: HTTP at this daemon's api_addr (default http://127.0.0.1:2121/mcp/). Stdio (a2ald --mcp-stdio) proxies to a running daemon. A second node needs its own data directory and matching --api.
+
+If they are not reachable now, leave a note (a2al_mailbox_send) — they will have it when they are back. That is not an immediate answer.
+Incoming notes announce themselves — do not go looking when there is no hint:
+  - A successful tool result may include envelope field "pending": {"<aid>": {"mailbox": N, "chat_invites": N, "chat_unread": N, ...}}. mailbox → a2al_mailbox_poll. chat_invites → chat_contacts then chat_accept. chat_unread → chat_read then chat_mark_read. Other keys belong to the app that registered them.
+  - No hint means nothing is waiting.
+  - Group invitations still arrive as ordinary mailbox notes (pending.mailbox). Chat invitations do not: they are pending.chat_invites, never mailbox_poll.
+
+Collaboration Groups (the group_* tools) — the parts you cannot infer from the tool names:
+  - group_list is local unread; use it when you need the Groups on this AID.
+  - group_read's after_seq is per call and not remembered; omit it and you get the oldest entries, not the newest. Page with scanned_to_seq. Reading does not mark read: call group_mark_read when you have dealt with what you read.
+  - group_append commits to your log only. There are no delivery or read receipts — the only evidence that a peer acted is an entry that peer wrote.
+  - group.unread fires once when unread goes 0 to positive; group.appended is your own write, never other people's.
+  - Being invited does not create a replica — call group_join. Pass inviter_aid from the mailbox sender. Each AID's Groups are its own.
+  - group_sync is diagnostic; the conventional path does not need it.
+
+One-to-one chat (the chat_* tools) is not mailbox and not a Group:
+  - Do not use a2al_mailbox_send as chat. Invite with chat_request; send with chat_send.
+  - chat_send to someone not on the list returns not_friends — call chat_request first. If already friends, chat_request resends the invite to heal a stale peer roster. chat_remove drops a friend (both sides); chat_block keeps them blocked.
+  - Invitations: pending.chat_invites / chat.invites / chat_contacts (in_pending). Unread: pending.chat_unread / chat.unread / chat_read, then chat_mark_read. chat.received is for an open thread, not the red-dot.
+`
+
 func buildMCPServer(d *Daemon) *mcp.Server {
 	s := mcp.NewServer(&mcp.Implementation{Name: "a2ald", Title: "A2AL Daemon", Version: "0.1"}, &mcp.ServerOptions{
-		Instructions: `a2ald is the A2AL peer-to-peer daemon (DHT + QUIC).
-
-ALWAYS call a2al_status first and check these fields before any network operation (resolve, discover, fetch, mailbox, connect):
-  - network_ready: true  → DHT is online, safe to proceed.
-  - network_ready: false → daemon just started; DHT connections still initialising (~1–2 min). Poll a2al_status and wait before retrying.
-  - dht_peers: 0         → daemon cannot reach the network; check connectivity or restart a2ald.
-
-When to keep a2ald running persistently:
-  - OUTBOUND-ONLY use (resolve, discover, connect, fetch, mailbox): persistence is NOT required. Start a2ald, wait 60–120 s for network_ready, then use normally. Recommended but optional.
-  - INBOUND / PUBLISHED agent (agent has called a2al_agent_publish): persistence IS REQUIRED. Published endpoint records have a TTL. a2ald automatically renews them while running — if it stops, the records expire and the agent becomes UNREACHABLE within minutes. Never assume "publish once = permanently reachable". The agent is online only as long as a2ald is running.
-
-After publishing an agent, always recommend the user install a2ald as a persistent service:
-  Run: a2ald service install
-  This ensures the agent stays reachable 24/7 without manual intervention.
-
-Two operating modes:
-  - Service mode (recommended): a2ald runs as a persistent system service (Linux: systemd, macOS: launchd, Windows: Task Scheduler/SCM). network_ready is true by the time any AI session starts — network operations are near-instant with no wait. MCP clients connect via HTTP: http://127.0.0.1:2121/mcp/
-  - Stdio mode: a2ald is launched as a subprocess by the MCP client (--mcp-stdio). If a service is already running, a2ald --mcp-stdio automatically proxies to it (no cold-start, no lock conflict). If no service exists, the DHT cold-starts — network_ready will be false for 60–120 seconds.
-
-Install as a service: run 'a2ald service install' or see https://github.com/a2al/a2al/tree/main/deploy`,
+		Instructions: mcpInstructions,
 	})
+
+	s.AddReceivingMiddleware(pendingHitchMiddleware(d))
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_identity_generate",
@@ -91,7 +113,7 @@ Install as a service: run 'a2ald service install' or see https://github.com/a2al
 	}, d.mcpAgentProbe)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_agent_patch",
-		Description: "Update a registered agent's service_tcp address (e.g. after the local HTTP service moves to a different port). Pass an empty string to stop exposing a local service.",
+		Description: "Update a registered agent's service_tcp (host:port of this agent's own HTTP, never the daemon api_addr). Empty string stops exposing a local service. After a non-empty bind you are callable: give other agents this AID and tell them to a2al_fetch (they add their own API path) or GET/POST http://<their a2ald>/aid/<AID>/<path>. If they cannot reach you now and can wait, a2al_mailbox_send — that is not an HTTP reply.",
 	}, d.mcpAgentPatch)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_agent_publish",
@@ -99,7 +121,7 @@ Install as a service: run 'a2ald service install' or see https://github.com/a2al
 	}, d.mcpAgentPublish)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_agent_heartbeat",
-		Description: "Keep a registered agent visible on the Tangled Network when it has no direct service address. Call periodically to prevent the agent from expiring off the network.",
+		Description: "Diagnostics only — the conventional path does not need this. Any MCP or REST call that acts as a registered local agent already records liveness. Use this only when you must refresh liveness without doing other work.",
 	}, d.mcpAgentHeartbeat)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_agent_delete",
@@ -107,7 +129,7 @@ Install as a service: run 'a2ald service install' or see https://github.com/a2al
 	}, d.mcpAgentDelete)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_status",
-		Description: "Return the daemon's current status: this node's AID, whether auto-publish is enabled, and the last/next publish times.",
+		Description: "Return daemon status. dht_peers is who is currently in view (a signal, not a go/no-go). Do not treat network_ready as proof others can find you, or as a gate on calling others.",
 	}, d.mcpStatus)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_agent_publish_record",
@@ -127,11 +149,11 @@ Install as a service: run 'a2ald service install' or see https://github.com/a2al
 	}, d.mcpConnect)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_mailbox_send",
-		Description: "Send an encrypted message to any agent by AID, even if they are currently offline. The message is stored on the Tangled Network until the recipient retrieves it.",
+		Description: "Leave a note for an agent by AID when they are not reachable now. They will have it when they are back. This is not an immediate answer.",
 	}, d.mcpMailboxSend)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_mailbox_poll",
-		Description: "Check for and decrypt any incoming messages for a local registered agent.",
+		Description: "Collect notes waiting for a local registered agent. Call this when a successful result told you a note is waiting; do not poll when there is no hint.",
 	}, d.mcpMailboxPoll)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_service_register",
@@ -147,7 +169,7 @@ Install as a service: run 'a2ald service install' or see https://github.com/a2al
 	}, d.mcpDiscover)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_fetch",
-		Description: "Send an HTTP request to a remote agent over the Tangled Network. End-to-end encrypted via QUIC; no ports are exposed. Returns {status, headers, body}. The remote agent must have a service_tcp registered; if it is offline or unreachable, the request fails — use a2al_mailbox_send as an async fallback (note: mailbox is fire-and-forget, not an HTTP response).",
+		Description: "Send an HTTP request to a remote agent over the Tangled Network. End-to-end encrypted via QUIC; no ports are exposed. Returns {status, headers, body}. The remote agent must have a service_tcp registered; if they are not reachable now, the request fails — leave a note with a2al_mailbox_send if you can wait (that is not an HTTP response).",
 	}, d.mcpFetch)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_tunnel_open",
@@ -162,7 +184,63 @@ Install as a service: run 'a2ald service install' or see https://github.com/a2al
 		Description: "List all currently open multiplexed tunnels, including their local listen address, remote agent, active connection count, and idle time.",
 	}, d.mcpTunnelList)
 
+	mcp.AddTool(s, &mcp.Tool{
+		Name: "a2al_events_poll",
+		Description: `Return queued daemon events for a local agent since a given sequence number. The types are exactly: mailbox.received, group.appended (your own write), group.unread (edge-triggered, 0 to positive only), group.mentioned (one per entry naming you), chat.invites, chat.unread (edge-triggered per peer, 0 to positive), chat.received.
+Use last_seq from each response as after_seq on the next call. If truncated is true the cursor is too old — reset after_seq to 0 and do a full resync. For real-time delivery use GET /agents/{aid}/events (omit last_event_id for live frames; pass last_event_id=N to replay from that id). On connect that stream may first send event: pending with no id — same {"<aid>":{"mailbox":N,...}} shape as a tool result; it is local inventory, not a log event. mailbox → a2al_mailbox_poll; other keys belong to the app that registered them.
+Events are droppable doorbells, not the record: an event you missed is not recoverable from here, so treat the Group log, the chat log, and the mailbox as the source of truth and use group_list / chat_contacts / a2al_mailbox_poll to find out what you actually have.`,
+	}, d.mcpEventsPoll)
+
+	d.registerGroupMCPTools(s)
+	d.registerChatMCPTools(s)
+
 	return s
+}
+
+// pendingHitchMiddleware attaches the local pending snapshot to every
+// successful tools/call result — the interface-layer counterpart of the DHT
+// hitchhike: the caller is told what is waiting for it on a reply it was going
+// to receive anyway, so there is no "check for mail" step it can forget.
+//
+// It sits in middleware rather than in the result builders because there is no
+// single builder: group_mcp.go funnels through mcpOK, but mcp.go constructs
+// CallToolResultFor values inline in ~28 places. One middleware covers both, and
+// covers stdio and HTTP alike since both modes go through buildMCPServer.
+//
+// MCP is the only surface that gets this on every reply, because it is the only
+// one without an event loop — a turn-based agent cannot be woken by an event, so
+// the reply is the only channel. HTTP/CLI hitch the same snapshot on overview
+// endpoints and as an event: pending SSE envelope on subscribe (see routes.go).
+//
+// Known SDK coupling: AddTool infers an OutputSchema from map[string]any, and
+// v0.2.0 does not yet validate StructuredContent against it. If a later SDK
+// starts validating, re-check that an extra key is still permitted.
+func pendingHitchMiddleware(d *Daemon) mcp.Middleware[*mcp.ServerSession] {
+	return func(next mcp.MethodHandler[*mcp.ServerSession]) mcp.MethodHandler[*mcp.ServerSession] {
+		return func(ctx context.Context, ss *mcp.ServerSession, method string, params mcp.Params) (mcp.Result, error) {
+			res, err := next(ctx, ss, method, params)
+			if err != nil || method != "tools/call" {
+				return res, err
+			}
+			ctr, ok := res.(*mcp.CallToolResult)
+			if !ok || ctr.IsError {
+				// A failed call must not carry unrelated state.
+				return res, err
+			}
+			m, ok := ctr.StructuredContent.(map[string]any)
+			if !ok {
+				return res, err
+			}
+			if _, taken := m["pending"]; taken {
+				// A tool's own field always wins; never shadow business data.
+				return res, err
+			}
+			if p := d.pendingSnapshot(ctx, ss); len(p) > 0 {
+				m["pending"] = p
+			}
+			return res, err
+		}
+	}
 }
 
 func (d *Daemon) mcpIdentityGenerate(ctx context.Context, _ *mcp.ServerSession, _ *mcp.CallToolParamsFor[struct{}]) (*mcp.CallToolResultFor[map[string]any], error) {
@@ -420,10 +498,11 @@ func (d *Daemon) mcpMailboxSend(ctx context.Context, _ *mcp.ServerSession, param
 	}
 	sctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
-	if err := d.execMailboxSend(sctx, params.Arguments.AID, params.Arguments.Recipient, params.Arguments.MsgType, raw); err != nil {
+	msgID, err := d.execMailboxSend(sctx, params.Arguments.AID, params.Arguments.Recipient, params.Arguments.MsgType, raw)
+	if err != nil {
 		return nil, err
 	}
-	return &mcp.CallToolResultFor[map[string]any]{StructuredContent: map[string]any{"ok": true}}, nil
+	return &mcp.CallToolResultFor[map[string]any]{StructuredContent: map[string]any{"ok": true, "message_id": msgID}}, nil
 }
 
 func (d *Daemon) mcpMailboxPoll(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[mcpAIDArgs]) (*mcp.CallToolResultFor[map[string]any], error) {
@@ -535,9 +614,9 @@ func (d *Daemon) mcpFetch(ctx context.Context, _ *mcp.ServerSession, params *mcp
 	if err != nil {
 		switch {
 		case errors.Is(err, errResolve):
-			return nil, errors.New("resolve failed: remote agent not found on the network — try a2al_discover to search by capability, or a2al_mailbox_send for deferred delivery")
+			return nil, errors.New("resolve failed: remote agent not found on the network — try a2al_discover to search by capability, or leave a note with a2al_mailbox_send if you can wait")
 		case errors.Is(err, errConnectQUIC):
-			return nil, errors.New("connect failed: remote agent is unreachable right now — try a2al_mailbox_send for deferred async delivery")
+			return nil, errors.New("connect failed: remote agent is not reachable now — leave a note with a2al_mailbox_send if you can wait")
 		case isAccessDeniedErr(err):
 			return nil, protocol.ErrAccessDenied
 		default:
@@ -609,4 +688,45 @@ func (d *Daemon) mcpTunnelList(_ context.Context, _ *mcp.ServerSession, _ *mcp.C
 		items[i] = m
 	}
 	return &mcp.CallToolResultFor[map[string]any]{StructuredContent: map[string]any{"tunnels": items}}, nil
+}
+
+// ── a2al_events_poll ─────────────────────────────────────────────────────────
+
+type mcpEventsPollArgs struct {
+	AID      string `json:"aid"`
+	AfterSeq uint64 `json:"after_seq"` // events with seq > AfterSeq; 0 = from the start of the buffer
+}
+
+func (d *Daemon) mcpEventsPoll(_ context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[mcpEventsPollArgs]) (*mcp.CallToolResultFor[map[string]any], error) {
+	aid, err := a2al.ParseAddress(params.Arguments.AID)
+	if err != nil {
+		return nil, errors.New("bad aid")
+	}
+	d.noteActingAgent(aid)
+
+	events, oldestSeq, truncated := d.evtLog.Since(aid, params.Arguments.AfterSeq)
+
+	// Compute last_seq: highest seq returned, or AfterSeq if nothing new.
+	lastSeq := params.Arguments.AfterSeq
+	items := make([]any, 0, len(events))
+	for _, le := range events {
+		items = append(items, map[string]any{
+			"seq":  le.Seq,
+			"type": le.Type,
+			"ts":   le.Ts,
+			"data": le.Data,
+		})
+		if le.Seq > lastSeq {
+			lastSeq = le.Seq
+		}
+	}
+
+	return &mcp.CallToolResultFor[map[string]any]{
+		StructuredContent: map[string]any{
+			"events":     items,
+			"last_seq":   lastSeq,
+			"oldest_seq": oldestSeq,
+			"truncated":  truncated,
+		},
+	}, nil
 }

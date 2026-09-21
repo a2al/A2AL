@@ -19,6 +19,7 @@ import (
 	"github.com/a2al/a2al"
 	"github.com/a2al/a2al/config"
 	"github.com/a2al/a2al/host"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 func (d *Daemon) routes() http.Handler {
@@ -38,6 +39,18 @@ func (d *Daemon) routes() http.Handler {
 	mux.HandleFunc("POST /agents/paralism/proof", d.handleParalismProof)
 	mux.HandleFunc("GET /agents", d.handleAgentsList)
 	mux.HandleFunc("GET /agents/{aid}", d.handleAgentsGet)
+	mux.HandleFunc("GET /agents/{aid}/groups", d.handleGroupInspectList)
+	mux.HandleFunc("GET /agents/{aid}/groups/{group_id}", d.handleGroupInspectHead)
+	mux.HandleFunc("GET /agents/{aid}/groups/{group_id}/entries", d.handleGroupInspectEntries)
+	mux.HandleFunc("GET /agents/{aid}/chat/contacts", d.handleChatInspectContacts)
+	mux.HandleFunc("GET /agents/{aid}/chat/peers/{peer}", d.handleChatInspectLog)
+	mux.HandleFunc("POST /agents/{aid}/chat/request", d.withAgentMiddleware(d.handleChatRequest))
+	mux.HandleFunc("POST /agents/{aid}/chat/accept", d.withAgentMiddleware(d.handleChatAccept))
+	mux.HandleFunc("POST /agents/{aid}/chat/refuse", d.withAgentMiddleware(d.handleChatRefuse))
+	mux.HandleFunc("POST /agents/{aid}/chat/remove", d.withAgentMiddleware(d.handleChatRemove))
+	mux.HandleFunc("POST /agents/{aid}/chat/block", d.withAgentMiddleware(d.handleChatBlock))
+	mux.HandleFunc("POST /agents/{aid}/chat/send", d.withAgentMiddleware(d.handleChatSend))
+	mux.HandleFunc("POST /agents/{aid}/chat/mark-read", d.withAgentMiddleware(d.handleChatMarkRead))
 	mux.HandleFunc("GET /agents/{aid}/probe", d.handleAgentsProbe)
 	mux.HandleFunc("PATCH /agents/{aid}", d.withAgentMiddleware(d.handleAgentsPatch))
 	mux.HandleFunc("POST /agents/{aid}/heartbeat", d.withAgentMiddleware(d.handleAgentHeartbeat))
@@ -68,10 +81,12 @@ func (d *Daemon) routes() http.Handler {
 	mux.HandleFunc("GET /tunnel/{id}", d.handleTunnelGet)
 	mux.Handle("/debug/", d.h.DebugHTTPHandler())
 	mux.Handle("/mcp/", d.mcpHTTPHandler())
+	mux.HandleFunc("POST /mcp/call", d.handleMCPCall)
 	mux.HandleFunc("POST /demo/start", d.handleDemoStart)
 	mux.HandleFunc("POST /demo/stop", d.handleDemoStop)
 	mux.HandleFunc("GET /sessions/{port}", d.handleGetSession)
 	mux.HandleFunc("GET /agents/{aid}/events", d.withAgentMiddleware(d.handleAgentEvents))
+	mux.HandleFunc("POST /agents/{aid}/cas", d.withAgentMiddleware(d.handleAgentCASUpload))
 	mux.HandleFunc("GET /events", d.handleGlobalEvents)
 	mux.HandleFunc("GET /update/status", d.handleUpdateStatus)
 	mux.HandleFunc("POST /update/apply", d.handleUpdateApply)
@@ -94,6 +109,24 @@ func (d *Daemon) routes() http.Handler {
 	return outer
 }
 
+// isDataPlaneRoute reports whether r targets a local endpoint that carries raw
+// bytes rather than control-plane JSON. Kept as an explicit allowlist so that
+// exempting a route from the body cap is a deliberate act, visible next to the
+// guards it skips.
+//
+// Currently the only member is object upload: POST /agents/{aid}/cas.
+func isDataPlaneRoute(r *http.Request) bool {
+	if r.Method != http.MethodPost {
+		return false
+	}
+	rest, ok := strings.CutPrefix(r.URL.Path, "/agents/")
+	if !ok {
+		return false
+	}
+	aid, tail, found := strings.Cut(rest, "/")
+	return found && aid != "" && tail == "cas"
+}
+
 // withAgentMiddleware wraps agent-specific handlers with:
 //  1. (Future) per-agent token verification via X-Agent-Token header.
 //     When the registry entry carries a token (not yet issued), it will be
@@ -104,7 +137,10 @@ func (d *Daemon) routes() http.Handler {
 //
 // The hook point for per-agent auth is intentionally isolated here so that
 // future implementations only need to fill in step 1 without touching
-// individual handler functions.
+// individual handler functions. Filling it also gates what these routes may
+// disclose about an identity — including the pending-mail count on
+// GET /agents/{aid} — because the whole resource becomes unreachable to a
+// caller not authorised for that AID.
 func (d *Daemon) withAgentMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		aid, err := a2al.ParseAddress(r.PathValue("aid"))
@@ -138,7 +174,17 @@ func (d *Daemon) withAgentMiddleware(next http.HandlerFunc) http.HandlerFunc {
 func (d *Daemon) withMiddleware(next http.Handler) http.Handler {
 	const maxRequestBody = 1 << 20 // 1 MiB
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
+		// The body cap and the JSON content-type rule below are control-plane
+		// guards: they keep a JSON endpoint from being used to make the daemon
+		// buffer arbitrary memory. Data-plane routes carry raw object bytes and
+		// stream them straight to disk, so neither guard applies — an object's
+		// size is bounded by the sandbox's disk, not by a limit meant for
+		// request JSON. Auth and the Host check stay on every route: there is
+		// still exactly one place that decides who may call the local API.
+		streaming := isDataPlaneRoute(r)
+		if !streaming {
+			r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
+		}
 
 		// Auth model:
 		//   - No api_token configured  → fully open (local + remote).
@@ -164,8 +210,9 @@ func (d *Daemon) withMiddleware(next http.Handler) http.Handler {
 				return
 			}
 		}
-		switch r.Method {
-		case http.MethodGet, http.MethodHead, http.MethodOptions:
+		switch {
+		case streaming:
+		case r.Method == http.MethodGet, r.Method == http.MethodHead, r.Method == http.MethodOptions:
 		default:
 			ct := r.Header.Get("Content-Type")
 			if !strings.HasPrefix(ct, "application/json") {
@@ -227,7 +274,9 @@ func (d *Daemon) handleHealth(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (d *Daemon) handleStatus(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, d.execStatus())
+	out := d.execStatus()
+	addPendingHitch(out, d.pendingSnapshot(context.Background(), nil))
+	writeJSON(w, out)
 }
 
 func (d *Daemon) handleAgentHeartbeat(w http.ResponseWriter, r *http.Request) {
@@ -658,7 +707,26 @@ func (d *Daemon) handleAgentsPost(w http.ResponseWriter, r *http.Request) {
 }
 
 func (d *Daemon) handleAgentsList(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, map[string]any{"agents": d.execAgentsList()})
+	out := map[string]any{"agents": d.execAgentsList()}
+	addPendingHitch(out, d.pendingSnapshot(context.Background(), nil))
+	writeJSON(w, out)
+}
+
+// addPendingHitch puts a pending-mail snapshot on a response, leaving any field
+// the handler already produced untouched.
+//
+// Scope is the caller's choice, and it follows the endpoint: the overview
+// endpoints pass every visible identity, GET /agents/{aid} passes only the
+// identity it is about. The rendered shape is the same either way, so a client
+// parses "pending" identically wherever it appears.
+func addPendingHitch(out map[string]any, pending map[string]any) {
+	if len(pending) == 0 {
+		return
+	}
+	if _, taken := out["pending"]; taken {
+		return
+	}
+	out["pending"] = pending
 }
 
 func (d *Daemon) handleAgentsGet(w http.ResponseWriter, r *http.Request) {
@@ -672,6 +740,9 @@ func (d *Daemon) handleAgentsGet(w http.ResponseWriter, r *http.Request) {
 		}
 		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
 		return
+	}
+	if aid, perr := a2al.ParseAddress(r.PathValue("aid")); perr == nil {
+		addPendingHitch(out, d.pendingFor(aid))
 	}
 	writeJSON(w, out)
 }
@@ -812,7 +883,8 @@ func (d *Daemon) handleAgentsMailboxSend(w http.ResponseWriter, r *http.Request)
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
-	if err := d.execMailboxSend(ctx, r.PathValue("aid"), req.Recipient, req.MsgType, body); err != nil {
+	msgID, err := d.execMailboxSend(ctx, r.PathValue("aid"), req.Recipient, req.MsgType, body)
+	if err != nil {
 		switch {
 		case errors.Is(err, errBadAID):
 			http.Error(w, `{"error":"bad aid"}`, http.StatusBadRequest)
@@ -823,7 +895,7 @@ func (d *Daemon) handleAgentsMailboxSend(w http.ResponseWriter, r *http.Request)
 		}
 		return
 	}
-	writeJSON(w, map[string]bool{"ok": true})
+	writeJSON(w, map[string]any{"ok": true, "message_id": msgID})
 }
 
 func (d *Daemon) handleAgentsMailboxPoll(w http.ResponseWriter, r *http.Request) {
@@ -1194,7 +1266,15 @@ func mustParseAddress(s string) a2al.Address {
 }
 
 // handleAgentEvents streams SSE events for a specific agent AID.
-// Accepts optional ?types=mailbox.received,... query param to filter event types.
+//
+// Query params:
+//   - types=mailbox.received,...  — filter by EventLog type (empty = all)
+//   - last_event_id=N             — replay missed events with seq > N before live stream
+//
+// W3C Last-Event-ID header is also honoured on reconnect (browser EventSource
+// sends it automatically). Logged frames carry id: <seq>; the optional first
+// event: pending envelope and keepalive comments do not, so they never move
+// the resume cursor. types= filters the log only — pending still goes out.
 func (d *Daemon) handleAgentEvents(w http.ResponseWriter, r *http.Request) {
 	aidStr := r.PathValue("aid")
 	aid, err := a2al.ParseAddress(aidStr)
@@ -1203,28 +1283,67 @@ func (d *Daemon) handleAgentEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	types := parseTypesParam(r.URL.Query().Get("types"))
-	ch, cancel := d.bus.Subscribe(Filter{AID: aid, Types: types})
-	defer cancel()
 
+	// Determine the replay cursor: prefer Last-Event-ID (browser reconnect),
+	// then ?last_event_id=, then 0 (stream from live only).
+	afterSeq := parseAfterSeq(r.Header.Get("Last-Event-ID"))
+	if afterSeq == 0 {
+		afterSeq = parseAfterSeq(r.URL.Query().Get("last_event_id"))
+	}
+
+	// SSE live stream is driven by EventLog.Watch, not EventBus, to eliminate
+	// the race between the EventBus→EventLog mirror goroutine and the SSE
+	// subscriber receiving the same event before it has been written to the log.
+	// The types filter is applied server-side when pulling from EventLog.Since.
 	if d.subMgr != nil {
 		d.subMgr.Acquire(aid)
 		defer d.subMgr.Release(aid)
 	}
 
-	serveSSE(w, r, ch)
+	serveSSEWithReplay(w, r, aid, afterSeq, types, d.evtLog, d.pendingFor(aid))
 }
 
 // handleGlobalEvents streams SSE events for all agents (CLI-friendly, loopback-only in practice).
-// Accepts optional ?types=... query param to filter event types.
+// Accepts optional ?types=... to filter EventLog types. An event: pending
+// envelope may precede the live stream (same shape as GET /status); it is not
+// an EventLog entry and is not filtered by types=.
 func (d *Daemon) handleGlobalEvents(w http.ResponseWriter, r *http.Request) {
 	types := parseTypesParam(r.URL.Query().Get("types"))
 	ch, cancel := d.bus.Subscribe(Filter{Types: types})
 	defer cancel()
-	serveSSE(w, r, ch)
+	serveSSE(w, r, ch, d.pendingSnapshot(r.Context(), nil))
 }
 
-// serveSSE writes W3C SSE headers and streams events from ch until the client disconnects.
-func serveSSE(w http.ResponseWriter, r *http.Request, ch <-chan Event) {
+// parseAfterSeq parses a cursor string into a uint64; returns 0 on error.
+func parseAfterSeq(s string) uint64 {
+	if s == "" {
+		return 0
+	}
+	var n uint64
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return 0
+		}
+		n = n*10 + uint64(c-'0')
+	}
+	return n
+}
+
+// sseLiveKeepaliveInterval is the interval at which a comment heartbeat is sent
+// on idle SSE connections. Keeps proxies alive and lets clients self-detect dead
+// connections without waiting for a TCP timeout.
+const sseLiveKeepaliveInterval = 15 * time.Second
+
+// serveSSEWithReplay writes W3C SSE headers, optionally an event: pending
+// envelope (local inventory, no id:), replays buffered events with seq >
+// afterSeq, then live-streams from EventLog.Watch so logged frames carry
+// id: <seq>.
+//
+// Using EventLog.Watch instead of an EventBus channel eliminates the race where
+// the SSE goroutine receives a bus event before the mirror goroutine has written
+// it to the log (making seq unavailable). The mirror goroutine writes to the log
+// first; Watch is notified after the append completes.
+func serveSSEWithReplay(w http.ResponseWriter, r *http.Request, aid a2al.Address, afterSeq uint64, types []string, evtLog *EventLog, pending map[string]any) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -1235,6 +1354,128 @@ func serveSSE(w http.ResponseWriter, r *http.Request, ch <-chan Event) {
 	if !ok {
 		return
 	}
+
+	ctx := r.Context()
+
+	// W3C SSE: instruct clients to reconnect after 3 s on disconnect.
+	fmt.Fprintf(w, "retry: 3000\n\n")
+	fl.Flush()
+
+	// Register a watcher BEFORE replay to avoid missing events that arrive
+	// between the replay scan and the live-loop start.
+	watchCh, unwatch := evtLog.Watch(aid)
+	defer unwatch()
+
+	// Hitch the local inventory onto this subscribe. Envelope, not an EventLog
+	// entry: no id:, so Last-Event-ID is unchanged and reconnect still sees
+	// the current count until mailbox_poll consumes it.
+	if writePendingSSE(w, pending) {
+		fl.Flush()
+	}
+
+	// Replay buffered events (seq > afterSeq).
+	lastSentSeq := afterSeq
+	if afterSeq > 0 {
+		missed, oldest, truncated := evtLog.Since(aid, afterSeq)
+		if truncated {
+			// Cursor is too old; client should do a full resync.
+			fmt.Fprintf(w, "event: log.truncated\ndata: {\"oldest_seq\":%d}\n\n", oldest)
+			fl.Flush()
+		}
+		for _, le := range missed {
+			if matchesTypes(le.Type, types) {
+				writeLoggedEventSSE(w, le)
+			}
+			lastSentSeq = le.Seq
+		}
+		fl.Flush()
+	}
+
+	// Live stream driven by EventLog.Watch.
+	keepalive := time.NewTicker(sseLiveKeepaliveInterval)
+	defer keepalive.Stop()
+
+	sendNew := func() {
+		events, _, _ := evtLog.Since(aid, lastSentSeq)
+		for _, le := range events {
+			if matchesTypes(le.Type, types) {
+				writeLoggedEventSSE(w, le)
+			}
+			lastSentSeq = le.Seq
+		}
+		fl.Flush()
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-watchCh:
+			sendNew()
+		case <-keepalive.C:
+			// W3C SSE comment — passes through proxies without triggering event handlers.
+			fmt.Fprintf(w, ": keepalive\n\n")
+			fl.Flush()
+		}
+	}
+}
+
+// matchesTypes reports whether evtType matches the filter list.
+// An empty filter list means "all types".
+func matchesTypes(evtType string, types []string) bool {
+	if len(types) == 0 {
+		return true
+	}
+	for _, t := range types {
+		if t == evtType {
+			return true
+		}
+	}
+	return false
+}
+
+// writePendingSSE writes the local pending snapshot as an SSE envelope frame.
+// No id: — this is not a log event and must not move Last-Event-ID.
+// Returns whether a frame was written.
+func writePendingSSE(w http.ResponseWriter, pending map[string]any) bool {
+	if len(pending) == 0 {
+		return false
+	}
+	payload, err := json.Marshal(pending)
+	if err != nil {
+		return false
+	}
+	fmt.Fprintf(w, "event: pending\ndata: %s\n\n", payload)
+	return true
+}
+
+// writeLoggedEventSSE writes a single replayed LoggedEvent as an SSE frame with id:.
+func writeLoggedEventSSE(w http.ResponseWriter, le LoggedEvent) {
+	payload, err := json.Marshal(map[string]any{
+		"type": le.Type,
+		"at":   time.UnixMilli(le.Ts).UTC().Format(time.RFC3339), // RFC 3339: W3C SSE convention
+		"data": le.Data,
+	})
+	if err != nil {
+		return
+	}
+	fmt.Fprintf(w, "id: %d\nevent: %s\ndata: %s\n\n", le.Seq, le.Type, payload)
+}
+
+// serveSSE writes W3C SSE headers, optionally an event: pending envelope
+// (no id:), then streams live bus events from ch until the client disconnects.
+func serveSSE(w http.ResponseWriter, r *http.Request, ch <-chan Event, pending map[string]any) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+
+	fl, ok := w.(http.Flusher)
+	if !ok {
+		return
+	}
+	writePendingSSE(w, pending)
 	fl.Flush()
 
 	enc := json.NewEncoder(w)
@@ -1261,7 +1502,7 @@ func serveSSE(w http.ResponseWriter, r *http.Request, ch <-chan Event) {
 func sseEventJSON(evt Event) ([]byte, error) {
 	payload := map[string]any{
 		"type": evt.Type,
-		"at":   evt.At.UTC().Format(time.RFC3339),
+		"at":   evt.At.UTC().Format(time.RFC3339), // RFC 3339: W3C SSE / CloudEvents convention
 	}
 	if evt.AID != (a2al.Address{}) {
 		payload["aid"] = evt.AID.String()
@@ -1309,4 +1550,76 @@ func parseTypesParam(s string) []string {
 		}
 	}
 	return out
+}
+
+// mcpLocalSession returns (or lazily creates) a persistent in-process
+// ClientSession backed by the daemon's own MCP server. Used by handleMCPCall.
+func (d *Daemon) mcpLocalSession() *mcp.ClientSession {
+	d.mcpLocalOnce.Do(func() {
+		ct, st := mcp.NewInMemoryTransports()
+		srv := d.mcpInstance()
+		// Run server side in background; it lives for the process lifetime.
+		go func() { _ = srv.Run(context.Background(), st) }()
+		c := mcp.NewClient(&mcp.Implementation{Name: "a2al-cli-bridge", Version: "0"}, nil)
+		cs, err := c.Connect(context.Background(), ct)
+		if err != nil {
+			d.log.Error("mcp local session init failed", "err", err)
+			return
+		}
+		d.mcpLocalSess = cs
+	})
+	return d.mcpLocalSess
+}
+
+// handleMCPCall handles POST /mcp/call — a thin REST shim that lets the CLI
+// invoke any registered MCP tool without speaking the MCP protocol directly.
+//
+// Request body:  {"tool": "<name>", "args": {…}}
+// Response 200:  the tool's structured result as JSON
+// Response 422:  {"error": "<tool error text>"} when IsError is true
+func (d *Daemon) handleMCPCall(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Tool string         `json:"tool"`
+		Args map[string]any `json:"args"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONStatus(w, http.StatusBadRequest, map[string]string{"error": "invalid request body: " + err.Error()})
+		return
+	}
+	if req.Tool == "" {
+		writeJSONStatus(w, http.StatusBadRequest, map[string]string{"error": "tool name is required"})
+		return
+	}
+	cs := d.mcpLocalSession()
+	if cs == nil {
+		writeJSONStatus(w, http.StatusInternalServerError, map[string]string{"error": "mcp local session not available"})
+		return
+	}
+	result, err := cs.CallTool(r.Context(), &mcp.CallToolParams{
+		Name:      req.Tool,
+		Arguments: req.Args,
+	})
+	if err != nil {
+		// Protocol-level error (tool not found, etc.)
+		writeJSONStatus(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	if result.IsError {
+		// Tool returned a business-logic error; extract text from Content[].
+		msg := "tool returned an error"
+		for _, c := range result.Content {
+			if b, jerr := c.MarshalJSON(); jerr == nil {
+				var tc struct {
+					Text string `json:"text"`
+				}
+				if jerr2 := json.Unmarshal(b, &tc); jerr2 == nil && tc.Text != "" {
+					msg = tc.Text
+					break
+				}
+			}
+		}
+		writeJSONStatus(w, http.StatusUnprocessableEntity, map[string]string{"error": msg})
+		return
+	}
+	writeJSON(w, result.StructuredContent)
 }

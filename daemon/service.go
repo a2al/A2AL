@@ -12,6 +12,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"net"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -193,6 +195,7 @@ func (d *Daemon) persistDelegatedAgent(aid a2al.Address, opPriv ed25519.PrivateK
 		return errPersist
 	}
 	d.bumpIceRegistry()
+	d.syncLocalReceiveKeysLocked()
 	return nil
 }
 
@@ -463,6 +466,9 @@ func (d *Daemon) execAgentRegister(req registerAgentReq) (a2al.Address, error) {
 	if err := d.persistDelegatedAgent(aid, opPriv, proofRaw, req.ServiceTCP); err != nil {
 		return a2al.Address{}, err
 	}
+	// Registration is itself a liveness signal: the agent is announcing that
+	// it exists and wants to be reachable. Catch its groups up.
+	go d.alignAID(context.Background(), aid)
 	return aid, nil
 }
 
@@ -655,6 +661,7 @@ func (d *Daemon) execAgentPublish(ctx context.Context, aidStr string) (uint64, e
 	if e == nil {
 		return 0, errNotFound
 	}
+	d.touchHeartbeat(aid)
 	// Warn when service_tcp is set but unreachable; still allow publish for agents with their own public URL.
 	if e.ServiceTCP != "" && !probeTCP(e.ServiceTCP, 2*time.Second) {
 		d.log.Warn("service_tcp unreachable at publish time; daemon gateway forwarding will not work", "aid", aid.String(), "service_tcp", e.ServiceTCP)
@@ -714,16 +721,41 @@ persist:
 	return nextSeq, nil
 }
 
-// touchHeartbeat records agent liveness for auto-republish (middleware + explicit heartbeat).
-// If the agent's last publish is stale or unknown (e.g. after daemon restart), an immediate
-// background republish is triggered so services recover without waiting for the 30-min tick.
+// noteActingAgent records liveness when aid is a registered local agent.
+// Unregistered addresses, including the node identity, are ignored.
+// Must not be called while holding d.regMu.
+func (d *Daemon) noteActingAgent(aid a2al.Address) {
+	if d.reg == nil {
+		return
+	}
+	d.regMu.RLock()
+	e := d.reg.Get(aid)
+	d.regMu.RUnlock()
+	if e == nil {
+		return
+	}
+	d.touchHeartbeat(aid)
+}
+
+// touchHeartbeat records agent liveness for auto-republish (middleware, MCP acting
+// calls, and explicit heartbeat). If the agent's last publish is stale or unknown
+// (e.g. after daemon restart), an immediate background republish is triggered so
+// services recover without waiting for the 30-min tick.
 func (d *Daemon) touchHeartbeat(aid a2al.Address) {
 	d.heartbeatMu.Lock()
 	if d.heartbeatAt == nil {
 		d.heartbeatAt = make(map[a2al.Address]time.Time)
 	}
+	prev, had := d.heartbeatAt[aid]
 	d.heartbeatAt[aid] = time.Now()
 	d.heartbeatMu.Unlock()
+
+	// Dead → alive edge: this AID's agent just came back (first contact, a
+	// lapsed heartbeat, or the zero sentinel set when it was forcibly marked
+	// inactive). Align the groups it already has; nobody else will tell it to.
+	if !had || prev.IsZero() || time.Since(prev) > heartbeatTTL {
+		go d.alignAID(context.Background(), aid)
+	}
 
 	d.publishMetaMu.Lock()
 	lastPub := d.agentLastPublish[aid]
@@ -810,7 +842,44 @@ func (d *Daemon) execStatus() map[string]any {
 	out["tunnel_bytes_up_total"] = totalUp
 	out["tunnel_bytes_down_total"] = totalDown
 
+	// Storage layout. data_dir tells operators where replicas and keys live
+	// (needed to clear group state between test rounds); files_root reports
+	// whether object registration is sandboxed, and whether that sandbox is
+	// actually usable — a configured-but-missing directory is the difference
+	// between "file sharing works" and "every put fails".
+	out["data_dir"] = d.dataDir
+	root := strings.TrimSpace(d.cfg.FilesRoot)
+	out["files_root"] = root
+	out["files_root_ready"] = filesRootReady(root)
+
 	return out
+}
+
+// filesRootReady reports whether an object sandbox is configured AND usable:
+// the path resolves, exists, is a directory, and accepts a write. Unconfigured
+// returns false — callers distinguish the two cases via the files_root value.
+func filesRootReady(root string) bool {
+	if root == "" {
+		return false
+	}
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return false
+	}
+	st, err := os.Stat(abs)
+	if err != nil || !st.IsDir() {
+		return false
+	}
+	// Permission bits lie on Windows and under systemd ProtectSystem; the only
+	// honest check is to write.
+	probe, err := os.CreateTemp(abs, ".probe-*")
+	if err != nil {
+		return false
+	}
+	name := probe.Name()
+	_ = probe.Close()
+	_ = os.Remove(name)
+	return true
 }
 
 func (d *Daemon) execAgentDelete(aidStr string) error {
@@ -836,6 +905,7 @@ func (d *Daemon) execAgentDelete(aidStr string) error {
 	// Stop background replication probing for this agent's records.
 	d.h.Node().RemoveRepSetsForPublisher(a2al.NodeIDFromAddress(aid))
 	d.bumpIceRegistry()
+	d.syncLocalReceiveKeysLocked()
 	return nil
 }
 
@@ -850,6 +920,7 @@ func (d *Daemon) execAgentPatch(aidStr string, req patchAgentReq) error {
 	if e == nil {
 		return errNotFound
 	}
+	d.touchHeartbeat(aid)
 	// If the caller supplies operational_private_key_hex, verify it matches the
 	// stored key. Omitting it is allowed for the local Web UI which does not
 	// persist private keys; the daemon is already localhost-only.
@@ -936,6 +1007,7 @@ func (d *Daemon) execConnect(ctx context.Context, remoteAidStr string, body conn
 	if err != nil {
 		return connectResult{}, err
 	}
+	d.noteActingAgent(local)
 	er, contacted, err := d.resolveTracked(ctx, remote)
 	if err != nil {
 		if d.beacon != nil && d.beaconShouldFallbackForResolve(err, contacted) {
@@ -963,7 +1035,7 @@ func (d *Daemon) execConnect(ctx context.Context, remoteAidStr string, body conn
 		}
 		return connectResult{}, errConnectQUIC
 	}
-	allowed, err := d.probeServiceAdmission(ctx, qc, body.AccessToken)
+	qc, _, allowed, err := d.probeServiceAdmission(ctx, local, remote, er, nr, qc, body.AccessToken)
 	if err != nil {
 		return connectResult{}, errConnectQUIC
 	}
@@ -1001,33 +1073,38 @@ func (d *Daemon) execConnect(ctx context.Context, remoteAidStr string, body conn
 	return connectResult{Tunnel: ln.Addr().String(), Connected: true, Allowed: true}, nil
 }
 
-func (d *Daemon) execMailboxSend(ctx context.Context, localAidStr, recipientStr string, msgType uint8, body []byte) error {
+// execMailboxSend delivers one mailbox message and returns its message_id, the
+// same identifier the recipient sees from execMailboxPoll. Callers can use it
+// to reconcile "what I sent" against "what arrived".
+func (d *Daemon) execMailboxSend(ctx context.Context, localAidStr, recipientStr string, msgType uint8, body []byte) (string, error) {
 	aid, err := a2al.ParseAddress(localAidStr)
 	if err != nil {
-		return errBadAID
+		return "", errBadAID
 	}
 	recipient, err := a2al.ParseAddress(recipientStr)
 	if err != nil {
-		return errBadAID
+		return "", errBadAID
 	}
 	d.regMu.RLock()
 	e := d.reg.Get(aid)
 	d.regMu.RUnlock()
 	if e == nil {
-		return errNotFound
+		return "", errNotFound
 	}
+	d.touchHeartbeat(aid)
 
 	// Build the signed record once; try delivery in three layers.
 	sr, err := d.h.BuildMailboxSignedRecord(ctx, aid, recipient, msgType, body)
 	if err != nil {
-		return err
+		return "", err
 	}
 	msgID := MsgIDFromRecord(sr)
+	msgIDHex := hex.EncodeToString(msgID[:])
 
 	// L1: existing live QUIC connection — best-effort zero-latency delivery.
 	// L3 always runs regardless of L1 outcome to guarantee DHT persistence.
 	if conn := d.connPool.getLive(aid, recipient); conn != nil {
-		_ = sendMailboxQuic(ctx, conn, msgID, sr)
+		_ = d.sendMailboxQuic(ctx, conn, msgID, sr)
 	}
 
 	// L2: background ICE dial + concurrent delivery attempt.
@@ -1046,12 +1123,15 @@ func (d *Daemon) execMailboxSend(ctx context.Context, localAidStr, recipientStr 
 		defer cancel()
 		conn, _, err := d.connPool.acquire(warmCtx, aid, recipient, er, false, false)
 		if err == nil {
-			_ = sendMailboxQuic(warmCtx, conn, msgID, sr)
+			_ = d.sendMailboxQuic(warmCtx, conn, msgID, sr)
 		}
 	}()
 
 	// L3: DHT STORE — caller awaits this for the reliability guarantee.
-	return d.h.PublishMailboxRecord(ctx, recipient, sr)
+	if err := d.h.PublishMailboxRecord(ctx, recipient, sr); err != nil {
+		return "", err
+	}
+	return msgIDHex, nil
 }
 
 // endpointFresh returns true when the EndpointRecord's Timestamp + TTL is in the future,
@@ -1068,25 +1148,19 @@ func endpointFresh(er *protocol.EndpointRecord) bool {
 	return age <= maxAge && expiry > time.Now().Unix()
 }
 
-func (d *Daemon) execMailboxPoll(ctx context.Context, aidStr string) ([]map[string]any, error) {
-	aid, err := a2al.ParseAddress(aidStr)
-	if err != nil {
-		return nil, errBadAID
-	}
-	d.regMu.RLock()
-	reg := d.reg.Get(aid)
-	d.regMu.RUnlock()
-	if reg == nil {
-		return nil, errNotFound
-	}
-
-	// Fetch raw SignedRecords from DHT so we can persist them in the store.
+// refreshMailbox pulls mailbox records for aid out of the DHT (with beacon
+// fallback) and files the new ones in the local store, emitting one
+// mailbox.received per batch of unclaimed arrivals.
+//
+// Ordinary notes are not consumed here; that remains execMailboxPoll.
+// MailboxMsgEnvelope may be claimed by a registered consumer at ingest.
+func (d *Daemon) refreshMailbox(ctx context.Context, aid a2al.Address) (newCount int, err error) {
 	recs, err := d.h.FetchMailboxRawForAgent(ctx, aid)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 
-	// Auxiliary fallback: supplement when DHT returned nothing.
+	// Beacon fallback: supplement when DHT returned nothing.
 	if d.beacon != nil && len(recs) == 0 {
 		if beaconRecs, _ := d.beacon.FindRecords(ctx, a2al.NodeIDFromAddress(aid), protocol.RecTypeMailbox); len(beaconRecs) > 0 {
 			now2 := time.Now()
@@ -1098,42 +1172,66 @@ func (d *Daemon) execMailboxPoll(ctx context.Context, aidStr string) ([]map[stri
 		}
 	}
 
-	now := time.Now()
-	store := d.mboxStore
-
-	// Insert new records into store; publish event for genuinely new ones.
-	newCount := 0
 	for _, sr := range recs {
-		msgID := MsgIDFromRecord(sr)
-		ttlExpires := now.Unix() + int64(sr.TTL)
-		if store.Put(msgID, MailboxStoreEntry{
-			RecipientAID: aid,
-			Record:       sr,
-			ReceivedAt:   now.Unix(),
-			TTLExpires:   ttlExpires,
-		}) {
+		_, doorbell := d.fileMailbox(aid, sr)
+		if doorbell {
 			newCount++
 		}
 	}
+
+	// One event per batch of unclaimed arrivals. Claimed envelopes are not notes.
 	if newCount > 0 && d.bus != nil {
 		d.bus.Publish(Event{
 			Type: "mailbox.received",
 			AID:  aid,
-			Data: map[string]any{"count": newCount},
+			Data: map[string]any{"count": newCount, "source": "dht_poll"},
 		})
 	}
+	return newCount, nil
+}
 
-	// Decrypt and return unconsumed entries.
+func (d *Daemon) execMailboxPoll(ctx context.Context, aidStr string) ([]map[string]any, error) {
+	aid, err := a2al.ParseAddress(aidStr)
+	if err != nil {
+		return nil, errBadAID
+	}
+	d.regMu.RLock()
+	reg := d.reg.Get(aid)
+	d.regMu.RUnlock()
+	if reg == nil {
+		return nil, errNotFound
+	}
+	d.touchHeartbeat(aid)
+
+	if _, err := d.refreshMailbox(ctx, aid); err != nil {
+		return nil, err
+	}
+	store := d.mboxStore
+
+	// Decrypt unconsumed entries. Every message is handed to the agent as-is:
+	// the daemon does not interpret msg_type and does not consume messages on
+	// the agent's behalf.
 	unconsumed, _ := store.GetUnconsumed(aid)
 	out := make([]map[string]any, 0, len(unconsumed))
 	for _, entry := range unconsumed {
+		msgID := MsgIDFromRecord(entry.Record)
 		msg, decErr := d.h.DecryptMailboxRecordFor(aid, entry.Record)
 		if decErr != nil {
+			// Consume it anyway, and say so. For this AID's current key material
+			// the failure is terminal, not transient, so retrying forever buys
+			// nothing — and leaving it unconsumed would pin the pending count
+			// above zero permanently, making the agent poll and come back empty
+			// on every turn. The entry stays in the store until its TTL sweep,
+			// so it remains available for diagnosis.
+			d.log.Warn("mailbox poll: undecryptable record consumed",
+				"aid", aid.String(), "message_id", hex.EncodeToString(msgID[:]), "err", decErr)
+			store.MarkConsumed(msgID)
 			continue
 		}
-		msgID := MsgIDFromRecord(entry.Record)
 		store.MarkConsumed(msgID)
+
 		out = append(out, map[string]any{
+			"message_id":  hex.EncodeToString(msgID[:]),
 			"sender":      msg.Sender.String(),
 			"msg_type":    msg.MsgType,
 			"body_base64": base64.StdEncoding.EncodeToString(msg.Body),
@@ -1204,6 +1302,7 @@ func (d *Daemon) execTopicRegister(ctx context.Context, aidStr string, req topic
 	if e == nil {
 		return errNotFound
 	}
+	d.touchHeartbeat(aid)
 	if err := d.h.RegisterTopicsForAgent(ctx, aid, req.Services, base, req.TTL); err != nil {
 		return err
 	}
@@ -1278,6 +1377,7 @@ func (d *Daemon) execTopicUnregister(aidStr, topic string) error {
 	if e == nil {
 		return errNotFound
 	}
+	d.touchHeartbeat(aid)
 	out := make([]registry.ServiceRecord, 0, len(e.Services))
 	for _, s := range e.Services {
 		if s.Topic != topic {
@@ -1397,6 +1497,7 @@ func (d *Daemon) execAgentPublishRecord(ctx context.Context, aidStr string, req 
 	if e == nil {
 		return errNotFound
 	}
+	d.touchHeartbeat(aid)
 	if len(e.DelegationCBOR) == 0 {
 		return errNoDelegation
 	}
