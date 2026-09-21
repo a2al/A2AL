@@ -68,6 +68,27 @@ func TestServiceAdmissionSkipsUnknownUntilKeysDone(t *testing.T) {
 	}
 }
 
+func TestCASAdmissionRoundTrip(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WriteCASAdmission(&buf, "room-pw"); err != nil {
+		t.Fatal(err)
+	}
+	magic := make([]byte, 4)
+	if _, err := io.ReadFull(&buf, magic); err != nil {
+		t.Fatal(err)
+	}
+	if string(magic) != protocol.MagicCAS {
+		t.Fatalf("magic=%q", magic)
+	}
+	tok, err := ReadServiceAdmission(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok != "room-pw" {
+		t.Fatalf("tok=%q", tok)
+	}
+}
+
 func TestAccessResultRoundTrip(t *testing.T) {
 	var buf bytes.Buffer
 	if err := WriteAccessResult(&buf, false, "denied"); err != nil {

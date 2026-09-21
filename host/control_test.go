@@ -29,12 +29,15 @@ func TestSendAcceptorMsgsAdvertisesServiceStream(t *testing.T) {
 	go func() {
 		_ = sendAcceptorMsgs(pw, nil, nil, 0)
 	}()
-	_, _, svc, err := readAcceptorMsgs(pr)
+	_, _, caps, err := readAcceptorMsgs(pr)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !svc {
+	if !caps.Service {
 		t.Fatal("want 0x06 ServiceStream")
+	}
+	if !caps.Envelope {
+		t.Fatal("want 0x08 EnvelopeStream")
 	}
 }
 
@@ -44,11 +47,14 @@ func TestReadAcceptorMsgsSkipsUnknownWithoutServiceStream(t *testing.T) {
 		_ = writeCtrlMsg(pw, 0x99, []byte("x"))
 		_ = pw.Close()
 	}()
-	_, _, svc, err := readAcceptorMsgs(pr)
+	_, _, caps, err := readAcceptorMsgs(pr)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if svc {
+	if caps.Service {
 		t.Fatal("want no ServiceStream without 0x06")
+	}
+	if caps.Envelope {
+		t.Fatal("want no EnvelopeStream without 0x08")
 	}
 }

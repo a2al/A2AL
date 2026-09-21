@@ -12,7 +12,7 @@ import (
 )
 
 // lastInboundFreshTTL is how long an observed inbound UDP source address remains
-// eligible for learned-path outbound selection.
+// eligible for L1 outbound selection (P-Reach §7).
 const lastInboundFreshTTL = 5 * time.Minute
 
 // inboundChannel identifies which transport delivered an inbound DHT request.

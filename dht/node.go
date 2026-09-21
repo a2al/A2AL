@@ -127,7 +127,7 @@ type Config struct {
 	PunchTransport PunchTransport
 
 	// LearnedPathFirst enables learned-path outbound selection (lastInbound,
-	// skipCold, DeferICE). Default false preserves legacy direct-UDP behaviour.
+	// skipCold DeferICE). Default false preserves legacy direct-UDP behaviour.
 	LearnedPathFirst bool
 
 	// PushHandler is called when this node receives a MsgDHTPush (oneShot delivery).
@@ -183,7 +183,7 @@ type familyHealth struct {
 	// nodes that have only ever been contacted over one address family.
 	everUsed bool
 
-	// Inbound/outbound path hints (per address family).
+	// Learned-path inbound/outbound path hints (per address family).
 	skipColdUDP   bool       // prefer ICE/QUIC over cold stable UDP; not a hard ban
 	skipColdAt    time.Time  // when skipColdUDP was set
 	lastInbound   *net.UDPAddr
@@ -245,7 +245,7 @@ type Node struct {
 
 	selfExtMu   sync.RWMutex
 	selfExtIP   net.IP // our own public IPv4 (set by host after STUN/HTTP probe)
-	selfExtIPv6 net.IP // our own public IPv6 GUA (set by host after STUN/HTTP probe)
+	selfExtIPv6 net.IP // our own public IPv6 GUA (set by host; used for auxiliary node self-identification)
 
 	statsRx  atomic.Uint64
 	statsTx  atomic.Uint64
@@ -332,6 +332,15 @@ type Node struct {
 	// pushHandler is called when this node receives a MsgDHTPush from a DHT node.
 	// Returns true if the message was new (causing the sender to renew its oneShot subscription).
 	pushHandler func(key a2al.NodeID, rec protocol.SignedRecord) bool
+
+	// hitchMu guards receivePoolHandler and localRecvKeys.
+	hitchMu sync.RWMutex
+	// receivePoolHandler consumes receive-pool hints returned to this node in a
+	// STORE_RESP after its own outbound StoreAt (the hitchhike).
+	receivePoolHandler func(visitor a2al.Address, fromPeer a2al.NodeID, pool []protocol.ReceivePoolHint)
+	// localRecvKeys are the DHT keys of AIDs hosted by this node, used to detect
+	// an inbound receive-pool STORE that happens to land on the recipient's home.
+	localRecvKeys map[string]struct{}
 
 	// recoveryNotify receives a token when recordSuccess detects the first
 	// successful RPC after a suspectOffline period (long disconnect → reconnect).
@@ -464,23 +473,23 @@ func (n *Node) recvLoop() {
 func (n *Node) dispatchIncoming(from net.Addr, ch inboundChannel, dec *protocol.DecodedMessage) {
 	n.inboundLearn(from, ch, dec)
 	switch dec.Header.MsgType {
-	case protocol.MsgPing:
+		case protocol.MsgPing:
 		n.onPing(from, ch, dec)
-	case protocol.MsgFindNode:
+		case protocol.MsgFindNode:
 		n.onFindNode(from, ch, dec)
-	case protocol.MsgFindValue:
+		case protocol.MsgFindValue:
 		n.onFindValue(from, ch, dec)
-	case protocol.MsgStore:
+		case protocol.MsgStore:
 		n.onStore(from, ch, dec)
-	case protocol.MsgNATProbeReq:
+		case protocol.MsgNATProbeReq:
 		n.onNATProbeReq(from, ch, dec)
-	case protocol.MsgNATProbeEcho:
+		case protocol.MsgNATProbeEcho:
 		n.onNATProbeEcho(from, ch, dec)
 	case protocol.MsgDHTPush:
 		n.onDHTPush(from, ch, dec)
-	default:
+		default:
+		}
 	}
-}
 
 // InjectReceived processes a pre-received DHT message from an external
 // transport (e.g. a punched QUIC stream managed by the host layer).
@@ -675,7 +684,7 @@ func (n *Node) remember(from net.Addr, ch inboundChannel, dec *protocol.DecodedM
 	}
 	n.peerMu.Unlock()
 	if !isNeverDialableUDP(from) {
-		n.addrToID.Store(from.String(), id)
+	n.addrToID.Store(from.String(), id)
 	}
 	// Inbound message = direct-contact evidence; set VerifiedAt now.
 	n.tabAdd(nodeInfoFromMessage(dec, from), routing.EntryMeta{VerifiedAt: time.Now()}, from)
@@ -1396,7 +1405,7 @@ func (n *Node) PeerHealthOf(id a2al.NodeID) PeerHealthState {
 	}
 	// Collect active (ever-used) families.
 	if !e.v4.everUsed && !e.v6.everUsed {
-		return PeerHealthUnknown
+	return PeerHealthUnknown
 	}
 	// All active families must be Bad to declare the peer Bad.
 	if e.v4.everUsed && v4s != PeerHealthBad {
@@ -1702,7 +1711,7 @@ func (n *Node) SetSelfExtIP(ip net.IP) {
 
 // SetSelfExtIPv6 records our own public IPv6 GUA (from STUN/HTTP probe).
 // Unlike the v4 counterpart this is not used for hairpin detection (v6 GUA
-// nodes are directly reachable); it is used to self-identify when the node's
+// nodes are directly reachable); it is used by the auxiliary node manager to
 // self-identify when the node's v6 address appears in the well-known DNS list.
 func (n *Node) SetSelfExtIPv6(ip net.IP) {
 	n.selfExtMu.Lock()
@@ -1958,12 +1967,34 @@ func (n *Node) onStore(from net.Addr, ch inboundChannel, dec *protocol.DecodedMe
 		}
 		n.log.Debug("store rejected", "from", from, "key", hex.EncodeToString(key[:4]), "reason", reason, "err", err)
 	}
-	n.reply(from, ch, dec, protocol.MsgStoreResp, &protocol.BodyStoreResp{Stored: ok, AlreadyHad: alreadyHad, Reason: reason})
+	resp := &protocol.BodyStoreResp{Stored: ok, AlreadyHad: alreadyHad, Reason: reason}
+	// Hitchhike: hand the visiting publisher a snapshot of its own receive pool.
+	// Reached only when Put got far enough to have verified the signature, so a
+	// forged record never buys a hint.
+	if err == nil || alreadyHad || errors.Is(err, ErrStorePolicy) {
+		n.attachReceivePoolHint(from, dec.SenderAddr, body.Record, resp)
+	}
+	n.reply(from, ch, dec, protocol.MsgStoreResp, resp)
 
 	// Deliver DHT_PUSH to all one-shot subscribers for this key.
 	// Only fires on genuinely new records (not already-had / rejected).
 	if err == nil {
 		n.dispatchDHTPush(key, body.Record)
+	}
+
+	// Coincidence ingest: a receive-pool record whose key is an AID hosted here.
+	// Normally the home node is not in the replica set, so this is the rare case
+	// of mail landing directly at its destination. Handed off to the same handler
+	// as DHT_PUSH, asynchronously: onStore runs on the recvLoop goroutine.
+	if err == nil && protocol.IsReceivePoolType(body.Record.RecType) {
+		storeKey := key
+		if storeKey == (a2al.NodeID{}) {
+			storeKey = recordKeyForSigned(body.Record)
+		}
+		if n.hasLocalReceiveKey(storeKey) {
+			rec := body.Record
+			go n.invokePushHandler(storeKey, rec)
+		}
 	}
 
 	// Path-cache registration for sovereign records (Direction B).
@@ -2142,6 +2173,104 @@ func (n *Node) onDHTPush(from net.Addr, ch inboundChannel, dec *protocol.Decoded
 		MsgID:            msgID[:],
 		OneShotSubscribe: resubscribe,
 	})
+}
+
+// attachReceivePoolHint fills resp.Pool with the receive pool held for the AID
+// that owns rec, but only when the STORE came from that AID itself.
+//
+// The pool is looked up under NodeID(rec.Address) — the visitor's own key — never
+// under BodyStore.Key. That distinction is what keeps a mailbox deposit from
+// handing the sender the recipient's pool: the deposit's key is the recipient,
+// but its Address is the sender, so the sender only ever sees its own mail.
+//
+// Only sovereign records qualify. Topic keys are not AID-derived, and a topic
+// publisher visiting a topic key has no receive-pool relationship with it.
+func (n *Node) attachReceivePoolHint(from net.Addr, sender a2al.Address, rec protocol.SignedRecord, resp *protocol.BodyStoreResp) {
+	if protocol.RecordCategory(rec.RecType) != protocol.CategorySovereign {
+		return
+	}
+	visitorKey := recordKeyForSigned(rec)
+	// senderID matches for a self-publishing node; senderIPIsPublisher covers a
+	// hosted agent, whose daemon NodeID differs from the agent AID.
+	if a2al.NodeIDFromAddress(sender) != visitorKey && !n.senderIPIsPublisher(from, rec) {
+		return
+	}
+	hints := n.store.ReceivePoolHints(visitorKey, time.Now(), protocol.MaxReceivePoolIDs)
+	if len(hints) == 0 {
+		return
+	}
+	resp.Pool = hints
+	trimStoreRespPool(resp)
+}
+
+// trimStoreRespPool drops hint detail until the body fits a UDP response.
+// Counts are preserved as long as any slice survives: the visitor can always
+// fall back to fetching. With one receive-pool type the cap is never reached;
+// the guard exists because the type range allows several slices at once.
+func trimStoreRespPool(resp *protocol.BodyStoreResp) {
+	for len(resp.Pool) > 0 {
+		sz, err := protocol.StoreRespWireSize(resp)
+		if err == nil && sz <= maxResponsePayload {
+			return
+		}
+		last := &resp.Pool[len(resp.Pool)-1]
+		if len(last.IDs) > 0 {
+			last.IDs = last.IDs[:len(last.IDs)-1]
+			continue
+		}
+		resp.Pool = resp.Pool[:len(resp.Pool)-1]
+	}
+	resp.Pool = nil
+}
+
+// invokePushHandler delivers a record to the DHT_PUSH handler (also used by the
+// coincidence-ingest path in onStore).
+func (n *Node) invokePushHandler(key a2al.NodeID, rec protocol.SignedRecord) {
+	n.pushMu.RLock()
+	h := n.pushHandler
+	n.pushMu.RUnlock()
+	if h != nil {
+		h(key, rec)
+	}
+}
+
+func (n *Node) deliverReceivePool(visitor a2al.Address, fromPeer a2al.NodeID, pool []protocol.ReceivePoolHint) {
+	n.hitchMu.RLock()
+	h := n.receivePoolHandler
+	n.hitchMu.RUnlock()
+	if h != nil {
+		h(visitor, fromPeer, pool)
+	}
+}
+
+// SetLocalReceiveKeys replaces the set of DHT keys whose receive-pool records
+// this node should ingest locally (the AIDs it hosts). Thread-safe.
+func (n *Node) SetLocalReceiveKeys(keys []a2al.NodeID) {
+	m := make(map[string]struct{}, len(keys))
+	for _, k := range keys {
+		if k == (a2al.NodeID{}) {
+			continue
+		}
+		m[nodeIDKey(k)] = struct{}{}
+	}
+	n.hitchMu.Lock()
+	n.localRecvKeys = m
+	n.hitchMu.Unlock()
+}
+
+func (n *Node) hasLocalReceiveKey(key a2al.NodeID) bool {
+	n.hitchMu.RLock()
+	_, ok := n.localRecvKeys[nodeIDKey(key)]
+	n.hitchMu.RUnlock()
+	return ok
+}
+
+// SetReceivePoolHandler registers fn as the consumer of receive-pool hints that
+// neighbours return in STORE_RESP after this node's own StoreAt. Thread-safe.
+func (n *Node) SetReceivePoolHandler(fn func(visitor a2al.Address, fromPeer a2al.NodeID, pool []protocol.ReceivePoolHint)) {
+	n.hitchMu.Lock()
+	n.receivePoolHandler = fn
+	n.hitchMu.Unlock()
 }
 
 // SetPushHandler registers fn as the handler for incoming MsgDHTPush messages.
@@ -2483,11 +2612,18 @@ func (n *Node) StoreAt(ctx context.Context, peer net.Addr, storeKey a2al.NodeID,
 	case !stored && resp.Reason == protocol.StoreReasonRecordInvalid:
 		n.log.Debug("dht store: record invalid", "peer", peer, "key", hex.EncodeToString(storeKey[:4]))
 	}
+	// The peer may have hitched a snapshot of this publisher's receive pool.
+	// Handed off asynchronously so a slow consumer cannot stall replication.
+	if len(resp.Pool) > 0 {
+		var visitor a2al.Address
+		copy(visitor[:], rec.Address)
+		go n.deliverReceivePool(visitor, peerNID, resp.Pool)
+	}
 	return stored, peerNID, meta, resp.Reason, nil
 }
 
 // rememberStoreSuccess registers dial→nodeID mapping after a successful outbound
-// STORE. Anchor binding is handled by tabAdd (UDP inbound) or explicit well-known paths;
+// STORE. Anchor binding is handled by tabAdd (UDP inbound) or explicit beacon paths;
 // do not write Anchor here from outbound dial evidence alone.
 func (n *Node) rememberStoreSuccess(id a2al.NodeID, dial net.Addr) {
 	if dial == nil {

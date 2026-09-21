@@ -25,6 +25,7 @@ package host
 //	0x05  AccessResult   acceptor → dialer   allowed (1B) + reason (optional UTF-8); a2s1
 //	0x06  ServiceStream  acceptor → dialer   empty: peer accepts a2s1 on service streams
 //	0x07  KeysDone       dialer  → acceptor  a2s1: no more keys; remainder is business bytes
+//	0x08  EnvelopeStream acceptor → dialer   empty: peer accepts a2en envelope RPC
 //
 // Unknown message types are skipped by consuming the declared length, ensuring
 // forward compatibility without a new magic number.
@@ -43,13 +44,14 @@ import (
 )
 
 const (
-	ctrlMsgObservedAddr  uint8 = 0x01 // acceptor → dialer
-	ctrlMsgAgentInfoHint uint8 = 0x02 // dialer → acceptor
-	ctrlMsgAgentInfo     uint8 = 0x03 // acceptor → dialer
-	ctrlMsgAccessToken   uint8 = 0x04 // dialer → acceptor (a2s1 key)
-	ctrlMsgAccessResult  uint8 = 0x05 // acceptor → dialer (a2s1 result)
-	ctrlMsgServiceStream uint8 = 0x06 // acceptor → dialer (Stream 0 capability)
-	ctrlMsgKeysDone      uint8 = 0x07 // dialer → acceptor (a2s1 keys finished)
+	ctrlMsgObservedAddr   uint8 = 0x01 // acceptor → dialer
+	ctrlMsgAgentInfoHint  uint8 = 0x02 // dialer → acceptor
+	ctrlMsgAgentInfo      uint8 = 0x03 // acceptor → dialer
+	ctrlMsgAccessToken    uint8 = 0x04 // dialer → acceptor (a2s1 key)
+	ctrlMsgAccessResult   uint8 = 0x05 // acceptor → dialer (a2s1 result)
+	ctrlMsgServiceStream  uint8 = 0x06 // acceptor → dialer (Stream 0 capability)
+	ctrlMsgKeysDone       uint8 = 0x07 // dialer → acceptor (a2s1 keys finished)
+	ctrlMsgEnvelopeStream uint8 = 0x08 // acceptor → dialer (a2en capability)
 
 	maxAccessToken = 256
 
@@ -133,6 +135,7 @@ func sendAcceptorMsgs(w io.WriteCloser, remoteAddr net.Addr, localRecs []protoco
 
 	// Capability: extra payload bytes (if any) are ignored by this version.
 	_ = writeCtrlMsg(w, ctrlMsgServiceStream, nil)
+	_ = writeCtrlMsg(w, ctrlMsgEnvelopeStream, nil)
 
 	return w.Close() // FIN: no more acceptor messages
 }
@@ -165,15 +168,15 @@ func readDialerMsgs(r io.Reader) (heldSeq uint64, accessToken string, err error)
 // readAcceptorMsgs drains the acceptor's control messages until FIN.
 // Returns the observed-address wire bytes and any SignedRecords received.
 // Ignores malformed or expired records rather than failing.
-func readAcceptorMsgs(r io.Reader) (observedWire []byte, records []protocol.SignedRecord, serviceStream bool, err error) {
+func readAcceptorMsgs(r io.Reader) (observedWire []byte, records []protocol.SignedRecord, caps peerStreamCaps, err error) {
 	now := time.Now()
 	for {
 		msgType, payload, rerr := readCtrlMsg(r)
 		if rerr == io.EOF {
-			return observedWire, records, serviceStream, nil
+			return observedWire, records, caps, nil
 		}
 		if rerr != nil {
-			return observedWire, records, serviceStream, rerr
+			return observedWire, records, caps, rerr
 		}
 		switch msgType {
 		case ctrlMsgObservedAddr:
@@ -188,8 +191,15 @@ func readAcceptorMsgs(r io.Reader) (observedWire []byte, records []protocol.Sign
 				}
 			}
 		case ctrlMsgServiceStream:
-			serviceStream = true
+			caps.Service = true
+		case ctrlMsgEnvelopeStream:
+			caps.Envelope = true
 		}
 		// Unknown types: consumed, skipped.
 	}
+}
+
+type peerStreamCaps struct {
+	Service  bool
+	Envelope bool
 }

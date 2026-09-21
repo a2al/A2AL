@@ -217,6 +217,7 @@ type Host struct {
 	decideAccess func(local, remote a2al.Address, secret string, src net.Addr) bool
 	svcMu        sync.Mutex
 	svcStream    map[quic.Connection]struct{}
+	envStream    map[quic.Connection]struct{}
 
 	// peerPubkeys caches the Ed25519 identity public key for each peer AID
 	// observed via verified incoming mailbox records.  A given AID always maps
@@ -405,6 +406,7 @@ func New(cfg Config) (*Host, error) {
 		hasV6:     !cfg.DisableIPv6 && outboundIPv6() != nil,
 		punchPool: punchPool,
 		svcStream: make(map[quic.Connection]struct{}),
+		envStream: make(map[quic.Connection]struct{}),
 		agents: map[a2al.Address]*agentEntry{
 			myAddr: {addr: myAddr, priv: priv, cert: defaultCert},
 		},
@@ -900,7 +902,7 @@ func (h *Host) BuildEndpointPayload(ctx context.Context) (protocol.EndpointPaylo
 	// Inform the DHT node of our public IPv4 so it can detect NAT hairpin peers
 	// (nodes behind the same NAT share the same public IP).  IPv6 GUA nodes are
 	// directly reachable without hairpinning, so v6 hairpin detection is
-	// intentionally skipped. The v6 IP is stored separately for self-identification.
+	// intentionally skipped. The v6 IP is stored separately for auxiliary node self-identification.
 	if ext != "" {
 		ipStr := ext
 		if host, _, err := net.SplitHostPort(ext); err == nil {
@@ -1121,6 +1123,12 @@ func (h *Host) SetBeaconStatsProvider(fn func() map[string]any) {
 // Works in both single-port (UDPMux) and dual-port modes.
 func (h *Host) SetDHTPushHandler(fn func(key a2al.NodeID, rec protocol.SignedRecord) bool) {
 	h.node.SetPushHandler(fn)
+}
+
+// SetReceivePoolHandler registers fn as the consumer of STORE_RESP receive-pool
+// hints. visitor is the AID that just published (the hitchhike subject).
+func (h *Host) SetReceivePoolHandler(fn func(visitor a2al.Address, fromPeer a2al.NodeID, pool []protocol.ReceivePoolHint)) {
+	h.node.SetReceivePoolHandler(fn)
 }
 
 const extipCacheTTL = 5 * time.Minute
@@ -1524,7 +1532,7 @@ func (h *Host) doDialerControlStream(ctx context.Context, conn quic.Connection, 
 		str.CancelWrite(0) // reset stream so acceptor unblocks from readDialerMsgs
 		return nil
 	}
-	observedWire, receivedRecs, serviceStream, err := readAcceptorMsgs(str)
+	observedWire, receivedRecs, caps, err := readAcceptorMsgs(str)
 
 	// Apply whatever DHT data was received regardless of err — best-effort.
 	// readAcceptorMsgs returns partial results even on error, and discarding
@@ -1547,8 +1555,11 @@ func (h *Host) doDialerControlStream(ctx context.Context, conn quic.Connection, 
 		_ = conn.CloseWithError(1, "control exchange incomplete")
 		return &controlStreamError{cause: fmt.Errorf("%w: %w", ErrControlExchangeIncomplete, err)}
 	}
-	if serviceStream {
+	if caps.Service {
 		h.noteServiceStream(conn)
+	}
+	if caps.Envelope {
+		h.noteEnvelopeStream(conn)
 	}
 	return nil
 }
@@ -1591,6 +1602,26 @@ func (h *Host) noteServiceStream(conn quic.Connection) {
 		<-conn.Context().Done()
 		h.svcMu.Lock()
 		delete(h.svcStream, conn)
+		h.svcMu.Unlock()
+	}()
+}
+
+// PeerEnvelopeStream reports whether the peer advertised a2en on Stream 0.
+func (h *Host) PeerEnvelopeStream(conn quic.Connection) bool {
+	h.svcMu.Lock()
+	defer h.svcMu.Unlock()
+	_, ok := h.envStream[conn]
+	return ok
+}
+
+func (h *Host) noteEnvelopeStream(conn quic.Connection) {
+	h.svcMu.Lock()
+	h.envStream[conn] = struct{}{}
+	h.svcMu.Unlock()
+	go func() {
+		<-conn.Context().Done()
+		h.svcMu.Lock()
+		delete(h.envStream, conn)
 		h.svcMu.Unlock()
 	}()
 }

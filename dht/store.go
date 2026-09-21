@@ -419,6 +419,81 @@ func (s *Store) GetAll(key a2al.NodeID, recType uint8, now time.Time) []protocol
 	return out
 }
 
+// recordTTLLive reports whether rec is still within its signed TTL.
+func recordTTLLive(rec protocol.SignedRecord, now time.Time) bool {
+	return rec.Timestamp+uint64(rec.TTL) >= uint64(now.Unix())
+}
+
+// ReceivePoolHints returns a compact snapshot of the inbound (receive-pool)
+// records held at key: a per-RecType count plus up to maxIDs newest RecordIDs.
+//
+// Signatures are deliberately not re-verified: Put already verified every record
+// on the way in, and onStore calls this on the recvLoop goroutine where a batch
+// of ed25519 verifications would stall every other DHT reply. Only the signed
+// TTL is re-checked. RecordID is computed for the IDs actually returned, not for
+// the whole pool.
+//
+// lastAccess is intentionally left untouched: a hint served to a visiting
+// publisher is not interest in that key by this node, and must not shield it
+// from LRU eviction.
+func (s *Store) ReceivePoolHints(key a2al.NodeID, now time.Time, maxIDs int) []protocol.ReceivePoolHint {
+	if maxIDs <= 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	list := s.m[nodeIDKey(key)]
+
+	// Collect references first so RecordID is only hashed for the newest maxIDs.
+	type ref struct {
+		recType uint8
+		ts      uint64
+		idx     int
+	}
+	var refs []ref
+	for i, r := range list {
+		if !protocol.IsReceivePoolType(r.RecType) || !recordTTLLive(r, now) {
+			continue
+		}
+		refs = append(refs, ref{recType: r.RecType, ts: r.Timestamp, idx: i})
+	}
+	if len(refs) == 0 {
+		return nil
+	}
+	slices.SortStableFunc(refs, func(a, b ref) int {
+		if a.ts == b.ts {
+			return 0
+		}
+		if a.ts > b.ts {
+			return -1
+		}
+		return 1
+	})
+
+	order := make([]uint8, 0, 2)
+	counts := make(map[uint8]int)
+	ids := make(map[uint8][][]byte)
+	for _, rf := range refs {
+		if _, seen := counts[rf.recType]; !seen {
+			order = append(order, rf.recType)
+		}
+		counts[rf.recType]++
+		if len(ids[rf.recType]) < maxIDs {
+			id := protocol.RecordID(list[rf.idx])
+			ids[rf.recType] = append(ids[rf.recType], id[:])
+		}
+	}
+	out := make([]protocol.ReceivePoolHint, 0, len(order))
+	for _, t := range order {
+		out = append(out, protocol.ReceivePoolHint{
+			RecType: t,
+			Count:   uint16(min(counts[t], int(^uint16(0)))),
+			IDs:     ids[t],
+		})
+	}
+	return out
+}
+
 // Get returns the newest valid endpoint record (RecTypeEndpoint) at key, or nil.
 func (s *Store) Get(key a2al.NodeID, now time.Time) *protocol.SignedRecord {
 	s.mu.Lock()

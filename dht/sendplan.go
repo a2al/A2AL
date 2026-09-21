@@ -131,7 +131,7 @@ func (n *Node) deliver(ctx context.Context, peerID a2al.NodeID, addrHint net.Add
 	}
 
 	// Send: caller already chose a concrete control-plane address. Do not
-	// re-Select onto a stale Anchor (well-known/bootstrap IP change).
+	// re-Select onto a stale Anchor (beacon/bootstrap IP change).
 	if n.usableExplicitHint(peerID, addrHint) {
 		meta.dialAddr = addrHint
 		meta.reason = "l0_explicit_hint"
@@ -228,7 +228,7 @@ func deliverPlanWorthLogging(reason string) bool {
 func (n *Node) logDeliverPlanIfChanged(peerID a2al.NodeID, plan sendPlan, addrHint net.Addr) {
 	if !deliverPlanWorthLogging(plan.reason) {
 		// Process logs (disabled): routine outbound paths during normal operation.
-		// Restore for connectivity debugging.
+		// Restore for learned-path rollout / connectivity debugging.
 		//
 		// sig := sendPlanLogSig(plan)
 		// key := nodeIDKey(peerID)

@@ -85,6 +85,10 @@ type Config struct {
 	// legacy direct-UDP for emergency rollback.
 	LearnedPathFirst bool `toml:"learned_path_first" json:"learned_path_first"`
 
+	// FilesRoot, if set, sandboxes object-path registration: mapped files
+	// must sit under this directory. Empty means no extra path constraint.
+	FilesRoot string `toml:"files_root" json:"files_root,omitempty"`
+
 	// DisableRelay is the node-level default for relay usage on outbound connections.
 	// When true, relay (TURN) candidates are excluded unless the per-call API field
 	// override enables it. Default false (relay allowed).

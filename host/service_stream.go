@@ -13,9 +13,8 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
-// WriteServiceAdmission writes the a2s1 magic, optional AccessToken, and KeysDone.
-func WriteServiceAdmission(w io.Writer, token string) error {
-	if _, err := io.WriteString(w, protocol.MagicServiceStream); err != nil {
+func writeAdmission(w io.Writer, magic, token string) error {
+	if _, err := io.WriteString(w, magic); err != nil {
 		return err
 	}
 	if token != "" {
@@ -29,8 +28,18 @@ func WriteServiceAdmission(w io.Writer, token string) error {
 	return writeCtrlMsg(w, ctrlMsgKeysDone, nil)
 }
 
-// ReadServiceAdmission drains a2s1 key messages until KeysDone.
-// The 4-byte magic must already have been consumed.
+// WriteServiceAdmission writes the a2s1 magic, optional AccessToken, and KeysDone.
+func WriteServiceAdmission(w io.Writer, token string) error {
+	return writeAdmission(w, protocol.MagicServiceStream, token)
+}
+
+// WriteCASAdmission writes the a2cs magic, optional AccessToken, and KeysDone.
+func WriteCASAdmission(w io.Writer, token string) error {
+	return writeAdmission(w, protocol.MagicCAS, token)
+}
+
+// ReadServiceAdmission drains admission key messages until KeysDone.
+// The 4-byte magic (a2s1 or a2cs) must already have been consumed.
 func ReadServiceAdmission(r io.Reader) (token string, err error) {
 	for {
 		msgType, payload, rerr := readCtrlMsg(r)
@@ -88,10 +97,25 @@ func AdmitServiceStream(ctx context.Context, conn quic.Connection, token string)
 	if err != nil {
 		return nil, err
 	}
+	return admitOpened(ctx, str, WriteServiceAdmission, token)
+}
+
+// AdmitCASStream opens a stream, runs a2cs admission, and returns it
+// positioned at the HTTP/1.1 bytes.
+func AdmitCASStream(ctx context.Context, conn quic.Connection, token string) (quic.Stream, error) {
+	str, err := conn.OpenStreamSync(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return admitOpened(ctx, str, WriteCASAdmission, token)
+}
+
+func admitOpened(ctx context.Context, str quic.Stream, write func(io.Writer, string) error, token string) (quic.Stream, error) {
 	if dl, ok := ctx.Deadline(); ok {
 		_ = str.SetDeadline(dl)
 	}
-	if err := WriteServiceAdmission(str, token); err != nil {
+
+	if err := write(str, token); err != nil {
 		_ = str.Close()
 		return nil, err
 	}
