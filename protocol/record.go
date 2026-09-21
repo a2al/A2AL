@@ -6,6 +6,8 @@ package protocol
 import (
 	"bytes"
 	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"time"
@@ -365,6 +367,22 @@ func RecordIsNewer(a, b SignedRecord) bool {
 		return a.Seq > b.Seq
 	}
 	return a.Timestamp > b.Timestamp
+}
+
+// RecordID is the stable fingerprint used to de-duplicate inbound records.
+// SHA-256 of Payload when present; otherwise SHA-256(Address || Seq BE).
+func RecordID(sr SignedRecord) [32]byte {
+	if len(sr.Payload) > 0 {
+		return sha256.Sum256(sr.Payload)
+	}
+	h := sha256.New()
+	h.Write(sr.Address)
+	var seq [8]byte
+	binary.BigEndian.PutUint64(seq[:], sr.Seq)
+	h.Write(seq[:])
+	var out [32]byte
+	copy(out[:], h.Sum(nil))
+	return out
 }
 
 // delegationIssuedAt returns the IssuedAt field from a delegation CBOR blob,

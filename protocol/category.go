@@ -32,3 +32,9 @@ func RecordCategory(recType uint8) uint8 {
 		return CategoryUnknown
 	}
 }
+
+// IsReceivePoolType reports whether recType belongs in an AID's receive pool
+// (inbound records left for that AID), as opposed to the publish pool.
+func IsReceivePoolType(recType uint8) bool {
+	return RecordCategory(recType) == CategoryMailbox
+}

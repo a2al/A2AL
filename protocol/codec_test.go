@@ -173,3 +173,47 @@ func TestCanonicalDeterminism(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestStoreResp_poolOptional(t *testing.T) {
+	_, priv, _ := ed25519.GenerateKey(rand.Reader)
+	tx := make([]byte, txIDLen)
+	rand.Read(tx)
+	hdr := Header{Version: ProtocolVersion, MsgType: MsgStoreResp, TxID: tx}
+	id := bytes.Repeat([]byte{1}, 32)
+	raw, err := MarshalSignedMessage(hdr, &BodyStoreResp{
+		Stored: true,
+		Pool:   []ReceivePoolHint{{RecType: RecTypeMailbox, Count: 2, IDs: [][]byte{id}}},
+	}, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dec, err := VerifyAndDecode(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := dec.Body.(*BodyStoreResp)
+	if len(got.Pool) != 1 || got.Pool[0].Count != 2 || !bytes.Equal(got.Pool[0].IDs[0], id) {
+		t.Fatalf("pool round-trip: %+v", got.Pool)
+	}
+
+	plain, err := MarshalSignedMessage(hdr, &BodyStoreResp{Stored: true}, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dec2, err := VerifyAndDecode(plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dec2.Body.(*BodyStoreResp).Pool) != 0 {
+		t.Fatal("old three-field STORE_RESP must decode with empty Pool")
+	}
+}
+
+func TestIsReceivePoolType(t *testing.T) {
+	if IsReceivePoolType(RecTypeEndpoint) || IsReceivePoolType(RecTypeTopic) {
+		t.Fatal("publish-pool types are not receive-pool")
+	}
+	if !IsReceivePoolType(RecTypeMailbox) {
+		t.Fatal("mailbox is receive-pool")
+	}
+}

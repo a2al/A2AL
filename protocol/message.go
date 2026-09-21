@@ -120,9 +120,23 @@ const (
 )
 
 type BodyStoreResp struct {
-	Stored     bool        `cbor:"1,keyasint"`
-	AlreadyHad bool        `cbor:"2,keyasint,omitempty"` // true when the node already held an equal-or-newer record
-	Reason     StoreReason `cbor:"3,keyasint,omitempty"` // non-zero only on rejection; 0 from old nodes means unknown
+	Stored     bool              `cbor:"1,keyasint"`
+	AlreadyHad bool              `cbor:"2,keyasint,omitempty"` // true when the node already held an equal-or-newer record
+	Reason     StoreReason       `cbor:"3,keyasint,omitempty"` // non-zero only on rejection; 0 from old nodes means unknown
+	Pool       []ReceivePoolHint `cbor:"4,keyasint,omitempty"` // receive-pool hint for the visiting publisher AID
+}
+
+// MaxReceivePoolIDs is the v1 cap on RecordIDs per RecType in a STORE_RESP hitch.
+// 8×32 B plus framing stays well under maxResponsePayload so STORE_RESP stays a
+// small replication ACK, not a cargo packet.
+const MaxReceivePoolIDs = 8
+
+// ReceivePoolHint is a compact snapshot of inbound records held for the visiting AID.
+// v1 carries Count + truncated IDs only — never full SignedRecords.
+type ReceivePoolHint struct {
+	RecType uint8    `cbor:"1,keyasint"`           // concrete type; 0 is invalid and must not be sent
+	Count   uint16   `cbor:"2,keyasint"`           // unexpired total of this type at the visitor's key
+	IDs     [][]byte `cbor:"3,keyasint,omitempty"` // RecordID values, newest first, may be truncated
 }
 
 // BodyNATProbeReq asks the receiver to send a NATProbeEcho directly to ClaimedAddr.

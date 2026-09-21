@@ -478,6 +478,21 @@ func FindNodeResponseWireSize(resp *BodyFindNodeResp) (int, error) {
 	return len(b), nil
 }
 
+// StoreRespWireSize returns the canonical CBOR size of a STORE_RESP body (UDP trim).
+func StoreRespWireSize(resp *BodyStoreResp) (int, error) {
+	if resp == nil {
+		return 0, ErrInvalidMessage
+	}
+	if err := bodyWireCheck(MsgStoreResp, resp); err != nil {
+		return 0, err
+	}
+	b, err := canonical.Marshal(resp)
+	if err != nil {
+		return 0, err
+	}
+	return len(b), nil
+}
+
 // FindValueResponseWireSize returns the canonical CBOR size of a FIND_VALUE_RESP body (UDP trim, spec §3.7).
 func FindValueResponseWireSize(resp *BodyFindValueResp) (int, error) {
 	if resp == nil {

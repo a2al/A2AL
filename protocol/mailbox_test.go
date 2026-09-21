@@ -80,4 +80,28 @@ func TestMailboxEncodeOpen_roundtrip(t *testing.T) {
 	if msg.MsgType != MailboxMsgText || string(msg.Body) != "hello" || msg.Sender != addrA {
 		t.Fatalf("got %+v", msg)
 	}
+
+	inner, err := EncodeEnvelopeInner("chat.invite", []byte(`{"n":1}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err = EncodeMailboxPayload(addrA, addrB, pubB, MailboxMsgEnvelope, inner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, err = SignRecord(privA, addrA, RecTypeMailbox, payload, 2, uint64(now.Unix()), 3600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg, err = OpenMailboxRecord(privB, addrB, rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msg.MsgType != MailboxMsgEnvelope {
+		t.Fatalf("msg_type %d", msg.MsgType)
+	}
+	kind, body, err := SplitEnvelopeInner(msg.Body)
+	if err != nil || kind != "chat.invite" || string(body) != `{"n":1}` {
+		t.Fatalf("envelope note kind=%q body=%q err=%v", kind, body, err)
+	}
 }

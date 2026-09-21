@@ -17,6 +17,11 @@ const MagicMailboxFrame = "a2mb"
 // MagicServiceStream identifies a QUIC stream that admits into service_tcp (a2s1).
 const MagicServiceStream = "a2s1"
 
+// MagicCAS identifies a QUIC stream that serves content-addressed objects
+// as HTTP/1.1 after the same admission keys as a2s1. It is not bridged to
+// service_tcp; the daemon answers GET/HEAD /cas/{hash} itself.
+const MagicCAS = "a2cs"
+
 // StreamErrAccessDenied is the QUIC application error code for a data-plane
 // stream refused by ACL. Dialers that understand it map this to "access denied";
 // old peers just see a reset stream.

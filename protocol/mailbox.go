@@ -17,7 +17,7 @@ const (
 	MaxMailboxPayloadCBOR = 512
 	// DefaultMailboxTTL is the recommended mailbox record TTL in seconds (spec §4.8).
 	DefaultMailboxTTL uint32 = 3600
-	mailboxSalt                = "a2al-mailbox\x00"
+	mailboxSalt              = "a2al-mailbox\x00"
 )
 
 // Mailbox message types (spec §4.3).
@@ -25,6 +25,9 @@ const (
 	MailboxMsgConnectRequest uint8 = 0x01
 	MailboxMsgCandidates     uint8 = 0x02
 	MailboxMsgText           uint8 = 0x03
+	// MailboxMsgEnvelope is the persist form of a data-plane envelope (kind+body).
+	// Not application-specific: consumers register by kind.
+	MailboxMsgEnvelope uint8 = 0x04
 )
 
 // MailboxPayload is the CBOR inside SignedRecord.payload for rec_type=0x80 (spec §4.1).

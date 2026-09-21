@@ -13,6 +13,24 @@ import (
 	"github.com/a2al/a2al/identity"
 )
 
+func TestRecordID_payloadAndFallback(t *testing.T) {
+	withPayload := SignedRecord{Payload: []byte("abc")}
+	id1 := RecordID(withPayload)
+	id2 := RecordID(withPayload)
+	if id1 != id2 {
+		t.Fatal("RecordID must be stable")
+	}
+	empty := SignedRecord{Address: make([]byte, 21), Seq: 7}
+	idEmpty := RecordID(empty)
+	if idEmpty == id1 {
+		t.Fatal("empty-payload fallback must not match payload hash")
+	}
+	empty2 := SignedRecord{Address: make([]byte, 21), Seq: 7}
+	if RecordID(empty2) != idEmpty {
+		t.Fatal("fallback must be stable")
+	}
+}
+
 func TestSignVerify_endpointRoundTrip(t *testing.T) {
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
