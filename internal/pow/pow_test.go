@@ -31,11 +31,35 @@ func TestSolveVerify_roundtrip(t *testing.T) {
 	if !Verify("chat.invite", from, to, 42, nonce, DefaultBits) {
 		t.Fatal("solved nonce must verify")
 	}
-	if Verify("acl.join", from, to, 42, nonce, DefaultBits) {
-		t.Fatal("different purpose must not verify")
+	want := Hash("chat.invite", from, to, 42, nonce)
+	if Hash("acl.join", from, to, 42, nonce) == want {
+		t.Fatal("purpose must bind")
 	}
-	if Verify("chat.invite", to, from, 42, nonce, DefaultBits) {
-		t.Fatal("swapped AIDs must not verify")
+	if Hash("chat.invite", to, from, 42, nonce) == want {
+		t.Fatal("from/to must bind")
+	}
+}
+
+func TestVerify_matchesHash(t *testing.T) {
+	var from, to a2al.Address
+	from[0], to[0] = 1, 2
+	nonce := []byte{1, 2, 3, 4, 5, 6, 7, 8}
+	cases := []struct {
+		purpose string
+		a, b    a2al.Address
+		ts      int64
+	}{
+		{"chat.invite", from, to, 42},
+		{"acl.join", from, to, 42},
+		{"chat.invite", to, from, 42},
+		{"chat.invite", from, to, 43},
+	}
+	for _, c := range cases {
+		got := Verify(c.purpose, c.a, c.b, c.ts, nonce, DefaultBits)
+		n := LeadingZeros(Hash(c.purpose, c.a, c.b, c.ts, nonce))
+		if got != (n >= DefaultBits) {
+			t.Fatalf("%s zeros=%d Verify=%v", c.purpose, n, got)
+		}
 	}
 }
 

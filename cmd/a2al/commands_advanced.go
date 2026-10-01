@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/a2al/a2al/internal/envelope"
@@ -544,7 +545,7 @@ func cmdConnect(c *Client, g globalOpts, args []string) {
 // cmdTunnel manages persistent multiplexed encrypted tunnels.
 //
 //	a2al tunnel                          — list active tunnels
-//	a2al tunnel open <aid> [flags]       — open a persistent tunnel
+//	a2al tunnel open <aid> [flags]       — open a persistent tunnel (--local-port N pins the local port)
 //	a2al tunnel close <id>               — close a tunnel by ID
 //	a2al tunnel reset <id>               — force-close the QUIC connection; tunnel self-closes
 //	a2al tunnel status <id>              — show tunnel status
@@ -556,7 +557,7 @@ func cmdTunnel(c *Client, g globalOpts, args []string) {
 	switch args[0] {
 	case "open":
 		if len(args) < 2 {
-			fatalf("usage: a2al tunnel open <remote-aid> [--local-aid …] [--idle-timeout N] [--access-token …]")
+			fatalf("usage: a2al tunnel open <remote-aid> [--local-aid …] [--local-port N] [--idle-timeout N] [--access-token …]")
 		}
 		tunnelOpen(c, g, args[1:])
 	case "close":
@@ -575,7 +576,7 @@ func cmdTunnel(c *Client, g globalOpts, args []string) {
 		}
 		tunnelStatus(c, g, args[1])
 	default:
-		fatalf("unknown tunnel subcommand: %s\n\nUsage:\n  a2al tunnel\n  a2al tunnel open <aid> [--local-aid …] [--idle-timeout N]\n  a2al tunnel close <id>\n  a2al tunnel reset <id>\n  a2al tunnel status <id>", args[0])
+		fatalf("unknown tunnel subcommand: %s\n\nUsage:\n  a2al tunnel\n  a2al tunnel open <aid> [--local-aid …] [--local-port N] [--idle-timeout N]\n  a2al tunnel close <id>\n  a2al tunnel reset <id>\n  a2al tunnel status <id>", args[0])
 	}
 }
 
@@ -615,6 +616,8 @@ func tunnelOpen(c *Client, g globalOpts, args []string) {
 	la := flagString(args[1:], "--local-aid")
 	idleStr := flagString(args[1:], "--idle-timeout")
 	tok := flagString(args[1:], "--access-token")
+	portStr := flagString(args[1:], "--local-port")
+	var localPort int
 
 	body := map[string]any{}
 	if la != "" {
@@ -630,13 +633,27 @@ func tunnelOpen(c *Client, g globalOpts, args []string) {
 		}
 		body["idle_timeout_sec"] = n
 	}
+	if portStr != "" {
+		n, err := strconv.Atoi(portStr)
+		if err != nil || n < 1 || n > 65535 {
+			fatalf("invalid --local-port: must be 1–65535")
+		}
+		localPort = n
+		body["local_port"] = n
+	}
 
 	if !g.Quiet && !g.JSON {
 		label := resolveLocalIdentityLabel(c, la)
 		fmt.Fprintf(os.Stderr, "Opening tunnel as %s → %s\n", label, shortAID(remote))
 	}
 	var tun map[string]any
-	if _, _, err := c.DoRequest(http.MethodPost, "/tunnel/"+url.PathEscape(remote), body, &tun); err != nil {
+	if status, _, err := c.DoRequest(http.MethodPost, "/tunnel/"+url.PathEscape(remote), body, &tun); err != nil {
+		if status == http.StatusConflict {
+			if localPort > 0 {
+				fatalf("port %d in use: choose another --local-port, or omit it to let the system assign one", localPort)
+			}
+			fatalf("port in use: choose another --local-port, or omit it to let the system assign one")
+		}
 		fatal(err)
 	}
 	if allowed, ok := tun["allowed"].(bool); ok && !allowed {

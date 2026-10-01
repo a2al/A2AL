@@ -356,11 +356,14 @@ Open a **persistent multiplexed** encrypted tunnel. A single tunnel accepts any 
 {
   "local_aid": "a2alXYZ...",
   "idle_timeout_sec": 90,
-  "disable_relay": false
+  "disable_relay": false,
+  "local_port": 18080
 }
 ```
 
 `disable_relay`: same semantics as in `POST /connect/{aid}`.
+
+`local_port`: optional 1–65535. Omit or 0 to let the system assign a port. The same local identity, remote AID, and port returns the existing tunnel if it is still usable. A different occupant of that port returns HTTP 409 `{"error":"port_in_use"}`. A value outside 1–65535 (and not 0) returns HTTP 400 `{"error":"bad local_port"}`.
 
 **Response:**
 
@@ -551,7 +554,7 @@ See [MCP Setup](mcp-setup.md) for platform-specific config snippets.
 | `a2al_resolve_records` | Fetch all signed records published by a remote agent. |
 | `a2al_connect` | Open a one-shot encrypted tunnel to a remote agent. Returns `127.0.0.1:<port>`. |
 | `a2al_fetch` | Send an HTTP request to a remote agent over an encrypted QUIC connection. Returns `{status, headers, body}`. No local TCP port required. |
-| `a2al_tunnel_open` | Open a persistent multiplexed encrypted tunnel. Returns `{id, listen}`. |
+| `a2al_tunnel_open` | Open a persistent multiplexed encrypted tunnel. Returns `{id, listen}`. Optional `local_port` requests that local port. |
 | `a2al_tunnel_close` | Close a persistent tunnel by ID. |
 | `a2al_tunnel_list` | List all active persistent tunnels. |
 | `a2al_mailbox_send` | Send an encrypted note to any agent (offline delivery supported). |

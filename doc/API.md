@@ -204,7 +204,7 @@ Binds to `config.Config.APIAddr` (default `127.0.0.1:2121`). If `api_token` is s
 | `POST` | `/resolve/{aid}` | Resolve remote AID to endpoint record JSON. |
 | `POST` | `/connect/{aid}` | One-shot tunnel: returns `{"tunnel":"127.0.0.1:<port>"}`. Tunnel closes when TCP connection closes. Optional `{"local_aid":"..."}`. |
 | `POST` | `/fetch/{aid}` | Send HTTP request to remote agent over QUIC; daemon handles transport internally. Request: `{"method","path","headers","body_base64","local_aid"}`. Response: `{"status","headers","body"(base64),"truncated"}`. |
-| `POST` | `/tunnel/{aid}` | Open persistent multiplexed tunnel (multiple concurrent TCP connections over one QUIC stream pool). Returns `{"id","listen","remote_aid"}`. Optional `{"local_aid","idle_timeout_sec"}`. |
+| `POST` | `/tunnel/{aid}` | Open persistent multiplexed tunnel (multiple concurrent TCP connections over one QUIC stream pool). Returns `{"id","listen","remote_aid"}`. Optional `{"local_aid","idle_timeout_sec","local_port"}`. Same local+remote+port reuses the existing tunnel; another occupant returns 409 `port_in_use`. |
 | `DELETE` | `/tunnel/{id}` | Close persistent tunnel by ID. Returns `{"ok":true}`. |
 | `GET` | `/tunnel` | List active persistent tunnels: `{"tunnels":[{"id","listen","remote_aid","active_conns"},...]}`. |
 | `GET` | `/tunnel/{id}` | Status of a single persistent tunnel. |

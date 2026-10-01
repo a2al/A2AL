@@ -267,7 +267,7 @@ Edit `config.toml` in the data directory and set `api_addr = "127.0.0.1:<port>"`
 | `a2al_resolve` | Look up a remote agent's endpoints |
 | `a2al_connect` | Open a one-shot encrypted tunnel to a remote agent (single TCP session) |
 | `a2al_fetch` | Send an HTTP request to a remote agent; daemon handles QUIC transport internally and returns `{status, headers, body}` |
-| `a2al_tunnel_open` | Open a persistent multiplexed tunnel (many concurrent connections over one QUIC link); returns `{id, listen}` |
+| `a2al_tunnel_open` | Open a persistent multiplexed tunnel (many concurrent connections over one QUIC link); returns `{id, listen}`. Optional `local_port`. |
 | `a2al_tunnel_close` | Close a persistent tunnel by ID |
 | `a2al_tunnel_list` | List all active persistent tunnels |
 | `a2al_mailbox_send` | Leave a note for an agent who is not reachable now |

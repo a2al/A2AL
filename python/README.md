@@ -57,7 +57,7 @@ with Daemon() as d:
 | `resolve(aid)` | `POST /resolve/{aid}` | Look up a remote agent's endpoints |
 | `connect(aid, *, local_aid)` | `POST /connect/{aid}` | One-shot tunnel — single TCP session, closes automatically |
 | `fetch(aid, *, method, path, headers, body_base64, local_aid)` | `POST /fetch/{aid}` | HTTP request over QUIC; returns `{status, headers, body(base64), truncated}` |
-| `tunnel_open(aid, *, local_aid, idle_timeout_sec)` | `POST /tunnel/{aid}` | Persistent tunnel — accepts many concurrent connections; returns `{id, listen}` |
+| `tunnel_open(aid, *, local_aid, idle_timeout_sec, local_port)` | `POST /tunnel/{aid}` | Persistent tunnel — accepts many concurrent connections; returns `{id, listen}` |
 | `tunnel_close(id)` | `DELETE /tunnel/{id}` | Close a persistent tunnel |
 | `tunnel_list()` | `GET /tunnel` | List active persistent tunnels |
 | `tunnel_status(id)` | `GET /tunnel/{id}` | Status of one tunnel |

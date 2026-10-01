@@ -213,6 +213,7 @@ class Client:
         *,
         local_aid: str = "",
         idle_timeout_sec: Optional[int] = None,
+        local_port: Optional[int] = None,
     ) -> Any:
         """POST /tunnel/{aid} — open a persistent multiplexed tunnel."""
         body: dict[str, Any] = {}
@@ -220,6 +221,8 @@ class Client:
             body["local_aid"] = local_aid
         if idle_timeout_sec is not None:
             body["idle_timeout_sec"] = idle_timeout_sec
+        if local_port:
+            body["local_port"] = local_port
         return self._request("POST", f"/tunnel/{aid}", body)
 
     def tunnel_close(self, tunnel_id: str) -> Any:

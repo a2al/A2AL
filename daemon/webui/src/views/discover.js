@@ -26,7 +26,15 @@ function accessRetryHTML(t, requesterAid) {
       </div>`;
 }
 
-function actionFailHTML(e, t, requesterAid) {
+function isPortInUse(e) {
+  return e && e.status === 409 && e.message === 'port_in_use';
+}
+
+function actionFailHTML(e, t, requesterAid, opts) {
+  if (isPortInUse(e)) {
+    return `<p style="color:var(--error);margin:0">${esc(t('discover.tunnel.port_in_use', { port: opts && opts.port }))}</p>
+      <button type="button" class="btn btn-ghost btn-sm" data-port-random style="margin-top:.35rem">${esc(t('discover.tunnel.port_use_random'))}</button>`;
+  }
   if (isAccessDenied(e)) {
     return accessRetryHTML(t, requesterAid);
   }
@@ -426,15 +434,129 @@ export async function renderDiscover(mount, ctx) {
   }
 
   /* ── Helpers ───────────────────────────────────────────── */
-  async function findOrOpenTunnel(remoteAid, token) {
-    const aidNorm = remoteAid.toLowerCase();
+  const TUNNEL_PORT_KEY = 'a2al.tunnelLocalPort';
+
+  function aidKey(aid) {
+    return String(aid || '').toLowerCase();
+  }
+
+  function loadPortMap() {
     try {
-      const { tunnels = [] } = await api('/tunnel');
-      const existing = tunnels.find((t) => (t.remote_aid || '').toLowerCase() === aidNorm);
-      if (existing) return existing;
-    } catch (_) {}
-    const body = token ? { access_token: token } : {};
-    return api(`/tunnel/${encodeURIComponent(remoteAid)}`, { method: 'POST', body: JSON.stringify(body) });
+      const raw = localStorage.getItem(TUNNEL_PORT_KEY);
+      if (!raw || raw[0] !== '{') {
+        if (raw) localStorage.removeItem(TUNNEL_PORT_KEY);
+        return {};
+      }
+      const obj = JSON.parse(raw);
+      return obj && typeof obj === 'object' ? obj : {};
+    } catch (_) {
+      return {};
+    }
+  }
+
+  function savedTunnelPort(remoteAid) {
+    const n = Number(loadPortMap()[aidKey(remoteAid)]);
+    return Number.isInteger(n) && n >= 1 && n <= 65535 ? n : 0;
+  }
+
+  function setSavedTunnelPort(remoteAid, port) {
+    const m = loadPortMap();
+    const k = aidKey(remoteAid);
+    if (!port) delete m[k];
+    else m[k] = port;
+    if (Object.keys(m).length === 0) localStorage.removeItem(TUNNEL_PORT_KEY);
+    else localStorage.setItem(TUNNEL_PORT_KEY, JSON.stringify(m));
+  }
+
+  function listenPortOf(listen) {
+    const i = String(listen || '').lastIndexOf(':');
+    if (i < 0) return 0;
+    const n = Number(listen.slice(i + 1));
+    return Number.isInteger(n) ? n : 0;
+  }
+
+  function tunnelPortControls(btnClass, remoteAid) {
+    const saved = savedTunnelPort(remoteAid);
+    const label = saved ? t('discover.tunnel.port_edit') : t('discover.tunnel.port_modify');
+    return `<input type="text" inputmode="numeric" data-tunnel-port class="${saved ? '' : 'hidden'}" placeholder="${esc(t('discover.tunnel.port_ph'))}" value="${saved ? esc(String(saved)) : ''}" disabled style="width:6.5rem" />
+      <button type="button" class="btn btn-ghost ${btnClass}" data-tunnel-port-btn>${esc(label)}</button>`;
+  }
+
+  function bindTunnelPortEditor(root, remoteAid) {
+    const input = root.querySelector('[data-tunnel-port]');
+    const btn = root.querySelector('[data-tunnel-port-btn]');
+    if (!input || !btn) return;
+    let editing = false;
+    const showIdle = () => {
+      editing = false;
+      const saved = savedTunnelPort(remoteAid);
+      input.disabled = true;
+      if (!saved) {
+        input.value = '';
+        input.classList.add('hidden');
+        btn.textContent = t('discover.tunnel.port_modify');
+        return;
+      }
+      input.value = String(saved);
+      input.classList.remove('hidden');
+      btn.textContent = t('discover.tunnel.port_edit');
+    };
+    btn.onclick = () => {
+      if (!editing) {
+        editing = true;
+        input.classList.remove('hidden');
+        input.disabled = false;
+        btn.textContent = t('discover.tunnel.port_save');
+        input.focus();
+        return;
+      }
+      const raw = input.value.trim();
+      if (raw === '') {
+        setSavedTunnelPort(remoteAid, 0);
+        toast(t('discover.tunnel.port_cleared'), 'ok');
+        showIdle();
+        return;
+      }
+      const n = Number(raw);
+      if (!Number.isInteger(n) || n < 1 || n > 65535) {
+        toast(t('discover.tunnel.port_invalid'), 'warn');
+        return;
+      }
+      setSavedTunnelPort(remoteAid, n);
+      toast(t('discover.tunnel.port_saved'), 'ok');
+      showIdle();
+    };
+  }
+
+  function bindPortRandom(root, remoteAid, retry) {
+    const btn = root.querySelector('[data-port-random]');
+    if (!btn) return;
+    btn.onclick = () => {
+      setSavedTunnelPort(remoteAid, 0);
+      retry();
+    };
+  }
+
+  async function findOrOpenTunnel(remoteAid, token) {
+    let port = savedTunnelPort(remoteAid);
+    if (!port) {
+      try {
+        const aidNorm = remoteAid.toLowerCase();
+        const { tunnels = [] } = await api('/tunnel');
+        const existing = tunnels.find((t) => (t.remote_aid || '').toLowerCase() === aidNorm);
+        const n = listenPortOf(existing && existing.listen);
+        if (n) port = n;
+      } catch (_) {}
+    }
+    const body = {};
+    if (token) body.access_token = token;
+    if (port) body.local_port = port;
+    try {
+      return await api(`/tunnel/${encodeURIComponent(remoteAid)}`, { method: 'POST', body: JSON.stringify(body) });
+    } catch (e) {
+      if (port) e.localPort = port;
+      throw e;
+    }
   }
 
   function fmtEndpoints(ep) {
@@ -813,6 +935,7 @@ export async function renderDiscover(mount, ctx) {
       <div style="display:flex;align-items:center;gap:.4rem;flex-wrap:wrap;margin-bottom:.4rem">
         <code class="mono" style="font-size:.87rem">${esc(tr.listen)}</code>
         <button type="button" class="btn btn-ghost btn-sm" id="dTunnelCp">\u29c9</button>
+        ${tunnelPortControls('btn-sm', currentAid)}
         <button type="button" class="btn btn-ghost btn-sm" id="dTunnelClose">${esc(t('discover.tunnel.close'))}</button>
         <button type="button" class="btn btn-ghost btn-sm" id="dTunnelReset">${esc(t('discover.tunnel.reset'))}</button>
       </div>
@@ -821,6 +944,7 @@ export async function renderDiscover(mount, ctx) {
         ${tr.https_url ? `<button type="button" class="btn btn-ghost btn-sm" id="dTunnelOpenHttps">${esc(t('discover.tunnel.open_https'))}</button><span class="muted" style="font-size:.79rem">${esc(t('discover.tunnel.open_hint'))}</span>` : ''}
       </div>`;
     actionOut.querySelector('#dTunnelCp').onclick = () => copyText(tr.listen);
+    bindTunnelPortEditor(actionOut, currentAid);
     actionOut.querySelector('#dTunnelOpen').onclick = () => window.open('http://' + tr.listen, '_blank', 'noopener');
     if (tr.https_url) actionOut.querySelector('#dTunnelOpenHttps').onclick = () => window.open(tr.https_url, '_blank', 'noopener');
     actionOut.querySelector('#dTunnelClose').onclick = async () => {
@@ -849,8 +973,9 @@ export async function renderDiscover(mount, ctx) {
     try {
       paintMainTunnel(await findOrOpenTunnel(currentAid, token), (tok) => runMainTunnel(btn, tok));
     } catch (e) {
-      actionOut.innerHTML = actionFailHTML(e, t, nodeAid);
+      actionOut.innerHTML = actionFailHTML(e, t, nodeAid, { port: e.localPort || savedTunnelPort(currentAid) });
       bindAccessRetry(actionOut, e, (tok) => runMainTunnel(btn, tok));
+      bindPortRandom(actionOut, currentAid, () => runMainTunnel(btn));
     } finally {
       setLoading(btn, false);
     }
@@ -1245,6 +1370,7 @@ export async function renderDiscover(mount, ctx) {
         <div style="display:flex;align-items:center;gap:.4rem;flex-wrap:wrap;margin-bottom:.35rem">
           <code class="mono" style="font-size:.84rem">${esc(tr.listen)}</code>
           <button type="button" class="btn btn-ghost btn-xs" data-tcp>\u29c9</button>
+          ${tunnelPortControls('btn-xs', fav.aid)}
           <button type="button" class="btn btn-ghost btn-xs" data-tclose>${esc(t('discover.tunnel.close'))}</button>
           <button type="button" class="btn btn-ghost btn-xs" data-treset>${esc(t('discover.tunnel.reset'))}</button>
         </div>
@@ -1253,6 +1379,7 @@ export async function renderDiscover(mount, ctx) {
           ${tr.https_url ? `<button type="button" class="btn btn-ghost btn-sm" data-topen-https>${esc(t('discover.tunnel.open_https'))}</button><span class="muted" style="font-size:.78rem">${esc(t('discover.tunnel.open_hint'))}</span>` : ''}
         </div>`;
       panel.querySelector('[data-tcp]').onclick = () => copyText(tr.listen);
+      bindTunnelPortEditor(panel, fav.aid);
       panel.querySelector('[data-topen]').onclick = () => window.open('http://' + tr.listen, '_blank', 'noopener');
       if (tr.https_url) panel.querySelector('[data-topen-https]').onclick = () => window.open(tr.https_url, '_blank', 'noopener');
       panel.querySelector('[data-tclose]').onclick = async () => {
@@ -1273,8 +1400,9 @@ export async function renderDiscover(mount, ctx) {
         }
       };
     } catch (e) {
-      panel.innerHTML = actionFailHTML(e, t, nodeAid);
+      panel.innerHTML = actionFailHTML(e, t, nodeAid, { port: e.localPort || savedTunnelPort(fav.aid) });
       bindAccessRetry(panel, e, (tok) => setupFavTunnel(fav, panel, deactivateFavBtns, tok));
+      bindPortRandom(panel, fav.aid, () => setupFavTunnel(fav, panel, deactivateFavBtns));
     }
   }
 
