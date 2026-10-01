@@ -1568,6 +1568,8 @@ var (
 	errResolve              = errors.New("resolve failed")
 	errListen               = errors.New("listen failed")
 	errConnectQUIC          = errors.New("quic connect failed")
+	errPortInUse            = errors.New("port_in_use")
+	errBadLocalPort         = errors.New("bad local_port")
 	errOpKeyMismatch        = errors.New("operational key mismatch")
 	errServicesRequired     = errors.New("services required")
 	errBadRecType           = errors.New("rec_type must be sovereign custom 0x02-0x0f")

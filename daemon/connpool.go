@@ -158,8 +158,18 @@ func (p *modeAConnPool) acquire(ctx context.Context, local, remote a2al.Address,
 	}
 	p.mu.Unlock()
 
-	res := <-p.startDial(ctx, key, local, remote, er, noRelay, user)
-	return unpackDial(res)
+	ch := p.startDial(ctx, key, local, remote, er, noRelay, user)
+	select {
+	case res := <-ch:
+		return unpackDial(res)
+	case <-ctx.Done():
+		select {
+		case res := <-ch:
+			return unpackDial(res)
+		default:
+			return nil, false, ctx.Err()
+		}
+	}
 }
 
 type dialResult struct {

@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -173,7 +174,7 @@ func buildMCPServer(d *Daemon) *mcp.Server {
 	}, d.mcpFetch)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_tunnel_open",
-		Description: "Open a persistent multiplexed tunnel to a remote agent's service. Returns a local TCP address (e.g. 127.0.0.1:PORT) and a tunnel_id. Unlike a2al_connect, the tunnel accepts unlimited concurrent TCP connections, each mapped to its own QUIC stream. Ideal for SSH forwarding, database clients, and any tool that opens multiple connections. Close with a2al_tunnel_close when done.",
+		Description: "Open a persistent multiplexed tunnel to a remote agent's service. Returns a local TCP address (e.g. 127.0.0.1:PORT) and a tunnel_id. Unlike a2al_connect, the tunnel accepts unlimited concurrent TCP connections, each mapped to its own QUIC stream. Ideal for SSH forwarding, database clients, and any tool that opens multiple connections. Optional local_port (1-65535) requests that local port; omit it to let the system assign one. Close with a2al_tunnel_close when done.",
 	}, d.mcpTunnelOpen)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_tunnel_close",
@@ -637,6 +638,7 @@ type mcpTunnelOpenArgs struct {
 	LocalAID       string `json:"local_aid,omitempty"`
 	AccessToken    string `json:"access_token,omitempty"`
 	IdleTimeoutSec int    `json:"idle_timeout_sec,omitempty"`
+	LocalPort      int    `json:"local_port,omitempty"`
 }
 
 func (d *Daemon) mcpTunnelOpen(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[mcpTunnelOpenArgs]) (*mcp.CallToolResultFor[map[string]any], error) {
@@ -646,11 +648,19 @@ func (d *Daemon) mcpTunnelOpen(ctx context.Context, _ *mcp.ServerSession, params
 		LocalAID:       params.Arguments.LocalAID,
 		AccessToken:    params.Arguments.AccessToken,
 		IdleTimeoutSec: params.Arguments.IdleTimeoutSec,
+		LocalPort:      params.Arguments.LocalPort,
 	})
 	if err != nil {
 		switch {
 		case errors.Is(err, errBadAID):
 			return nil, errors.New("bad remote_aid")
+		case errors.Is(err, errBadLocalPort):
+			return nil, errors.New("bad local_port")
+		case errors.Is(err, errPortInUse):
+			if p := params.Arguments.LocalPort; p > 0 {
+				return nil, fmt.Errorf("port %d in use: choose another local_port, or omit it to let the system assign one", p)
+			}
+			return nil, errors.New("port in use: choose another local_port, or omit it to let the system assign one")
 		case errors.Is(err, errResolve):
 			return nil, errors.New("resolve failed: remote agent not found on the network — try a2al_discover to search by capability")
 		case errors.Is(err, errConnectQUIC):

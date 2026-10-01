@@ -26,6 +26,57 @@ func testAID(t *testing.T, hexPair string) a2al.Address {
 	return aid
 }
 
+func TestConnPool_acquireCallerCancelKeepsDial(t *testing.T) {
+	fresh := newStubConn()
+	dialDone := make(chan struct{})
+	var dials int
+	p := newModeAConnPool(func(context.Context, a2al.Address, a2al.Address, *protocol.EndpointRecord, bool, bool) (quic.Connection, bool, error) {
+		dials++
+		time.Sleep(300 * time.Millisecond)
+		close(dialDone)
+		return fresh, false, nil
+	}, slog.Default())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	local := testAID(t, "a1")
+	remote := testAID(t, "a2")
+	start := time.Now()
+	_, _, err := p.acquire(ctx, local, remote, nil, false, true)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("got %v", err)
+	}
+	if time.Since(start) > 200*time.Millisecond {
+		t.Fatal("caller blocked on the full dial")
+	}
+	select {
+	case <-dialDone:
+	case <-time.After(time.Second):
+		t.Fatal("dial did not finish after the caller returned")
+	}
+	var conn quic.Connection
+	deadline := time.Now().Add(time.Second)
+	for {
+		var ok bool
+		conn, _, ok = p.cachedLive(connPoolKey{local: local, remote: remote})
+		if ok && conn == fresh {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("finished dial must stay in the pool")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	got, _, err := p.acquire(context.Background(), local, remote, nil, false, true)
+	if err != nil || got != fresh {
+		t.Fatalf("second acquire got %v err=%v", got, err)
+	}
+	if dials != 1 {
+		t.Fatalf("dials=%d want 1", dials)
+	}
+}
+
 func TestConnPool_userSkipsBackoff(t *testing.T) {
 	var dials int
 	p := newModeAConnPool(func(context.Context, a2al.Address, a2al.Address, *protocol.EndpointRecord, bool, bool) (quic.Connection, bool, error) {
@@ -68,8 +119,10 @@ func TestConnPool_userSkipsBackoff(t *testing.T) {
 }
 
 type stubConn struct {
-	ctx    context.Context
-	cancel context.CancelFunc
+	ctx     context.Context
+	cancel  context.CancelFunc
+	openOK  bool
+	openErr error
 }
 
 func newStubConn() *stubConn {
@@ -81,9 +134,17 @@ func (c *stubConn) AcceptStream(context.Context) (quic.Stream, error) { panic("u
 func (c *stubConn) AcceptUniStream(context.Context) (quic.ReceiveStream, error) {
 	panic("unused")
 }
-func (c *stubConn) OpenStream() (quic.Stream, error)                    { panic("unused") }
-func (c *stubConn) OpenStreamSync(context.Context) (quic.Stream, error) { panic("unused") }
-func (c *stubConn) OpenUniStream() (quic.SendStream, error)             { panic("unused") }
+func (c *stubConn) OpenStream() (quic.Stream, error) { panic("unused") }
+func (c *stubConn) OpenStreamSync(context.Context) (quic.Stream, error) {
+	if c.openOK {
+		return nil, nil
+	}
+	if c.openErr != nil {
+		return nil, c.openErr
+	}
+	panic("unused")
+}
+func (c *stubConn) OpenUniStream() (quic.SendStream, error) { panic("unused") }
 func (c *stubConn) OpenUniStreamSync(context.Context) (quic.SendStream, error) {
 	panic("unused")
 }

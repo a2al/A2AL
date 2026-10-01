@@ -9,12 +9,16 @@ import (
 	"encoding/hex"
 	"errors"
 	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/a2al/a2al"
 	"github.com/a2al/a2al/host"
+	"github.com/a2al/a2al/protocol"
+	"github.com/quic-go/quic-go"
 )
 
 // tunnelEntry represents a persistent multiplexed TCP→QUIC tunnel.
@@ -43,9 +47,33 @@ type tunnelEntry struct {
 	bytesDown    atomic.Int64
 	lastProgress atomic.Int64 // unix nano; updated whenever either direction advances
 
+	qcMu     sync.Mutex
+	qc       quic.Connection
+	repairMu sync.Mutex
+
 	// shutdown
 	cancel context.CancelFunc
 	done   <-chan struct{} // closed when the accept loop exits
+}
+
+func (e *tunnelEntry) conn() quic.Connection {
+	e.qcMu.Lock()
+	defer e.qcMu.Unlock()
+	return e.qc
+}
+
+func (e *tunnelEntry) setConn(c quic.Connection, relayed bool) {
+	e.qcMu.Lock()
+	e.qc = c
+	e.isRelayed = relayed
+	e.qcMu.Unlock()
+}
+
+// connLive is true when there is no tracked connection (tests, race) or it
+// has not yet closed. A dead QUIC must not be handed back as a reusable tunnel.
+func (e *tunnelEntry) connLive() bool {
+	c := e.conn()
+	return c == nil || c.Context().Err() == nil
 }
 
 // tunnelStatus is the JSON-serialisable view of a tunnelEntry.
@@ -127,6 +155,57 @@ func (r *tunnelRegistry) delete(id string) {
 	r.mu.Unlock()
 }
 
+// findListen reports a tunnel already bound to port.
+// exact is set when that tunnel belongs to local→remote.
+// occupied is set when some other tunnel holds the port.
+func (r *tunnelRegistry) findListen(local, remote a2al.Address, port int) (exact *tunnelEntry, occupied bool) {
+	if port <= 0 {
+		return nil, false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, e := range r.entries {
+		if listenPort(e.listen) != port {
+			continue
+		}
+		if e.localAID == local && e.remoteAID == remote {
+			return e, false
+		}
+		occupied = true
+	}
+	return nil, occupied
+}
+
+func listenPort(listen string) int {
+	_, ps, err := net.SplitHostPort(listen)
+	if err != nil {
+		return 0
+	}
+	p, err := strconv.Atoi(ps)
+	if err != nil || p < 1 || p > 65535 {
+		return 0
+	}
+	return p
+}
+
+func listenTunnel(port int) (net.Listener, error) {
+	addr := "127.0.0.1:0"
+	if port > 0 {
+		addr = net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+	}
+	return net.Listen("tcp", addr)
+}
+
+func isAddrInUse(err error) bool {
+	if errors.Is(err, syscall.EADDRINUSE) {
+		return true
+	}
+	// Windows Listen returns WSAEADDRINUSE (10048). Current Go's
+	// syscall.EADDRINUSE is a different constant, so errors.Is misses it.
+	var errno syscall.Errno
+	return errors.As(err, &errno) && errno == 10048
+}
+
 func (r *tunnelRegistry) list() []tunnelStatus {
 	r.mu.RLock()
 	out := make([]tunnelStatus, 0, len(r.entries))
@@ -169,6 +248,7 @@ type tunnelOpenReq struct {
 	AccessToken    string `json:"access_token,omitempty"`
 	IdleTimeoutSec int    `json:"idle_timeout_sec,omitempty"` // 0 = default (6 min), -1 = no timeout
 	DisableRelay   *bool  `json:"disable_relay,omitempty"`    // nil = use node default
+	LocalPort      int    `json:"local_port,omitempty"`       // 0 = ephemeral 127.0.0.1 port
 }
 
 func randomID() string {
@@ -192,6 +272,25 @@ func (d *Daemon) execTunnelOpen(ctx context.Context, remoteAidStr string, req tu
 		return nil, false, err
 	}
 	d.noteActingAgent(local)
+
+	if req.LocalPort < 0 || req.LocalPort > 65535 {
+		return nil, false, errBadLocalPort
+	}
+	// A requested port already held by this same pair is that caller's tunnel.
+	// Checked before resolve/dial so a repeat open does not acquire or retain again.
+	if req.LocalPort > 0 {
+		if e, occupied := d.tunnels.findListen(local, remote, req.LocalPort); e != nil {
+			keep, err := d.reuseTunnel(ctx, e, local, remote)
+			if err != nil {
+				return nil, false, err
+			}
+			if keep != nil {
+				return keep, true, nil
+			}
+		} else if occupied {
+			return nil, false, errPortInUse
+		}
+	}
 
 	// Resolve with 20 s cap, same as execFetch / execConnect.
 	rctx, rcancel := context.WithTimeout(ctx, 20*time.Second)
@@ -234,10 +333,13 @@ func (d *Daemon) execTunnelOpen(ctx context.Context, remoteAidStr string, req tu
 	}
 	d.connPool.retain(local, remote, nr)
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := listenTunnel(req.LocalPort)
 	if err != nil {
-		d.connPool.release(local, remote, nr)
-		return nil, false, errListen
+		e, lerr := d.dropTunnelListen(local, remote, nr, req.LocalPort, err)
+		if lerr != nil {
+			return nil, false, lerr
+		}
+		return e, true, nil
 	}
 
 	tctx, cancel := context.WithCancel(context.Background())
@@ -266,6 +368,7 @@ func (d *Daemon) execTunnelOpen(ctx context.Context, remoteAidStr string, req tu
 		noRelay:   nr,
 		token:     req.AccessToken,
 		openedAt:  time.Now(),
+		qc:        qc,
 		cancel:    cancel,
 		done:      done,
 	}
@@ -281,19 +384,7 @@ func (d *Daemon) execTunnelOpen(ctx context.Context, remoteAidStr string, req tu
 			close(done)
 		}()
 
-		// Shut down the listener when the QUIC connection dies or the tunnel
-		// is explicitly cancelled. ln.Close() unblocks the Accept() call in
-		// the main loop below; calling it multiple times is safe (net.Listener
-		// returns an error on subsequent closes, which we ignore with _ =).
-		go func() {
-			select {
-			case <-qc.Context().Done():
-				d.log.Debug("tunnel: quic died, closing listener", "id", entry.id)
-				cancel()
-			case <-tctx.Done():
-			}
-			_ = ln.Close() // unblock Accept()
-		}()
+		go d.watchTunnelConn(entry, ln, cancel, tctx)
 
 		// Idle watcher: close when no new connections for idleTimeout.
 		// Only started when idleTimeout > 0; a negative IdleTimeoutSec disables it.
@@ -332,13 +423,32 @@ func (d *Daemon) execTunnelOpen(ctx context.Context, remoteAidStr string, req tu
 
 			go func() {
 				defer entry.connDone()
-				openCtx, openCancel := context.WithTimeout(tctx, 30*time.Second)
-				defer openCancel()
-				qs, err := d.openAdmittedStream(openCtx, qc, entry.token)
+				cur := entry.conn()
+				qs, err := d.openTunnelStream(tctx, cur, entry.token)
 				if err != nil {
-					d.log.Warn("tunnel: open stream failed", "id", entry.id, "err", err)
-					_ = tcpConn.Close()
-					return
+					if isAccessDeniedErr(err) || tctx.Err() != nil {
+						d.log.Warn("tunnel: open stream failed", "id", entry.id, "err", err)
+						_ = tcpConn.Close()
+						return
+					}
+					next, rerr := d.repairTunnelConn(tctx, entry, local, remote, nr, er, cur)
+					if rerr != nil {
+						d.log.Warn("tunnel: repair failed", "id", entry.id, "err", rerr)
+						cancel()
+						_ = ln.Close()
+						_ = tcpConn.Close()
+						return
+					}
+					qs, err = d.openTunnelStream(tctx, next, entry.token)
+					if err != nil {
+						d.log.Warn("tunnel: open stream failed", "id", entry.id, "err", err)
+						if !isAccessDeniedErr(err) && tctx.Err() == nil {
+							cancel()
+							_ = ln.Close()
+						}
+						_ = tcpConn.Close()
+						return
+					}
 				}
 				// Sniff and optionally upgrade to TLS so the browser
 				// can use https://127.0.0.1:PORT with the persisted
@@ -351,6 +461,115 @@ func (d *Daemon) execTunnelOpen(ctx context.Context, remoteAidStr string, req tu
 	}()
 
 	return entry, true, nil
+}
+
+// reuseTunnel returns e when the existing listen is still usable.
+// A dead or unrepairable connection is closed and the caller opens a new tunnel.
+func (d *Daemon) reuseTunnel(ctx context.Context, e *tunnelEntry, local, remote a2al.Address) (*tunnelEntry, error) {
+	if !e.connLive() {
+		d.closeTunnel(e.id)
+		return nil, nil
+	}
+	if err := d.probeTunnelStream(ctx, e.conn(), e.token); err == nil || isAccessDeniedErr(err) {
+		return e, nil
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	next, rerr := d.repairTunnelConn(ctx, e, local, remote, e.noRelay, nil, e.conn())
+	if rerr == nil {
+		if err := d.probeTunnelStream(ctx, next, e.token); err == nil || isAccessDeniedErr(err) {
+			return e, nil
+		}
+	}
+	d.closeTunnel(e.id)
+	return nil, nil
+}
+
+// openTunnelStream opens one admitted stream, bounded by connPoolOpenProbeTimeout.
+func (d *Daemon) openTunnelStream(ctx context.Context, conn quic.Connection, token string) (quic.Stream, error) {
+	return openLimited(ctx, conn, func(ctx context.Context, c quic.Connection) (quic.Stream, error) {
+		return d.openAdmittedStream(ctx, c, token)
+	})
+}
+
+// probeTunnelStream confirms the cached QUIC can still open a service stream.
+// A nil conn skips the probe (tests).
+func (d *Daemon) probeTunnelStream(ctx context.Context, conn quic.Connection, token string) error {
+	if conn == nil {
+		return nil
+	}
+	str, err := d.openTunnelStream(ctx, conn, token)
+	if str != nil {
+		_ = str.Close()
+	}
+	return err
+}
+
+// watchTunnelConn closes the listener when the current QUIC dies or the
+// tunnel is cancelled. ln.Close unblocks Accept. A repair that swaps the
+// connection first is ignored: Done on the old connection must not tear
+// down a tunnel that already holds a new one.
+func (d *Daemon) watchTunnelConn(entry *tunnelEntry, ln net.Listener, cancel context.CancelFunc, tctx context.Context) {
+	for {
+		cur := entry.conn()
+		if cur == nil {
+			return
+		}
+		select {
+		case <-cur.Context().Done():
+			if entry.conn() != cur {
+				continue
+			}
+			d.log.Debug("tunnel: quic died, closing listener", "id", entry.id)
+			cancel()
+			_ = ln.Close()
+			return
+		case <-tctx.Done():
+			_ = ln.Close()
+			return
+		}
+	}
+}
+
+// repairTunnelConn replaces a tunnel's pooled QUIC after stream open failed.
+// The listen address is unchanged. Concurrent repairs share one dial.
+func (d *Daemon) repairTunnelConn(ctx context.Context, entry *tunnelEntry, local, remote a2al.Address, noRelay bool, er *protocol.EndpointRecord, dead quic.Connection) (quic.Connection, error) {
+	entry.repairMu.Lock()
+	defer entry.repairMu.Unlock()
+	if cur := entry.conn(); cur != nil && cur != dead && cur.Context().Err() == nil {
+		return cur, nil
+	}
+	old := entry.conn()
+	d.connPool.forget(local, remote, noRelay)
+	qc2, relayed, err := d.connPool.acquireRepair(ctx, local, remote, er, noRelay, true)
+	if err != nil {
+		if old != nil {
+			_ = old.CloseWithError(0, "reconnect requested")
+		}
+		return nil, err
+	}
+	d.connPool.retain(local, remote, noRelay)
+	entry.setConn(qc2, relayed)
+	if old != nil && old != qc2 {
+		_ = old.CloseWithError(0, "reconnect requested")
+	}
+	return qc2, nil
+}
+
+// dropTunnelListen releases the retain taken for a listener that did not start.
+// A concurrent open of the same local→remote port wins: return that tunnel.
+func (d *Daemon) dropTunnelListen(local, remote a2al.Address, noRelay bool, port int, listenErr error) (*tunnelEntry, error) {
+	d.connPool.release(local, remote, noRelay)
+	if port > 0 {
+		if e, _ := d.tunnels.findListen(local, remote, port); e != nil {
+			return e, nil
+		}
+		if isAddrInUse(listenErr) {
+			return nil, errPortInUse
+		}
+	}
+	return nil, errListen
 }
 
 // closeTunnel cancels and waits for the tunnel accept loop to exit.

@@ -1103,6 +1103,10 @@ func (d *Daemon) handleTunnelOpen(w http.ResponseWriter, r *http.Request) {
 			writeJSONStatus(w, http.StatusBadRequest, map[string]string{"error": "bad aid"})
 		case errors.Is(err, errResolve):
 			writeJSONStatus(w, http.StatusBadGateway, map[string]string{"error": "resolve failed"})
+		case errors.Is(err, errBadLocalPort):
+			writeJSONStatus(w, http.StatusBadRequest, map[string]string{"error": "bad local_port"})
+		case errors.Is(err, errPortInUse):
+			writeJSONStatus(w, http.StatusConflict, map[string]string{"error": "port_in_use"})
 		case errors.Is(err, errListen):
 			writeJSONStatus(w, http.StatusInternalServerError, map[string]string{"error": "listen failed"})
 		case errors.Is(err, host.ErrRelayRequired):

@@ -7,6 +7,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -208,6 +209,24 @@ func TestMCP_tunnelList_empty(t *testing.T) {
 	}
 	if len(tunnels) != 0 {
 		t.Fatalf("tunnels len=%d want 0", len(tunnels))
+	}
+}
+
+func TestMCP_tunnelOpen_portInUse(t *testing.T) {
+	d := newTestDaemon(t)
+	remote := newTestAddr(t)
+	other := newTestAddr(t)
+	d.tunnels.add(&tunnelEntry{
+		id: "other", localAID: d.nodeAddr, remoteAID: other, listen: "127.0.0.1:18192",
+	})
+	_, err := d.mcpTunnelOpen(context.Background(), nil, &mcp.CallToolParamsFor[mcpTunnelOpenArgs]{
+		Arguments: mcpTunnelOpenArgs{RemoteAID: remote.String(), LocalPort: 18192},
+	})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "18192") {
+		t.Fatalf("want port in error, got %v", err)
 	}
 }
 
