@@ -1,8 +1,20 @@
 # a2al (Python)
 
-Python client for [A2AL](https://github.com/a2al/a2al) — decentralized agent networking. Spawns a local `a2ald` daemon as a sidecar and exposes a typed REST helper covering the full API surface: identity, publish, discover, resolve, fetch, and multiplexed persistent tunnels.
+A2AL is an open peer-to-peer protocol with a local daemon that gives every agent a permanent
+address — no account, no server in between.
 
-Full API: [doc/api-reference.md](https://github.com/a2al/a2al/blob/main/doc/api-reference.md)
+[![PyPI](https://img.shields.io/pypi/v/a2al)](https://pypi.org/project/a2al/)
+[![Python versions](https://img.shields.io/pypi/pyversions/a2al)](https://pypi.org/project/a2al/)
+[![license](https://img.shields.io/pypi/l/a2al)](https://github.com/a2al/a2al/blob/main/LICENSE)
+
+**Use A2AL from Python — give your app or agent a permanent address, find others, and talk to
+them directly.**
+
+`pip install a2al` bundles the `a2ald` daemon and runs it as a sidecar: one install, your own
+address, and no cloud account to sign up for. **An AID is self-sovereign: it comes from a key you
+control, and no registry issues, revokes, or reassigns it.**
+
+![a2al in ten seconds: create an AID in the Web UI, then call your own agent and someone else's by address from a terminal](https://a2al.org/img/a2ald/quickstart-2.gif)
 
 ## Installation
 
@@ -10,7 +22,7 @@ Full API: [doc/api-reference.md](https://github.com/a2al/a2al/blob/main/doc/api-
 pip install a2al
 ```
 
-Pre-built `a2ald` binaries are bundled inside platform wheels:
+Install once — the wheel bundles the right `a2ald` binary for your platform:
 
 | Platform | Architecture  |
 |----------|---------------|
@@ -18,92 +30,107 @@ Pre-built `a2ald` binaries are bundled inside platform wheels:
 | macOS    | x86_64, arm64 |
 | Windows  | x86_64        |
 
-On unsupported platforms, install `a2ald` manually and set `A2ALD_PATH` to the executable path.
+On an unsupported platform, install `a2ald` yourself and point `A2ALD_PATH` at it.
+Python 3.10+, with no third-party dependencies.
 
-## Quick Start
+## Quick start
+
+Three actions — resolve an address, call a service, keep a connection open.
 
 ```python
 from a2al import Daemon, Client
 
-with Daemon() as d:
+with Daemon() as d:                          # bundles + starts a2ald; stops it on exit
     c = Client(d.api_base, token=d.api_token)
 
-    # 1 — Check daemon health
-    print(c.health())
+    endpoints = c.resolve(remote_aid)         # AID -> current endpoints
 
-    # 2 — Send an HTTP request to a remote agent (encrypted QUIC, no local port needed)
-    result = c.fetch(
-        remote_aid,
-        method="GET",
-        path="/.well-known/agent.json",
-    )
-    # result = {"status": 200, "headers": {...}, "body": "<base64>", "truncated": False}
+    r = c.fetch(remote_aid, method="GET", path="/.well-known/agent.json")
+    # -> 200 · the other agent's own answer, over the encrypted link
 
-    # 3 — Open a persistent tunnel (multiple concurrent TCP connections)
-    tunnel = c.tunnel_open(remote_aid)
-    local_addr = tunnel["listen"]   # e.g. "127.0.0.1:58320"
-    tunnel_id  = tunnel["id"]       # e.g. "tun_abc123"
-
-    # ... connect your application to local_addr ...
-
-    c.tunnel_close(tunnel_id)
+    t = c.tunnel_open(remote_aid)
+    print(t["listen"])                        # point your app at this local address
+    c.tunnel_close(t["id"])
 ```
+
+Call the client directly — there is no readiness gate. Peer discovery continues in the
+background: if your first call happens before the daemon has discovered any peers, the same call a
+few seconds later goes through.
+
+Prefer your own build? `Daemon(a2ald_exe="/usr/local/bin/a2ald", extra_args=["--data-dir", "/var/lib/a2al"])`.
+
+## Why not a URL or a VPN?
+
+- **No domain, no port-forwarding.** Peers keep an AID — an address that persists when the
+  machine moves or changes networks.
+- **No account, no gateway in the data path.** The network stores *where to find you now*;
+  application bytes go directly between peers, end-to-end encrypted.
+- **Built for the hard cases.** The same code runs on a cloud VM and on a laptop behind NAT —
+  neither needs a special case.
+
+## What you can do
+
+**Today from Python**
+
+- **Create and publish an identity** — generate an AID, register it, announce it so other machines find you.
+- **Resolve an address** — get a known AID's current endpoints.
+- **Call a remote agent** — HTTP to any AID over an encrypted link, with no local port.
+- **Keep a connection open** — one encrypted link carrying many concurrent TCP connections (SSH, databases, gRPC).
+
+**Also available today — through the `a2al` CLI, local REST, MCP, or the Web UI:**
+
+- **Discover by capability** — search the network for agents by what they do.
+- **Be callable, on your terms** — expose a service on your machine to peers: both sides authenticate, and per-AID access control decides who gets in.
+- **Leave an encrypted note** — store-and-forward to an AID that is offline right now.
+- **Chat and rooms** — 1:1 messages, or a shared signed log with offline catch-up and file objects.
+- **Get told** — an event stream notifies an agent when a note, a room update, or a chat arrives.
+- **See it** — the Web UI at `http://localhost:2121`, and the same capabilities as MCP tools.
+
+These are available today through the CLI, the local REST API, and MCP; native Python methods are
+coming.
+
+![Agents collaborating over AIDs: a chat by address, a file sent by hash, and a shared room log](https://a2al.org/img/a2ald/collab-1.gif)
+
+*Real output from agents on separate machines — an address each, no account, and nothing routed
+through a server in between.*
 
 ## Client API
 
-| Method | REST endpoint | Description |
-|--------|---------------|-------------|
-| `health()` | `GET /health` | Daemon liveness check |
-| `resolve(aid)` | `POST /resolve/{aid}` | Look up a remote agent's endpoints |
-| `connect(aid, *, local_aid)` | `POST /connect/{aid}` | One-shot tunnel — single TCP session, closes automatically |
-| `fetch(aid, *, method, path, headers, body_base64, local_aid)` | `POST /fetch/{aid}` | HTTP request over QUIC; returns `{status, headers, body(base64), truncated}` |
-| `tunnel_open(aid, *, local_aid, idle_timeout_sec, local_port)` | `POST /tunnel/{aid}` | Persistent tunnel — accepts many concurrent connections; returns `{id, listen}` |
-| `tunnel_close(id)` | `DELETE /tunnel/{id}` | Close a persistent tunnel |
-| `tunnel_list()` | `GET /tunnel` | List active persistent tunnels |
-| `tunnel_status(id)` | `GET /tunnel/{id}` | Status of one tunnel |
-| `agents_list()` | `GET /agents` | List locally registered agents |
-| `identity_generate()` | `POST /identity/generate` | Create a new Ed25519 AID |
-| `agent_register(payload)` | `POST /agents` | Register a generated identity |
-| `agent_publish(aid)` | `POST /agents/{aid}/publish` | Announce agent to the Tangled Network |
+| Method | What it does |
+|--------|--------------|
+| `identity_generate()` / `agent_register()` / `agent_publish()` | Create, register, and announce an identity |
+| `resolve(aid)` | AID → current endpoints |
+| `fetch(aid, method=, path=)` | HTTP to a remote AID over an encrypted link |
+| `tunnel_open()` / `tunnel_close()` / `tunnel_list()` | Persistent multiplexed tunnels |
+| `agents_list()` / `health()` | Local daemon and agent status |
 
-## Daemon Context Manager
+Full method list: [API reference](https://github.com/a2al/a2al/blob/main/doc/api-reference.md).
 
-`Daemon()` starts `a2ald` as a subprocess and stops it when the `with` block exits.
+## What you get — and what it asks of you
 
-```python
-from a2al import Daemon, Client
+**What you get**
 
-# Default: auto-locate a2ald binary, random API port, temp data dir
-with Daemon() as d:
-    c = Client(d.api_base, token=d.api_token)
-    ...
+| You get | Why it matters |
+|---|---|
+| Nobody in the middle | Your traffic stays between the two peers and crosses no third party |
+| An address you own outright | Switch machines, cloud environments, or networks: the AID in your config does not change, and no platform can revoke it or transfer it |
 
-# Custom binary path and extra daemon flags
-with Daemon(
-    a2ald_exe="/usr/local/bin/a2ald",
-    extra_args=["--data-dir", "/var/lib/a2al", "--fallback-host", "1.2.3.4"],
-) as d:
-    c = Client(d.api_base, token=d.api_token)
-    ...
-```
+**What it asks of you**
 
-## Environment Variables
-
-| Variable      | Description                                              |
-|---------------|----------------------------------------------------------|
-| `A2ALD_PATH`  | Override path to the `a2ald` executable                  |
-| `A2AL_API_TOKEN` | Bearer token when the daemon enforces authentication  |
-
-## Requirements
-
-- Python 3.10+
-- No third-party dependencies (standard library only)
+- **Keep the daemon running** — the sidecar stays up for as long as your `with` block runs; run
+  `a2ald` as a service when your app needs to be reachable around the clock.
 
 ## Links
 
-- [a2al.org](https://a2al.org) — project site
+- [a2al.org](https://a2al.org) — project site, quick start, and docs
+- **Machine-readable:** [`llms.txt`](https://a2al.org/llms.txt) / [`llms-full.txt`](https://a2al.org/llms-full.txt) · MCP tools over
+  `http://127.0.0.1:2121/mcp/` · any agent's card at `/aid/<AID>/.well-known/agent.json`
 - [API reference](https://github.com/a2al/a2al/blob/main/doc/api-reference.md)
-- [tanglednet.org](https://tanglednet.org) / [tngld.net](https://tngld.net) — Tangled Network
+- [a2ald on npm](https://www.npmjs.com/package/a2ald)
+- [tanglednet.org](https://tanglednet.org) / [tngld.net](https://tngld.net) — **Tangled Network**:
+  the public peer-to-peer network that A2AL agents form (an outcome of the protocol, not a
+  dependency), plus its public AID gateway. Unrelated projects use similar names —
+  **tanglednet.org is the only official domain.**
 - [GitHub](https://github.com/a2al/a2al)
 
 ## License
