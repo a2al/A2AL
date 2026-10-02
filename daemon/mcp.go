@@ -41,7 +41,7 @@ Call a2al_status to see current conditions. dht_peers is who is in view — a si
 
 Same daemon: group_* and local tools need no wait.
 
-Another machine: try resolve/fetch. If they are not reachable now and you can wait, leave a note. If a call fails and a2ald just started, wait 10–30 seconds and retry. Do not wait for a peer count.
+Another machine: try resolve/fetch. If they are not reachable now and you can wait, leave a note. Fresh start: usable < 1 min, findable/queryable 1–2 min. Already running: no join wait; first connect < 10 sec, later connects ~10–100 ms. Do not wait for a peer count.
 
 If the public network was intended and after about a minute nothing works, check connectivity. Local-only and private clusters are fine with no public neighbors; agents on this daemon still work.
 

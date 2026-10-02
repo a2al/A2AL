@@ -105,3 +105,33 @@ func TestMailboxEncodeOpen_roundtrip(t *testing.T) {
 		t.Fatalf("envelope note kind=%q body=%q err=%v", kind, body, err)
 	}
 }
+
+func TestMaxMailboxTextBody(t *testing.T) {
+	pubA, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pubB, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addrA, _ := crypto.AddressFromPublicKey(pubA)
+	addrB, _ := crypto.AddressFromPublicKey(pubB)
+	lo, hi, best := 0, MaxMailboxPayloadCBOR, 0
+	for lo <= hi {
+		mid := (lo + hi) / 2
+		body := make([]byte, mid)
+		for i := range body {
+			body[i] = 'a'
+		}
+		if _, err := EncodeMailboxPayload(addrA, addrB, pubB, MailboxMsgText, body); err != nil {
+			hi = mid - 1
+			continue
+		}
+		best = mid
+		lo = mid + 1
+	}
+	if best != 389 {
+		t.Fatalf("max note body %d bytes, want 389", best)
+	}
+}

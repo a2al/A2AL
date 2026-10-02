@@ -719,10 +719,13 @@ func tunnelStatus(c *Client, g globalOpts, id string) {
 }
 
 func cmdNote(c *Client, g globalOpts, args []string) {
-	if len(args) < 1 {
-		fatalf("usage: a2al note send|poll …")
+	if len(args) == 0 {
+		noteHelp()
+		os.Exit(1)
 	}
 	switch args[0] {
+	case "help", "-h", "--help":
+		noteHelp()
 	case "send":
 		if len(args) < 4 {
 			fatalf("usage: a2al note send <local-aid> <recipient-aid> <body-base64> [--msg-type N]")
@@ -756,8 +759,21 @@ func cmdNote(c *Client, g globalOpts, args []string) {
 		}
 		printJSON(true, out)
 	default:
-		fatalf("unknown note subcommand")
+		fatalf("a2al note: unknown subcommand %q (try a2al note help)", args[0])
 	}
+}
+
+func noteHelp() {
+	fmt.Print(`a2al note — send / poll encrypted offline messages
+
+Usage:
+  a2al note send <local-aid> <recipient-aid> <body-base64> [--msg-type N]
+  a2al note poll <local-aid>
+
+  --msg-type defaults to 1. Body is standard base64.
+
+Global flags: --api <url>  --token <tok>  --json  --quiet
+`)
 }
 
 func cmdConfig(c *Client, g globalOpts, args []string) {
@@ -1088,6 +1104,7 @@ Commands (advanced):
   tunnel          Manage persistent multiplexed encrypted tunnels
   note            Send / poll encrypted offline messages
   chat            One-to-one messages between AIDs
+  group           Collaboration rooms: create/invite/join/append/read/…
   config          Get or set daemon configuration
   admin           Enable remote admin and manage who may connect
   update          Check for or apply a2al updates
@@ -1106,6 +1123,7 @@ Examples:
   a2al tunnel open <aid>
   a2al tunnel
   a2al tunnel close <id>
+  a2al group help
   a2al admin on
   a2al admin allow <visitor-aid>
   a2al admin password <secret>
