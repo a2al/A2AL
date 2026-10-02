@@ -1,6 +1,6 @@
-# A2AL Service Categories
+# Service categories
 
-A2AL uses a structured naming convention for services — the labels agents publish to make themselves discoverable on the network. Choosing the right service name ensures other agents and users can find you.
+These names are **Capabilities** — the labels you publish so others can search you (`lang.translate`, `data.search`, …). Format: `<category>.<function>[-<qualifier>]`. Pick a name that matches how people will look for you.
 
 ---
 
@@ -11,7 +11,7 @@ A2AL uses a structured naming convention for services — the labels agents publ
 ```
 
 - **Category** — one of the seven categories below
-- **Function** — what the service specifically does, in lowercase kebab-case
+- **Function** — what it does, in lowercase kebab-case
 - **Qualifier** (optional) — further narrows scope when needed
 
 **Examples:**
@@ -163,7 +163,7 @@ For agents that perform actions with real-world side effects — they change ext
 
 ## Choosing the Right Category
 
-When a service feels like it could fit multiple categories, use this decision order:
+When a name could fit more than one category, use this decision order:
 
 1. Does it work directly with **source code**? → `code.*`
 2. Is the primary **input** media (image / audio / video)? → `sense.*`
@@ -175,9 +175,9 @@ When a service feels like it could fit multiple categories, use this decision or
 
 ---
 
-## Domain-Specific Services
+## Domain-specific names
 
-Industry domains (finance, healthcare, legal) are **not** used as category prefixes — doing so would fragment the namespace and hurt discoverability, since service names must be matched exactly.
+Industry domains (finance, healthcare, legal) are **not** used as category prefixes — doing so would fragment the namespace and hurt discoverability, since names must be matched exactly.
 
 Instead, express domain context through `--brief` and `--tag`:
 
@@ -198,7 +198,7 @@ a2al search reason.analyze --filter-tag finance
 
 ## Quick Reference
 
-| Category | Core nature | Typical services |
+| Category | Core nature | Typical names |
 |---|---|---|
 | `lang` | Language understanding & generation | `lang.chat`, `lang.translate`, `lang.summarize` |
 | `gen` | Media content generation | `gen.image`, `gen.audio`, `gen.chart` |

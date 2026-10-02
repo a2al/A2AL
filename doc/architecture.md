@@ -1,220 +1,143 @@
 # A2AL Architecture
 
-## Overview
+## Concepts (start here)
 
-A2AL is a decentralized address resolution protocol. Its sole function is to map a cryptographic identity (AID) to current network endpoints, so that any two agents can establish a direct encrypted connection without prior knowledge of each other's IP address, network location, or deployment environment.
+**The one-sentence model:** every participant has a permanent address (an AID), and any two
+addresses can find and connect to each other directly.
 
-What A2AL does not do: route application data, operate as a message relay, or manage application-level state. Once a connection is established, the protocol steps aside. All data flows directly between agents.
+**AID** — not an IP, not a username, not a domain. It is a cryptographic address derived from a
+key you generate locally, tied to you by math. Your IP changes; your AID does not. Someone stores
+your AID in their contacts; it works the next time you change networks.
 
-The three protocol operations that compose the full interaction:
+**Three operations — that is the whole protocol:**
 
 ```
-Publish  — agent announces its endpoints to the DHT
-Resolve  — caller retrieves live endpoints for a target AID
-Connect  — direct QUIC connection with mutual identity verification
+Publish  — announce that you exist and where to find you right now
+Resolve  — look up where someone is right now, given their AID
+Connect  — open a direct, encrypted, mutually authenticated channel to them
 ```
+
+After `Connect`, application data flows directly between the two endpoints. It does not pass
+through the Tangled Network. The network's job is only addressing — it does not see your payload.
+
+**Why NAT is not a problem:** the daemon tries direct connection first. When both sides are behind
+NAT, it negotiates a path using ICE (the same mechanism browsers use for WebRTC calls). The
+protocol figures out the route; your application code sees a plain connection.
+
+**a2ald** is the local daemon that implements all of this, plus applications on top: 1:1 chat,
+rooms, notes (offline-tolerant messages), file objects, and access control. REST, MCP, CLI, and
+the Web UI are all interfaces to the same daemon.
 
 ---
 
-## Module Map
+## Protocol internals
+
+A2AL is a peer-to-peer addressing and connectivity layer. An **AID** (cryptographic identity) maps to live endpoints on a DHT; two agents then open a mutual-TLS QUIC session. Application payloads travel on that session, not through the directory.
+
+The **protocol** does not sit in the data path after connect and does not host application state. The **daemon** (`a2ald`) additionally offers local applications: notes, 1:1 chat, rooms, file objects, access control, MCP, REST, and the Web UI.
+
+---
+
+## Runtime
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                          daemon                              │
-│          REST API · MCP Server · Web UI · auto-publish       │
-└──────────────────────────┬──────────────────────────────────┘
-                           │
-┌──────────────────────────▼──────────────────────────────────┐
-│                           host                               │
-│    DHT + QUIC + NAT sensing + UPnP + ICE fallback           │
-└───┬──────────┬──────────────────────┬──────────────────┬────┘
+┌──────────────────────────────────────────────────────────────┐
+│  a2ald — REST · MCP · Web UI · chat · rooms · notes · ACL    │
+└──────────────────────────────┬───────────────────────────────┘
+                               │
+┌──────────────────────────────▼───────────────────────────────┐
+│  host — DHT + QUIC + NAT sense + UPnP + ICE + TURN (optional)│
+└───┬──────────┬──────────────────────┬──────────────────┬─────┘
     │          │                      │                  │
-┌───▼───┐  ┌──▼──────┐  ┌────────────▼──────┐  ┌───────▼────┐
-│  dht  │  │transport│  │    natsense        │  │  signaling │
-│       │  │(UDPMux) │  │ natmap (UPnP)      │  │(ICE/WS)    │
-└───┬───┘  └─────────┘  └───────────────────┘  └────────────┘
+  dht      transport              natsense           signaling
+           (UDP mux,               natmap             (ICE hub)
+            dual-stack)            (UPnP IPv4)
     │
-┌───▼───────────────────────────────────────────────────────┐
-│                        protocol                            │
-│     wire format · CBOR records · mailbox · topic          │
-└───┬───────────────────────────────────────────────────────┘
-    │
-┌───▼─────────────────────────────────────────┐
-│              identity / crypto               │
-│   AID derivation · signing · delegation      │
-└─────────────────────────────────────────────┘
+ protocol — records, mailbox, topics, streams
+ identity / crypto — AID, sign, delegation
 ```
 
-Dependencies flow downward. `daemon` depends on `host`; `host` depends on `dht`, `transport`, `natsense`, `natmap`, `signaling`, and `protocol`; all depend on `identity`/`crypto` at the bottom.
+Go programs that only need publish/resolve/connect depend on `host`. Everyone else talks to `a2ald`.
 
 ---
 
-## Module Descriptions
+## Identity
 
-### `identity` / `crypto`
+An AID is 21 bytes: `[version 1][hash 20]`.
 
-The foundation layer. `crypto` provides key generation, address derivation from public keys, and sign/verify primitives. `identity` builds the delegation model on top: a master key issues a `DelegationProof` authorizing an operational key to act on its behalf. The daemon uses the operational key day-to-day; the master key can remain offline.
-
-Public surface: `Address`, `NodeID`, `KeyStore`, `GenerateEd25519`, `AddressFromPublicKey`, `SignDelegation`, `VerifyDelegation`.
-
-### `protocol`
-
-Defines all on-wire data structures as CBOR-encoded types: endpoint records, mailbox messages, topic (service) records, and the `SignedRecord` container. Also provides signing and verification helpers for each record type.
-
-This package is the schema layer — it defines what gets stored in the DHT and transmitted on the wire, independently of how it is routed or transported.
-
-### `transport`
-
-UDP socket management. The key type is `UDPMux`, which demultiplexes a single UDP socket between the DHT and QUIC subsystems. When `host.Config.QUICListenAddr` is empty, DHT and QUIC share one port via this mux.
-
-### `dht`
-
-Kademlia-style distributed hash table. Implements iterative `FIND_NODE` and `FIND_VALUE` queries, `STORE` RPCs, bootstrap, and K-Bucket routing. Record storage enforces `RecordAuth` — callers can plug in custom authority logic (the default in `host` requires records to be either self-signed or carry a valid delegation proof).
-
-The DHT does not know about QUIC or connections. It only routes and stores `SignedRecord` blobs.
-
-### `natsense` / `natmap`
-
-`natsense` collects reflected UDP addresses reported by DHT peers and infers the local NAT type (full cone, restricted, port-restricted, symmetric). `natmap` handles UPnP IGD port mapping requests to open external ports on home routers. Both feed candidate endpoint data to `host` during endpoint publishing.
-
-### `signaling`
-
-WebSocket-based ICE trickle signaling. Provides the room rendezvous model: two agents independently connect to a signaling server with a deterministic room ID (derived from both AIDs), exchange ICE candidates, and establish a peer-to-peer connection. Used as a fallback when direct QUIC connection fails.
-
-### `host`
-
-The primary integration layer for Go applications. `Host` composes all lower layers into a single runtime: it owns a DHT node, a QUIC transport, NAT sensing, and UPnP mapping. It exposes the three protocol operations (`PublishEndpoint`, `Resolve`, `ConnectFromRecord` / `Accept`) plus multi-agent routing (multiple AIDs sharing one QUIC listener via TLS SNI and agent-route framing).
-
-Most Go applications that embed A2AL depend only on this package.
-
-### `daemon`
-
-The `a2ald` binary. Wraps `host` with a persistent service layer: auto-publish on a schedule, agent registration and lifecycle management, REST API, MCP server, embedded Web UI, and a config/persistence layer. Non-Go integrations use `a2ald` exclusively and never call `host` directly.
-
-**Management API access control.** The HTTP management API (`127.0.0.1:2121` by default) enforces token-based access when `api_token` is set in `config.toml`:
-
-- Loopback requests (`127.0.0.1` / `::1`) bypass token checks unless `require_local_token = true` is set, enabling frictionless integration for local tools and AI agents.
-- Non-loopback requests always require a valid `Authorization: Bearer <token>` header when a token is configured.
-- An empty `api_token` means unconditional open access — intentional, not an error. A security nudge is surfaced in the Web UI.
-- The Host header is validated on loopback requests: if the header is present and resolves to a non-loopback address, the request is rejected (DNS rebinding defense).
-- The credential export endpoint (`GET /agents/{aid}/export`) is unconditionally restricted to loopback regardless of token configuration. Responses carry `Cache-Control: no-store`.
-
-**Credential encryption.** The `internal/envelope` package implements PBKDF2-SHA256 (100 000 iterations) + AES-256-GCM encryption with a random 16-byte salt and 12-byte nonce. This shared primitive is used by both the CLI (`a2al export/import`) and the Web UI vault.
-
----
-
-## Key Data Structures
-
-### `Address` (AID)
-
-```
-[ version_byte (1 byte) ] [ hash (20 bytes) ]   = 21 bytes total
-```
-
-The version byte encodes the cryptographic scheme:
-
-| Version | Scheme | Derivation |
-|---------|--------|-----------|
+| Version | Scheme | Hash |
+|---------|--------|------|
 | `0xA0` | Ed25519 | `SHA-256(pubkey)[0:20]` |
-| `0xA1` | P-256 | `SHA-256(pubkey)[0:20]` |
-| `0xA2` | Paralism / secp256k1+HASH160 | `RIPEMD160(SHA-256(pubkey))` |
-| `0xA3` | Ethereum / secp256k1+Keccak | `Keccak-256(pubkey)[12:32]` |
+| `0xA1` | P-256 | `SHA-256(pubkey)[0:20]` (byte assigned; no generate path in `a2ald`) |
+| `0xA2` | Paralism / HASH160 | `RIPEMD160(SHA-256(pubkey))` |
+| `0xA3` | Ethereum | `Keccak-256(pubkey)[12:32]` |
 
-Displayed as a ~44-character base58-like string (Ed25519 native) or `0x`-prefixed hex (Ethereum/Paralism). Parsing is automatic based on format.
+Display: native base58-like string, or `0x` hex for Ethereum/Paralism. Registry: [address-version-registry.md](address-version-registry.md).
 
-See [`doc/address-version-registry.md`](address-version-registry.md) for the full registry and assignment process.
+**NodeID** = `SHA-256(version ‖ hash)` — DHT routing key only, not an application identity.
 
-### `NodeID`
-
-The DHT routing key, derived deterministically from an `Address`:
-
-```
-NodeID = SHA-256(version_byte || hash_20bytes)   = 32 bytes
-```
-
-`NodeID` is used only inside the DHT for XOR-distance routing. It is never exposed at the application layer. The separation allows the routing scheme to evolve independently of the identity scheme.
-
-### `SignedRecord`
-
-The universal on-wire container stored in the DHT:
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `RecType` | `uint8` | Record type: `0x01` endpoint, `0x10` topic, `0x80` mailbox, `0x02–0x0f` custom |
-| `Address` | 21 bytes | AID of the publishing agent |
-| `Pubkey` | bytes | Signing public key (may be an operational key) |
-| `Payload` | bytes | CBOR-encoded type-specific payload |
-| `Seq` | `uint64` | Monotone sequence number |
-| `Timestamp` | `uint64` | Unix seconds |
-| `TTL` | `uint32` | Validity window in seconds |
-| `Signature` | bytes | Ed25519 or secp256k1 signature over canonical fields |
-| `Delegation` | bytes | Optional CBOR `DelegationProof` (present when an operational key signs for a master-derived AID) |
-
-Records are verified before storage and on retrieval: signature integrity, timestamp + TTL coverage of "now", and (at storage time) authority — the signing key must either derive the record's `Address` directly, or carry a valid `Delegation` from the master key that does.
-
-**Operational key revocation.** `RecordIsNewer` — the function that determines which of two DHT records for the same AID takes precedence — uses `delegation.IssuedAt` as the highest-priority tiebreaker. A legitimate owner can revoke a stolen or compromised operational key by issuing a new `DelegationProof` with a higher `IssuedAt` timestamp and re-publishing. Any peer that holds both records will keep the newer delegation, pushing out the stolen key without requiring a sequence number increment.
-
-### `EndpointPayload`
-
-The payload carried in a `RecType 0x01` record:
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `Endpoints` | `[]string` | Network endpoints as URLs, e.g. `quic://1.2.3.4:4122` |
-| `NatType` | `uint8` | Coarse NAT classification (unknown / full cone / restricted / port-restricted / symmetric) |
-| `Signal` | `string` | Optional WebSocket base URL for ICE trickle signaling |
-| `Turns` | `[]string` | Optional credential-free `turn://` relay hints for remote peers |
-
-Multiple endpoint candidates are published per record (direct bind, UPnP-mapped, externally reflected). The connecting peer dials all candidates concurrently (Happy Eyeballs) and uses whichever succeeds first.
-
-### `DelegationProof`
-
-An authorization statement binding an operational key to a master AID:
-
-| Field | Description |
-|-------|-------------|
-| `MasterAID` | The permanent AID being delegated for |
-| `OperationalPubkey` | The Ed25519 public key authorized to publish on behalf of `MasterAID` |
-| `Scope` | Permission scope (currently: network operations) |
-| `IssuedAt` / `ExpiresAt` | Validity window (Unix seconds) |
-| `Signature` | Master private key signature over the canonical fields |
-
-The master private key is only needed to produce a `DelegationProof`. After that, `a2ald` holds only the operational key and the CBOR-encoded proof. Rotating credentials means issuing a new proof; the AID is unchanged.
-
-### `TopicPayload`
-
-The payload carried in a `RecType 0x10` (topic / service) record:
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `Name` | `string` | Human-readable agent name |
-| `Protocols` | `[]string` | Supported protocols (e.g. `"mcp"`, `"http"`, `"a2a"`) |
-| `Tags` | `[]string` | Capability tags for filtering |
-| `Brief` | `string` | Short description (≤ 256 bytes) |
-| `Meta` | map | Optional extended metadata (e.g. `url` for self-hosted agents) |
-
-Topic records are stored at `SHA-256("topic:" + service_name)` in the DHT, not at the agent's own `NodeID`. Multiple agents can publish the same service name; the DHT aggregates all current registrants, enabling capability-based discovery.
+**Delegation.** Master key derives the AID and stays offline. Operational key publishes with a `DelegationProof`. Newer `delegation.IssuedAt` wins if keys rotate.
 
 ---
 
-## Connection Establishment
+## Records (DHT)
 
-Two paths exist for establishing a QUIC connection between agents:
+Universal container: `SignedRecord` (CBOR). Verified on store and fetch: signature, TTL window, authority (self-sign or valid delegation).
 
-**Direct path (primary):** `ConnectFromRecord` dials all `Endpoints` from the target's endpoint record concurrently. The first successful QUIC handshake wins. Both sides perform mutual TLS with certificates derived from their Ed25519 keys — identity is verified as part of the handshake.
+| RecType | Role |
+|---------|------|
+| `0x01` | Endpoint record (`quic://` candidates, NAT hint, ICE signal URLs) |
+| `0x02`–`0x0f` | Profile / custom signed records |
+| `0x10` | Topic (Capability) at `SHA-256("topic:" ‖ name)` |
+| `0x80` | Encrypted note (mailbox) at recipient NodeID |
 
-**ICE path (fallback):** When all direct dials fail and the endpoint record carries a `Signal` URL, both peers connect to the signaling server using a deterministic room ID and exchange ICE candidates via WebSocket trickle. A peer-to-peer UDP path is established through ICE; QUIC then runs over that path.
-
-After either path, the client sends a 25-byte **agent-route frame** (`a2r1` prefix + 21-byte target AID) on the first QUIC stream. This allows multiple agents sharing one QUIC listener to be addressed independently.
+Endpoint payloads may list **IPv4 and IPv6** `quic://` URLs. New nodes do **not** publish TURN URLs in the record; relay credentials stay local. Multi-hub ICE URLs use `Signals` (key 5); `Signal` (key 3) remains the primary URL for older peers.
 
 ---
 
-## Relationship to Other Protocols
+## Connect
 
-| Protocol | Role | Relationship |
-|----------|------|-------------|
-| **MCP** | Agent tool-calling interface | A2AL runs as an MCP server, exposing networking as tools. MCP defines the calling convention; A2AL provides the network. |
-| **A2A** | Agent collaboration semantics | A2AL provides the discovery and connectivity layer A2A assumes but does not define. A2A messages flow over A2AL connections. |
-| **ANP** | Agent networking vision | A2AL implements the decentralized network layer ANP describes conceptually. |
-| **QUIC** | Transport | A2AL uses QUIC for all agent-to-agent connections. QUIC provides TLS 1.3, stream multiplexing, and connection migration. |
-| **ICE/STUN** | NAT traversal | Used in the ICE fallback path. A2AL does not define its own NAT traversal protocol. |
+Wildcard listen (`:4121`) is **dual-stack** by default (`udp` on `[::]`; Windows: paired sockets). Explicit `1.2.3.4:port` stays IPv4-only. Go `host.Config.DisableIPv6` forces IPv4 (not a TOML key).
+
+Dialers race candidates (Happy Eyeballs, IPv6 first when present). If direct QUIC fails and a signal URL is in the record, both sides use the **embedded ICE hub** (WebSocket trickle). Optional **external TURN** (static / HMAC / REST credentials) supplies relay candidates. UPnP IGD mapping is IPv4.
+
+After TLS, stream 0 carries an **agent-route** frame so several AIDs can share one QUIC listener:
+
+- Current: `a2r2` + 21-byte target AID, then a short control exchange, then data streams.
+- Inbound still accepts legacy `a2r1` (25-byte frame only).
+
+Service HTTP uses a dedicated stream type; file objects use a content-addressed stream. Unknown `a2*` magics are closed, not bridged to TCP.
+
+**Access control** (daemon) applies to inbound HTTP and object fetch for that AID. Notes, DHT, and chat envelopes are not gated by the same allow/deny lists.
+
+---
+
+## Daemon applications (not the DHT)
+
+| Feature | Behavior |
+|------------|----------|
+| Notes | Encrypted store-and-forward on the DHT mailbox |
+| Chat | 1:1 after mutual invite; live path when connected, else local pending |
+| Rooms | Per-AID signed replica; members sync over QUIC; objects by hash |
+| ACL | Allow/deny + optional join password for that AID’s HTTP / objects |
+| Profile | Signed name/brief/skills record (RecType 0x02) |
+| Address book | Local aliases + favorites (`/node/address-book`) |
+| Remote admin | Another AID may administer this node |
+| AID URL | `http://127.0.0.1:2121/aid/{AID}/path` — local gateway, no extra port |
+
+---
+
+## Management API
+
+Default `127.0.0.1:2121`. If `api_token` is set: loopback skips the token unless `require_local_token = true`; non-loopback always needs `Authorization: Bearer`. Empty token is open access (intentional). Credential export is loopback-only. Host header on loopback is checked against DNS rebinding.
+
+---
+
+## Related protocols
+
+| | Role vs A2AL |
+|--|----------------|
+| **MCP** | Tool calling. `a2ald` is an MCP server. |
+| **A2A / ANP** | Collaboration / networking vision. A2AL supplies addressing and connect. |
+| **QUIC** | Agent-to-agent transport. |
+| **ICE / STUN / TURN** | NAT traversal; TURN is an optional *external* server. |

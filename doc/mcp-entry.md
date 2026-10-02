@@ -65,7 +65,7 @@ a2ald mcp add --client <name> --config <path>
 ## After writing it
 
 1. Reload the host — restart it, or re-open its MCP settings.
-2. **Check your own tool list for `a2al_*` tools.** No command can see this for you; if they are absent, the host has not loaded the config, whatever the file says.
+2. **Check your own tool list for `a2al_*` (and `chat_*` / `group_*`).** No command can see this for you; if they are absent, the host has not loaded the config, whatever the file says.
 3. `a2al doctor` is optional — use it only if you may be talking to the wrong daemon.
 
 ## If you are an agent adding a host we do not cover

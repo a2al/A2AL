@@ -1,637 +1,351 @@
 # API Reference
 
-This document covers all integration paths for developers: REST API, MCP tools, Python SDK, and Go SDK.
+REST, MCP, and the Python sidecar. All except embedding Go require `a2ald` (default `http://127.0.0.1:2121`). Go embed: [Go SDK](API.md). MCP hosts: [MCP Setup](mcp-setup.md).
 
-If you're not sure which to use, start here:
-
-| Path | Best for | Requires |
-|------|----------|----------|
-| **REST API** | Any language; most direct control | `a2ald` running locally |
-| **MCP** | AI agents using Claude, Cursor, Windsurf, etc. | `a2ald` + MCP config |
-| **Python SDK** | Python applications | `pip install a2al` |
-| **Go SDK** | Go programs; embed without a separate process | Go 1.24+ |
-
-All paths except Go SDK require `a2ald` running. The daemon binds to `http://127.0.0.1:2121` by default.
+| Path | Use |
+|------|-----|
+| REST | Any language |
+| MCP | Claude, Cursor, Windsurf, … |
+| `pip install a2al` | Python `Daemon` + thin `Client` |
+| `a2al` CLI | Same daemon; `group` / `chat` call `POST /mcp/call` |
 
 ---
 
-## REST API
+## Auth
 
-### Authentication
+If `api_token` is set: non-loopback needs `Authorization: Bearer <token>`. Loopback skips the token unless `require_local_token = true`. Empty token = open (intentional). Mutating requests: `Content-Type: application/json`. `GET /agents/{aid}/export` is loopback-only.
 
-If `api_token` is configured, every request must include:
+JSON bodies on the management API are capped at **1 MiB**. Fetch response bodies are capped at **4 MiB** (`truncated: true` if cut). CAS `POST /agents/{aid}/cas` streams and has no JSON cap.
 
-```
-Authorization: Bearer <token>
-```
-
-All mutating requests (`POST`, `PATCH`, `DELETE`) require `Content-Type: application/json`.
-
-### Base URL
-
-`http://127.0.0.1:2121` (default; set via `--api-addr`)
+AID gateway `GET /aid/…` is **not** the management API: no bearer token; remote object/HTTP access uses that AID’s ACL.
 
 ---
 
-### Health and Status
+## REST
 
-#### `GET /health`
+### Health, config, update
 
-```json
-{"status":"ok"}
+| Method | Path | Notes |
+|--------|------|--------|
+| `GET` | `/health` | `{"status":"ok"}` |
+| `GET` | `/status` | Node AID, publish times, `pending` inventory |
+| `GET` `PATCH` | `/config` | GET redacts `api_token`. PATCH fields listed below |
+| `GET` | `/config/schema` | JSON Schema |
+| `GET` | `/update/status` | Current check / last apply |
+| `POST` | `/update/apply` | Body ignored. **202** `{message}`; may include `warning` if not a managed service |
+
+`PATCH /config` accepts only: `listen_addr`, `quic_listen_addr`, `bootstrap`, `disable_upnp`, `fallback_host`, `min_observed_peers`, `api_addr`, `api_token`, `key_dir`, `log_format`, `log_level`, `auto_publish`, `turn_servers`, `disable_relay`. Response `{ok, restart_required:[…]}`. Other TOML keys: edit `config.toml` and restart.
+
+### Identity and agents
+
+| Method | Path | Notes |
+|--------|------|--------|
+| `POST` | `/identity/generate` | Ed25519 master + op key + proof. Master shown once |
+| `POST` | `/agents/generate` | `{"chain":"ethereum"\|"paralism"}` |
+| `POST` | `/agents/ethereum/delegation-message` | See Ethereum body below |
+| `POST` | `/agents/ethereum/register` | After wallet `personal_sign` |
+| `POST` | `/agents/ethereum/proof` | Local eth private key (automation) |
+| `POST` | `/agents/paralism/proof` | Same shape as eth proof, key field `paralism_private_key_hex` |
+| `POST` | `/agents` | Register *or* import: `operational_private_key_hex`, `delegation_proof_hex`, optional `service_tcp` |
+| `GET` | `/agents` | List (includes `pending`) |
+| `GET` | `/agents/{aid}` | One agent |
+| `GET` | `/agents/{aid}/export` | Operational credentials (plaintext JSON); loopback only. CLI `--password` encrypts the file |
+| `PATCH` | `/agents/{aid}` | `service_tcp` (string or empty to unbind); optional `operational_private_key_hex` |
+| `DELETE` | `/agents/{aid}` | Body `{}` |
+| `GET` | `/agents/{aid}/probe` | TCP + DHT reachability |
+| `POST` | `/agents/{aid}/heartbeat` | Optional; other mutating agent calls already count |
+| `POST` | `/agents/{aid}/publish` | Force endpoint publish |
+| `POST` | `/agents/{aid}/records` | Custom RecType `0x02`–`0x0f`: `rec_type`, `payload_base64`, `ttl` |
+| `POST` `DELETE` | `/agents/{aid}/profile` | See profile body below |
+
+`POST /identity/generate` → `aid`, `master_private_key_hex`, `operational_private_key_hex`, `delegation_proof_hex`. Recover from a master key in the Web UI (browser signs locally); CLI re-imports via export file or `POST /agents`.
+
+Ethereum (provide **exactly one** of `operational_public_key_hex` or `operational_private_key_seed_hex` on the message call; register needs an op private key or seed):
+
+```http
+POST /agents/ethereum/delegation-message
+{"agent":"0x…","issued_at":0,"expires_at":0,"scope":0,
+ "operational_public_key_hex":"…"}            # or operational_private_key_seed_hex
+# → {"message":"<EIP-191 text>"}
+
+POST /agents/ethereum/register
+{"agent":"0x…","issued_at":0,"expires_at":0,"eth_signature_hex":"…",
+ "service_tcp":"","operational_private_key_hex":"…"}   # or …_seed_hex
+# → {"aid","status":"registered"}
+
+POST /agents/ethereum/proof
+{"ethereum_private_key_hex":"…","issued_at":0,"expires_at":0}
+# op key optional; generated if omitted
 ```
 
-#### `GET /status`
+Profile body (all optional): `name`, `brief`, `protocols`, `skills` (max 3), `modalities`, `card_hash` (SHA-256 of `agent.json`, hex or base64), `meta`. DELETE drops the override.
 
-Returns the node's current state.
+### Services and discover
 
-```json
-{
-  "node_aid": "a2alEKFspDoevpF...",
-  "auto_publish": true,
-  "node_seq": 4,
-  "node_published": true,
-  "node_last_publish_at": "2026-04-06T12:00:00Z",
-  "node_next_republish_estimate": "2026-04-06T12:30:00Z",
-  "republish_interval_s": 1800,
-  "endpoint_ttl_s": 3600
-}
+```http
+POST /agents/{aid}/services
+{"services":["lang.translate"],"name":"…","protocols":["http"],"tags":["legal"],"brief":"…","ttl":3600}
+
+DELETE /agents/{aid}/services/lang.translate
+{}
+
+POST /discover
+{"services":["lang.translate"],"filter":{"protocols":["mcp"],"tags":["legal"]}}
 ```
+
+### Resolve, fetch, tunnels
+
+```http
+POST /resolve/{aid}
+GET  /resolve/{aid}/records?type=0
+
+POST /fetch/{aid}
+{"method":"GET","path":"/.well-known/agent.json","local_aid":"…","access_token":"…","headers":{},"body_base64":""}
+# → {status, headers, body (base64), truncated}   body cap 4 MiB
+
+POST /connect/{aid}
+{"local_aid":"…","access_token":"…","disable_relay":false}
+# → {"tunnel":"127.0.0.1:PORT"}   one TCP session
+
+POST /tunnel/{aid}
+{"local_aid":"…","access_token":"…","local_port":18080,"idle_timeout_sec":90,"disable_relay":false}
+# → {id, listen, remote_aid, is_relayed}
+# same local+remote+port reuses; 409 port_in_use; 412 relay_required
+
+GET    /tunnel
+GET    /tunnel/{id}
+DELETE /tunnel/{id}
+POST   /tunnel/{id}/reset
+```
+
+`disable_relay: true` skips TURN even if configured. `idle_timeout_sec`: omit/0 = 6 min; `-1` = no idle close.
+
+### Notes (mailbox)
+
+```http
+POST /agents/{aid}/mailbox/send
+{"recipient":"…","msg_type":1,"body_base64":"…"}
+
+POST /agents/{aid}/mailbox/poll
+{}
+# → {"messages":[{"sender","msg_type","body_base64"},…]}
+```
+
+`msg_type`: CLI default `1`. Application text notes typically `3`. Room invites are `0x10` (daemon-written on `group_invite`). Chat invites never use mailbox.
+
+### Chat
+
+| Method | Path | Body |
+|--------|------|------|
+| `POST` | `/agents/{aid}/chat/request` | `{"peer","note?"}` |
+| `POST` | `/agents/{aid}/chat/accept` | `{"peer"}` |
+| `POST` | `/agents/{aid}/chat/refuse` | `{"peer"}` |
+| `POST` | `/agents/{aid}/chat/remove` | `{"peer"}` |
+| `POST` | `/agents/{aid}/chat/block` | `{"peer"}` |
+| `POST` | `/agents/{aid}/chat/send` | `{"peer","text?"}` plus `path` **or** `object_id` (not both) |
+| `POST` | `/agents/{aid}/chat/mark-read` | `{"peer","scanned_to?"}` |
+| `GET` | `/agents/{aid}/chat/contacts` | friends / `out_pending` / `in_pending` |
+| `GET` | `/agents/{aid}/chat/peers/{peer}` | `?after_seq` `&limit` → `{entries, scanned_to, has_more, read_cursor, unread_count}` |
+
+Invite first; send without it → `not_friends`.
+
+### Rooms (inspect vs write)
+
+Read-only REST (looking does not count as heartbeat):
+
+| Method | Path | Response / Notes |
+|--------|------|-----------------|
+| `GET` | `/agents/{aid}/groups` | `{groups:[…]}` — local replicas only |
+| `GET` | `/agents/{aid}/groups/{group_id}` | Head / counters |
+| `GET` | `/agents/{aid}/groups/{group_id}/entries` | `?after_seq` `&limit` (default and max 50). No kind/author filters on this path |
+
+Write path: MCP `group_*` or `POST /mcp/call` (CLI `a2al group`). Inspect does **not** record heartbeat.
+
+### Objects (CAS)
+
+```http
+POST /agents/{aid}/cas?name=file.bin
+Content-Type: application/octet-stream
+<bytes>
+# requires files_root; → {object_id, size, name, url}
+
+GET|HEAD /aid/{holder}/cas/{object_id}
+```
+
+Reads on `/aid/` follow the holder’s ACL. Writes are local-only (API token). `group_object_put` with `path` can hash in place without copying when the file is visible to `a2ald`.
+
+### ACL (agent HTTP / objects)
+
+```http
+GET   /agents/{aid}/acl
+PATCH /agents/{aid}/acl          {"default":"public"|"deny"}
+POST  /agents/{aid}/acl/allow    {"aid":"…"}  or  {"secret":"…"}
+POST  /agents/{aid}/acl/deny     {"aid":"…"}
+DELETE /agents/{aid}/acl/allow/{id}
+DELETE /agents/{aid}/acl/deny/{id}
+```
+
+Does not gate notes, DHT, or chat.
+
+### Events
+
+- HTTP: `GET /agents/{aid}/events` (SSE). Replay: `?last_event_id=N` or `Last-Event-ID`. Filter: `?types=chat.unread,mailbox.received` (comma). `GET /events` is node-wide.
+- Poll: MCP `a2al_events_poll` (`after_seq`, not `last_event_id`) or `POST /mcp/call`.
+
+On subscribe, `event: pending` may appear **without** `id`: local counts such as `{"<aid>":{"mailbox":1,"chat_invites":0,"chat_unread":2}}`. Log events: `mailbox.received`, `group.unread`, `group.mentioned`, `group.appended` (own write), `chat.invites`, `chat.unread`, `chat.received`. Events are doorbells; mailbox / chat log / room log are source of truth.
+
+### Node: remote admin, address book, AID gateway
+
+| Method | Path | Notes |
+|--------|------|--------|
+| `GET` `PATCH` | `/node/remote-admin` | PATCH `{"enabled":true}` |
+| `POST` | `/node/remote-admin/allow` / `deny` | `{"aid"}` or allow `{"secret"}` |
+| `DELETE` | `/node/remote-admin/allow/{id}` / `deny/{id}` | |
+| `GET` `PUT` | `/node/address-book` | `{aliases:{aid:label}, favorites:[{id,aid,skill,protocols,addedAt}]}` |
+| `GET` | `/aid/{AID}/{path}` | Forwards any HTTP method except CONNECT. Uses the **node** identity; **no** `access_token`. ACL-gated peers: `POST /fetch` |
+| `GET` | `/debug/identity` `/debug/routing` `/debug/store` `/debug/stats` `/debug/host` | DHT / NAT / bind |
+| `POST` | `/mcp/call` | `{"tool":"group_create","args":{…}}` → tool JSON; tool errors **422** |
+| | `/mcp/` | Streamable HTTP MCP |
+
+`POST /demo/start|stop` and `GET /sessions/{port}` are the built-in demo helper, not general apps.
 
 ---
 
-### Identity
+## MCP tools
 
-#### `POST /identity/generate`
+HTTP: `http://127.0.0.1:2121/mcp/`. Stdio: `a2ald --mcp-stdio` proxies a running daemon; if none is running, that process is the node (no REST/UI).
 
-Generate a new Ed25519 agent identity. Returns keys and delegation proof once — the daemon does not retain the master key.
+Successful results may include `pending`. Room invites → mailbox; chat invites → `chat_invites`. No MCP for ACL, remote admin, address book, or profile.
 
-**Response:**
+Required fields in **bold**. `aid` on every `chat_*` / `group_*` is the **local** identity.
 
-```json
-{
-  "aid": "a2alEKFspDoevpF...",
-  "master_private_key_hex": "...",
-  "operational_private_key_hex": "...",
-  "delegation_proof_hex": "...",
-  "warning": "Save the master key — it will not be shown again."
-}
-```
+### `a2al_*`
 
-#### `POST /agents/generate`
+| Tool | Arguments |
+|------|-----------|
+| `a2al_identity_generate` | (none) — save master key |
+| `a2al_agents_list` / `a2al_status` / `a2al_tunnel_list` | (none) |
+| `a2al_agents_generate_ethereum` | (none) |
+| `a2al_ethereum_delegation_message` | **agent**, **issued_at**, **expires_at**, `scope?`; exactly one of `operational_public_key_hex` / `operational_private_key_seed_hex` |
+| `a2al_ethereum_register` | **agent**, timestamps, **eth_signature_hex**, `service_tcp?`, op private key **or** seed |
+| `a2al_ethereum_proof` | **ethereum_private_key_hex**, timestamps, `scope?`, op key optional |
+| `a2al_agent_register` | **operational_private_key_hex**, **delegation_proof_hex**, `service_tcp?` |
+| `a2al_agent_get` / `_probe` / `_publish` / `_heartbeat` / `_delete` | **aid** |
+| `a2al_agent_patch` | **aid**, `service_tcp`, `operational_private_key_hex?` |
+| `a2al_agent_publish_record` | **aid**, **rec_type**, **payload_base64**, `ttl?` |
+| `a2al_resolve` | **aid** |
+| `a2al_resolve_records` | **aid**, `type` (0 = all) |
+| `a2al_discover` | **services[]**, `filter.protocols?`, `filter.tags?` |
+| `a2al_service_register` | **aid**, **services[]**, `name`, `protocols[]`, `tags[]`, `brief`, `meta`, `ttl` |
+| `a2al_service_unregister` | **aid**, **service** |
+| `a2al_fetch` | **remote_aid**, **path**, `method?`, `headers?`, `body_base64?`, `local_aid?`, `access_token?` |
+| `a2al_connect` | **remote_aid**, `local_aid?`, `access_token?` (no `disable_relay` on this tool) |
+| `a2al_tunnel_open` | **remote_aid**, `local_aid?`, `access_token?`, `local_port?`, `idle_timeout_sec?` |
+| `a2al_tunnel_close` | **tunnel_id** |
+| `a2al_mailbox_send` | **aid**, **recipient**, **msg_type**, **body_base64** |
+| `a2al_mailbox_poll` | **aid** |
+| `a2al_events_poll` | **aid**, `after_seq` (0 = start of buffer) |
 
-Generate a blockchain-linked identity (Ethereum or Paralism). Keys are not retained by the daemon.
+`a2al_events_poll` → `{events, last_seq, oldest_seq, truncated}`. Next call: `after_seq = last_seq`. If `truncated`, reset to 0.
 
-**Request:**
+### `chat_*`
 
-```json
-{"chain": "ethereum"}
-```
+| Tool | Other args |
+|------|------------|
+| `chat_request` | **peer**, `note?` |
+| `chat_accept` / `chat_refuse` / `chat_remove` / `chat_block` | **peer** |
+| `chat_send` | **peer**, `text?`, `path` **or** `object_id` |
+| `chat_read` | **peer**, `after_seq`, `limit?` → page with `scanned_to` |
+| `chat_mark_read` | **peer**, `scanned_to` (0 / omit = all currently in the log) |
+| `chat_contacts` | (aid only) |
 
-`chain` is `"ethereum"` (default) or `"paralism"`.
+### `group_*`
 
----
-
-### Agents
-
-#### `POST /agents`
-
-Register a previously generated agent identity with the daemon.
-
-**Request:**
-
-```json
-{
-  "operational_private_key_hex": "...",
-  "delegation_proof_hex": "...",
-  "service_tcp": "127.0.0.1:8080"
-}
-```
-
-`service_tcp` is optional — the address of your local service endpoint, included in published records.
-
-**Response:**
-
-```json
-{"aid": "a2alEKFspDoevpF...", "status": "registered"}
-```
-
-#### `GET /agents`
-
-List all registered agents and their status.
-
-```json
-{
-  "agents": [
-    {
-      "aid": "a2alEKFspDoevpF...",
-      "service_tcp": "127.0.0.1:8080",
-      "service_tcp_ok": true,
-      "heartbeat_seconds_ago": 12,
-      "last_publish_at": "2026-04-06T12:00:00Z"
-    }
-  ]
-}
-```
-
-#### `GET /agents/{aid}`
-
-Single agent status including reachability and publish info.
-
-#### `PATCH /agents/{aid}`
-
-Update `service_tcp` for a registered agent. Requires the operational private key to authorize.
-
-**Request:**
-
-```json
-{
-  "operational_private_key_hex": "...",
-  "service_tcp": "127.0.0.1:9090"
-}
-```
-
-#### `DELETE /agents/{aid}`
-
-Unregister an agent. Body: `{}`.
-
-#### `POST /agents/{aid}/publish`
-
-Publish or refresh the agent's DHT endpoint record immediately.
-
-**Response:** `{"ok": true, "seq": 5}`
-
-#### `POST /agents/{aid}/heartbeat`
-
-Signal that the agent is alive. Prevents auto-publish from skipping re-publication for idle agents. Implicit on any non-GET call through agent middleware.
-
-#### `POST /agents/{aid}/records`
-
-Publish a custom signed record (RecType `0x02`–`0x0f`) for the agent.
-
-**Request:**
-
-```json
-{
-  "rec_type": 2,
-  "payload_base64": "...",
-  "ttl": 3600
-}
-```
-
-#### `POST /agents/{aid}/profile`
-
-Set or update the agent's profile override. The daemon persists the fields and immediately publishes a RecType `0x02` sovereign record to the DHT. Any field omitted from the request leaves the daemon's inferred value (derived from registered services) as the fallback.
-
-**Request (all fields optional):**
-
-```json
-{
-  "name": "My Translation Agent",
-  "brief": "Specialized in legal document translation between Chinese and English.",
-  "protocols": ["mcp", "http"],
-  "skills": ["lang.translate"],
-  "modalities": ["text"],
-  "card_hash": "<64-char hex or 44-char base64 SHA-256 of agent.json>",
-  "meta": {"url": "https://example.com/agent"}
-}
-```
-
-`card_hash` must be the SHA-256 digest of the agent's `agent.json` card, encoded as 64-char lowercase hex or 44-char standard base64. Clients use it as an ETag to avoid re-fetching unchanged cards.
-
-**Response:** `{"ok": true}`
-
-#### `DELETE /agents/{aid}/profile`
-
-Remove the explicit profile override. The daemon falls back to inferring profile data from the agent's registered services and republishes the `0x02` record. If no services are registered, the record is not re-published (the previous DHT entry expires naturally).
-
-**Request:** `{}`
-
-**Response:** `{"ok": true}`
+| Tool | Other args |
+|------|------------|
+| `group_create` | `title?` → `{group_id, link}` |
+| `group_list` | local replicas only |
+| `group_invite` | **group_id**, **target_aid** |
+| `group_join` | **link** *or* (`group_id` + `creator_aid`); `peer_aid?`, `inviter_aid?`, `member_hints[]?`, `title?` |
+| `group_get_link` / `group_head` / `group_members` | **group_id** |
+| `group_append` | **group_id**, `kind?` (default `msg`), `body?` (base64, ≤2 KiB decoded), `ref?`, `reply_to?`, `to[]?` |
+| `group_read` | **group_id**, `after_seq?`, `limit?` (default 50), `kind` / `author` / `since_ts` / `until_ts` / `to` / `reply_to`. Page with **`scanned_to_seq`**. Omit `after_seq` → oldest entries |
+| `group_mark_read` | **group_id**, **seq** (0 = nothing read) |
+| `group_retract` | **group_id**, **entry_id** |
+| `group_object_put` | `path` **or** `body_base64` (+ `name?`; needs `files_root`) |
+| `group_object_locate` | **object_id**, `hint_aid?` |
+| `group_object_get` | **object_id**, `dest?`, `hint_aid?`, `register?`, `access_token?` |
+| `group_sync` | **group_id**, **peer_aid** — diagnostics |
 
 ---
 
-### Services (Capability Discovery)
-
-#### `POST /agents/{aid}/services`
-
-Register one or more capabilities for an agent, making it discoverable by service name.
-
-**Request:**
-
-```json
-{
-  "services": ["lang.translate"],
-  "name": "My Translation Agent",
-  "protocols": ["mcp", "http"],
-  "tags": ["legal", "zh-en"],
-  "brief": "Specialized in legal document translation.",
-  "meta": {"url": "https://example.com/agent"},
-  "ttl": 3600
-}
-```
-
-#### `DELETE /agents/{aid}/services/{service...}`
-
-Remove a service registration from the daemon's renewal list. Body: `{}`. The DHT entry expires after its TTL.
-
-#### `POST /discover`
-
-Search for agents by capability.
-
-**Request:**
-
-```json
-{
-  "services": ["lang.translate"],
-  "filter": {
-    "protocols": ["mcp"],
-    "tags": ["legal"]
-  }
-}
-```
-
-**Response:**
-
-```json
-{
-  "entries": [
-    {
-      "service": "lang.translate",
-      "aid": "a2alEKFspDoevpF...",
-      "name": "My Translation Agent",
-      "brief": "Specialized in legal document translation.",
-      "protocols": ["mcp"],
-      "tags": ["legal", "zh-en"]
-    }
-  ]
-}
-```
-
----
-
-### Resolve and Connect
-
-#### `POST /resolve/{aid}`
-
-Resolve a remote AID to its current endpoint record.
-
-**Response:**
-
-```json
-{
-  "aid": "a2alEKFspDoevpF...",
-  "endpoints": ["quic://1.2.3.4:4122"],
-  "nat_type": 1,
-  "seq": 7,
-  "ttl": 3600
-}
-```
-
-#### `GET /resolve/{aid}/records?type={rec_type}`
-
-Fetch raw `SignedRecord`s for a remote AID. Omit `type` or set `type=0` for all record types.
-
-#### `POST /connect/{aid}`
-
-Open a **one-shot** encrypted tunnel to a remote agent. Returns a local TCP address your application connects to. The tunnel is released when the TCP connection closes.
-
-**Request (all fields optional):**
-
-```json
-{
-  "local_aid": "a2alXYZ...",
-  "disable_relay": false
-}
-```
-
-`disable_relay`: if `true`, relay is suppressed for this connection even if TURN servers are configured. If direct connection then fails and TURN is available, returns HTTP 412 with `{"error":"relay_required"}`.
-
-**Response:**
-
-```json
-{"tunnel": "127.0.0.1:54321"}
-```
-
-> For multiple concurrent connections to the same remote agent, use the persistent tunnel API below.
-
-#### `POST /fetch/{aid}`
-
-Send an HTTP request to a remote agent over an encrypted QUIC connection. The daemon handles NAT traversal and connection reuse internally — no local TCP port is required.
-
-**Request:**
-
-```json
-{
-  "method": "GET",
-  "path": "/.well-known/agent.json",
-  "headers": {"Accept": ["application/json"]},
-  "body_base64": "",
-  "local_aid": "a2alXYZ..."
-}
-```
-
-`method` defaults to `GET`. `headers`, `body_base64`, and `local_aid` are optional.
-
-**Response:**
-
-```json
-{
-  "status": 200,
-  "headers": {"Content-Type": ["application/json"]},
-  "body": "<base64-encoded response body>",
-  "truncated": false
-}
-```
-
-`body` is base64-encoded. `truncated` is `true` when the response body exceeded the 4 MiB limit and was cut off.
-
-#### `POST /tunnel/{aid}`
-
-Open a **persistent multiplexed** encrypted tunnel. A single tunnel accepts any number of concurrent TCP connections, each mapped to a new QUIC stream over the same pooled QUIC connection.
-
-**Request (all fields optional):**
-
-```json
-{
-  "local_aid": "a2alXYZ...",
-  "idle_timeout_sec": 90,
-  "disable_relay": false,
-  "local_port": 18080
-}
-```
-
-`disable_relay`: same semantics as in `POST /connect/{aid}`.
-
-`local_port`: optional 1–65535. Omit or 0 to let the system assign a port. The same local identity, remote AID, and port returns the existing tunnel if it is still usable. A different occupant of that port returns HTTP 409 `{"error":"port_in_use"}`. A value outside 1–65535 (and not 0) returns HTTP 400 `{"error":"bad local_port"}`.
-
-**Response:**
-
-```json
-{
-  "id": "tun_abc123",
-  "listen": "127.0.0.1:58320",
-  "remote_aid": "a2alRemote...",
-  "is_relayed": false
-}
-```
-
-`is_relayed`: `true` when the underlying QUIC connection was established via a TURN relay.
-
-Connect any number of TCP clients to `listen`. The tunnel persists until explicitly closed or the QUIC connection idles out (`idle_timeout_sec`, default 90 s).
-
-#### `DELETE /tunnel/{id}`
-
-Close a persistent tunnel by ID. All in-flight connections are terminated immediately.
-
-**Response:** `{"ok": true}`
-
-#### `GET /tunnel`
-
-List all active persistent tunnels.
-
-**Response:**
-
-```json
-{
-  "tunnels": [
-    {
-      "id": "tun_abc123",
-      "listen": "127.0.0.1:58320",
-      "remote_aid": "a2alRemote...",
-      "active_conns": 2
-    }
-  ]
-}
-```
-
-#### `GET /tunnel/{id}`
-
-Get the status of a single persistent tunnel.
-
-**Response:** same shape as one element of the `tunnels` array above.
-
----
-
-### Mailbox
-
-#### `POST /agents/{aid}/mailbox/send`
-
-Send an encrypted note to any agent by AID, even if they are offline.
-
-**Request:**
-
-```json
-{
-  "recipient": "a2alRemoteAID...",
-  "msg_type": 1,
-  "body_base64": "..."
-}
-```
-
-#### `POST /agents/{aid}/mailbox/poll`
-
-Retrieve and decrypt pending incoming notes for a local agent.
-
-**Response:**
-
-```json
-{
-  "messages": [
-    {
-      "sender": "a2alSenderAID...",
-      "msg_type": 1,
-      "body_base64": "..."
-    }
-  ]
-}
-```
-
----
-
-### Ethereum Identity
-
-#### `POST /agents/ethereum/delegation-message`
-
-Build the EIP-191 `personal_sign` message for wallet-based delegation.
-
-**Request:**
-
-```json
-{
-  "agent": "0x3a7f...",
-  "issued_at": 1712345678,
-  "expires_at": 1743881678,
-  "operational_public_key_hex": "..."
-}
-```
-
-**Response:** `{"message": "Sign this message in your wallet:\n..."}`
-
-#### `POST /agents/ethereum/register`
-
-Register an Ethereum-linked agent after the user has signed the delegation message.
-
-**Request:**
-
-```json
-{
-  "agent": "0x3a7f...",
-  "issued_at": 1712345678,
-  "expires_at": 1743881678,
-  "eth_signature_hex": "...",
-  "service_tcp": "127.0.0.1:8080",
-  "operational_private_key_seed_hex": "..."
-}
-```
-
-#### `POST /agents/ethereum/proof`
-
-Generate an Ethereum delegation proof directly from a private key (automation / scripting only).
-
-#### `POST /agents/paralism/proof`
-
-Generate a Paralism blockchain delegation proof from a private key.
-
----
-
-### Config
-
-#### `GET /config`
-
-Current daemon configuration (`api_token` redacted as `***`).
-
-#### `PATCH /config`
-
-Partial config update. Fields that require restart are listed in the response.
-
-**Request (any subset of fields):**
-
-```json
-{
-  "auto_publish": true,
-  "fallback_host": "1.2.3.4",
-  "api_token": "mysecret"
-}
-```
-
-**Response:** `{"ok": true, "restart_required": ["fallback_host"]}`
-
-#### `GET /config/schema`
-
-JSON Schema for all config fields (for UI / tooling).
-
----
-
-## MCP Tools
-
-`a2ald` exposes its capabilities as MCP tools. Two transport modes:
-
-- **Streamable HTTP**: `http://127.0.0.1:2121/mcp/` (requires daemon running)
-- **Stdio**: `a2ald --mcp-stdio` (standalone; no REST API in this mode)
-
-See [MCP Setup](mcp-setup.md) for platform-specific config snippets.
-
-### Tool list
-
-| Tool | Description |
-|------|-------------|
-| `a2al_identity_generate` | Create a new Ed25519 agent identity (AID, keys, delegation proof). Master key shown once. |
-| `a2al_agents_generate_ethereum` | Create a new Ethereum-linked agent identity. Keys not retained. |
-| `a2al_ethereum_delegation_message` | Build the EIP-191 message for wallet signing. |
-| `a2al_ethereum_register` | Complete Ethereum agent registration after wallet signature. |
-| `a2al_ethereum_proof` | Generate Ethereum delegation proof from a raw private key (scripting only). |
-| `a2al_agents_list` | List all agents registered with the daemon. |
-| `a2al_agent_register` | Register a generated identity with the daemon. |
-| `a2al_agent_get` | Get a local agent's status (reachability, last publish, service address). |
-| `a2al_agent_patch` | Update a registered agent's service address. |
-| `a2al_agent_publish` | Force-publish an agent's endpoint record to the Tangled Network. |
-| `a2al_agent_heartbeat` | Keep an agent visible when it has no direct service address. |
-| `a2al_agent_delete` | Remove a local agent registration. |
-| `a2al_agent_publish_record` | Publish a custom signed data record for an agent. |
-| `a2al_status` | Daemon status: node AID, auto-publish state, last/next publish times. |
-| `a2al_resolve` | Look up a remote agent's current endpoints by AID. |
-| `a2al_resolve_records` | Fetch all signed records published by a remote agent. |
-| `a2al_connect` | Open a one-shot encrypted tunnel to a remote agent. Returns `127.0.0.1:<port>`. |
-| `a2al_fetch` | Send an HTTP request to a remote agent over an encrypted QUIC connection. Returns `{status, headers, body}`. No local TCP port required. |
-| `a2al_tunnel_open` | Open a persistent multiplexed encrypted tunnel. Returns `{id, listen}`. Optional `local_port` requests that local port. |
-| `a2al_tunnel_close` | Close a persistent tunnel by ID. |
-| `a2al_tunnel_list` | List all active persistent tunnels. |
-| `a2al_mailbox_send` | Send an encrypted note to any agent (offline delivery supported). |
-| `a2al_mailbox_poll` | Retrieve pending incoming notes for a local agent. |
-| `a2al_service_register` | Publish capability tags for an agent (e.g. `lang.translate`, `code.review`). |
-| `a2al_service_unregister` | Remove a capability tag from an agent. |
-| `a2al_discover` | Search the Tangled Network for agents by capability name, protocol, or tags. |
-
----
-
-## Python SDK
+## Python
 
 ```bash
 pip install a2al
 ```
 
-### `Daemon`
-
-Starts `a2ald` as a sidecar process. The bundled binary is used automatically — no PATH setup required.
-
 ```python
 from a2al import Daemon, Client
 
-# Context manager — starts and stops cleanly
 with Daemon() as d:
     c = Client(d.api_base, token=d.api_token)
-    print(c.health())
-
-# Or manually
-d = Daemon()
-d.start()          # blocks until /health responds
-c = Client(d.api_base, token=d.api_token)
-# ... use c ...
-d.close()          # terminates the process and cleans up the temp data dir
+    c.health()
+    c.resolve(remote_aid)
+    r = c.fetch(remote_aid, method="GET", path="/.well-known/agent.json")
+    t = c.tunnel_open(remote_aid)
+    c.tunnel_close(t["id"])
 ```
 
-**Constructor parameters:**
+`Daemon(a2ald_exe=…, extra_args=["--bootstrap", "127.0.0.1:4121"])`. Env: `A2ALD_PATH`, `A2AL_API_TOKEN`. Sidecar uses a temp data dir and a free API port.
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `a2ald_exe` | auto-detected | Path to `a2ald` binary. Falls back to `A2ALD_PATH` env, then bundled binary. |
-| `api_token` | `None` | Bearer token for API auth. Falls back to `A2AL_API_TOKEN` env. |
-| `extra_args` | `[]` | Additional CLI args passed to `a2ald` (e.g. `["--bootstrap", "1.2.3.4:4121"]`). |
+| Method | REST |
+|--------|------|
+| `health` / `config_get` | `/health`, `/config` |
+| `identity_generate` / `agent_register` / `agent_publish` / `agents_list` | identity + agents |
+| `resolve` / `connect` / `fetch` | resolve, connect, fetch |
+| `tunnel_open` / `tunnel_close` / `tunnel_list` / `tunnel_status` | tunnels |
 
-After `start()`, `d.api_base` is the HTTP base URL (e.g. `http://127.0.0.1:52341`).
-
-### `Client`
-
-A thin REST client. All methods map to the REST API above.
-
-```python
-c = Client("http://127.0.0.1:2121", token="mysecret")
-
-c.health()                          # GET /health
-c.status()                          # GET /status
-c.identity_generate()               # POST /identity/generate
-c.agent_register(op_key, proof)     # POST /agents
-c.agent_publish(aid)                # POST /agents/{aid}/publish
-c.resolve(remote_aid)               # POST /resolve/{aid}
-c.connect(remote_aid)               # POST /connect/{aid} → {"tunnel":"127.0.0.1:PORT"}
-c.discover(services, filter=None)   # POST /discover
-c.mailbox_send(aid, recipient, ...)  # POST /agents/{aid}/mailbox/send
-c.mailbox_poll(aid)                 # POST /agents/{aid}/mailbox/poll
-```
-
-For the full method list, see the source at `python/src/a2al/_sidecar.py`.
+`Client.fetch` / `connect` / `tunnel_open` do not take `access_token`. No `tunnel_reset`. Everything else: HTTP to `d.api_base` or `a2al` CLI.
 
 ---
 
-## Go SDK
+## CLI
 
-Import the module:
+Global: `--api`, `--token`, `--json`, `--quiet`. Env `A2AL_API`, `A2AL_TOKEN`. `chat` / `group` call `POST /mcp/call`. `a2al group help` / `a2al note help`.
 
-```
-github.com/a2al/a2al
-```
+| Command | Flags / args |
+|---------|----------------|
+| `status` `doctor` `version` | |
+| `register` | `[--ethereum --eth-key 0x…] [--service-tcp host:port] [--save-master FILE] [--no-publish]` |
+| `identity new` / `new-eth` | Raw keys (JSON); does not register |
+| `publish` | `<service> [--from URL] [--name] [--brief] [--url] [--aid] [--ttl] [--protocol] [--tag] [-y]` |
+| `unpublish` | `<service> [--aid]` |
+| `search` | `<service>… [--filter-protocol] [--filter-tag]` |
+| `info` `resolve` | `<aid>` |
+| `get` | `<aid> <path> [--header K:V] [--local-aid] [--access-token]` |
+| `post` | `<aid> <path> [-d JSON] [--header] [--local-aid] [--access-token]` |
+| `inbound bind` | `--addr host:port [--aid]` — never the daemon `api_addr` |
+| `connect` | `<aid> [--local-aid] [--access-token]` |
+| `tunnel` | (list) · `open <aid> [--local-aid] [--local-port N] [--idle-timeout N] [--access-token]` · `close` / `reset` / `status <id>` |
+| `note send` | `<local> <remote> <body-base64> [--msg-type N]` (default type `1`) |
+| `note poll` | `<local>` |
+| `chat` / `group` | Same flags as [User Guide](user-guide.md#chat-11) / [rooms](user-guide.md#rooms) |
+| `agents` | `new` `new-eth` `get` `update --service-tcp` `del` `publish` `heartbeat` `export [-o] [--password]` `import [--password]` `topic add <aid> <svc>… [--name --brief --url --ttl --protocol --tag]` `topic del` `acl` `acl-default` `acl-allow` (`--secret`) `acl-deny` `acl-del` |
+| `config` | `get [key]` · `set <key> <value>` (PATCH-able keys only) |
+| `admin` | `on` `off` `password <secret>\|off` `allow` `deny` `del allow\|deny <id>` |
+| `update` | `[--check]` `[--confirm]` |
 
-The primary entry point for most applications is `github.com/a2al/a2al/host`. Lower-level packages (`dht`, `protocol`, `identity`, `crypto`) are available when you need finer control.
+### `a2ald`
 
-See [`doc/API.md`](API.md) for the full Go API reference including `host.Host`, `dht.Node`, endpoint record types, and the `config` package.
+`--data-dir` `--config` `--listen` `--api-addr` `--fallback-host` `--bootstrap` (comma `host:port`) `--mcp-stdio` `--no-open-browser`
+
+Default data dir: `os.UserConfigDir()/a2al` — Windows `%APPDATA%\a2al`, macOS `~/Library/Application Support/a2al`, Linux `~/.config/a2al`.
+
+`service install|uninstall|start|stop|status` — Windows and macOS (`-data-dir`; `-user` is Windows only: Task Scheduler, stops at logout). Linux: [deploy/linux](../deploy/linux/README.md).
+
+`mcp add [--client auto\|name] [--config PATH] [--transport http\|stdio] [--dry-run] [--npx] [--name a2al] [--data-dir]`
+
+`mcp print [--transport http\|stdio] [--format json\|toml] [--bare] [--npx]`
+
+`update [--check]`

@@ -1,6 +1,6 @@
 # Examples
 
-The `examples/` directory contains runnable demos that verify A2AL's core capabilities end to end.
+These demos verify addressing, QUIC, and daemon REST. They are not daily-use tutorials — for that, see [Quick Start](quickstart.md) and [Recipes](recipes.md). Built-in **chat and rooms** live in the Web UI / `a2al chat` / `a2al group`; these demos are not that product surface.
 
 ---
 
@@ -46,8 +46,8 @@ Demos 3–6 use `a2ald` as the network layer and focus on application-level beha
 
 ## Prerequisites
 
-- **Demos 1 and 2**: pre-built binary from [**Demo binaries (latest)**](https://github.com/a2al/a2al/releases/tag/demos-latest), or Go 1.22+ to build from source.
-- **Demos 3–6**: `a2ald` running on each participating machine, plus a pre-built demo binary or Go 1.22+.
+- **Demos 1 and 2**: pre-built binary from [**Demo binaries (latest)**](https://github.com/a2al/a2al/releases/tag/demos-latest), or Go 1.24+ to build from source.
+- **Demos 3–6**: `a2ald` running on each participating machine, plus a pre-built demo binary or Go 1.24+.
 
 Start `a2ald` with no arguments on any internet-connected machine; it joins the public Tangled Network automatically.
 
@@ -123,7 +123,7 @@ Buyer  demo:   demo5-marketplace --role buyer --api 127.0.0.1:2122
 
 **Verifies:** named service registration and discovery, encrypted notes send and poll, Sovereign Record metadata.
 
-Alice publishes a translation service as the named service `lang.translate`. Bob discovers it, sends a translation request via encrypted notes, and waits for the reply — without either party knowing the other's IP address.
+Alice publishes `lang.translate` (a **Capability**). Bob discovers it, sends a translation request via encrypted notes, and waits for the reply — without either party knowing the other's IP address.
 
 **Two machines (recommended):**
 ```

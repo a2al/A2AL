@@ -1,109 +1,117 @@
 # Quick Start
 
-Get two agents to find each other and communicate, in under five minutes.
+Get an AID and reach another agent in a few minutes.
 
----
+**AID** — permanent cryptographic address. You generate it locally; nobody assigns it.
 
-## Concepts first
+**Tangled Network** — peer-to-peer directory of *where to find an AID now*. Application data does not flow through it.
 
-Before touching a command, understand three things.
-
-**AID — your agent's permanent address.** A cryptographic address derived from a key pair you generate locally. No one assigns it, no registry records it. It looks like a ~44-character string (Ed25519) or `0x3a7f...` (Ethereum-style). As long as you hold the private key, the AID is yours — regardless of IP, network, or machine changes.
-
-**The Tangled Network — a global P2P directory.** When you *publish* an AID, a signed record mapping it to your current endpoints is stored across a distributed hash table. Anyone can *resolve* any AID to find its live endpoints, without a central server. The network stores "where to find me now" — it never carries your application data.
-
-**a2ald — your local daemon.** One process: identities, the network, QUIC, Web UI, REST, and MCP. People open the UI; agents use tools; scripts use the CLI. It connects, then steps aside — application data flows directly between peers.
-
-The three operations:
-
-| Operation | What happens |
-|-----------|-------------|
-| **Publish** | Sign your AID + current endpoints and store on the Tangled Network |
-| **Discover** | Search agents by capability, or resolve a known AID to its endpoints |
-| **Connect** | Negotiate a direct encrypted connection (same AID on a server or a laptop) |
+**a2ald** — local daemon: identities, connections, Web UI, REST, MCP.
 
 ---
 
 ## Install
 
-Download the latest release for your platform from [GitHub Releases](https://github.com/a2al/a2al/releases). Each archive contains two binaries:
-
-- `a2ald` — the daemon
-- `a2al` — the CLI
-
-Extract and place both in your PATH.
-
-> **Other install methods** exist for specific integration scenarios: `npm install -g a2ald` for [MCP integration](mcp-setup.md), `pip install a2al` for the [Python SDK](api-reference.md). This guide uses the binary release.
+- **Binary:** [GitHub Releases](https://github.com/a2al/a2al/releases) — `a2ald` + `a2al` on PATH.
+- **npm:** `npm install -g a2ald` (or `npx -y a2ald`).
+- **Python sidecar:** `pip install a2al`.
 
 ---
 
-## Start the daemon
-
-**Option A — Install as a persistent background service (recommended)**
-
-```bash
-a2ald service install   # registers and starts the service
-```
-
-The service starts automatically on login and stays connected 24/7. Network operations are near-instant with no warm-up wait.
-
-To manage the service later:
-
-```bash
-a2ald service status
-a2ald service stop
-a2ald service start
-a2ald service uninstall
-```
-
-> **Windows:** just run `a2ald service install` — if admin rights are needed, an interactive menu appears with two options: **[1] System Service** (triggers a UAC prompt; survives reboot, recommended) or **[2] Task Scheduler** (no elevation; stops at logout). You can also pass `-user` directly to skip the menu and install via Task Scheduler.
-
-**Option B — Run directly (one-off or transient use)**
+## Start
 
 ```bash
 a2ald
 ```
 
-`a2ald` generates a node identity on first run, joins the Tangled Network, and starts listening. No configuration needed. Try the next step immediately; if a call fails right after start, wait 10–30 seconds and retry. Do not wait for a peer count.
+Open **http://localhost:2121**. First start generates a node identity and joins the public network (data dir: `%APPDATA%\a2al` / `~/Library/Application Support/a2al` / `~/.config/a2al`). Usable **< 1 min**; findable **1–2 min**. If `a2ald` is already running, there is no join wait. Do not wait for a peer count. Times: [User Guide — Timing](user-guide.md#timing).
 
-## Open the Web UI
+**Keep it running across logins** — only if others must still find you after you close the terminal:
 
-Go to **http://localhost:2121** in your browser.
-
-### Register your agent
-
-Click **New Agent**. An AID is generated instantly. Give your agent a name and click **Register** — your agent now has a permanent, globally unique identity.
-
-### Publish to the network
-
-Fill in the service form — service name, protocol, and a brief description of what your agent does. Click **Publish**. Your agent is now discoverable by anyone on the Tangled Network, worldwide.
-
-### Discover other agents
-
-Go to the **Discover** tab. Search by service name (e.g. `reason.qa`, `lang.translate`) to find agents offering that capability. Or paste an AID in the **Resolve** tab to look up a specific agent's endpoints.
-
-### Connect
-
-Click **Connect** on any discovered agent. The daemon opens a direct encrypted connection. Changing IPs and typical firewalls are handled for you.
-
-- **Send Request** — issue an HTTP GET or POST to the remote agent. The daemon handles the QUIC transport internally and returns the response.
-- **One-shot tunnel** — get a local TCP address for a single session (useful for SSH, RDP, or other non-HTTP protocols).
-- **Persistent tunnel** — open a long-lived local port that accepts multiple concurrent connections to the same remote agent.
-
-### Send a note to an offline agent
-
-If the remote agent is offline, you can leave an encrypted note that it will pick up later — no need for both parties to be online at the same time.
-
-> **Prefer the CLI?** Everything above can also be done via `a2al register`, `a2al search`, `a2al resolve`, `a2al get`, `a2al post`, `a2al tunnel`, and `a2al note`. Run `a2al help` for the full command list.
+| Platform | What to run |
+|----------|-------------|
+| Windows / macOS | `a2ald service install` then `status` / `stop` / `start` / `uninstall` |
+| Linux | [Deploy on Linux](../deploy/linux/README.md) (package or systemd) |
 
 ---
 
-## What's next
+## Verify it works
 
-| Goal | Where to go |
-|------|-------------|
-| Understand concepts, scenarios, and operations in depth | [User Guide](user-guide.md) |
-| Integrate via REST API, Go SDK, Python, or MCP | [API Reference](api-reference.md) |
-| Set up MCP for AI agents (Claude, Cursor, etc.) | [MCP Setup](mcp-setup.md) |
-| Run demos: encrypted chat, marketplace, multi-agent swarm | [`examples/`](../examples/) — pre-built binaries: [Demo binaries (latest)](https://github.com/a2al/a2al/releases/tag/demos-latest) |
-| Deploy on a Linux server | [`deploy/linux/`](../deploy/linux/README.md) |
+Everything below runs on a single machine. No second device needed.
+
+```bash
+# Create a local identity
+a2al register
+# → AID: <abc123…>   (copy this)
+
+# Publish it so the network can find it
+a2al publish
+
+# Resolve it back — should return your own endpoint
+a2al resolve <abc123…>
+# → Endpoints: quic://…
+
+# Call it directly through the daemon gateway
+a2al get <abc123…> /.well-known/agent.json
+# → {"name":"…","acp":…}
+```
+
+If `resolve` returns an endpoint and `get` returns JSON, the daemon is up, your identity is
+registered, and the network layer is working. That is all you need before connecting to another
+agent.
+
+---
+
+## Web UI
+
+Tabs: **Agents**, **Discover**, **Node**.
+
+1. **Agents → Add Identity.** Creates an Ed25519 AID (optional: recover from a master key, or **Ethereum Identity**). Save the master key — the daemon does not keep it.
+2. Give someone the **AID**. They look it up under **Discover**, or you paste theirs there.
+3. From Discover: **fetch** HTTP, open a **tunnel**, or leave a **note** if they are offline.
+4. On an identity, **Room** / **Chat** open the collaboration bubble. Chat is ready in the UI; creating a room is CLI/MCP (`a2al group create`). The bubble can watch a room you already joined.
+
+**Access Control** on an identity gates who may fetch that identity’s HTTP / file objects — not notes or discovery.
+
+---
+
+## CLI
+
+```bash
+a2al status
+a2al register
+a2al publish lang.translate --from http://127.0.0.1:8080 -y   # optional: list a Capability
+a2al get <aid> /.well-known/agent.json
+a2al inbound bind --addr 127.0.0.1:8080 [--aid <local>]   # expose local HTTP
+a2al note send <your-aid> <their-aid> "$(echo -n 'hello' | base64)"
+a2al chat request --aid <your-aid> --peer <their-aid>
+a2al group create --aid <your-aid> --title "standup"
+```
+
+Same fetch as a URL on any machine that runs `a2ald`:
+
+```text
+http://127.0.0.1:2121/aid/{AID}/…
+```
+
+---
+
+## MCP
+
+```bash
+npx -y a2ald mcp add
+```
+
+Reload the host and confirm `a2al_*` tools. Details: [MCP Setup](mcp-setup.md).
+
+---
+
+## Next
+
+| Goal | Page |
+|------|------|
+| Solve a specific problem end-to-end | [Recipes](recipes.md) |
+| Chat, rooms, ACL, private network, TURN | [User Guide](user-guide.md) |
+| REST / MCP / Python | [API Reference](api-reference.md) |
+| Demos | [Examples](examples.md) |
+| Linux/macOS/Windows service files | [`deploy/`](../deploy/) |

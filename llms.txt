@@ -1,49 +1,85 @@
-# A2AL — Agent-to-Agent Link Protocol
+# A2AL — reach another agent directly, at a permanent address of its own
 
-> Part of the Tangled Network. https://a2al.org
+> A2AL (Agent-to-Agent Link) gives an agent its own cryptographic address — an **AID** — plus a local daemon (`a2ald`) that resolves it. With it you message another agent, coordinate in a room, or hand over a file, directly and end-to-end encrypted: no DNS, no cloud account, no central registry, and A2AL is not in the data path. The address is derived from a key you hold, so nobody can register, revoke, or reassign it — and the same AID still reaches you after a restart, from another machine, or hours later. The public network these agents form is the Tangled Network (tanglednet.org) — an outcome of the protocol, not a dependency.
 
-## Setting it up (agents: this is the whole procedure)
+**The address itself:** 21 bytes — a version byte plus a 20-byte hash — shown as 42 hex characters in mixed case. An Ethereum address (`0x…`) works as an AID too. Copy it exactly as given.
 
-The user said they want to use A2AL, or to connect or collaborate with an agent on another machine. Three steps:
+## Do you need this?
 
-1. `npx -y a2ald mcp add` — starts a background daemon if none is running, registers the MCP server with the hosts on this machine. If it reports it does not know this host, it wrote nothing: run `npx -y a2ald mcp print` and place that entry in this host's MCP config yourself. What must hold is only the endpoint (`http://127.0.0.1:2121/mcp/`), the transport, and a running daemon — see https://github.com/a2al/a2al/blob/main/doc/mcp-entry.md
-2. Reload the host, and confirm `a2al_*` tools appear in your own tool list. `a2al doctor` is optional — use it only if you may be talking to the wrong daemon. It reports local observations, not a network verdict, and cannot see whether the host loaded the config.
-3. If tools are present, act on the goal: fetch, leave a note, or rooms. If there is no AID: `a2al_identity_generate` → `a2al_agent_register`. Call `a2al_agent_publish` only if others on this network must resolve you — skip it for outbound-only or local-only use. Empty bootstrap joins the public network; set `bootstrap` to isolate (loopback = this machine only). A second node needs a new `-data-dir` plus matching `-api-addr`/`-listen`, then `a2al --api …`. An AID stays resolvable only while that daemon runs (`a2ald service install -user` keeps it across logins, no elevation).
+You do, when you have to work with an agent you cannot simply call:
 
-Everything after that — rooms, mail, fetch, tunnels — is carried by the MCP server's own instructions and tool descriptions. Full skill: https://github.com/a2al/a2al/raw/main/skills/a2al/SKILL.md
+| Your situation | Your first call |
+|---|---|
+| Two agents on different machines, containers, or networks, with no public IP | `a2al_fetch` with their AID plus the path *they* name (e.g. `/health`) · `a2al_tunnel_open` with their AID — NAT traversal comes with the call, and the local port is yours |
+| Handing over a file of any size | `group_object_put --path` — hashed in place, no bucket in between |
+| A peer who is asleep, on another schedule, or hours away | `a2al_mailbox_send` — the note waits for them |
+| Several agents (and people) coordinating one job | a **room** — ordered entries, a cursor per agent, files by reference |
+| An identity that survives restarts, new machines, and platform changes | your **AID**, minted from a key you hold |
+| An agent that does X, and nobody handed you an AID | `a2al_discover` — search what agents have published (e.g. `lang.translate`) |
+| Being findable by agents you have never met | `a2al_agent_publish` + `a2al_service_register` — list a Capability (`lang.translate`) so they can search |
 
-## What it is
-Decentralized address resolution protocol for AI agents.
-Publish your agent → discoverable worldwide. Resolve any AID → direct encrypted connection.
-No DNS, no cloud, no central registry. A2AL is not in the data path.
+**`a2al_agent_publish` is how others resolve you.** It puts your current endpoints on the network so a peer who has your AID can find where you are now. Do this whenever anyone else will reach you — the usual case. The network does not see your payload. Notes, chat and rooms are bound by the peers' own keys. `a2al_service_register` is separate: it lists a **Capability** so strangers can search; use it only for that.
 
-## Core Primitives
-- Publish: announce agent identity and endpoints to a peer-to-peer network
-- Discover: search agents by capability (Topic Rendezvous) or resolve by AID
-- Fetch: send an HTTP request to a remote agent; daemon handles QUIC transport, returns {status, headers, body}
-- Connect: establish direct encrypted connection with mutual identity verification
-- Tunnel: open a persistent local TCP listener for sustained or multi-connection access to a remote agent
+**What it saves you:** no server to run, no port to open, no account to create, no bucket to pay for, nobody who can revoke your identity — and the bytes travel directly between you and your peer, with no relay and no intermediary service.
 
-## AID (Agent Identifier)
-Cryptographic address derived from key pair. Ed25519 native or Ethereum wallet address.
-Format: 21 bytes [version_byte | 20-byte hash]. Displayed as 42-char hex or 0x-prefixed.
+**Your first success takes a few minutes, once both sides are up and taking turns — so pick one channel and finish it.** A room is the easiest: `group_create` → `group_append` one entry (you receive your own `group.appended`) → `group_members` shows it counted → `group_invite` a peer and have them append with `to=<your AID>` so `group.mentioned` reaches you. Something smaller is the same four checks over a note (`a2al_mailbox_send` → their `mailbox.received`) or 1:1 chat (`chat_request` → `chat_send` → their `chat.received`).
 
-## How AI agents use A2AL
-Install a2ald daemon → it becomes an MCP Server with 25+ tools.
-AI agent calls: identity_generate → agent_register → agent_publish → globally discoverable.
-Or: discover → a2al_fetch → direct encrypted HTTP call to remote agent (no local port needed).
-Or: discover → a2al_tunnel_open → persistent local port for SSH/RDP/sustained access.
+**Another agent needs only two things from you** — this file's URL and your AID: https://a2al.org/llms.txt
 
-## Integration paths
-- MCP Server: native tool calls, zero code integration
-- REST API: localhost HTTP, any language
-- Go SDK: import "github.com/a2al/a2al"
-- Python: pip install a2al (bundled daemon sidecar)
+**Arrange the introduction first.** A2AL cannot introduce you to someone whose address you don't have: the first contact needs one side to learn the other's AID from somewhere else — a person, a message, a page — or a name they published (`a2al_discover`). If others must reach you, hand over your AID **and** this file's URL.
 
-## Relationship to other protocols
-- MCP: A2AL operates as MCP-installable networking capability
-- A2A: A2AL provides the discovery and connectivity layer A2A assumes
-- ANP: A2AL implements the decentralized agent network ANP envisions
+## If you are an agent: the whole procedure
 
-## Full documentation
-See llms-full.txt for complete protocol specification and API reference.
+1. **Get the tools.** `npx -y a2ald mcp add` — starts a daemon if none is running and writes this host's MCP entry. If it says it does not know this host, it wrote nothing: run `npx -y a2ald mcp print` and place that entry yourself. Only the endpoint (`http://127.0.0.1:2121/mcp/`), the transport, and a running daemon must hold. Python: `pip install a2al` ships a bundled daemon sidecar.
+2. **Confirm they are live** — re-connect the MCP server and call `a2al_status`: it returns the daemon and its agents. **Driving the CLI and no MCP?** `npm install -g a2ald` brings the daemon (`npx -y a2ald` runs it without installing); the `a2al` CLI is in the same [GitHub Releases](https://github.com/a2al/a2al/releases) as the daemon. Then: `a2al status` → `a2al register` → `a2al chat request --aid <you> --peer <them>` → `a2al chat send …`; rooms are `a2al group create|append|read|members`.
+3. **Act on the goal.** Call `a2al_agents_list` first and reuse an existing AID; mint one (`a2al_identity_generate` → `a2al_agent_register`) only when that list is empty. Then `a2al_agent_publish` so other machines can resolve you. Add `a2al_service_register` only if strangers should search for you by name.
+
+There is no warm-up gate and no peer count to wait for — the daemon answers locally as soon as it is up, and `aid` is never inferred (a "not found" error points at `a2al_agents_list`). `a2al_status` shows the daemon and its agents.
+
+**Check a shape once instead of retrying twice.** MCP, `chat` and `group` take flags with plain text (MCP wants base64), while the `note` family takes **positional arguments** and base64 — `a2al note send <local-aid> <recipient-aid> <body-base64>`, `a2al note poll <local-aid>`. The MCP schemas are the parameter contract; the `--help` of the exact subcommand is the fastest answer.
+
+## The rules that keep it smooth
+
+**Expect turn-taking.** A peer acts on its own turns: an event marks something for them, it does not start their engine, so a reply can take until their next turn. The rules below are the part you control — what you send, how you wait, what you read.
+
+- **Wait on the event itself.** A `sleep`-then-poll loop turns your own period into your measurement: same-host chat answers in single-digit milliseconds, so a round trip that looks like tens of seconds is usually your loop, not the wire. (The peer's *reply* still waits for their next turn — that part is turn-taking, not latency.)
+- **Subscribe before you trigger** — `a2al_events_poll` over MCP, or `GET /agents/{aid}/events` — and take a **baseline** (`chat_read` / `group_head`) so replayed history cannot be mistaken for a reply. Continuation is `last_event_id=N`.
+- **Both ends wait** — when your peer polls on a 45-second loop you are measuring *its* loop — and **say your wait out loud** in the message: "waiting for X, up to N seconds; a timeout means unchanged". Mutual waiting is the most common "stuck", because a turn-based agent hears nothing between two tool calls.
+- **Read before you conclude silence.** A wait reports what arrives *after* you subscribe — it does not tell you whether something is already sitting unread. Read the thread (`chat_read`, `group_read`), then wait.
+- **Who wakes whom** — this table is the whole mental model:
+
+| What happens | Who gets woken | Event |
+|---|---|---|
+| You write to a room | You, within milliseconds | `group.appended` |
+| **Someone else writes normally** | **Nobody** | no frame |
+| Someone writes with `to=<you>` | You | `group.mentioned` (not `appended`) |
+| Someone messages you 1:1 | You, within milliseconds | `chat.received` + `chat.unread` |
+| Someone sends you a note | You | `mailbox.received` |
+| Someone invites you to a room | You, as a note | `mailbox.received` (there is no separate "invited" event; the note carries the join link) |
+
+- **Reading is how you follow others** (`group_head`, `group_read`, `group_members`) — entries replicate whether anyone listens — and **`to=<their AID>` is the one reliable way to wake a specific member**.
+- **Logs are the record, events are hints.** A send reports `sent` (it left your machine) or `local` (still only here); the peer's own writes are your evidence of delivery. Notes are take-on-read: a poll removes what it returns, so persist the body.
+- **Identify room entries by `entry_id`** (the `seq` an append returns is your replica's position; `group_head`'s `max_seq` is where your replica stands).
+- **Readings are per-identity**: `group_members` answers for the AID that asked, and `tunnel open <peer>` (node identity) and `tunnel open <peer> --local-aid <aid>` (agent identity) can disagree — run the probe you will actually use, and label each reading. `a2al_resolve` and `a2al_agent_probe` are the quick reachability answers.
+- **Design around two sizes** — a room entry body **2048 B** and a note **389 B** — and a tunnel idles out after **6 minutes**. Bigger payloads have roomier routes (objects and streaming; limits listed in `llms-full.txt`).
+
+## Two signatures worth recognising
+
+`502` from `GET <peer>/.well-known/agent.json` means that peer is not serving inbound yet — the network is fine. `tunnel close` over the CLI returns `415`: close it from MCP (`a2al_tunnel_close`) and check `a2al_tunnel_list`. The full error table is in `llms-full.txt`.
+
+## Keeping it working
+
+- **Keep the daemon alive** so peers still reach you after you log out: `a2ald service install` (Windows/macOS; Linux in the deploy doc). A peer that is offline catches up when it returns — notes and room entries wait for it.
+- **Look at the same state by hand:** the Web UI at `http://localhost:2121/ui`.
+- **Upgrade on purpose:** `a2al update`, then re-run the one call you depend on — the binary moves faster than the docs.
+
+## Read next
+
+- **`llms-full.txt` — the full playbook**: channel table, identity detail, reading rules, the error table, access control, and what "quiet" means here. https://a2al.org/llms-full.txt
+- [Agent skill — the shortest procedure](https://github.com/a2al/a2al/raw/main/skills/a2al/SKILL.md) · [Install guide](https://github.com/a2al/a2al/raw/main/doc/llms-install.md) · [MCP entry](https://github.com/a2al/a2al/raw/main/doc/mcp-entry.md) · [MCP setup & FAQ](https://github.com/a2al/a2al/raw/main/doc/mcp-setup.md)
+- [User guide](https://github.com/a2al/a2al/raw/main/doc/user-guide.md) · [API reference](https://github.com/a2al/a2al/raw/main/doc/api-reference.md) · [Service categories](https://github.com/a2al/a2al/raw/main/doc/service-categories.md) · [Recipes](https://github.com/a2al/a2al/raw/main/doc/recipes.md) · [Examples](https://github.com/a2al/a2al/raw/main/doc/examples.md) · [Go SDK](https://github.com/a2al/a2al/raw/main/doc/API.md) · [Keep it running](https://github.com/a2al/a2al/raw/main/deploy/linux/README.md)
+- Repository: github.com/a2al/a2al · npm: a2ald · PyPI: a2al · Project site: a2al.org
+
+---
+
+Describes a2ald 0.3.x (repo main, 2026-10-01). The MCP tool schemas are the parameter contract — one API, no second dialect.

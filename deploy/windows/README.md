@@ -1,110 +1,93 @@
-# Deploy A2AL on Windows (Task Scheduler)
+# Deploy A2AL on Windows
 
-Runs `a2ald` automatically when you log in, with automatic restart on failure.
-No admin rights required. No third-party tools needed.
+Two paths: **built-in service install** (recommended) and **manual Task Scheduler XML**
+(for custom paths or scripted deployment).
+
+Data directory: `%APPDATA%\a2al\`
 
 ---
 
-## Install
+## Path A — Built-in service install (recommended)
 
-### Step 1 — Install `a2ald`
+Install `a2ald` (choose one):
 
-**npm (recommended):**
 ```powershell
 npm install -g a2ald
+# or: download a2ald_windows_amd64.zip from Releases, extract, add to PATH
 ```
 
-**Binary download:**
-Download `a2ald_windows_amd64.zip` from [Releases](https://github.com/a2al/a2al/releases), extract, and place `a2ald.exe` somewhere in your `PATH` (e.g. `C:\Tools\`).
+Then:
 
-Verify:
 ```powershell
-a2ald --version
+a2ald service install
 ```
 
-### Step 2 — Register the scheduled task
+If this terminal already has administrator rights, that installs a Windows Service
+(survives reboot, no login required) and starts it.
 
-Open **PowerShell** (no admin needed) and run:
+If not, and stdin is a terminal, a menu appears:
 
-```powershell
-schtasks /create /tn "A2AL Daemon" /xml "$PWD\a2ald-task.xml" /f
+```
+[1] System Service  — UAC prompt; survives reboot (recommended for a machine that stays on)
+[2] Task Scheduler  — no elevation; starts at login, stops when you log out
 ```
 
-> If `a2ald` is not in your `PATH`, edit `a2ald-task.xml` first and replace `<Command>a2ald</Command>` with the full path, e.g. `<Command>C:\Tools\a2ald.exe</Command>`.
-
-### Step 3 — Start immediately (without logging out)
+Skip the menu:
 
 ```powershell
-schtasks /run /tn "A2AL Daemon"
+a2ald service install -user    # Task Scheduler; stops at logout
+```
+
+Manage:
+
+```powershell
+a2ald service status
+a2ald service stop
+a2ald service start
+a2ald service uninstall
 ```
 
 ---
 
-## Verify
+## Path B — Manual Task Scheduler XML (scripted / custom path)
+
+Use this for unattended deployment or when `a2ald` is not in the system PATH.
+
+```powershell
+# If a2ald is not in PATH, edit a2ald-task.xml first:
+# Change <Command>a2ald</Command> to <Command>C:\path\to\a2ald.exe</Command>
+
+schtasks /create /tn "A2AL Daemon" /xml "$PWD\a2ald-task.xml" /f
+schtasks /run    /tn "A2AL Daemon"
+```
+
+Verify:
 
 ```powershell
 schtasks /query /tn "A2AL Daemon" /fo LIST
 ```
 
-Or try a call via MCP (`a2al_status`, resolve, or fetch). Neighbor count and `network_ready` are local signals, not a go/no-go. If a call fails right after start, wait 10–30 seconds and retry.
-
-Logs go to `%USERPROFILE%\.a2al\a2ald.log` by default (check `config.toml` for the exact path).
-
----
-
-## Management
+Manage:
 
 ```powershell
-# Stop
-schtasks /end /tn "A2AL Daemon"
-
-# Start
-schtasks /run /tn "A2AL Daemon"
-
-# Disable (survives reboot but won't start automatically)
-schtasks /change /tn "A2AL Daemon" /disable
-
-# Remove entirely
-schtasks /delete /tn "A2AL Daemon" /f
+schtasks /end    /tn "A2AL Daemon"        # stop
+schtasks /run    /tn "A2AL Daemon"        # start
+schtasks /change /tn "A2AL Daemon" /disable   # disable autostart
+schtasks /delete /tn "A2AL Daemon" /f    # remove
 ```
+
+Logs: `%APPDATA%\a2al\a2ald.log` (see `log_file` in `config.toml`).
 
 ---
 
-## Data directory
+## Configuration
 
-On first start, `a2ald` creates `%USERPROFILE%\.a2al\` for keys and `config.toml`.
+Edit config while the service is stopped:
 
-To use a custom directory, add arguments in `a2ald-task.xml`:
-
-```xml
-<Actions Context="Author">
-  <Exec>
-    <Command>a2ald</Command>
-    <Arguments>-data-dir C:\a2al-data</Arguments>
-  </Exec>
-</Actions>
-```
-
-Then re-import the task:
 ```powershell
-schtasks /delete /tn "A2AL Daemon" /f
-schtasks /create /tn "A2AL Daemon" /xml "$PWD\a2ald-task.xml" /f
-```
-
----
-
-## MCP client config (HTTP mode — recommended when running as a service)
-
-Once `a2ald` is running as a background task, point MCP clients at the HTTP endpoint instead of using `--mcp-stdio`:
-
-```json
-{
-  "mcpServers": {
-    "a2al": {
-      "url": "http://127.0.0.1:2121/mcp/"
-    }
-  }
-}
+a2ald service stop
+notepad "$env:APPDATA\a2al\config.toml"
+a2ald service start
 ```
 
 ---
@@ -112,8 +95,15 @@ Once `a2ald` is running as a background task, point MCP clients at the HTTP endp
 ## Uninstall
 
 ```powershell
+a2ald service uninstall
+# Optional: remove data and keys
+Remove-Item -Recurse -Force "$env:APPDATA\a2al"
+```
+
+If installed via Path B:
+
+```powershell
 schtasks /end    /tn "A2AL Daemon"
 schtasks /delete /tn "A2AL Daemon" /f
-# Optional: remove data and keys
-Remove-Item -Recurse -Force "$env:USERPROFILE\.a2al"
+Remove-Item -Recurse -Force "$env:APPDATA\a2al"   # optional
 ```

@@ -1,264 +1,143 @@
-# A2AL Go library — API reference
+# A2AL Go library
 
-This document describes the **public surfaces** for application developers: discovery, signed endpoint records, QUIC sessions, the optional `a2ald` daemon HTTP API, and related packages. Module: `github.com/a2al/a2al`.
+Public surfaces for embedding A2AL: `host`, `dht`, `protocol`, `identity`, `crypto`. Module: `github.com/a2al/a2al`.
 
-## Integration levels
+Daemon REST, MCP, and Python: [API Reference](api-reference.md). Concepts: [Architecture](architecture.md).
 
-| Level | Package / binary | Use when |
-|--------|------------------|----------|
-| **Node runtime** | `github.com/a2al/a2al/host` | DHT + QUIC on one or two UDP ports, mutual TLS between agents, publish/resolve/connect helpers. |
-| **DHT only** | `github.com/a2al/a2al/dht` | You provide transport and only need routing, bootstrap, and iterative `FIND_VALUE` / `STORE`. |
-| **Daemon** | `a2ald` (`cmd/a2ald`) | Local REST + embedded Web UI + MCP + DHT debug JSON under `/debug/*` on the configured API address. |
-
-Lower-level packages (`transport`, `routing`, UDP mux internals) are building blocks; most applications should depend on `host`, `dht`, or the daemon only.
+| Level | Package | Use when |
+|--------|---------|----------|
+| Node runtime | `github.com/a2al/a2al/host` | DHT + QUIC, publish / resolve / connect |
+| DHT only | `github.com/a2al/a2al/dht` | Routing and STORE/FIND with your own transport |
+| Daemon | `a2ald` | REST, Web UI, MCP — do not import `host` unless you embed |
 
 ---
 
-## `host` — `Host`
+## `host.Host`
 
-A `Host` runs a DHT `Node`, optional UDP demux for DHT+QUIC on a single port, a QUIC listener, and NAT/reflection hints via `natsense.Sense`.
+DHT node, UDP mux or split QUIC socket, NAT/reflection (`natsense`), ICE, optional TURN.
 
-### Configuration (`host.Config`)
+Wildcard `ListenAddr` / `QUICListenAddr` (`:4121`, `0.0.0.0:port`) bind **dual-stack**. Explicit IPv4 stays IPv4-only. `DisableIPv6` forces `udp4` (library only; not a daemon TOML key).
+
+### `host.Config`
 
 | Field | Meaning |
 |-------|---------|
-| `KeyStore` | Required. Must list **exactly one** `Address` (see `crypto.KeyStore`). |
-| `ListenAddr` | DHT UDP bind, e.g. `":4121"` (default). Currently uses IPv4 UDP (`udp4`). |
-| `QUICListenAddr` | If non-empty, QUIC binds here **separately** from DHT. If empty, QUIC shares the DHT UDP socket (mux). |
-| `PrivateKey` | Ed25519 key for QUIC/TLS. If nil, `EncryptedKeyStore.Ed25519PrivateKey` is used when available; otherwise set explicitly. |
-| `MinObservedPeers` | Minimum distinct peers that must report the same reflected address before `Sense` treats it as trusted (default 3 if ≤0). |
-| `FallbackHost` | Optional advertised host when bind address and reflection data are ambiguous (e.g. `0.0.0.0`). |
-| `DisableUPnP` | If true, skips IGD UDP port mapping for the QUIC listen port. |
-| `ICESignalURL` | WebSocket base URL published in endpoint records for ICE trickle signaling (optional). When set, `ConnectFromRecord` uses the ICE path as a fallback when direct QUIC fails. |
-| `ICESTUNURLs` | `stun:` URIs for ICE gathering. Empty means default public STUN when no TURN is configured. |
-| `ICETURNURLs` | Legacy `turn:` URIs with embedded credentials. Still supported; prefer `TURNServers` for new deployments. |
-| `ICEPublishTurns` | Deprecated. Credential-free `turn:` hints formerly stored in `EndpointPayload.Turns`; new nodes do not publish these. |
-| `TURNServers` | Structured TURN server list (`[]TURNServer`). Each entry has `URL`, `Username`, `Credential`, and `CredentialType` (`"static"` / `"hmac"` / `"rest_api"`). Credentials are resolved per ICE session and never published to the DHT. |
-| `DisableRelay` | If true, the node will not use TURN relay by default. Can be overridden per-connection via `DialOptions.DisableRelay`. |
-| `Logger` | `*slog.Logger` forwarded to the DHT node. If nil, `slog.Default()` is used. |
+| `KeyStore` | Required. Exactly one `Address`. |
+| `ListenAddr` | DHT UDP bind (default `":4121"`). Dual-stack unless a specific IPv4/IPv6 host is set. |
+| `QUICListenAddr` | Empty: share the DHT socket (mux). Non-empty: separate QUIC bind. |
+| `PrivateKey` | Ed25519 for QUIC/TLS. Else `EncryptedKeyStore.Ed25519PrivateKey`. |
+| `MinObservedPeers` | Peers that must agree on a reflected address (default 3). |
+| `FallbackHost` | Advertised host when bind/reflection is ambiguous. |
+| `DisableUPnP` | Skip IGD mapping of the QUIC port (IPv4). |
+| `DisableIPv6` | Force IPv4-only sockets. |
+| `ICESignalURL` / `ICESignalURLs` | ICE WebSocket hubs. Non-empty `ICESignalURLs` wins; first URL is also `EndpointPayload.Signal`. |
+| `ICESTUNURLs` | `stun:` URIs. Empty: public STUN if no TURN. |
+| `ICETURNURLs` | Legacy `turn:` with embedded credentials. Prefer `TURNServers`. |
+| `TURNServers` | External TURN: `URL`, `Username`, `Credential`, `CredentialType` (`static` / `hmac` / `rest_api`). Credentials are per ICE session, never published. |
+| `ICEPublishTurns` | Deprecated. New nodes do not write `turns[]` on the DHT. |
+| `DisableRelay` | If true, omit TURN relay candidates by default. Per-call: `DialOptions.DisableRelay`. Default false (relay allowed when TURN is configured). |
+| `ICENetworkTypes` | ICE networks; default UDP4+UDP6. |
+| `Logger` | `*slog.Logger`; default `slog.Default()`. |
 
-The DHT node created by `Host` sets `dht.Config.RecordAuth` so stored records must be either self-signed for their address or carry a valid operational-key delegation (see `identity`).
+`RecordAuth` on the inner DHT node requires self-sign or a valid delegation.
 
 ### Lifecycle
 
-1. `host.New(cfg)` — starts the DHT receive loop and QUIC listener.  
-2. `h.Node().BootstrapAddrs(ctx, []net.Addr{...})` (or `StartWithBootstrap` on a bare `Node`).  
-3. Optionally `h.ObserveFromPeers(ctx, seeds)` to seed observed-address sampling.  
-4. `h.PublishEndpoint`, `h.Resolve`, `h.Connect` / `h.ConnectFromRecord`, `h.Accept` as needed.  
-5. `h.Close()` — also removes any UPnP mapping created for QUIC.
+1. `host.New(cfg)`
+2. `h.Node().BootstrapAddrs(ctx, []net.Addr{...})` — seeds are `ip:port`
+3. Optional `ObserveFromPeers`
+4. `PublishEndpoint` / `Resolve` / `ConnectFromRecord` / `Accept`
+5. `h.Close()`
 
-### Primary methods
+### Methods
 
 | Method | Role |
 |--------|------|
-| `PublishEndpoint(ctx, seq, ttl)` | Builds multi-candidate `quic://` payload (reflection, public bind, fallback, optional UPnP), signs with the node identity, stores on the DHT. |
-| `PublishEndpointForAgent(ctx, agentAddr, seq, ttl)` | Same as `PublishEndpoint` but for a **registered** delegated agent (operational key + delegation on the host). |
-| `Resolve(ctx, target Address)` | Iterative lookup; returns `*protocol.EndpointRecord`. |
-| `Connect(ctx, expectRemote Address, udpAddr)` | QUIC dial to one UDP address with mutual TLS + agent-route (see below). |
-| `ConnectFromRecord(ctx, expectRemote Address, er)` | Happy Eyeballs: staggered dials over every `quic://` / `udp://` in `er` (deduped); if all fail and `er.Signal` is set, falls back to ICE trickle via WebSocket signaling (with relay allowed). Returns `(quic.Connection, isRelayed bool, error)`. |
-| `ConnectFromRecordFor(ctx, localAgent, expectRemote Address, er, opts DialOptions)` | Same as `ConnectFromRecord` but dials using TLS credentials for `localAgent` and respects `opts.DisableRelay`. Returns `(quic.Connection, isRelayed bool, error)`. If `DisableRelay=true` and TURN is configured but direct connection fails, returns `ErrRelayRequired`. |
-| `Accept(ctx)` | Blocks for inbound QUIC; returns `*AgentConn` with `Local` / `Remote` addresses. |
-| `FirstQUICAddr(er)` | First `quic://` or legacy `udp://` entry as `*net.UDPAddr` (same order as `QUICDialTargets`). |
-| `QUICDialTargets(er)` | Ordered, deduplicated `[]*net.UDPAddr` from an `EndpointRecord`. |
-| `BuildEndpointPayload(ctx)` | Same candidate list as publish (includes UPnP attempt when enabled); does not sign or store. |
-| `SymmetricNATReachabilityHint()` | Non-empty user-facing note when inferred NAT is symmetric (reachability not guaranteed without relay). |
-| `RegisterAgent(addr, priv)` | Add an extra agent identity on the same QUIC listener (self-signed TLS cert). |
-| `RegisterDelegatedAgent(addr, opPriv, delegationCBOR)` | Register an agent published under a master-derived AID using an operational key and CBOR `DelegationProof`. |
-| `UnregisterAgent(addr)` / `RegisteredAgents()` | Remove or list extra agents. |
-| `Address`, `DHTLocalAddr`, `QUICLocalAddr` | Introspection. |
-| `Node()`, `Sense()` | Access underlying DHT node or NAT/reflection state. |
-| `ObserveFromPeers` | Triggers ping/bootstrap-style contact to collect `observed_addr` for `Sense`. |
-| `SendMailbox` / `PollMailbox` | DHT mailbox (Phase 4): encrypt/decrypt for the **default** host identity. |
-| `SendMailboxForAgent` / `PollMailboxForAgent` | Same for a **registered** agent address (self-sign or delegated). |
-| `RegisterTopic` / `RegisterTopics` | Topic rendezvous (Phase 4 B): publish RecType `0x10` at `SHA-256("topic:"+string)` for the default identity. |
-| `RegisterTopicForAgent` / `RegisterTopicsForAgent` | Same for a registered agent (delegation-aware). |
-| `SearchTopic` / `SearchTopics` | `AggregateRecords` on topic key; `SearchTopics` returns AIDs present in **all** listed topics. |
-| `StartDebugHTTP(addr)` / `DebugHTTPHandler()` | Read-only JSON (see Debug HTTP). |
-| `Close()` | Shuts down QUIC, mux, and DHT. |
+| `PublishEndpoint` / `PublishEndpointForAgent` | Sign and STORE a multi-candidate `quic://` payload (v4/v6, UPnP when enabled). |
+| `Resolve` | Iterative lookup → `*protocol.EndpointRecord`. |
+| `Connect` | QUIC to one UDP address + agent-route. |
+| `ConnectFromRecord` / `ConnectFromRecordFor` | Happy Eyeballs over record endpoints; ICE if direct fails and a signal URL is present. Returns `(conn, isRelayed, err)`. `ErrRelayRequired` when relay is configured but disabled and direct failed. |
+| `Accept` | Inbound QUIC → `*AgentConn`. |
+| `QUICDialTargets` / `FirstQUICAddr` | Ordered UDP targets from a record. |
+| `BuildEndpointPayload` | Candidates only; no STORE. |
+| `SymmetricNATReachabilityHint` | Non-empty when NAT looks symmetric (relay may still be needed). |
+| `RegisterAgent` / `RegisterDelegatedAgent` / `UnregisterAgent` / `RegisteredAgents` | Extra AIDs on one listener. |
+| `SendMailbox` / `PollMailbox` (+ `ForAgent`) | Encrypted notes. |
+| `RegisterTopic(s)` / `SearchTopic(s)` (+ `ForAgent`) | Capability rendezvous. |
+| `StartDebugHTTP` / `DebugHTTPHandler` | Read-only JSON. |
+| `Close` | QUIC, mux, DHT, UPnP cleanup. |
 
-### `AgentConn`
+`AgentConn` embeds `quic.Connection` with `Local` / `Remote` AIDs.
 
-Embeds `quic.Connection`. Fields:
+### Agent-route
 
-- `Local` — agent `Address` selected for this connection (agent-route frame, else SNI, else default).  
-- `Remote` — peer `Address` from the mutual TLS peer certificate (inbound).
+After TLS, the client writes **4-byte magic + 21-byte target AID** on stream 0.
 
-### QUIC agent-route (interoperability)
+- **`a2r2`** (current): length-prefixed control messages, then both sides FIN that stream; data uses later streams. `host` implements this.
+- **`a2r1`**: still accepted inbound (frame only).
 
-After the TLS handshake, the **client** MUST open a stream and write **25 bytes**: prefix `a2r1` (ASCII) followed by the 21-byte binary `Address` of the intended server agent. The server uses this for routing when multiple agents share one listener; TLS SNI is a secondary hint.
+TLS SNI is a secondary hint when several agents share a listener.
 
 ---
 
-## `dht` — `Node`
-
-Use when you implement your own stack but need Kademlia-style RPCs and storage.
-
-### Configuration (`dht.Config`)
+## `dht.Node`
 
 | Field | Meaning |
 |-------|---------|
-| `Transport` | Required. DHT UDP (or mux) transport. |
-| `Keystore` | Required. Exactly one identity. |
-| `OnObservedAddr` | Optional callback when responses carry `observed_addr`. |
-| `RecordAuth` | Optional. After `VerifySignedRecord` passes, called before accepting a `STORE`; enforce whether `Pubkey` may publish for the record `Address` (e.g. self-sign or delegation). If nil, no authority check. |
+| `Transport` | Required. |
+| `Keystore` | Required. One identity. |
+| `OnObservedAddr` | Reflected addresses. |
+| `RecordAuth` | After `VerifySignedRecord`; nil = no authority check. |
 
-### Lifecycle
-
-1. `dht.NewNode(dht.Config{Transport, Keystore, ...})`  
-2. `Start()`  
-3. `BootstrapAddrs` / `Bootstrap` / `StartWithBootstrap`  
-4. `PublishEndpointRecord` or `NewQuery(n).Resolve` / `FindNode`  
-5. `Close()`
-
-### Common methods
-
-| Method | Role |
-|--------|------|
-| `BootstrapAddrs(ctx, []net.Addr)` | Recommended bootstrap: only `ip:port` required; identity learned from PONG. |
-| `PingIdentity(ctx, addr)` | Returns `PeerIdentity{Address, NodeID}`. |
-| `PublishEndpointRecord(ctx, rec)` | STORE signed record to closest peers. |
-| `PublishMailboxRecord(ctx, storeKey, rec)` | STORE mailbox `SignedRecord` at recipient `NodeID` to k-closest peers (Phase 4). |
-| `PublishTopicRecord(ctx, storeKey, rec)` | STORE topic `SignedRecord` at `TopicNodeID` to k-closest peers (Phase 4 B). |
-| `NewQuery(n).Resolve(ctx, NodeID)` | Iterative endpoint fetch. |
-| `NewQuery(n).FindNode(ctx, NodeID)` | Iterative `FIND_NODE`. |
-| `StartDebugHTTP` / `DebugHTTPHandler()` | DHT JSON (no `/debug/host`; that is `Host`-only). |
+`BootstrapAddrs` takes `ip:port` only. `PublishMailboxRecord` / `PublishTopicRecord` STORE at recipient or topic NodeID.
 
 ---
 
-## Identity and signing
+## Identity
 
 | Package | Items |
 |---------|--------|
 | `github.com/a2al/a2al` | `Address`, `NodeID`, `ParseAddress`, `NodeIDFromAddress` |
-| `github.com/a2al/a2al/crypto` | `KeyStore`, `EncryptedKeyStore` (optional `Ed25519PrivateKey` for QUIC), `AddressFromPublicKey`, `GenerateEd25519`, sign/verify helpers |
-| `github.com/a2al/a2al/identity` | `ScopeNetworkOps`, `SignDelegation`, `EncodeDelegationProof`, `ParseDelegationProof`, `VerifyDelegation`, `(DelegationProof).AgentAID()` |
+| `…/crypto` | `KeyStore`, `EncryptedKeyStore`, `AddressFromPublicKey`, `GenerateEd25519` |
+| `…/identity` | `SignDelegation`, `VerifyDelegation`, Ethereum/Paralism helpers |
 
 ---
 
-## Endpoint records (`protocol`)
+## `protocol`
 
 | Item | Role |
 |------|------|
-| `SignedRecord` | On-wire CBOR container; optional `Delegation` bytes (field 9) for operational-key publishes. |
-| `EndpointPayload` | `Endpoints []string` (use `quic://host:port`), `NatType uint8`, `Signal string` (ICE WebSocket base URL, optional), `Turns []string` (credential-free relay hints, optional) |
-| `EndpointRecord` | Decoded view after verify (`Address`, `Endpoints`, `NatType`, `Signal`, `Turns`, `Seq`, `Timestamp`, `TTL`) |
-| `SignEndpointRecord(priv, addr, payload, seq, timestamp, ttl)` | Build `SignedRecord` when the signing key is the AID's master key |
-| `SignEndpointRecordDelegated(opPriv, delegationCBOR, addr, payload, seq, timestamp, ttl)` | Build `SignedRecord` when an operational key publishes for a master-derived `addr` |
-| `ParseEndpointRecord(sr)` | Verify and decode to `EndpointRecord` |
-| `VerifySignedRecord(sr, now)` | Cryptographic integrity + expiry + payload shape; does **not** enforce pubkey↔address authority (use `RecordAuth` at store/query) |
-| NAT constants | `NATUnknown`, `NATFullCone`, `NATRestricted`, `NATPortRestricted`, `NATSymmetric` |
+| `SignedRecord` | On-wire CBOR; optional `Delegation`. |
+| `EndpointPayload` | `Endpoints` (`quic://host:port` or `quic://[v6]:port`), `NatType`, `Signal`, `Signals`. `Turns` is decoded from old records; **new publishes omit it**. |
+| `SignEndpointRecord` / `SignEndpointRecordDelegated` | Master vs operational key. |
+| `ParseEndpointRecord` / `VerifySignedRecord` | Verify does not enforce pubkey↔AID (use `RecordAuth`). |
+| Mailbox | `RecTypeMailbox` `0x80`; X25519 + AES-GCM helpers. |
+| Topic | `RecTypeTopic` `0x10`; key `SHA-256("topic:" ‖ name)`; `DiscoverFilter`. |
 
-`timestamp` + `TTL` must cover "now" or verification/storage fails.
-
-### Mailbox (Phase 4)
-
-| Item | Role |
-|------|------|
-| `RecTypeMailbox` (0x80) | Stored at `NodeID(recipient)`; outer `SignedRecord.Address` = sender AID. |
-| `EncodeMailboxPayload`, `OpenMailboxRecord` | X25519 + HKDF + AES-256-GCM wire helpers. |
-| `MailboxMessage` | Decrypted view: `Sender`, `MsgType`, `Body`. |
-
-### Topic rendezvous (Phase 4 B)
-
-| Item | Role |
-|------|------|
-| `TopicNodeID(topic)` | `SHA-256("topic:" \|\| UTF-8 topic)` as DHT key. |
-| `RecTypeTopic` (0x10) | `TopicPayload` CBOR in `SignedRecord.payload` (≤512 B); `Address` = registrant AID. |
-| `TopicEntry` | Decoded listing: AID, `TopicPayload` fields, `Seq` / `Timestamp` / `TTL`. |
-| `DiscoverFilter`, `FilterTopicEntries` | Optional `protocols` / `tags` AND-style client filter. |
+`timestamp` + `TTL` must cover now.
 
 ---
 
-## `a2ald` — HTTP API
+## `config` (daemon TOML)
 
-Binds to `config.Config.APIAddr` (default `127.0.0.1:2121`). If `api_token` is set, requests must send `Authorization: Bearer <token>`. For mutating methods, use `Content-Type: application/json` (including `DELETE` with an empty JSON body `{}` where required).
-
-| Method | Path | Role |
-|--------|------|------|
-| `GET` | `/` | Embedded Web UI (HTML). |
-| `GET` | `/health` | `{"status":"ok"}`. |
-| `GET` | `/status` | Node status: `node_aid`, `auto_publish`, `node_seq`, `node_published` (bool), `node_last_publish_at` (RFC3339 or null), `node_next_republish_estimate` (RFC3339 or null), `republish_interval_s`, `endpoint_ttl_s`. |
-| `GET` | `/config` | Current config (`api_token` redacted as `***`). |
-| `PATCH` | `/config` | Partial update; response includes `restart_required` field names. |
-| `GET` | `/config/schema` | JSON Schema for config keys (UI / tooling). |
-| `POST` | `/identity/generate` | Generate Ed25519 master + operational keys and delegation proof; daemon does not retain the master key. |
-| `POST` | `/agents/generate` | Generate a blockchain-linked identity. Body: `{"chain":"ethereum"}` or `{"chain":"paralism"}`. Returns AID, keys, and delegation proof; keys are not stored. |
-| `POST` | `/agents/ethereum/delegation-message` | Build EIP-191 `personal_sign` text from `agent`, `issued_at`, `expires_at`, and one of `operational_public_key_hex` / `operational_private_key_seed_hex`. |
-| `POST` | `/agents/ethereum/register` | Register Ethereum-keyed agent after wallet `personal_sign`: `agent`, timestamps, `eth_signature_hex`, optional `service_tcp`, op key. |
-| `POST` | `/agents/ethereum/proof` | Autonomous Ethereum delegation: `ethereum_private_key_hex` signs; op keys generated if omitted. |
-| `POST` | `/agents/paralism/proof` | Autonomous Paralism delegation: `paralism_private_key_hex` signs; op keys generated if omitted. |
-| `POST` | `/agents` | Register delegated agent (`operational_private_key_hex`, `delegation_proof_hex`, `service_tcp` optional). |
-| `GET` | `/agents` | List registered agents with status (`service_tcp_ok`, `heartbeat_seconds_ago`, `last_publish`). |
-| `GET` | `/agents/{aid}` | Single agent status (reachability, publish info). |
-| `PATCH` | `/agents/{aid}` | Update `service_tcp` (requires operational key); triggers implicit heartbeat. |
-| `DELETE` | `/agents/{aid}` | Unregister agent. |
-| `POST` | `/agents/{aid}/publish` | Publish/refresh DHT endpoint record. |
-| `POST` | `/agents/{aid}/heartbeat` | Explicit agent liveness signal for auto-republish. |
-| `POST` | `/agents/{aid}/records` | Sovereign custom record (RecType `0x02`–`0x0f`): `rec_type`, `payload_base64`, `ttl`; signed with operational key + delegation. |
-| `POST` | `/agents/{aid}/mailbox/send` | Encrypted mailbox: JSON `recipient`, `msg_type`, `body_base64` → `{"ok":true}`. |
-| `POST` | `/agents/{aid}/mailbox/poll` | Returns `{"messages":[{"sender","msg_type","body_base64"},...]}`. |
-| `POST` | `/agents/{aid}/services` | Register service(s): `services`, `name`, `protocols`, `tags`, `brief`, optional `meta` (incl. `url` for self-hosted agents), `ttl`. |
-| `DELETE` | `/agents/{aid}/services/{service...}` | Drop service from daemon renewal list (body `{}`); DHT entry expires by TTL. |
-| `POST` | `/discover` | `{"services":["..."],"filter":{"protocols":[],"tags":[]}}` → `{"entries":[{"service","aid","name",...},...]}`. |
-| `GET` | `/resolve/{aid}/records?type={rec_type}` | List verified `SignedRecord`s for remote AID; omit `type` or `type=0` for all RecTypes. Response `records[]` with `payload_base64`, `pubkey_base64`, `signature_base64`, etc. |
-| `POST` | `/resolve/{aid}` | Resolve remote AID to endpoint record JSON. |
-| `POST` | `/connect/{aid}` | One-shot tunnel: returns `{"tunnel":"127.0.0.1:<port>"}`. Tunnel closes when TCP connection closes. Optional `{"local_aid":"..."}`. |
-| `POST` | `/fetch/{aid}` | Send HTTP request to remote agent over QUIC; daemon handles transport internally. Request: `{"method","path","headers","body_base64","local_aid"}`. Response: `{"status","headers","body"(base64),"truncated"}`. |
-| `POST` | `/tunnel/{aid}` | Open persistent multiplexed tunnel (multiple concurrent TCP connections over one QUIC stream pool). Returns `{"id","listen","remote_aid"}`. Optional `{"local_aid","idle_timeout_sec","local_port"}`. Same local+remote+port reuses the existing tunnel; another occupant returns 409 `port_in_use`. |
-| `DELETE` | `/tunnel/{id}` | Close persistent tunnel by ID. Returns `{"ok":true}`. |
-| `GET` | `/tunnel` | List active persistent tunnels: `{"tunnels":[{"id","listen","remote_aid","active_conns"},...]}`. |
-| `GET` | `/tunnel/{id}` | Status of a single persistent tunnel. |
-| `GET` | `/debug/...` | Same as `Host.DebugHTTPHandler()` (includes `/debug/host`). |
-| (MCP) | `/mcp/` | Streamable HTTP handler from `modelcontextprotocol/go-sdk` (see below). |
-
-### MCP (`a2ald`)
-
-- **Streamable HTTP**: mounted at `/mcp/` on the API server.  
-- **Stdio**: run `a2ald -mcp-stdio` (no HTTP API in that mode).
-
-All tools: `a2al_identity_generate`, `a2al_agents_generate_ethereum`, `a2al_ethereum_delegation_message`, `a2al_ethereum_register`, `a2al_ethereum_proof`, `a2al_agents_list`, `a2al_agent_register`, `a2al_agent_get`, `a2al_agent_patch`, `a2al_agent_publish`, `a2al_agent_heartbeat`, `a2al_agent_delete`, `a2al_agent_publish_record`, `a2al_status`, `a2al_resolve_records`, `a2al_resolve`, `a2al_connect`, `a2al_fetch`, `a2al_tunnel_open`, `a2al_tunnel_close`, `a2al_tunnel_list`, `a2al_mailbox_send`, `a2al_mailbox_poll`, `a2al_service_register`, `a2al_service_unregister`, `a2al_discover`.
-
----
-
-## `config` — daemon TOML (library)
-
-Used by `a2ald` and embeddable loaders.
-
-| Function / method | Role |
-|-------------------|------|
-| `Default()` | Spec default field values. |
-| `(*Config) Validate()` | Required fields and enums. |
-| `LoadFile(path)` / `Save(path, c)` | TOML read/write. |
-| `ApplyEnv(c)` | Overlay `A2AL_*` environment variables. |
-| `(*Config) KeyDirOrDefault(dataDir)` | Resolve key directory. |
+`Default()`, `Validate()`, `LoadFile` / `Save`, `ApplyEnv`. Example: [a2ald-config.example.toml](a2ald-config.example.toml).
 
 ---
 
 ## Debug HTTP
 
-Constant `dht.DebugHTTPAddr` is a suggested default (`127.0.0.1:2634`) when using `StartDebugHTTP` on a library-only `Host` or `Node`.
+Suggested bind: `dht.DebugHTTPAddr` (`127.0.0.1:2634`) for a library `Host`/`Node`. Daemon exposes the same under `/debug/` on the API address.
 
-| Path | Provided by |
-|------|----------------|
-| `/debug/identity`, `/debug/routing`, `/debug/store`, `/debug/stats` | `dht.Node` (and `Host` via combined handler) |
-| `/debug/host` | `Host` only — QUIC bind, registered agents, NAT/reflection summary |
-
-All responses are read-only JSON.
+| Path | Source |
+|------|--------|
+| `/debug/identity`, `/debug/routing`, `/debug/store`, `/debug/stats` | `dht.Node` |
+| `/debug/host` | `Host` — QUIC bind, agents, NAT summary |
 
 ---
 
-## `natsense` — optional reads
+## `natsense`
 
-When using `Host`, `Sense()` exposes consensus over reflected UDP endpoints:
-
-- `MinAgreeing` / `SetMinAgreeing` — lower to `1` for small test networks.  
-- `TrustedUDP` / `TrustedWire` / `InferNATType` — read trusted reflection and coarse NAT classification used when building published payloads.
-
----
-
-## Not yet implemented (library / network)
-
-- **IPv6 dual-stack `Host` listener** — wire format supports IPv6; `New()` currently uses `udp4` only.
+`Sense()`: `TrustedUDP` / `TrustedUDPAll` (v4 and v6), `InferNATType`, `InferV6Reach`. Lower `MinAgreeing` for tiny test nets.
 
 ---
 
@@ -268,4 +147,4 @@ When using `Host`, `Sense()` exposes consensus over reflected UDP endpoints:
 go test -vet=off -count=1 ./...
 ```
 
-Example programs under `examples/` use separate `go.mod` files and import the parent module via `replace`.
+`examples/` use their own `go.mod` with `replace`.

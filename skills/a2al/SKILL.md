@@ -12,6 +12,8 @@ description: >-
 
 If `a2al_*` tools are already in your tool list, act on the goal. Do not run doctor first.
 
+When others should reach this agent: `a2al_agent_publish` so they can resolve your AID. `a2al_service_register` only if strangers should search for you by name.
+
 If they are not:
 
 1. `npx -y a2ald mcp add` (or `a2ald mcp add`) — starts a daemon if none is running and registers this host.

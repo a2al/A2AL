@@ -1,115 +1,120 @@
-# Deploy A2AL on macOS (launchd)
+# Deploy A2AL on macOS
 
-Runs `a2ald` as a **user-level** Launch Agent — starts when you log in, restarts automatically on crash.
+Two paths: **built-in service install** (recommended) and **manual plist** (for custom
+paths or system-wide setup).
+
+Data directory: `~/Library/Application Support/a2al/`
 
 ---
 
-## Option A: Install via npm (recommended)
+## Path A — Built-in service install (recommended)
+
+Install `a2ald` (choose one):
 
 ```bash
 npm install -g a2ald
+# or: download binary from https://github.com/a2al/a2al/releases and place in PATH
 ```
 
-Then install the Launch Agent:
+Then:
 
 ```bash
-# Substitute your actual home directory into the log path placeholder
-sed "s|/Users/YOU|$HOME|g" org.a2al.a2ald.plist > ~/Library/LaunchAgents/org.a2al.a2ald.plist
+a2ald service install          # writes and loads a launchd user agent; starts immediately
+a2ald service status
+```
+
+The Launch Agent is written to `~/Library/LaunchAgents/org.a2al.a2ald.plist` and loaded
+automatically. Logs go to `~/Library/Logs/a2ald.log`.
+
+Manage:
+
+```bash
+a2ald service status
+a2ald service stop
+a2ald service start
+a2ald service uninstall
+```
+
+---
+
+## Path B — Manual plist (custom binary path)
+
+Use this when you need to point launchd at a binary that is not the one
+`a2ald service install` copies.
+
+The file in this directory is a **user** Launch Agent. It starts at login for that
+account; it is not a system Launch Daemon.
+
+Install the binary first (see Path A above), then:
+
+```bash
+# Copy and fix the log path placeholder
+sed "s|/Users/YOU|$HOME|g" org.a2al.a2ald.plist \
+  > ~/Library/LaunchAgents/org.a2al.a2ald.plist
+
 launchctl load ~/Library/LaunchAgents/org.a2al.a2ald.plist
 ```
 
-The plist expects the binary at `/usr/local/bin/a2ald`. If npm installed it elsewhere (check with `which a2ald`), edit the `ProgramArguments` string accordingly before loading.
-
-Logs are written to `~/Library/Logs/a2ald.log`.
-
----
-
-## Option B: Manual binary install
-
-```bash
-# Download binary
-curl -fsSL https://github.com/a2al/a2al/releases/latest/download/a2ald_darwin_amd64.tar.gz | tar xz
-sudo mv a2ald /usr/local/bin/
-sudo chmod +x /usr/local/bin/a2ald
-```
-
-For Apple Silicon (M1/M2/M3):
-```bash
-curl -fsSL https://github.com/a2al/a2al/releases/latest/download/a2ald_darwin_arm64.tar.gz | tar xz
-sudo mv a2ald /usr/local/bin/
-sudo chmod +x /usr/local/bin/a2ald
-```
-
-Then install the Launch Agent:
-
-```bash
-sed "s|/Users/YOU|$HOME|g" org.a2al.a2ald.plist > ~/Library/LaunchAgents/org.a2al.a2ald.plist
-launchctl load ~/Library/LaunchAgents/org.a2al.a2ald.plist
-```
-
----
-
-## Verify
-
-```bash
-launchctl list | grep a2al         # should show org.a2al.a2ald
-tail -f /tmp/a2ald.log             # live logs
-```
-
-Or try a call via MCP (`a2al_status`, resolve, or fetch). Neighbor count and `network_ready` are local signals, not a go/no-go. If a call fails right after start, wait 10–30 seconds and retry.
-
----
-
-## Management
-
-```bash
-# Stop
-launchctl unload ~/Library/LaunchAgents/org.a2al.a2ald.plist
-
-# Start
-launchctl load ~/Library/LaunchAgents/org.a2al.a2ald.plist
-
-# macOS 11+ alternative
-launchctl stop  org.a2al.a2ald
-launchctl start org.a2al.a2ald
-```
-
----
-
-## Data directory
-
-On first start, `a2ald` creates `~/.a2al/` for keys and `config.toml`. To override:
+If `a2ald` is not at `/usr/local/bin/a2ald`, edit `ProgramArguments` in the plist first:
 
 ```xml
 <key>ProgramArguments</key>
 <array>
-    <string>/usr/local/bin/a2ald</string>
-    <string>-data-dir</string>
-    <string>/Users/yourname/.a2al</string>
+    <string>/path/to/a2ald</string>
 </array>
 ```
 
----
+### Verify
 
-## MCP client config (HTTP mode — recommended when running as a service)
-
-```json
-{
-  "mcpServers": {
-    "a2al": {
-      "url": "http://127.0.0.1:2121/mcp/"
-    }
-  }
-}
+```bash
+launchctl list | grep a2al
+tail -f ~/Library/Logs/a2ald.log
 ```
 
----
+### Manage
 
-## Uninstall
+```bash
+# Unload (stop + disable autostart)
+launchctl unload ~/Library/LaunchAgents/org.a2al.a2ald.plist
+
+# Load (start + enable autostart)
+launchctl load ~/Library/LaunchAgents/org.a2al.a2ald.plist
+
+# macOS 11+ (Monterey and later)
+launchctl stop  org.a2al.a2ald
+launchctl start org.a2al.a2ald
+```
+
+### Uninstall
 
 ```bash
 launchctl unload ~/Library/LaunchAgents/org.a2al.a2ald.plist
 rm ~/Library/LaunchAgents/org.a2al.a2ald.plist
-sudo rm /usr/local/bin/a2ald
-rm -rf ~/.a2al   # optional — removes keys and config
+rm -rf "$HOME/Library/Application Support/a2al"   # optional — removes keys and config
 ```
+
+---
+
+## Configuration
+
+Edit config while the service is stopped:
+
+```bash
+a2ald service stop
+nano "$HOME/Library/Application Support/a2al/config.toml"
+a2ald service start
+```
+
+---
+
+## Build from source
+
+```bash
+# Intel Mac
+GOOS=darwin GOARCH=amd64 go build -o a2ald ./cmd/a2ald
+
+# Apple Silicon (M1/M2/M3/M4)
+GOOS=darwin GOARCH=arm64 go build -o a2ald ./cmd/a2ald
+```
+
+Place the binary in your PATH, then follow Path A or B.
