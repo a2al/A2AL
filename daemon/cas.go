@@ -5,7 +5,9 @@ package daemon
 
 import (
 	"bytes"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -20,10 +22,16 @@ import (
 	"github.com/a2al/a2al/group"
 )
 
+const casGrantBytes = 32
+
 // casRec is one local hash→path mapping for an AID.
+// Path empty means the hash is known (grant/hint recorded) but bytes are not local.
 type casRec struct {
-	Path string `json:"path"`
-	Size int64  `json:"size"`
+	Path   string   `json:"path,omitempty"`
+	Size   int64    `json:"size,omitempty"`
+	Grant  string   `json:"grant,omitempty"`
+	Author string   `json:"author,omitempty"`
+	Served []string `json:"served,omitempty"`
 }
 
 type casIndex struct {
@@ -106,8 +114,137 @@ func (d *Daemon) mapObject(aid a2al.Address, id [32]byte, abs string, size int64
 	if err != nil {
 		return err
 	}
-	idx.recs[hex.EncodeToString(id[:])] = casRec{Path: abs, Size: size}
+	k := hex.EncodeToString(id[:])
+	rec := idx.recs[k]
+	rec.Path = abs
+	rec.Size = size
+	idx.recs[k] = rec
 	return d.saveCasIndex(aid, idx)
+}
+
+func mintCASGrant() (string, error) {
+	var b [casGrantBytes]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
+}
+
+func grantMatch(stored, presented string) bool {
+	if stored == "" || presented == "" || len(stored) != len(presented) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(stored), []byte(presented)) == 1
+}
+
+func (d *Daemon) casRec(aid a2al.Address, id [32]byte) (casRec, bool) {
+	d.casMapMu.Lock()
+	defer d.casMapMu.Unlock()
+	idx, err := d.loadCasIndex(aid)
+	if err != nil {
+		return casRec{}, false
+	}
+	rec, ok := idx.recs[hex.EncodeToString(id[:])]
+	return rec, ok
+}
+
+func (d *Daemon) patchCasRec(aid a2al.Address, id [32]byte, fn func(*casRec)) error {
+	d.casMapMu.Lock()
+	defer d.casMapMu.Unlock()
+	idx, err := d.loadCasIndex(aid)
+	if err != nil {
+		return err
+	}
+	k := hex.EncodeToString(id[:])
+	rec := idx.recs[k]
+	fn(&rec)
+	idx.recs[k] = rec
+	return d.saveCasIndex(aid, idx)
+}
+
+func (d *Daemon) ensureShareGrant(aid a2al.Address, id [32]byte) (string, error) {
+	if rec, ok := d.casRec(aid, id); ok && rec.Grant != "" {
+		return rec.Grant, nil
+	}
+	g, err := mintCASGrant()
+	if err != nil {
+		return "", err
+	}
+	var out string
+	if err := d.patchCasRec(aid, id, func(rec *casRec) {
+		if rec.Grant == "" {
+			rec.Grant = g
+		}
+		out = rec.Grant
+	}); err != nil {
+		return "", err
+	}
+	return out, nil
+}
+
+func (d *Daemon) rememberObjectRef(aid a2al.Address, id [32]byte, grant string, author a2al.Address, size int64) {
+	_ = d.patchCasRec(aid, id, func(rec *casRec) {
+		if grant != "" {
+			rec.Grant = grant
+		}
+		if author != (a2al.Address{}) {
+			rec.Author = author.String()
+		}
+		if size > 0 && rec.Path == "" {
+			rec.Size = size
+		}
+	})
+}
+
+func (d *Daemon) noteCASServed(holder, remote a2al.Address, id [32]byte) {
+	if holder == (a2al.Address{}) || remote == (a2al.Address{}) || holder == remote {
+		return
+	}
+	rs := remote.String()
+	_ = d.patchCasRec(holder, id, func(rec *casRec) {
+		for _, a := range rec.Served {
+			if a == rs {
+				return
+			}
+		}
+		rec.Served = append(rec.Served, rs)
+	})
+}
+
+func parseObjectMeta(body []byte) (grant string, size int64) {
+	if len(body) == 0 {
+		return "", 0
+	}
+	var m map[string]any
+	if json.Unmarshal(body, &m) != nil {
+		return "", 0
+	}
+	grant, _ = m["grant"].(string)
+	switch v := m["size"].(type) {
+	case float64:
+		size = int64(v)
+	case json.Number:
+		size, _ = v.Int64()
+	}
+	return strings.TrimSpace(grant), size
+}
+
+func mergeJSONGrant(body []byte, grant string) []byte {
+	if grant == "" {
+		return body
+	}
+	m := map[string]any{}
+	if len(body) > 0 {
+		if json.Unmarshal(body, &m) != nil {
+			return body
+		}
+	}
+	m["grant"] = grant
+	out, err := json.Marshal(m)
+	if err != nil {
+		return body
+	}
+	return out
 }
 
 // registerLocalObject maps object_id → absPath for aid after hashing the file.
@@ -145,7 +282,29 @@ func (d *Daemon) registerLocalObject(aid a2al.Address, rawPath string) (id [32]b
 	return id, n, filepath.Base(abs), nil
 }
 
-// ingestCASObject streams r into the files_root sandbox, names the result after
+// casIngestDir is where POST /agents/{aid}/cas writes bytes.
+// files_root when set; otherwise {dataDir}/files. Empty files_root still
+// leaves registerLocalObject unconstrained (CLI --file of an arbitrary path).
+func (d *Daemon) casIngestDir() (string, error) {
+	root := strings.TrimSpace(d.cfg.FilesRoot)
+	if root == "" {
+		if strings.TrimSpace(d.dataDir) == "" {
+			return "", errors.New("cas: handing bytes to a2ald requires files_root to be configured; " +
+				"without a sandbox a2ald has nowhere to put them — register a path a2ald can read instead")
+		}
+		root = filepath.Join(d.dataDir, "files")
+	}
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return "", fmt.Errorf("cas: files_root: %w", err)
+	}
+	if err := os.MkdirAll(absRoot, 0o700); err != nil {
+		return "", fmt.Errorf("cas: mkdir files_root: %w", err)
+	}
+	return absRoot, nil
+}
+
+// ingestCASObject streams r into the object sandbox, names the result after
 // its own content hash, and maps it for aid.
 //
 // Nothing is buffered and the digest is computed during the write, so the only
@@ -154,17 +313,9 @@ func (d *Daemon) registerLocalObject(aid a2al.Address, rawPath string) (id [32]b
 // service that cannot see the user's workspace): they hand the bytes in rather
 // than a2ald reaching out, which is the direction files_root exists to enforce.
 func (d *Daemon) ingestCASObject(aid a2al.Address, r io.Reader, name string) (id [32]byte, size int64, outName string, err error) {
-	root := strings.TrimSpace(d.cfg.FilesRoot)
-	if root == "" {
-		return [32]byte{}, 0, "", errors.New("cas: handing bytes to a2ald requires files_root to be configured; " +
-			"without a sandbox a2ald has nowhere to put them — register a path a2ald can read instead")
-	}
-	absRoot, err := filepath.Abs(root)
+	absRoot, err := d.casIngestDir()
 	if err != nil {
-		return [32]byte{}, 0, "", fmt.Errorf("cas: files_root: %w", err)
-	}
-	if err := os.MkdirAll(absRoot, 0o700); err != nil {
-		return [32]byte{}, 0, "", fmt.Errorf("cas: mkdir files_root: %w", err)
+		return [32]byte{}, 0, "", err
 	}
 
 	tmp, err := os.CreateTemp(absRoot, ".ingest-*.part")
@@ -225,7 +376,7 @@ func (d *Daemon) lookupLocalObject(aid a2al.Address, id [32]byte) (path string, 
 		return "", 0, false
 	}
 	rec, ok := idx.recs[hex.EncodeToString(id[:])]
-	if !ok {
+	if !ok || rec.Path == "" {
 		return "", 0, false
 	}
 	st, err := os.Stat(rec.Path)
@@ -275,40 +426,41 @@ func (d *Daemon) locateObject(localAID a2al.Address, id [32]byte, hint a2al.Addr
 	}
 }
 
-func (d *Daemon) serveCASFile(w http.ResponseWriter, aid a2al.Address, id [32]byte, method string) {
+func (d *Daemon) serveCASFile(w http.ResponseWriter, aid a2al.Address, id [32]byte, method string) bool {
 	idx, err := d.loadCasIndex(aid)
 	if err != nil {
 		http.Error(w, "not found", http.StatusNotFound)
-		return
+		return false
 	}
 	rec, ok := idx.recs[hex.EncodeToString(id[:])]
 	if !ok {
 		http.Error(w, "not found", http.StatusNotFound)
-		return
+		return false
 	}
 	f, err := os.Open(rec.Path)
 	if err != nil {
 		http.Error(w, "not found", http.StatusNotFound)
-		return
+		return false
 	}
 	defer f.Close()
 	st, err := f.Stat()
 	if err != nil || st.IsDir() {
 		http.Error(w, "not found", http.StatusNotFound)
-		return
+		return false
 	}
 	if st.Size() != rec.Size {
 		http.Error(w, "gone", http.StatusGone)
-		return
+		return false
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("ETag", `"`+hex.EncodeToString(id[:])+`"`)
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", st.Size()))
 	w.WriteHeader(http.StatusOK)
 	if method == http.MethodHead {
-		return
+		return true
 	}
 	_, _ = io.Copy(w, f)
+	return true
 }
 
 func copyFile(src, dest string) error {

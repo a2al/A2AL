@@ -30,12 +30,12 @@ You are its only member afterwards. To add others, call group_invite for an AID 
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "group_list",
 		Description: `List the Groups this agent has a local replica of, with entry_count, unread_count and last activity.
-Local state only — no network IO. A Group someone invited you to is absent until you call group_join, so an empty list does not mean nobody invited you; check your mailbox with a2al_mailbox_poll.`,
+Local state only — no network IO. A Group someone invited you to is absent until you call group_join, so an empty list does not mean nobody invited you; check your mailbox with a2al_mailbox_list.`,
 	}, d.mcpGroupList)
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "group_invite",
 		Description: `Authorise an AID to join a Group. Requires creator or admin role. Writes a signed invite entry and sends the target a mailbox note with the join link, plus as many other member AIDs as that note can carry.
-This does not put the Group on their machine: they must call group_join after reading their mailbox (a2al_mailbox_poll). group_members lists them as soon as you invite — that is the authorisation in your log, not proof they have a replica. replica_head is absent until you have actually synced with them.`,
+This does not put the Group on their machine: they must call group_join after seeing the note (a2al_mailbox_list) and taking it (a2al_mailbox_poll). group_members lists them as soon as you invite — that is the authorisation in your log, not proof they have a replica. replica_head is absent until you have actually synced with them.`,
 	}, d.mcpGroupInvite)
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "group_append",
@@ -97,9 +97,8 @@ That endpoint has no size limit, returns the same {object_id, size, name, url}, 
 pending is not a promise: it means "nobody has checked", so treat it as unknown rather than reachable, and call group_object_get when you actually need the bytes.`,
 	}, d.mcpGroupObjectLocate)
 	mcp.AddTool(s, &mcp.Tool{
-		Name: "group_object_get",
-		Description: `Get an object. If it is already mapped locally and dest is omitted, returns that path. A remote fetch requires both dest (bytes are streamed to it, never base64-returned) and hint_aid to fetch from. register=true maps dest on this AID after a successful write.
-"object not available" means no holder answered, not that the object is gone: retry with hint_aid set to another member that group_members shows a recent replica for.`,
+		Name:        "group_object_get",
+		Description: `Get an object. Local bytes are returned when already mapped. Otherwise a2ald fetches using the stored grant and hint (or the entry author / a recently aligned member). dest is optional: omitted writes into the object sandbox and maps it. force=true skips the local hit. register=true maps dest on this AID after a successful write to dest.`,
 	}, d.mcpGroupObjectGet)
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "group_get_link",
@@ -236,6 +235,7 @@ type mcpGroupObjectGetArgs struct {
 	Dest        string `json:"dest,omitempty"`
 	HintAID     string `json:"hint_aid,omitempty"`
 	Register    bool   `json:"register,omitempty"`
+	Force       bool   `json:"force,omitempty"`
 	AccessToken string `json:"access_token,omitempty"`
 }
 
@@ -352,8 +352,10 @@ func (d *Daemon) mcpGroupAppend(_ context.Context, _ *mcp.ServerSession, p *mcp.
 		return nil, fmt.Errorf("group_append: %w", err)
 	}
 	opts := []group.EntryOption{}
+	var body []byte
 	if a.Body != "" {
-		body, err := base64.StdEncoding.DecodeString(a.Body)
+		var err error
+		body, err = base64.StdEncoding.DecodeString(a.Body)
 		if err != nil {
 			return nil, fmt.Errorf("group_append: body is not valid base64: %w", err)
 		}
@@ -361,7 +363,6 @@ func (d *Daemon) mcpGroupAppend(_ context.Context, _ *mcp.ServerSession, p *mcp.
 			return nil, fmt.Errorf("group_append: body %d bytes exceeds protocol limit of %d bytes; store as object and use ref instead",
 				len(body), group.MaxEntryBodySize)
 		}
-		opts = append(opts, group.WithBody(body))
 	}
 	if a.Ref != "" {
 		ref, err := parseHex32(a.Ref)
@@ -369,6 +370,20 @@ func (d *Daemon) mcpGroupAppend(_ context.Context, _ *mcp.ServerSession, p *mcp.
 			return nil, fmt.Errorf("group_append: ref: %w", err)
 		}
 		opts = append(opts, group.WithRef(ref))
+		if a.Kind == "file" {
+			grant, err := d.ensureShareGrant(aid, ref)
+			if err != nil {
+				return nil, fmt.Errorf("group_append: grant: %w", err)
+			}
+			body = mergeJSONGrant(body, grant)
+			if len(body) > group.MaxEntryBodySize {
+				return nil, fmt.Errorf("group_append: body %d bytes exceeds protocol limit of %d bytes; store as object and use ref instead",
+					len(body), group.MaxEntryBodySize)
+			}
+		}
+	}
+	if len(body) > 0 {
+		opts = append(opts, group.WithBody(body))
 	}
 	if a.ReplyTo != "" {
 		replyTo, err := parseHex32(a.ReplyTo)
@@ -584,6 +599,7 @@ func (d *Daemon) mcpGroupJoin(ctx context.Context, _ *mcp.ServerSession, p *mcp.
 	if _, err := d.groups.Join(aid, groupID, creatorAID, p.Arguments.Title); err != nil {
 		return nil, fmt.Errorf("group_join: init store: %w", err)
 	}
+	d.clearUnknownGroupLog(aid, groupID)
 
 	inviter := creatorAID
 	if a.InviterAID != "" {
@@ -988,65 +1004,32 @@ func (d *Daemon) mcpGroupObjectGet(ctx context.Context, _ *mcp.ServerSession, p 
 		}
 	}
 
-	loc := d.locateObject(aid, objectID, hint)
-	status, _ := loc["status"].(string)
-	switch status {
-	case "available":
-		src, _ := loc["path"].(string)
-		size := loc["size"]
-		if dest == "" || dest == src {
-			return mcpOK(map[string]any{
-				"object_id": a.ObjectID,
-				"path":      src,
-				"size":      size,
-			}), nil
-		}
-		if err := copyFile(src, dest); err != nil {
-			return nil, fmt.Errorf("group_object_get: copy: %w", err)
-		}
-		if a.Register {
-			if _, _, _, err := d.registerLocalObject(aid, dest); err != nil {
-				return nil, fmt.Errorf("group_object_get: register: %w", err)
-			}
-		}
-		st, _ := os.Stat(dest)
-		outSize := size
-		if st != nil {
-			outSize = st.Size()
-		}
-		return mcpOK(map[string]any{
-			"object_id": a.ObjectID,
-			"path":      dest,
-			"size":      outSize,
-		}), nil
-	case "pending":
-		if dest == "" {
-			return nil, errors.New("group_object_get: this object is not local yet, so a remote fetch needs dest: pass an absolute file path to stream the bytes into (bytes are never returned inline)")
-		}
-		if hint == (a2al.Address{}) {
-			return nil, errors.New("group_object_get: this object is not local yet, so a remote fetch needs hint_aid: pass the AID of a member that holds it — the entry's author, or any member group_members shows a recent replica_seen_at for")
-		}
-		if err := d.fetchCASToFile(ctx, aid, hint, objectID, dest, a.AccessToken); err != nil {
-			return nil, fmt.Errorf("group_object_get: %w", err)
-		}
-		if a.Register {
-			if _, _, _, err := d.registerLocalObject(aid, dest); err != nil {
-				return nil, fmt.Errorf("group_object_get: register: %w", err)
-			}
-		}
-		st, err := os.Stat(dest)
-		if err != nil {
-			return nil, fmt.Errorf("group_object_get: %w", err)
-		}
-		return mcpOK(map[string]any{
-			"object_id": a.ObjectID,
-			"path":      dest,
-			"size":      st.Size(),
-		}), nil
-	default:
-		// status "expired": this AID has no file and no holder was named, so
-		// there is nothing to try yet — say who could be asked instead.
-		return nil, fmt.Errorf("group_object_get: no holder known for object %s, so there is nothing to fetch from: pass hint_aid set to the AID that wrote the referencing entry (group_read shows its author), or to a member group_members reports a recent replica_seen_at for",
-			a.ObjectID)
+	src, size, err := d.ensureObjectLocal(ctx, aid, objectID, hint, a.Force, false, a.AccessToken)
+	if err != nil {
+		return nil, fmt.Errorf("group_object_get: %w", err)
 	}
+	if dest == "" || dest == src {
+		return mcpOK(map[string]any{
+			"object_id": a.ObjectID,
+			"path":      src,
+			"size":      size,
+		}), nil
+	}
+	if err := copyFile(src, dest); err != nil {
+		return nil, fmt.Errorf("group_object_get: copy: %w", err)
+	}
+	if a.Register {
+		if _, _, _, err := d.registerLocalObject(aid, dest); err != nil {
+			return nil, fmt.Errorf("group_object_get: register: %w", err)
+		}
+	}
+	st, err := os.Stat(dest)
+	if err != nil {
+		return nil, fmt.Errorf("group_object_get: %w", err)
+	}
+	return mcpOK(map[string]any{
+		"object_id": a.ObjectID,
+		"path":      dest,
+		"size":      st.Size(),
+	}), nil
 }

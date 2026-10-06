@@ -432,6 +432,42 @@ func TestSSE_pendingHitch_appSource(t *testing.T) {
 	}
 }
 
+func TestSSE_afterSeqRejected(t *testing.T) {
+	d := newTestDaemon(t)
+	d.evtLog = NewEventLog()
+	aid := newTestAgent(t, d)
+	srv := httptest.NewServer(d.routes())
+	t.Cleanup(srv.Close)
+	resp, err := http.Get(srv.URL + "/agents/" + aid.String() + "/events?" + "after_seq=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+}
+
+func TestSSE_omitCursorIsLiveOnly(t *testing.T) {
+	d := newTestDaemon(t)
+	d.evtLog = NewEventLog()
+	aid := newTestAgent(t, d)
+	d.evtLog.Append(aid, LoggedEvent{Type: "group.unread", Ts: 1})
+	srv := httptest.NewServer(d.routes())
+	t.Cleanup(srv.Close)
+
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		d.evtLog.Append(aid, LoggedEvent{Type: "mailbox.received", Ts: 2})
+	}()
+	body := readSSEUntil(t, srv.URL+"/agents/"+aid.String()+"/events", nil, 3*time.Second, func(s string) bool {
+		return strings.Contains(s, "event: mailbox.received")
+	})
+	if strings.Contains(body, "event: group.unread") {
+		t.Fatalf("live subscribe dumped history: %q", body)
+	}
+}
+
 func readSSEPendingFrame(t *testing.T, url string, extra http.Header) string {
 	t.Helper()
 	body := readSSEUntil(t, url, extra, 2*time.Second, func(s string) bool {

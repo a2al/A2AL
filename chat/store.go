@@ -76,6 +76,7 @@ type Rec struct {
 	Size   int64
 	Status string
 	Author a2al.Address
+	Grant  string
 	Idx    uint64 // 1-based local log index; set on Read, not stored
 }
 
@@ -122,6 +123,7 @@ type recWire struct {
 	Size   int64  `cbor:"8,keyasint,omitempty"`
 	Status string `cbor:"9,keyasint"`
 	Author []byte `cbor:"10,keyasint,omitempty"`
+	Grant  string `cbor:"11,keyasint,omitempty"`
 }
 
 func Open(dir string) (*Store, error) {
@@ -607,7 +609,7 @@ func (s *Store) loadLogLocked(peer a2al.Address) (*peerLog, error) {
 		pl.next = 1
 	}
 	for _, w := range f.Recs {
-		r := Rec{Seq: w.Seq, Dir: w.Dir, TS: w.TS, Kind: w.Kind, Body: w.Body, Name: w.Name, Size: w.Size, Status: w.Status}
+		r := Rec{Seq: w.Seq, Dir: w.Dir, TS: w.TS, Kind: w.Kind, Body: w.Body, Name: w.Name, Size: w.Size, Status: w.Status, Grant: w.Grant}
 		if len(w.Ref) == 32 {
 			copy(r.Ref[:], w.Ref)
 		}
@@ -626,7 +628,7 @@ func (s *Store) loadLogLocked(peer a2al.Address) (*peerLog, error) {
 func (s *Store) saveLogLocked(peer a2al.Address, pl *peerLog) error {
 	f := logFile{Next: pl.next, Recs: make([]recWire, 0, len(pl.recs))}
 	for _, r := range pl.recs {
-		w := recWire{Seq: r.Seq, Dir: r.Dir, TS: r.TS, Kind: r.Kind, Body: r.Body, Name: r.Name, Size: r.Size, Status: r.Status}
+		w := recWire{Seq: r.Seq, Dir: r.Dir, TS: r.TS, Kind: r.Kind, Body: r.Body, Name: r.Name, Size: r.Size, Status: r.Status, Grant: r.Grant}
 		if r.Ref != ([32]byte{}) {
 			w.Ref = r.Ref[:]
 		}

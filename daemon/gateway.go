@@ -371,16 +371,28 @@ func (d *Daemon) acceptServiceAdmission(ac *host.AgentConn, str quic.Stream, ser
 	if !allowed {
 		reason = "denied"
 	}
-	if werr := host.WriteAccessResult(str, allowed, reason); werr != nil {
-		_ = str.Close()
-		return
-	}
-	_ = str.SetDeadline(time.Time{})
 	if !allowed {
+		if werr := host.WriteAccessResult(str, false, reason); werr != nil {
+			_ = str.Close()
+			return
+		}
 		d.log.Warn("gateway: access denied", "local_aid", ac.Local.String(), "remote_aid", ac.Remote.String())
 		_ = str.Close()
 		return
 	}
+	if serviceTCP == "" {
+		// ACL passed; there is no TCP door. Signal before AccessResult so
+		// AdmitServiceStream maps 0x42 and never returns a business stream.
+		// Do not write HTTP: tunnel/SSH share this path.
+		d.log.Warn("gateway: empty service_tcp", "local_aid", ac.Local.String(), "remote_aid", ac.Remote.String())
+		rejectStream(str, protocol.StreamErrNoInbound)
+		return
+	}
+	if werr := host.WriteAccessResult(str, true, ""); werr != nil {
+		_ = str.Close()
+		return
+	}
+	_ = str.SetDeadline(time.Time{})
 	br := bufio.NewReader(str)
 	ps := &peekStream{Reader: br, Stream: str}
 	d.bridgeInboundStream(ac, ps, serviceTCP, true)
@@ -448,7 +460,7 @@ func (d *Daemon) bridgeInboundStream(ac *host.AgentConn, str quic.Stream, servic
 	tcp, err := dialServiceTCP(dialCtx, serviceTCP, 5*time.Second)
 	if err != nil {
 		d.log.Warn("gateway: tcp dial", "local_aid", ac.Local.String(), "remote_aid", ac.Remote.String(), "target", serviceTCP, "err", err)
-		_ = str.Close()
+		rejectStream(str, protocol.StreamErrInboundUnreachable)
 		return
 	}
 	if ac.Local == d.nodeAddr && d.ra != nil {

@@ -6,7 +6,9 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
 )
 
 func cmdChat(c *Client, g globalOpts, args []string) {
@@ -133,6 +135,14 @@ func chatBlock(c *Client, g globalOpts, args []string) {
 	fmt.Printf("state: %v\n", res["state"])
 }
 
+func chatFileUnreachable(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "files_root") || strings.Contains(s, "cas: cannot open")
+}
+
 func chatSend(c *Client, g globalOpts, args []string) {
 	var aid, peer, text, file string
 	parseGroupFlags(args, map[string]*string{"--aid": &aid, "--peer": &peer, "--text": &text, "--file": &file})
@@ -143,10 +153,35 @@ func chatSend(c *Client, g globalOpts, args []string) {
 	if text != "" {
 		argsMap["text"] = text
 	}
+	var res map[string]any
 	if file != "" {
-		argsMap["path"] = file
+		abs, err := filepath.Abs(file)
+		if err != nil {
+			fatalf("path: %v", err)
+		}
+		argsMap["path"] = abs
+		var sendErr error
+		res, sendErr = tryCallMCP(c, "chat_send", argsMap)
+		if sendErr != nil && chatFileUnreachable(sendErr) {
+			fmt.Fprintln(os.Stderr, "uploading (daemon cannot read path)…")
+			obj, upErr := uploadObject(c, aid, file)
+			if upErr != nil {
+				fatalf("chat_send: %v (and streaming upload failed: %v)", sendErr, upErr)
+			}
+			delete(argsMap, "path")
+			argsMap["object_id"] = obj["object_id"]
+			if n, ok := obj["name"].(string); ok && n != "" {
+				argsMap["name"] = n
+			} else {
+				argsMap["name"] = filepath.Base(file)
+			}
+			res = callMCP(c, "chat_send", argsMap)
+		} else if sendErr != nil {
+			fatal(sendErr)
+		}
+	} else {
+		res = callMCP(c, "chat_send", argsMap)
 	}
-	res := callMCP(c, "chat_send", argsMap)
 	if g.JSON {
 		printJSON(true, res)
 		return

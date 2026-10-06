@@ -5,6 +5,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -17,6 +18,7 @@ import (
 	"github.com/a2al/a2al/chat"
 	"github.com/a2al/a2al/protocol"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/quic-go/quic-go"
 )
 
 func TestChat_sameDaemonInviteSend(t *testing.T) {
@@ -43,7 +45,7 @@ func TestChat_sameDaemonInviteSend(t *testing.T) {
 	if _, err := d.execChatAccept(context.Background(), b.String(), a.String()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := d.execChatSend(context.Background(), a.String(), b.String(), "hello", "", ""); err != nil {
+	if _, err := d.execChatSend(context.Background(), a.String(), b.String(), "hello", "", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	got, err := d.execChatRead(b.String(), a.String(), 0, 20)
@@ -77,7 +79,7 @@ func TestChat_sendStaysLocalWhenAcquireFails(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
-	out, err := d.execChatSend(ctx, a.String(), peer.String(), "hello", "", "")
+	out, err := d.execChatSend(ctx, a.String(), peer.String(), "hello", "", "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,7 +100,7 @@ func TestChat_notFriendsAndSelf(t *testing.T) {
 	d := newTestDaemon(t)
 	a := newTestAgent(t, d)
 	b := newTestAgent(t, d)
-	if _, err := d.execChatSend(context.Background(), a.String(), b.String(), "x", "", ""); !errors.Is(err, chat.ErrNotFriends) {
+	if _, err := d.execChatSend(context.Background(), a.String(), b.String(), "x", "", "", ""); !errors.Is(err, chat.ErrNotFriends) {
 		t.Fatalf("err=%v", err)
 	}
 	if _, err := d.execChatRequest(context.Background(), a.String(), a.String(), ""); !errors.Is(err, chat.ErrSelf) {
@@ -146,7 +148,7 @@ func TestChat_blockKeepsRow(t *testing.T) {
 	if !ok || e.State != chat.StateBlocked {
 		t.Fatal("blocked row")
 	}
-	if _, err := d.execChatSend(context.Background(), b.String(), a.String(), "no", "", ""); err != nil {
+	if _, err := d.execChatSend(context.Background(), b.String(), a.String(), "no", "", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	got, _ := d.execChatRead(a.String(), b.String(), 0, 10)
@@ -217,7 +219,7 @@ func TestChat_sendPendingStaysLocal(t *testing.T) {
 	if _, err := d.execChatRequest(context.Background(), a.String(), b.String(), ""); err != nil {
 		t.Fatal(err)
 	}
-	out, err := d.execChatSend(context.Background(), a.String(), b.String(), "soon", "", "")
+	out, err := d.execChatSend(context.Background(), a.String(), b.String(), "soon", "", "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -327,7 +329,7 @@ func TestChat_unreadMarkRead(t *testing.T) {
 	if _, err := d.execChatAccept(context.Background(), b.String(), a.String()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := d.execChatSend(context.Background(), a.String(), b.String(), "ping", "", ""); err != nil {
+	if _, err := d.execChatSend(context.Background(), a.String(), b.String(), "ping", "", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -352,7 +354,7 @@ func TestChat_unreadMarkRead(t *testing.T) {
 	if got["unread_count"] != 0 {
 		t.Fatalf("after mark %v", got)
 	}
-	if _, err := d.execChatSend(context.Background(), a.String(), b.String(), "pong", "", ""); err != nil {
+	if _, err := d.execChatSend(context.Background(), a.String(), b.String(), "pong", "", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -402,7 +404,7 @@ func TestChat_pendingHitchInvitesAndUnread(t *testing.T) {
 	if got := d.pendingFor(b); got != nil {
 		t.Fatalf("after accept %v", got)
 	}
-	if _, err := d.execChatSend(context.Background(), a.String(), b.String(), "hello", "", ""); err != nil {
+	if _, err := d.execChatSend(context.Background(), a.String(), b.String(), "hello", "", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	per, _ = d.pendingFor(b)[b.String()].(map[string]any)
@@ -552,7 +554,7 @@ func TestChat_removeFriend(t *testing.T) {
 	if _, err := d.execChatAccept(context.Background(), b.String(), a.String()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := d.execChatSend(context.Background(), a.String(), b.String(), "hi", "", ""); err != nil {
+	if _, err := d.execChatSend(context.Background(), a.String(), b.String(), "hi", "", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := d.execChatRemove(context.Background(), a.String(), b.String()); err != nil {
@@ -566,7 +568,7 @@ func TestChat_removeFriend(t *testing.T) {
 	if _, ok := stb.Get(a); ok {
 		t.Fatal("peer still has row")
 	}
-	if _, err := d.execChatSend(context.Background(), a.String(), b.String(), "x", "", ""); !errors.Is(err, chat.ErrNotFriends) {
+	if _, err := d.execChatSend(context.Background(), a.String(), b.String(), "x", "", "", ""); !errors.Is(err, chat.ErrNotFriends) {
 		t.Fatalf("err=%v", err)
 	}
 	out, err := d.execChatRequest(context.Background(), a.String(), b.String(), "")
@@ -599,4 +601,267 @@ func TestChat_removeNotFriend(t *testing.T) {
 	if _, err := d.execChatRemove(context.Background(), a.String(), b.String()); !errors.Is(err, chat.ErrNotPending) {
 		t.Fatalf("err=%v", err)
 	}
+}
+
+func TestChat_invitesFrameListsPeers(t *testing.T) {
+	d := newTestDaemon(t)
+	a := newTestAgent(t, d)
+	b := newTestAgent(t, d)
+	ch, cancel := d.bus.Subscribe(Filter{AID: b, Types: []string{"chat.invites"}})
+	defer cancel()
+	if _, err := d.execChatRequest(context.Background(), a.String(), b.String(), "hi"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case ev := <-ch:
+		data, _ := ev.Data.(map[string]any)
+		if data["count"] != 1 && data["count"] != float64(1) {
+			t.Fatalf("count %v", data)
+		}
+		peers, _ := data["peers"].([]string)
+		if len(peers) != 1 || peers[0] != a.String() {
+			t.Fatalf("peers %v want %s", data["peers"], a)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no chat.invites")
+	}
+}
+
+func waitChatStatus(t *testing.T, d *Daemon, local, peer a2al.Address, want string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		got, err := d.execChatRead(local.String(), peer.String(), 0, 20)
+		if err != nil {
+			t.Fatal(err)
+		}
+		entries := got["entries"].([]map[string]any)
+		if len(entries) == 1 && entries[0]["status"] == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("status still %v want %s", entries, want)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestChat_pathLiveFlushesUnsent(t *testing.T) {
+	d := newTestDaemon(t)
+	a := newTestAgent(t, d)
+	peer := newTestAddr(t)
+	st, err := d.chatStore(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetMutual(peer); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	out, err := d.execChatSend(ctx, a.String(), peer.String(), "hello", "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out["status"] != chat.StatusLocal {
+		t.Fatalf("%v", out)
+	}
+
+	var dials int
+	p := newModeAConnPool(func(context.Context, a2al.Address, a2al.Address, *protocol.EndpointRecord, bool, bool) (quic.Connection, bool, error) {
+		dials++
+		return newStubConn(), false, nil
+	}, d.log)
+	d.connPool = p
+	p.setOnLive(d.notePathLive)
+	d.chatDeliverHook = func(ctx context.Context, local, remote a2al.Address, kind string, body []byte, persist bool) (EnvelopeResult, error) {
+		if kind == chat.KindMsg && !persist {
+			return EnvelopeResult{Code: protocol.EnvelopeOK}, nil
+		}
+		return EnvelopeResult{}, errEnvelopeUnavailable
+	}
+	if _, _, err := p.acquire(ctx, a, peer, nil, false, true); err != nil {
+		t.Fatal(err)
+	}
+	waitChatStatus(t, d, a, peer, chat.StatusSent)
+	if dials != 1 {
+		t.Fatalf("settler must not acquire dials=%d", dials)
+	}
+}
+
+func TestChat_pathLiveSkipsWithoutHeartbeat(t *testing.T) {
+	d := newTestDaemon(t)
+	a := newTestAgent(t, d)
+	peer := newTestAddr(t)
+	st, err := d.chatStore(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetMutual(peer); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	if _, err := d.execChatSend(ctx, a.String(), peer.String(), "hello", "", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	d.heartbeatMu.Lock()
+	delete(d.heartbeatAt, a)
+	d.heartbeatMu.Unlock()
+
+	p := newModeAConnPool(func(context.Context, a2al.Address, a2al.Address, *protocol.EndpointRecord, bool, bool) (quic.Connection, bool, error) {
+		return newStubConn(), false, nil
+	}, d.log)
+	d.connPool = p
+	p.setOnLive(d.notePathLive)
+	sent := make(chan struct{}, 1)
+	d.chatDeliverHook = func(ctx context.Context, local, remote a2al.Address, kind string, body []byte, persist bool) (EnvelopeResult, error) {
+		select {
+		case sent <- struct{}{}:
+		default:
+		}
+		return EnvelopeResult{Code: protocol.EnvelopeOK}, nil
+	}
+	if _, _, err := p.acquire(ctx, a, peer, nil, false, true); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-sent:
+		t.Fatal("settler must not send without heartbeat")
+	case <-time.After(80 * time.Millisecond):
+	}
+	got, err := d.execChatRead(a.String(), peer.String(), 0, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := got["entries"].([]map[string]any)
+	if len(entries) != 1 || entries[0]["status"] != chat.StatusLocal {
+		t.Fatalf("%v", entries)
+	}
+}
+
+func TestChatAttachName(t *testing.T) {
+	if got := chatAttachName("dir/notes.txt", "x.bin"); got != "notes.txt" {
+		t.Fatalf("%q", got)
+	}
+	if got := chatAttachName("  ", "x.bin"); got != "x.bin" {
+		t.Fatalf("%q", got)
+	}
+	if got := chatAttachName("..", "x.bin"); got != "x.bin" {
+		t.Fatalf("%q", got)
+	}
+}
+
+func TestChat_sendObjectIDUsesDisplayName(t *testing.T) {
+	d := newTestDaemon(t)
+	d.cfg.FilesRoot = t.TempDir()
+	a := newTestAgent(t, d)
+	b := newTestAgent(t, d)
+	if _, err := d.execChatRequest(context.Background(), a.String(), b.String(), ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.execChatAccept(context.Background(), b.String(), a.String()); err != nil {
+		t.Fatal(err)
+	}
+
+	id, _, ingestName, err := d.ingestCASObject(a, strings.NewReader("hello-file"), "notes.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ingestName != "notes.txt" {
+		t.Fatalf("ingest name %q", ingestName)
+	}
+	oid := hex.EncodeToString(id[:])
+	if _, err := d.execChatSend(context.Background(), a.String(), b.String(), "", "", oid, "notes.txt"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := d.execChatRead(b.String(), a.String(), 0, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := got["entries"].([]map[string]any)
+	if len(entries) != 1 || entries[0]["kind"] != chat.KindFile || entries[0]["name"] != "notes.txt" {
+		t.Fatalf("%v", entries)
+	}
+	if g, _ := entries[0]["grant"].(string); g == "" {
+		t.Fatalf("grant missing %v", entries[0])
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, _, ok := d.lookupLocalObject(b, id); ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("inbound file was not prefetched onto the receiver")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	var rec casRec
+	for {
+		var ok bool
+		rec, ok = d.casRec(a, id)
+		if ok && fetchedHas(rec.Served, b.String()) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("sender Served %v", rec.Served)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	sent, err := d.execChatRead(a.String(), b.String(), 0, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	se := sent["entries"].([]map[string]any)
+	if !fetchedHas(se[0]["fetched"], b.String()) {
+		t.Fatalf("sender fetched %v", se[0]["fetched"])
+	}
+
+	id2, _, _, err := d.ingestCASObject(a, strings.NewReader("other"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	oid2 := hex.EncodeToString(id2[:])
+	if _, err := d.execChatSend(context.Background(), a.String(), b.String(), "", "", oid2, ""); err != nil {
+		t.Fatal(err)
+	}
+	got, err = d.execChatRead(b.String(), a.String(), 0, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries = got["entries"].([]map[string]any)
+	if len(entries) != 2 || entries[1]["name"] != oid2+".bin" {
+		t.Fatalf("%v", entries)
+	}
+	deadline = time.Now().Add(2 * time.Second)
+	for {
+		if _, _, ok := d.lookupLocalObject(b, id2); ok {
+			rec, _ := d.casRec(a, id2)
+			if fetchedHas(rec.Served, b.String()) {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func fetchedHas(v any, aid string) bool {
+	switch xs := v.(type) {
+	case []string:
+		for _, s := range xs {
+			if s == aid {
+				return true
+			}
+		}
+	case []any:
+		for _, x := range xs {
+			if s, ok := x.(string); ok && s == aid {
+				return true
+			}
+		}
+	}
+	return false
 }

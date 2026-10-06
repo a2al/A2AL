@@ -6,6 +6,7 @@ package daemon
 import (
 	"bufio"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -72,10 +73,7 @@ func (dd *daemonDialer) Dial(ctx context.Context, remote a2al.Address) (io.ReadW
 		return dd.d.openAdmittedStream(ctx, c, "")
 	})
 	if err != nil {
-		if isAccessDeniedErr(err) {
-			return nil, protocol.ErrAccessDenied
-		}
-		return nil, errConnectQUIC
+		return nil, fetchStreamErr(err)
 	}
 	return stream, nil
 }
@@ -114,11 +112,7 @@ func (d *Daemon) proxyRemoteCAS(w http.ResponseWriter, r *http.Request, remote a
 	stream, err := d.dialCAS(dialCtx, d.nodeAddr, remote, "")
 	cancel()
 	if err != nil {
-		if isAccessDeniedErr(err) {
-			http.Error(w, "access denied", http.StatusForbidden)
-			return
-		}
-		http.Error(w, "connect failed", http.StatusBadGateway)
+		writeAIDHTTPErr(w, err, "connect failed", http.StatusBadGateway)
 		return
 	}
 	defer stream.Close()
@@ -135,11 +129,7 @@ func (d *Daemon) proxyRemoteCAS(w http.ResponseWriter, r *http.Request, remote a
 	}
 	resp, err := http.ReadResponse(bufio.NewReaderSize(stream, 32*1024), outReq)
 	if err != nil {
-		if isAccessDeniedErr(err) {
-			http.Error(w, "access denied", http.StatusForbidden)
-			return
-		}
-		http.Error(w, "upstream read failed", http.StatusBadGateway)
+		writeAIDHTTPErr(w, err, "upstream read failed", http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
@@ -175,10 +165,20 @@ func (d *Daemon) dialCAS(ctx context.Context, local, remote a2al.Address, token 
 		return host.AdmitCASStream(ctx, c, token)
 	})
 	if err != nil {
-		if isAccessDeniedErr(err) {
-			return nil, protocol.ErrAccessDenied
-		}
-		return nil, errConnectQUIC
+		return nil, fetchStreamErr(err)
 	}
 	return stream, nil
+}
+
+func writeAIDHTTPErr(w http.ResponseWriter, err error, fallback string, fallbackStatus int) {
+	switch {
+	case isAccessDeniedErr(err):
+		http.Error(w, "access denied", http.StatusForbidden)
+	case errors.Is(err, protocol.ErrNoInbound):
+		http.Error(w, "no inbound", http.StatusServiceUnavailable)
+	case errors.Is(err, protocol.ErrInboundUnreachable):
+		http.Error(w, "inbound unreachable", http.StatusBadGateway)
+	default:
+		http.Error(w, fallback, fallbackStatus)
+	}
 }

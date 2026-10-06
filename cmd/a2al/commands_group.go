@@ -125,7 +125,7 @@ Usage:
   a2al group retract   --aid <aid> --group-id <id> --entry <entry-id>
   a2al group object put    --aid <aid> <file>
   a2al group object locate --aid <aid> --hash <hash> [--hint <aid>]
-  a2al group object get    --aid <aid> --hash <hash> [--hint <aid>] [-o <file>] [--register]
+  a2al group object get    --aid <aid> --hash <hash> [--hint <aid>] [-o <file>] [--register] [--force]
 
 Diagnostics only (the daemon aligns replicas on its own; you should not need this):
   a2al group sync      --aid <aid> --group-id <id> --peer <aid>
@@ -556,9 +556,14 @@ func groupObjectGet(c *Client, g globalOpts, args []string) {
 	var aid, hash, hint, outFile string
 	filtered := make([]string, 0, len(args))
 	register := false
+	force := false
 	for i := 0; i < len(args); i++ {
 		if args[i] == "--register" {
 			register = true
+			continue
+		}
+		if args[i] == "--force" {
+			force = true
 			continue
 		}
 		filtered = append(filtered, args[i])
@@ -567,9 +572,12 @@ func groupObjectGet(c *Client, g globalOpts, args []string) {
 		"--aid": &aid, "--hash": &hash, "--hint": &hint, "-o": &outFile,
 	})
 	if aid == "" || hash == "" {
-		fatalf("usage: a2al group object get --aid <aid> --hash <hash> [--hint <aid>] [-o <file>] [--register]")
+		fatalf("usage: a2al group object get --aid <aid> --hash <hash> [--hint <aid>] [-o <file>] [--register] [--force]")
 	}
 	mcpArgs := map[string]any{"aid": aid, "object_id": hash, "register": register}
+	if force {
+		mcpArgs["force"] = true
+	}
 	if hint != "" {
 		mcpArgs["hint_aid"] = hint
 	}

@@ -41,6 +41,15 @@ func TestEventLog_SinceFromZero(t *testing.T) {
 	if len(ev) != 0 {
 		t.Fatalf("caught up: still %d events", len(ev))
 	}
+
+	if el.LastSeq(aid) != 2 {
+		t.Fatalf("LastSeq=%d want 2", el.LastSeq(aid))
+	}
+	var other a2al.Address
+	other[0] = 2
+	if el.LastSeq(other) != 0 {
+		t.Fatalf("empty AID LastSeq=%d", el.LastSeq(other))
+	}
 }
 
 // The event log is in memory, so a daemon restart renumbers from 1. A client

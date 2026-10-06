@@ -54,7 +54,7 @@ func (d *Daemon) handleChatInspectLog(w http.ResponseWriter, r *http.Request) {
 	entries, scanned, more := st.Read(peer, after, limit)
 	items := make([]map[string]any, 0, len(entries))
 	for _, rec := range entries {
-		items = append(items, recToMap(aid, peer, rec))
+		items = append(items, d.recToMap(aid, peer, rec))
 	}
 	writeJSON(w, map[string]any{
 		"entries":      items,
@@ -104,6 +104,7 @@ type chatPeerBody struct {
 	Text      string `json:"text,omitempty"`
 	Path      string `json:"path,omitempty"`
 	ObjectID  string `json:"object_id,omitempty"`
+	Name      string `json:"name,omitempty"`
 	ScannedTo uint64 `json:"scanned_to,omitempty"`
 }
 
@@ -143,7 +144,7 @@ func (d *Daemon) handleChatSend(w http.ResponseWriter, r *http.Request) {
 		writeJSONStatus(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	out, err := d.execChatSend(r.Context(), r.PathValue("aid"), body.Peer, body.Text, body.Path, body.ObjectID)
+	out, err := d.execChatSend(r.Context(), r.PathValue("aid"), body.Peer, body.Text, body.Path, body.ObjectID, body.Name)
 	if err != nil {
 		writeChatErr(w, err)
 		return

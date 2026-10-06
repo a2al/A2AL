@@ -105,10 +105,13 @@ func (ms *MemberSet) Apply(e Entry, creatorAID a2al.Address) {
 			}
 		}
 	case KindRevoke:
-		if authorRole >= RoleAdmin {
-			if target, ok := decodeMemberTarget(e.Body); ok && target != creatorAID {
-				ms.members[target] = RoleRevoked // distinct from RoleNone: was a member
-			}
+		target, ok := decodeMemberTarget(e.Body)
+		if !ok || target == creatorAID {
+			break
+		}
+		self := e.Author == target && authorRole >= RoleMember
+		if self || authorRole >= RoleAdmin {
+			ms.members[target] = RoleRevoked // distinct from RoleNone: was a member
 		}
 	case KindGrantAdmin:
 		if authorRole == RoleCreator {

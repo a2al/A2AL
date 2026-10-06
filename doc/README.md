@@ -38,5 +38,6 @@ no registry can revoke it, and no server needs to stay up for you to exist.
 | Run the demo binaries | [Examples](examples.md) |
 | Configure `a2ald` | [Config example](a2ald-config.example.toml) |
 | AID version bytes | [Address Version Registry](address-version-registry.md) |
+| What changed in each release | [Changelog](CHANGELOG.md) |
 
 CLI: `a2al help`. Daemon starts a Web UI at `http://localhost:2121`.

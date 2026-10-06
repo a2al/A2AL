@@ -19,6 +19,7 @@ import (
 	"github.com/a2al/a2al"
 	"github.com/a2al/a2al/config"
 	"github.com/a2al/a2al/host"
+	"github.com/a2al/a2al/protocol"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -42,6 +43,8 @@ func (d *Daemon) routes() http.Handler {
 	mux.HandleFunc("GET /agents/{aid}/groups", d.handleGroupInspectList)
 	mux.HandleFunc("GET /agents/{aid}/groups/{group_id}", d.handleGroupInspectHead)
 	mux.HandleFunc("GET /agents/{aid}/groups/{group_id}/entries", d.handleGroupInspectEntries)
+	mux.HandleFunc("POST /agents/{aid}/groups/{group_id}/append", d.withAgentMiddleware(d.handleGroupAppend))
+	mux.HandleFunc("POST /agents/{aid}/groups/{group_id}/leave", d.withAgentMiddleware(d.handleGroupLeave))
 	mux.HandleFunc("GET /agents/{aid}/chat/contacts", d.handleChatInspectContacts)
 	mux.HandleFunc("GET /agents/{aid}/chat/peers/{peer}", d.handleChatInspectLog)
 	mux.HandleFunc("POST /agents/{aid}/chat/request", d.withAgentMiddleware(d.handleChatRequest))
@@ -57,6 +60,7 @@ func (d *Daemon) routes() http.Handler {
 	mux.HandleFunc("POST /agents/{aid}/publish", d.withAgentMiddleware(d.handleAgentsPublish))
 	mux.HandleFunc("POST /agents/{aid}/records", d.withAgentMiddleware(d.handleAgentsRecordsPost))
 	mux.HandleFunc("POST /agents/{aid}/mailbox/send", d.withAgentMiddleware(d.handleAgentsMailboxSend))
+	mux.HandleFunc("GET /agents/{aid}/mailbox", d.handleAgentsMailboxList)
 	mux.HandleFunc("POST /agents/{aid}/mailbox/poll", d.withAgentMiddleware(d.handleAgentsMailboxPoll))
 	mux.HandleFunc("POST /agents/{aid}/services", d.withAgentMiddleware(d.handleAgentsTopicsPost))
 	mux.HandleFunc("DELETE /agents/{aid}/services/{service...}", d.withAgentMiddleware(d.handleAgentsTopicsDelete))
@@ -87,6 +91,7 @@ func (d *Daemon) routes() http.Handler {
 	mux.HandleFunc("GET /sessions/{port}", d.handleGetSession)
 	mux.HandleFunc("GET /agents/{aid}/events", d.withAgentMiddleware(d.handleAgentEvents))
 	mux.HandleFunc("POST /agents/{aid}/cas", d.withAgentMiddleware(d.handleAgentCASUpload))
+	mux.HandleFunc("GET /agents/{aid}/cas/{object_id}", d.withAgentMiddleware(d.handleAgentCASGet))
 	mux.HandleFunc("GET /events", d.handleGlobalEvents)
 	mux.HandleFunc("GET /update/status", d.handleUpdateStatus)
 	mux.HandleFunc("POST /update/apply", d.handleUpdateApply)
@@ -119,12 +124,8 @@ func isDataPlaneRoute(r *http.Request) bool {
 	if r.Method != http.MethodPost {
 		return false
 	}
-	rest, ok := strings.CutPrefix(r.URL.Path, "/agents/")
-	if !ok {
-		return false
-	}
-	aid, tail, found := strings.Cut(rest, "/")
-	return found && aid != "" && tail == "cas"
+	p := strings.TrimSuffix(r.URL.Path, "/")
+	return strings.HasPrefix(p, "/agents/") && strings.HasSuffix(p, "/cas")
 }
 
 // withAgentMiddleware wraps agent-specific handlers with:
@@ -898,6 +899,24 @@ func (d *Daemon) handleAgentsMailboxSend(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, map[string]any{"ok": true, "message_id": msgID})
 }
 
+func (d *Daemon) handleAgentsMailboxList(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+	msgs, err := d.execMailboxList(ctx, r.PathValue("aid"))
+	if err != nil {
+		switch {
+		case errors.Is(err, errBadAID):
+			http.Error(w, `{"error":"bad aid"}`, http.StatusBadRequest)
+		case errors.Is(err, errNotFound):
+			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+		default:
+			http.Error(w, `{"error":"mailbox list failed"}`, http.StatusBadGateway)
+		}
+		return
+	}
+	writeJSON(w, map[string]any{"messages": msgs})
+}
+
 func (d *Daemon) handleAgentsMailboxPoll(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
@@ -1081,6 +1100,10 @@ func (d *Daemon) handleConnect(w http.ResponseWriter, r *http.Request) {
 			writeJSONStatus(w, http.StatusPreconditionFailed, map[string]string{"error": "relay_required"})
 		case errors.Is(err, errConnectQUIC):
 			http.Error(w, `{"error":"quic connect failed"}`, http.StatusBadGateway)
+		case errors.Is(err, protocol.ErrNoInbound):
+			writeJSONStatus(w, http.StatusServiceUnavailable, map[string]string{"error": "no inbound"})
+		case errors.Is(err, protocol.ErrInboundUnreachable):
+			writeJSONStatus(w, http.StatusBadGateway, map[string]string{"error": "inbound unreachable"})
 		default:
 			writeJSONStatus(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		}
@@ -1287,6 +1310,10 @@ func (d *Daemon) handleAgentEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	types := parseTypesParam(r.URL.Query().Get("types"))
+	if _, ok := r.URL.Query()["after_seq"]; ok {
+		http.Error(w, `{"error":"SSE replay cursor is last_event_id (and Last-Event-ID); after_seq belongs to events_poll"}`, http.StatusBadRequest)
+		return
+	}
 
 	// Determine the replay cursor: prefer Last-Event-ID (browser reconnect),
 	// then ?last_event_id=, then 0 (stream from live only).
@@ -1377,9 +1404,13 @@ func serveSSEWithReplay(w http.ResponseWriter, r *http.Request, aid a2al.Address
 		fl.Flush()
 	}
 
-	// Replay buffered events (seq > afterSeq).
+	// Replay buffered events (seq > afterSeq). Omit last_event_id (afterSeq=0)
+	// means live only: start the cursor at the current head so the first Watch
+	// notification cannot Since(0) and dump the buffer.
 	lastSentSeq := afterSeq
-	if afterSeq > 0 {
+	if afterSeq == 0 {
+		lastSentSeq = evtLog.LastSeq(aid)
+	} else {
 		missed, oldest, truncated := evtLog.Since(aid, afterSeq)
 		if truncated {
 			// Cursor is too old; client should do a full resync.

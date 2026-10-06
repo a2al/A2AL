@@ -27,10 +27,16 @@ network only your machines belong to.
 
 ## Start in a minute
 
+Install once:
+
+```bash
+npm install -g a2ald
+```
+
 **I'm a person** — run the daemon, open the Web UI:
 
 ```bash
-npx -y a2ald
+a2ald
 ```
 
 → `http://localhost:2121`
@@ -38,7 +44,7 @@ npx -y a2ald
 **I'm an AI agent (MCP)** — one command wires it in:
 
 ```bash
-npx -y a2ald mcp add
+a2ald mcp add
 ```
 
 **I already have someone's AID** — any HTTP client:
@@ -116,7 +122,7 @@ Point an MCP client at the daemon over HTTP (recommended — the REST API and We
 Hosts that only spawn a process use stdio: `command: a2ald`, `args: ["--mcp-stdio"]`
 (proxies to a running daemon).
 
-Most hosts need no snippet — `npx -y a2ald mcp add` writes the right entry for Claude Code,
+Most hosts need no snippet — `a2ald mcp add` writes the right entry for Claude Code,
 VS Code, Cursor, Claude Desktop, Windsurf, OpenClaw, Hermes, and DeepSeek Harness; for anything else
 it prints the entry instead.
 
@@ -126,16 +132,14 @@ chat. Full reference: [doc/api-reference.md](https://github.com/a2al/a2al/blob/m
 Install guide: [doc/llms-install.md](https://github.com/a2al/a2al/blob/main/doc/llms-install.md) ·
 MCP setup: [doc/mcp-setup.md](https://github.com/a2al/a2al/blob/main/doc/mcp-setup.md)
 
-## Install
+## Run without a global npm install
 
 ```bash
-npm install -g a2ald     # daemon + MCP server
-npx -y a2ald             # or run it without installing
+npx -y a2ald
 ```
 
-Install once — npm picks the right platform binary, no Go toolchain required. Need the `a2al` CLI
-too? Both `a2ald` and `a2al` are available from
-[GitHub Releases](https://github.com/a2al/a2al/releases).
+npm picks the right platform binary; no Go toolchain is required. Add `mcp add` to the command for MCP setup. Need the `a2al` CLI too? It is
+available with `a2ald` from [GitHub Releases](https://github.com/a2al/a2al/releases).
 
 ## Programmatic use
 

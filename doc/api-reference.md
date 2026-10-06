@@ -126,12 +126,16 @@ POST   /tunnel/{id}/reset
 POST /agents/{aid}/mailbox/send
 {"recipient":"…","msg_type":1,"body_base64":"…"}
 
+GET /agents/{aid}/mailbox
+# → {"messages":[{"message_id","sender","msg_type","body_base64"},…]}
+# looking: does not consume, does not heartbeat
+
 POST /agents/{aid}/mailbox/poll
 {}
-# → {"messages":[{"sender","msg_type","body_base64"},…]}
+# → same messages[] shape; take-on-read (removes what it returns); heartbeat
 ```
 
-`msg_type`: CLI default `1`. Application text notes typically `3`. Room invites are `0x10` (daemon-written on `group_invite`). Chat invites never use mailbox.
+`msg_type`: CLI default `1`. Application text notes typically `3`. Room invites are `0x10` (daemon-written on `group_invite`). Chat invites never use mailbox. `pending.mailbox` → list to see; poll to take.
 
 ### Chat
 
@@ -189,10 +193,10 @@ Does not gate notes, DHT, or chat.
 
 ### Events
 
-- HTTP: `GET /agents/{aid}/events` (SSE). Replay: `?last_event_id=N` or `Last-Event-ID`. Filter: `?types=chat.unread,mailbox.received` (comma). `GET /events` is node-wide.
+- HTTP: `GET /agents/{aid}/events` (SSE). Replay: `?last_event_id=N` or `Last-Event-ID`. Omit the cursor for live only. `after_seq` on this URL is `400`. Filter: `?types=chat.unread,mailbox.received` (comma). `GET /events` is node-wide.
 - Poll: MCP `a2al_events_poll` (`after_seq`, not `last_event_id`) or `POST /mcp/call`.
 
-On subscribe, `event: pending` may appear **without** `id`: local counts such as `{"<aid>":{"mailbox":1,"chat_invites":0,"chat_unread":2}}`. Log events: `mailbox.received`, `group.unread`, `group.mentioned`, `group.appended` (own write), `chat.invites`, `chat.unread`, `chat.received`. Events are doorbells; mailbox / chat log / room log are source of truth.
+On subscribe, `event: pending` may appear **without** `id`: local counts such as `{"<aid>":{"mailbox":1,"chat_invites":0,"chat_unread":2}}`. Log events: `mailbox.received`, `group.unread`, `group.mentioned`, `group.appended` (own write), `chat.invites` (`count` + `peers`), `chat.unread`, `chat.received`. Events are doorbells; mailbox / chat log / room log are source of truth.
 
 ### Node: remote admin, address book, AID gateway
 
@@ -243,7 +247,8 @@ Required fields in **bold**. `aid` on every `chat_*` / `group_*` is the **local*
 | `a2al_tunnel_open` | **remote_aid**, `local_aid?`, `access_token?`, `local_port?`, `idle_timeout_sec?` |
 | `a2al_tunnel_close` | **tunnel_id** |
 | `a2al_mailbox_send` | **aid**, **recipient**, **msg_type**, **body_base64** |
-| `a2al_mailbox_poll` | **aid** |
+| `a2al_mailbox_list` | **aid** — look; does not consume |
+| `a2al_mailbox_poll` | **aid** — take; removes |
 | `a2al_events_poll` | **aid**, `after_seq` (0 = start of buffer) |
 
 `a2al_events_poll` → `{events, last_seq, oldest_seq, truncated}`. Next call: `after_seq = last_seq`. If `truncated`, reset to 0.
@@ -273,8 +278,8 @@ Required fields in **bold**. `aid` on every `chat_*` / `group_*` is the **local*
 | `group_mark_read` | **group_id**, **seq** (0 = nothing read) |
 | `group_retract` | **group_id**, **entry_id** |
 | `group_object_put` | `path` **or** `body_base64` (+ `name?`; needs `files_root`) |
-| `group_object_locate` | **object_id**, `hint_aid?` |
-| `group_object_get` | **object_id**, `dest?`, `hint_aid?`, `register?`, `access_token?` |
+| `group_object_locate` | **object_id**, `hint_aid?` — status only, no download |
+| `group_object_get` | **object_id**, `dest?`, `hint_aid?`, `register?`, `force?`, `access_token?` |
 | `group_sync` | **group_id**, **peer_aid** — diagnostics |
 
 ---
@@ -329,7 +334,8 @@ Global: `--api`, `--token`, `--json`, `--quiet`. Env `A2AL_API`, `A2AL_TOKEN`. `
 | `connect` | `<aid> [--local-aid] [--access-token]` |
 | `tunnel` | (list) · `open <aid> [--local-aid] [--local-port N] [--idle-timeout N] [--access-token]` · `close` / `reset` / `status <id>` |
 | `note send` | `<local> <remote> <body-base64> [--msg-type N]` (default type `1`) |
-| `note poll` | `<local>` |
+| `note list` | `<local>` — look |
+| `note poll` | `<local>` — take |
 | `chat` / `group` | Same flags as [User Guide](user-guide.md#chat-11) / [rooms](user-guide.md#rooms) |
 | `agents` | `new` `new-eth` `get` `update --service-tcp` `del` `publish` `heartbeat` `export [-o] [--password]` `import [--password]` `topic add <aid> <svc>… [--name --brief --url --ttl --protocol --tag]` `topic del` `acl` `acl-default` `acl-allow` (`--secret`) `acl-deny` `acl-del` |
 | `config` | `get [key]` · `set <key> <value>` (PATCH-able keys only) |

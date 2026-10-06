@@ -34,7 +34,7 @@ func (d *Daemon) handleCASStream(local, remote a2al.Address, src net.Addr, rw io
 		d.log.Debug("gateway: a2cs admission read", "err", aerr)
 		return
 	}
-	allowed := d.decideAccess(local, remote, token, src, accessCAS)
+	allowed := d.casAdmitStream(local, remote, token, src)
 	reason := ""
 	if !allowed {
 		reason = "denied"
@@ -49,10 +49,68 @@ func (d *Daemon) handleCASStream(local, remote a2al.Address, src net.Addr, rw io
 	if s, ok := rw.(interface{ SetDeadline(time.Time) error }); ok {
 		_ = s.SetDeadline(time.Time{})
 	}
-	d.serveCASHTTP(rw, local)
+	d.serveCASHTTPAuth(rw, local, remote, token, src)
+}
+
+func (d *Daemon) casAdmitStream(local, remote a2al.Address, token string, src net.Addr) bool {
+	if local == d.nodeAddr {
+		return d.decideNodeAdminAccess(remote, token, src)
+	}
+	d.regMu.RLock()
+	e := d.reg.Get(local)
+	d.regMu.RUnlock()
+	if e == nil {
+		return true
+	}
+	if d.aclIP.locked(src) {
+		return false
+	}
+	if aclDenies(e.ACL, remote) {
+		d.aclIP.noteFail(src)
+		return false
+	}
+	if e.ACL.Allows(remote, token) {
+		d.aclIP.noteOK(src)
+		if usedJoinPassword(e.ACL, remote, token) {
+			d.recordJoinAID(local, remote)
+		}
+		return true
+	}
+	if token != "" {
+		return true
+	}
+	d.aclIP.noteFail(src)
+	return false
+}
+
+func (d *Daemon) casObjectAllowed(local, remote a2al.Address, token string, src net.Addr, id [32]byte) bool {
+	if local == d.nodeAddr {
+		return d.decideNodeAdminAccess(remote, token, src)
+	}
+	d.regMu.RLock()
+	e := d.reg.Get(local)
+	d.regMu.RUnlock()
+	if e == nil {
+		return true
+	}
+	if d.aclIP.locked(src) {
+		return false
+	}
+	if aclDenies(e.ACL, remote) {
+		return false
+	}
+	if e.ACL.Allows(remote, token) {
+		return true
+	}
+	rec, ok := d.casRec(local, id)
+	return ok && grantMatch(rec.Grant, token)
 }
 
 func (d *Daemon) serveCASHTTP(rw io.ReadWriter, aid a2al.Address) {
+	d.serveCASHTTPAuth(rw, aid, a2al.Address{}, "", nil)
+}
+
+func (d *Daemon) serveCASHTTPAuth(rw io.ReadWriter, aid, remote a2al.Address, token string, src net.Addr) {
 	req, err := http.ReadRequest(bufio.NewReader(rw))
 	if err != nil {
 		return
@@ -64,7 +122,13 @@ func (d *Daemon) serveCASHTTP(rw io.ReadWriter, aid a2al.Address) {
 		http.Error(out, "not found", http.StatusNotFound)
 		return
 	}
-	d.serveCASFile(out, aid, id, req.Method)
+	if !d.casObjectAllowed(aid, remote, token, src, id) {
+		http.Error(out, "forbidden", http.StatusForbidden)
+		return
+	}
+	if d.serveCASFile(out, aid, id, req.Method) && (req.Method == http.MethodGet || req.Method == "") {
+		d.noteCASServed(aid, remote, id)
+	}
 }
 
 type streamResponseWriter struct {
@@ -107,7 +171,26 @@ func (d *Daemon) fetchCASToFile(ctx context.Context, local, remote a2al.Address,
 		return err
 	}
 	defer stream.Close()
+	return copyCASHTTP(stream, id, dest)
+}
 
+func (d *Daemon) fetchCASToFileLive(ctx context.Context, local, remote a2al.Address, id [32]byte, dest, token string) error {
+	if d.connPool == nil {
+		return errCASNoLive
+	}
+	conn := d.connPool.getLive(local, remote)
+	if conn == nil {
+		return errCASNoLive
+	}
+	stream, err := host.AdmitCASStream(ctx, conn, token)
+	if err != nil {
+		return err
+	}
+	defer stream.Close()
+	return copyCASHTTP(stream, id, dest)
+}
+
+func copyCASHTTP(stream io.ReadWriter, id [32]byte, dest string) error {
 	req, err := http.NewRequest(http.MethodGet, "http://cas"+group.CASPath(id), nil)
 	if err != nil {
 		return err

@@ -49,6 +49,7 @@ type Msg struct {
 	Name   string `json:"name,omitempty"`
 	Size   int64  `json:"size,omitempty"`
 	Author string `json:"author,omitempty"`
+	Grant  string `json:"grant,omitempty"`
 	Sig    string `json:"sig,omitempty"`
 }
 
@@ -102,7 +103,7 @@ func DecodeMsg(body []byte) (Msg, error) {
 }
 
 func RecFromMsg(m Msg, peer a2al.Address) (Rec, error) {
-	rec := Rec{Seq: m.Seq, TS: m.TS, Body: m.Body, Name: m.Name, Size: m.Size}
+	rec := Rec{Seq: m.Seq, TS: m.TS, Body: m.Body, Name: m.Name, Size: m.Size, Grant: strings.TrimSpace(m.Grant)}
 	switch m.K {
 	case MsgFile:
 		rec.Kind = KindFile
@@ -130,7 +131,7 @@ func RecFromMsg(m Msg, peer a2al.Address) (Rec, error) {
 }
 
 func MsgFromRec(r Rec) Msg {
-	m := Msg{Seq: r.Seq, TS: r.TS, Body: r.Body, Name: r.Name, Size: r.Size}
+	m := Msg{Seq: r.Seq, TS: r.TS, Body: r.Body, Name: r.Name, Size: r.Size, Grant: r.Grant}
 	if r.Kind == KindFile {
 		m.K = MsgFile
 	} else {

@@ -46,7 +46,7 @@ func (d *Daemon) openPooled(
 	if err == nil {
 		return conn, str, false, nil
 	}
-	if isAccessDeniedErr(err) || (ctx.Err() != nil && conn.Context().Err() == nil) {
+	if isServiceDoorErr(err) || (ctx.Err() != nil && conn.Context().Err() == nil) {
 		return conn, nil, false, err
 	}
 	if d.connPool == nil || !d.connPool.evictUnheld(conn) {
@@ -61,7 +61,7 @@ func (d *Daemon) openPooled(
 		return nil, nil, relayed, err2
 	}
 	str2, err3 := openLimited(ctx, conn2, open)
-	if err3 != nil && !isAccessDeniedErr(err3) && (ctx.Err() == nil || conn2.Context().Err() != nil) {
+	if err3 != nil && !isServiceDoorErr(err3) && (ctx.Err() == nil || conn2.Context().Err() != nil) {
 		d.connPool.evictUnheld(conn2)
 	}
 	return conn2, str2, relayed, err3

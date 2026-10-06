@@ -34,6 +34,19 @@ const (
 	fetchStreamTimeout = 30 * time.Second
 )
 
+func fetchStreamErr(err error) error {
+	if isAccessDeniedErr(err) {
+		return protocol.ErrAccessDenied
+	}
+	if errors.Is(err, protocol.ErrNoInbound) || errors.Is(err, protocol.ErrInboundUnreachable) {
+		return err
+	}
+	if e := streamAppErr(err); e != nil {
+		return e
+	}
+	return errConnectQUIC
+}
+
 // fetchReq is the body for POST /fetch/{aid} and the a2al_fetch MCP tool.
 type fetchReq struct {
 	// LocalAID selects which registered agent identity to dial from.
@@ -187,11 +200,7 @@ func (d *Daemon) execFetch(ctx context.Context, localAID, remoteAID a2al.Address
 		}
 		_, stream, _, err := d.openPooled(sctx, localAID, remoteAID, er, false, true, conn, open)
 		if err != nil {
-			if isAccessDeniedErr(err) {
-				return fetchResp{}, protocol.ErrAccessDenied
-			}
-			d.log.Debug("fetch: open stream failed (dead conn?)", "remote", remoteAID.String(), "err", err)
-			return fetchResp{}, errConnectQUIC
+			return fetchResp{}, fetchStreamErr(err)
 		}
 		defer func() {
 			stream.CancelRead(0)
@@ -262,11 +271,7 @@ func (d *Daemon) execFetchCAS(ctx context.Context, localAID, remoteAID a2al.Addr
 		}
 		_, stream, _, err := d.openPooled(sctx, localAID, remoteAID, er, false, true, conn, open)
 		if err != nil {
-			if isAccessDeniedErr(err) {
-				return fetchResp{}, protocol.ErrAccessDenied
-			}
-			d.log.Debug("fetch: cas stream failed", "remote", remoteAID.String(), "err", err)
-			return fetchResp{}, errConnectQUIC
+			return fetchResp{}, fetchStreamErr(err)
 		}
 		defer func() {
 			stream.CancelRead(0)
@@ -389,6 +394,9 @@ func doHTTPOverStream(stream io.ReadWriter, req fetchReq) (fetchResp, error) {
 
 	resp, err := http.ReadResponse(bufio.NewReaderSize(stream, 32*1024), httpReq)
 	if err != nil {
+		if e := streamAppErr(err); e != nil {
+			return fetchResp{}, e
+		}
 		return fetchResp{}, err
 	}
 	defer resp.Body.Close()
@@ -438,6 +446,10 @@ func (d *Daemon) handleFetch(w http.ResponseWriter, r *http.Request) {
 			writeJSONStatus(w, http.StatusBadGateway, map[string]string{"error": "connect failed"})
 		case isAccessDeniedErr(err):
 			writeJSONStatus(w, http.StatusForbidden, map[string]string{"error": "access denied"})
+		case errors.Is(err, protocol.ErrNoInbound):
+			writeJSONStatus(w, http.StatusServiceUnavailable, map[string]string{"error": "no inbound"})
+		case errors.Is(err, protocol.ErrInboundUnreachable):
+			writeJSONStatus(w, http.StatusBadGateway, map[string]string{"error": "inbound unreachable"})
 		default:
 			writeJSONStatus(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 		}

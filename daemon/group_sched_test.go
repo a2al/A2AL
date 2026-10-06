@@ -4,10 +4,17 @@
 package daemon
 
 import (
+	"bytes"
+	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/a2al/a2al"
+	"github.com/a2al/a2al/dht"
+	"github.com/a2al/a2al/internal/logedge"
 )
 
 func addrN(n byte) a2al.Address {
@@ -185,6 +192,60 @@ func TestPeerRecentlySyncedBothDirections(t *testing.T) {
 	}
 	if !d.peerRecentlySynced(peer, local, gid) {
 		t.Fatal("inbound success should skip the reverse pair")
+	}
+}
+
+func TestLogAlignPeerFailEdges(t *testing.T) {
+	var buf bytes.Buffer
+	d := newTestDaemon(t)
+	d.log = slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	d.logEdge = &logedge.Gate{Repeat: time.Hour}
+	local, peer := addrN(1), addrN(2)
+	var gid [32]byte
+	errNo := fmt.Errorf("resolve: %w", dht.ErrNoEndpoint)
+
+	d.logAlignPeerFail("group align: peer failed", peer, gid, errNo)
+	if n := strings.Count(buf.String(), "peer failed"); n != 1 {
+		t.Fatalf("first fail logs=%d, got %q", n, buf.String())
+	}
+	d.logAlignPeerFail("group align: peer failed", peer, gid, errNo)
+	if n := strings.Count(buf.String(), "peer failed"); n != 1 {
+		t.Fatalf("repeat must stay quiet, got %q", buf.String())
+	}
+	var gid2 [32]byte
+	gid2[0] = 1
+	d.logAlignPeerFail("group align: peer failed", peer, gid2, errNo)
+	if n := strings.Count(buf.String(), "peer failed"); n != 1 {
+		t.Fatalf("same peer other group must stay quiet, got %q", buf.String())
+	}
+
+	d.notePeerSync(local, peer, gid)
+	if !strings.Contains(buf.String(), "group peer recovered") {
+		t.Fatalf("recover must log, got %q", buf.String())
+	}
+}
+
+func TestLogUnknownGroupSyncEdges(t *testing.T) {
+	var buf bytes.Buffer
+	d := newTestDaemon(t)
+	d.log = slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	d.logEdge = &logedge.Gate{Repeat: time.Hour}
+	local := addrN(1)
+	var gid [32]byte
+	errNo := errors.New("no local replica")
+
+	d.logUnknownGroupSync(local, gid, errNo)
+	if n := strings.Count(buf.String(), "unknown group"); n != 1 {
+		t.Fatalf("first: %q", buf.String())
+	}
+	d.logUnknownGroupSync(local, gid, errNo)
+	if n := strings.Count(buf.String(), "unknown group"); n != 1 {
+		t.Fatalf("repeat must stay quiet, got %q", buf.String())
+	}
+	d.logUnknownGroupSync(local, gid, errNo)
+	d.clearUnknownGroupLog(local, gid)
+	if !strings.Contains(buf.String(), "replica present") {
+		t.Fatalf("join must log, got %q", buf.String())
 	}
 }
 

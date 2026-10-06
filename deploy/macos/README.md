@@ -9,24 +9,24 @@ Data directory: `~/Library/Application Support/a2al/`
 
 ## Path A — Built-in service install (recommended)
 
-Install `a2ald` (choose one):
+Download A2AL for macOS from [Releases](https://github.com/a2al/a2al/releases) and extract it. From that folder:
 
 ```bash
-npm install -g a2ald
-# or: download binary from https://github.com/a2al/a2al/releases and place in PATH
+./a2ald service install          # writes and loads a launchd user agent; starts immediately
 ```
 
-Then:
+The binary is copied to `~/Library/Application Support/A2AL/` — the downloaded copy can be deleted afterwards. Logs go to `~/Library/Logs/a2ald.log`.
+
+For convenient management, add the install directory to your PATH (one-time):
 
 ```bash
-a2ald service install          # writes and loads a launchd user agent; starts immediately
-a2ald service status
+echo 'export PATH="$HOME/Library/Application Support/A2AL:$PATH"' >> ~/.zprofile
+source ~/.zprofile       # or open a new terminal
 ```
 
-The Launch Agent is written to `~/Library/LaunchAgents/org.a2al.a2ald.plist` and loaded
-automatically. Logs go to `~/Library/Logs/a2ald.log`.
+Prefer a package manager? `npm install -g a2ald` installs and places `a2ald` on PATH automatically; then run `a2ald service install`.
 
-Manage:
+Manage (after PATH is set, or prefix with the full install path):
 
 ```bash
 a2ald service status

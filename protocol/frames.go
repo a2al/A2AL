@@ -22,13 +22,39 @@ const MagicServiceStream = "a2s1"
 // service_tcp; the daemon answers GET/HEAD /cas/{hash} itself.
 const MagicCAS = "a2cs"
 
-// StreamErrAccessDenied is the QUIC application error code for a data-plane
-// stream refused by ACL. Dialers that understand it map this to "access denied";
-// old peers just see a reset stream.
-const StreamErrAccessDenied uint64 = 0x41
+// Stream application error codes on Mode A data-plane streams (QUIC STREAM
+// STOP_SENDING / RESET_STREAM). The space is a 62-bit integer; these sit
+// next to each other so dialers can map them before any business bytes.
+// Old peers that do not recognise a code still see a reset stream.
+const (
+	StreamErrAccessDenied       uint64 = 0x41 // ACL / join-password refused
+	StreamErrNoInbound          uint64 = 0x42 // identity is live; no service_tcp bound
+	StreamErrInboundUnreachable uint64 = 0x43 // service_tcp bound; TCP dial failed
+)
 
 // ErrAccessDenied is returned by Mode A callers when the peer refused the data plane.
 var ErrAccessDenied = fmt.Errorf("access denied")
+
+// ErrNoInbound: QUIC and admission succeeded; this AID does not bridge HTTP/TCP.
+var ErrNoInbound = fmt.Errorf("no inbound")
+
+// ErrInboundUnreachable: this AID has a bind, but the local TCP backend did not accept.
+var ErrInboundUnreachable = fmt.Errorf("inbound unreachable")
+
+// StreamApplicationErr maps a QUIC stream application error code to a sentinel.
+// Unknown codes return nil — the caller keeps the original error.
+func StreamApplicationErr(code uint64) error {
+	switch code {
+	case StreamErrAccessDenied:
+		return ErrAccessDenied
+	case StreamErrNoInbound:
+		return ErrNoInbound
+	case StreamErrInboundUnreachable:
+		return ErrInboundUnreachable
+	default:
+		return nil
+	}
+}
 
 // EncodeSignedRecord CBOR-encodes a SignedRecord.
 func EncodeSignedRecord(sr SignedRecord) ([]byte, error) {

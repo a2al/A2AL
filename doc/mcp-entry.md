@@ -28,7 +28,7 @@ Hosts differ in where they keep this and what they wrap it in, but the body is o
 { "command": "a2ald", "args": ["--mcp-stdio"] }
 ```
 
-Use an absolute path if `a2ald` is not on the host's PATH, or `{ "command": "npx", "args": ["-y", "a2ald", "--mcp-stdio"] }` to avoid installing anything.
+Use an absolute path if `a2ald` is not on the host's PATH. If Node.js is already available, `{ "command": "npx", "args": ["-y", "a2ald", "--mcp-stdio"] }` runs it without a global npm install.
 
 Most JSON-configured hosts nest these under an object keyed by server name, commonly `mcpServers`; TOML-configured hosts commonly use a `[mcp_servers.a2al]` table. Both are conventions, not requirements. Get the exact text with:
 

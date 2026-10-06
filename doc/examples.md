@@ -11,7 +11,7 @@ No Go installation required. Download the two releases and you're ready:
 - **Demo binaries** (demo1 … demo6): [**Demo binaries (latest)**](https://github.com/a2al/a2al/releases/tag/demos-latest)
 - **`a2ald` daemon**: [Main Releases page](https://github.com/a2al/a2al/releases)
 
-Extract and place the binaries somewhere on your PATH, then follow the per-demo instructions below.
+Extract the binaries and run them from that folder, then follow the per-demo instructions below.
 
 ### Windows — unsigned binary warning
 

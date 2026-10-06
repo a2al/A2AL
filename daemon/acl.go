@@ -22,7 +22,6 @@ type accessClass string
 
 const (
 	accessService  accessClass = "service"
-	accessCAS      accessClass = "cas"
 	accessEnvelope accessClass = "envelope"
 )
 
@@ -64,6 +63,22 @@ func (d *Daemon) decideNodeAdminAccess(remote a2al.Address, secret string, src n
 		d.log.Warn("remote admin join password revoked: too many wrong passwords")
 	}
 	return ok
+}
+
+func aclDenies(p *registry.ACLPolicy, remote a2al.Address) bool {
+	if p == nil || remote == (a2al.Address{}) {
+		return false
+	}
+	for _, e := range p.Deny {
+		if e.AID == "" {
+			continue
+		}
+		aid, err := a2al.ParseAddress(e.AID)
+		if err == nil && aid == remote {
+			return true
+		}
+	}
+	return false
 }
 
 func usedJoinPassword(p *registry.ACLPolicy, remote a2al.Address, secret string) bool {
@@ -393,19 +408,40 @@ func (d *Daemon) handleACLListDelete(w http.ResponseWriter, r *http.Request, lis
 	writeJSON(w, map[string]string{"status": "deleted"})
 }
 
+func rejectStream(str quic.Stream, code uint64) {
+	c := quic.StreamErrorCode(code)
+	str.CancelWrite(c)
+	str.CancelRead(c)
+}
+
 func rejectAccessStream(str quic.Stream) {
-	code := quic.StreamErrorCode(protocol.StreamErrAccessDenied)
-	str.CancelWrite(code)
-	str.CancelRead(code)
+	rejectStream(str, protocol.StreamErrAccessDenied)
+}
+
+func streamAppErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	var se *quic.StreamError
+	if errors.As(err, &se) {
+		return protocol.StreamApplicationErr(uint64(se.ErrorCode))
+	}
+	return nil
 }
 
 func isAccessDeniedErr(err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, protocol.ErrAccessDenied) {
+	return errors.Is(err, protocol.ErrAccessDenied) || errors.Is(streamAppErr(err), protocol.ErrAccessDenied)
+}
+
+// isServiceDoorErr is a stream-level refusal that is not a dead QUIC slot:
+// ACL, no inbound, or inbound TCP down. Do not evict or redial for these.
+func isServiceDoorErr(err error) bool {
+	if isAccessDeniedErr(err) {
 		return true
 	}
-	var se *quic.StreamError
-	return errors.As(err, &se) && uint64(se.ErrorCode) == protocol.StreamErrAccessDenied
+	if errors.Is(err, protocol.ErrNoInbound) || errors.Is(err, protocol.ErrInboundUnreachable) {
+		return true
+	}
+	e := streamAppErr(err)
+	return errors.Is(e, protocol.ErrNoInbound) || errors.Is(e, protocol.ErrInboundUnreachable)
 }

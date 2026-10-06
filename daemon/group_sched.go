@@ -7,11 +7,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"errors"
 	"sort"
 	"time"
 
 	"github.com/a2al/a2al"
+	"github.com/a2al/a2al/dht"
 	"github.com/a2al/a2al/group"
+	"github.com/a2al/a2al/internal/logedge"
 )
 
 const (
@@ -27,6 +30,8 @@ const (
 	alignTickPeriod   = 1 * time.Second
 	alignGroupTimeout = 60 * time.Second
 	alignSweepPeriod  = 15 * time.Minute
+	// alignFailLogRepeat is the Hold pulse for an unchanged align/center fail.
+	alignFailLogRepeat = 2 * time.Minute
 )
 
 type alignGroupKey struct {
@@ -176,6 +181,17 @@ func (d *Daemon) notePeerSync(local, peer a2al.Address, gid [32]byte) {
 		st.lastSyncPeer = local
 	}
 	d.alignMu.Unlock()
+
+	if d.logEdge == nil {
+		return
+	}
+	r := d.logEdge.Clear(alignLogKey(peer))
+	if r.Event == logedge.Fall {
+		d.log.Debug("group peer recovered",
+			"group", hex.EncodeToString(gid[:4]),
+			"peer", hex.EncodeToString(peer[:4]),
+			"streak", r.Streak)
+	}
 }
 
 // notePeerRound records what a completed a2gp round taught us about the peer's
@@ -390,9 +406,7 @@ func (d *Daemon) alignRound(ctx context.Context, aid a2al.Address, gid [32]byte)
 		if serr != nil {
 			okAll = false
 			d.notePeerFail(aid, peer, gid)
-			d.log.Debug("group align: peer failed",
-				"group", hex.EncodeToString(gid[:4]),
-				"peer", hex.EncodeToString(peer[:4]), "err", serr)
+			d.logAlignPeerFail("group align: peer failed", peer, gid, serr)
 			if cand, next, ok := nextQueuedCandidate(order, extra, queued); ok {
 				extra = next
 				queued[cand] = struct{}{}
@@ -484,10 +498,10 @@ func (d *Daemon) alignWithPeer(ctx context.Context, local a2al.Address, gid [32]
 		d.notePeerRound(local, peer, gid, groupSyncStats{PeerHave: peerHave, LocalHave: localHave})
 		d.notePeerRound(peer, local, gid, groupSyncStats{PeerHave: localHave, LocalHave: peerHave})
 		if peerStore.MaxSeq() > prevPeer {
-			d.notifyGroupNewEntries(peer, gid, peerStore, prevPeer)
+			d.notifyGroupNewEntries(peer, local, gid, peerStore, prevPeer)
 		}
 		if localStore.MaxSeq() > prevLocal {
-			d.notifyGroupNewEntries(local, gid, localStore, prevLocal)
+			d.notifyGroupNewEntries(local, peer, gid, localStore, prevLocal)
 		}
 		_ = n
 		return got, nil
@@ -580,6 +594,85 @@ func nextQueuedCandidate(order []a2al.Address, start int, queued map[a2al.Addres
 		return cand, i + 1, true
 	}
 	return a2al.Address{}, len(order), false
+}
+
+func alignLogKey(peer a2al.Address) string {
+	return string(peer[:])
+}
+
+func alignFailSig(err error) string {
+	switch {
+	case err == nil:
+		return ""
+	case errors.Is(err, dht.ErrNoEndpoint):
+		return "no_endpoint"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timeout"
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	default:
+		return "other"
+	}
+}
+
+func (d *Daemon) logAlignPeerFail(msg string, peer a2al.Address, gid [32]byte, err error) {
+	var r logedge.Result
+	if d.logEdge == nil {
+		r = logedge.Result{Event: logedge.Rise, Streak: 1}
+	} else {
+		r = d.logEdge.Observe(alignLogKey(peer), alignFailSig(err))
+	}
+	if r.Event == logedge.Skip {
+		return
+	}
+	d.log.Debug(msg,
+		"group", hex.EncodeToString(gid[:4]),
+		"peer", hex.EncodeToString(peer[:4]),
+		"err", err,
+		"streak", r.Streak,
+		"suppressed", r.Suppressed)
+}
+
+// unknownGroupLogKey is local+gid, prefixed so it cannot collide with
+// alignLogKey (raw 21-byte peer AID).
+func unknownGroupLogKey(local a2al.Address, gid [32]byte) string {
+	var b [2 + 21 + 32]byte
+	b[0], b[1] = 'g', '/'
+	copy(b[2:23], local[:])
+	copy(b[23:], gid[:])
+	return string(b[:])
+}
+
+func (d *Daemon) logUnknownGroupSync(local a2al.Address, gid [32]byte, err error) {
+	var r logedge.Result
+	if d.logEdge == nil {
+		r = logedge.Result{Event: logedge.Rise, Streak: 1}
+	} else {
+		r = d.logEdge.Observe(unknownGroupLogKey(local, gid), "unknown_group")
+	}
+	if r.Event == logedge.Skip {
+		return
+	}
+	d.log.Debug("group sync: unknown group",
+		"id", hex.EncodeToString(gid[:4]),
+		"aid", hex.EncodeToString(local[:4]),
+		"err", err,
+		"streak", r.Streak,
+		"suppressed", r.Suppressed)
+}
+
+func (d *Daemon) clearUnknownGroupLog(local a2al.Address, gid [32]byte) {
+	if d.logEdge == nil {
+		return
+	}
+	r := d.logEdge.Clear(unknownGroupLogKey(local, gid))
+	if r.Event != logedge.Fall {
+		return
+	}
+	d.log.Debug("group sync: replica present",
+		"id", hex.EncodeToString(gid[:4]),
+		"aid", hex.EncodeToString(local[:4]),
+		"streak", r.Streak)
 }
 
 func nextAlignBackoff(cur time.Duration, received int, authored, okAll bool) time.Duration {

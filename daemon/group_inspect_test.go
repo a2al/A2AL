@@ -67,6 +67,10 @@ func TestGroupInspectDoesNotRecordHeartbeatOrMoveCursor(t *testing.T) {
 	if len(groups) != 1 {
 		t.Fatalf("groups=%v, want 1", list["groups"])
 	}
+	g0, _ := groups[0].(map[string]any)
+	if _, ok := g0["unread_count"].(float64); !ok {
+		t.Fatalf("inspect list unread_count=%v", g0["unread_count"])
+	}
 	head := getJSON(t, "/groups/"+gid)
 	if _, ok := head["unread_count"]; ok {
 		t.Fatal("inspect head must not expose unread_count")
@@ -76,6 +80,14 @@ func TestGroupInspectDoesNotRecordHeartbeatOrMoveCursor(t *testing.T) {
 	}
 	if _, ok := head["pending"]; ok {
 		t.Fatal("inspect must not hitch pending")
+	}
+	members, _ := head["members"].([]any)
+	if len(members) < 1 {
+		t.Fatal("inspect head must expose members")
+	}
+	m0, _ := members[0].(map[string]any)
+	if m0["aid"] == nil || m0["role"] == nil {
+		t.Fatalf("member %v", m0)
 	}
 	if head["title"] != "inspect-room" {
 		t.Fatalf("title=%v", head["title"])

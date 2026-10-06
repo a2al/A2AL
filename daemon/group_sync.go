@@ -42,9 +42,10 @@ func (d *Daemon) acceptGroupSync(ac *host.AgentConn, str quic.Stream) {
 
 	store, err := d.groups.Open(ac.Local, groupID)
 	if err != nil {
-		d.log.Debug("group sync: unknown group", "id", hex.EncodeToString(groupID[:4]), "err", err)
+		d.logUnknownGroupSync(ac.Local, groupID, err)
 		return
 	}
+	d.clearUnknownGroupLog(ac.Local, groupID)
 
 	// Member gate: only active/pending members may sync.
 	// Strangers and revoked members are rejected.
@@ -79,7 +80,7 @@ func (d *Daemon) acceptGroupSync(ac *host.AgentConn, str quic.Stream) {
 		d.log.Debug("group sync: inbound complete", "group", hex.EncodeToString(groupID[:4]), "new", newEntries)
 		// group.synced is a debug-level signal; do not surface to EventLog.
 		// Unread/mention events are emitted by notifyGroupNewEntries below.
-		d.notifyGroupNewEntries(ac.Local, groupID, store, prevMaxSeq)
+		d.notifyGroupNewEntries(ac.Local, ac.Remote, groupID, store, prevMaxSeq)
 	}
 }
 
@@ -183,7 +184,7 @@ func (d *Daemon) SyncGroupWith(ctx context.Context, groupID [32]byte, localAID, 
 		)
 	}
 	if total > 0 {
-		d.notifyGroupNewEntries(localAID, groupID, store, prevMaxSeq)
+		d.notifyGroupNewEntries(localAID, peerAID, groupID, store, prevMaxSeq)
 	}
 	if syncErr != nil {
 		if total > 0 {
@@ -456,7 +457,7 @@ func (s *localStream) Close() error {
 // group.unread is edge-triggered: fires only when the unread count transitions
 // from 0 to >0 (i.e. the store was fully read before this batch). Passing
 // prevMaxSeq lets us determine the pre-arrival unread count without re-reading.
-func (d *Daemon) notifyGroupNewEntries(localAID a2al.Address, groupID [32]byte, s *group.Store, prevMaxSeq uint64) {
+func (d *Daemon) notifyGroupNewEntries(localAID, peerAID a2al.Address, groupID [32]byte, s *group.Store, prevMaxSeq uint64) {
 	maxSeq := s.MaxSeq()
 	if maxSeq <= prevMaxSeq {
 		return // nothing arrived
@@ -500,5 +501,31 @@ func (d *Daemon) notifyGroupNewEntries(localAID a2al.Address, groupID [32]byte, 
 				"from":     er.Author.String(),
 			},
 		})
+	}
+
+	d.prefetchGroupFiles(localAID, peerAID, s, prevMaxSeq)
+}
+
+func (d *Daemon) prefetchGroupFiles(localAID, peerAID a2al.Address, s *group.Store, prevMaxSeq uint64) {
+	maxSeq := s.MaxSeq()
+	if maxSeq <= prevMaxSeq {
+		return
+	}
+	entries, _, _, err := s.Read(prevMaxSeq, int(maxSeq-prevMaxSeq), group.ReadFilter{})
+	if err != nil {
+		return
+	}
+	for _, er := range entries {
+		if er.Ref == ([32]byte{}) || er.Author == localAID {
+			continue
+		}
+		grant, size := parseObjectMeta(er.Body)
+		d.rememberObjectRef(localAID, er.Ref, grant, er.Author, size)
+		if size > casPrefetchMax {
+			continue
+		}
+		id := er.Ref
+		author := er.Author
+		go d.prefetchObject(localAID, id, peerAID, author)
 	}
 }

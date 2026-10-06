@@ -426,7 +426,7 @@ func (d *Daemon) execTunnelOpen(ctx context.Context, remoteAidStr string, req tu
 				cur := entry.conn()
 				qs, err := d.openTunnelStream(tctx, cur, entry.token)
 				if err != nil {
-					if isAccessDeniedErr(err) || tctx.Err() != nil {
+					if isServiceDoorErr(err) || tctx.Err() != nil {
 						d.log.Warn("tunnel: open stream failed", "id", entry.id, "err", err)
 						_ = tcpConn.Close()
 						return
@@ -442,7 +442,7 @@ func (d *Daemon) execTunnelOpen(ctx context.Context, remoteAidStr string, req tu
 					qs, err = d.openTunnelStream(tctx, next, entry.token)
 					if err != nil {
 						d.log.Warn("tunnel: open stream failed", "id", entry.id, "err", err)
-						if !isAccessDeniedErr(err) && tctx.Err() == nil {
+						if !isServiceDoorErr(err) && tctx.Err() == nil {
 							cancel()
 							_ = ln.Close()
 						}
@@ -470,7 +470,7 @@ func (d *Daemon) reuseTunnel(ctx context.Context, e *tunnelEntry, local, remote 
 		d.closeTunnel(e.id)
 		return nil, nil
 	}
-	if err := d.probeTunnelStream(ctx, e.conn(), e.token); err == nil || isAccessDeniedErr(err) {
+	if err := d.probeTunnelStream(ctx, e.conn(), e.token); err == nil || isServiceDoorErr(err) {
 		return e, nil
 	}
 	if ctx.Err() != nil {
@@ -478,7 +478,7 @@ func (d *Daemon) reuseTunnel(ctx context.Context, e *tunnelEntry, local, remote 
 	}
 	next, rerr := d.repairTunnelConn(ctx, e, local, remote, e.noRelay, nil, e.conn())
 	if rerr == nil {
-		if err := d.probeTunnelStream(ctx, next, e.token); err == nil || isAccessDeniedErr(err) {
+		if err := d.probeTunnelStream(ctx, next, e.token); err == nil || isServiceDoorErr(err) {
 			return e, nil
 		}
 	}

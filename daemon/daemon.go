@@ -26,6 +26,7 @@ import (
 	"github.com/a2al/a2al"
 	"github.com/a2al/a2al/config"
 	"github.com/a2al/a2al/host"
+	"github.com/a2al/a2al/internal/logedge"
 	"github.com/a2al/a2al/internal/nodeks"
 	"github.com/a2al/a2al/internal/peerscache"
 	"github.com/a2al/a2al/internal/registry"
@@ -116,6 +117,8 @@ type Daemon struct {
 	alignMu     sync.Mutex
 	alignGroups map[alignGroupKey]*alignGroupState
 	alignPeers  map[alignPeerKey]*alignPeerState
+	// logEdge gates repetitive group-align/center fail logs (internal/logedge).
+	logEdge *logedge.Gate
 	// centerBuckets rate-limits center-initiated pushes per local AID,
 	// across every room that AID is a center of.
 	centerBuckets map[a2al.Address]*tokenBucket
@@ -203,6 +206,9 @@ type Daemon struct {
 
 	// chatDeliverHook, if set, replaces chatDeliver (tests).
 	chatDeliverHook func(ctx context.Context, local, remote a2al.Address, kind string, body []byte, persist bool) (EnvelopeResult, error)
+
+	pathSettlersMu sync.Mutex
+	pathSettlers   []pathSettler
 
 	joinProbeMu sync.Mutex
 	joinProbes  map[alignGroupKey]*joinProbe
@@ -330,6 +336,7 @@ func New(cfg Config) (*Daemon, error) {
 		hitchInFlight:    make(map[a2al.Address]struct{}),
 		alignGroups:      make(map[alignGroupKey]*alignGroupState),
 		alignPeers:       make(map[alignPeerKey]*alignPeerState),
+		logEdge:          &logedge.Gate{Repeat: alignFailLogRepeat},
 		mboxStoreStop:    make(chan struct{}),
 		bus:              NewEventBus(log),
 		evtLog:           NewEventLog(),
@@ -357,6 +364,7 @@ func New(cfg Config) (*Daemon, error) {
 		}
 		return h.ConnectFromRecordFor(ctx, local, remote, er, opts)
 	}, log)
+	d.connPool.setOnLive(d.notePathLive)
 	d.tunnels = newTunnelRegistry()
 	if tlsCfg, err := loadOrCreateTunnelTLS(cfg.DataDir); err != nil {
 		log.Warn("tunnel tls: cert init failed, tunnel will use plain HTTP", "err", err)
@@ -585,8 +593,9 @@ func (d *Daemon) Run(ctx context.Context, mcpStdio bool) error {
 		Addr:              d.cfg.APIAddr,
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       60 * time.Second,
-		WriteTimeout:      120 * time.Second,
+		// ReadTimeout/WriteTimeout would also bound SSE and object ingest.
+		// Idle keep-alive is IdleTimeout; header slowloris is ReadHeaderTimeout.
+		IdleTimeout: 120 * time.Second,
 	}
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

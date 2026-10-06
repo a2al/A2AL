@@ -44,19 +44,22 @@ func (c *Client) authHeader(req *http.Request) {
 // DoRequest performs HTTP; if out != nil, decodes JSON on 2xx.
 func (c *Client) DoRequest(method, path string, body any, out any) (status int, bodyText string, err error) {
 	var rdr io.Reader
+	jsonBody := method != http.MethodGet && method != http.MethodHead && method != http.MethodOptions
 	if body != nil {
 		b, err := json.Marshal(body)
 		if err != nil {
 			return 0, "", err
 		}
 		rdr = bytes.NewReader(b)
+	} else if jsonBody {
+		rdr = bytes.NewReader([]byte("{}"))
 	}
 	req, err := http.NewRequest(method, c.Base+path, rdr)
 	if err != nil {
 		return 0, "", err
 	}
 	c.authHeader(req)
-	if body != nil {
+	if jsonBody {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	resp, err := c.HTTP.Do(req)

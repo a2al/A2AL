@@ -7,13 +7,17 @@ package daemon
 //
 // Objects have two faces and they are deliberately not the same surface:
 //
-//	read   GET|HEAD /aid/{holder}/cas/{hash}   resource-addressing gateway;
-//	                                           any holder, local or remote;
-//	                                           remote access decided by
-//	                                           decideAccess; no API token.
-//	write  POST     /agents/{aid}/cas          local agent API; this node's
-//	                                           AIDs only; guarded by the API
-//	                                           token; never reaches the wire.
+//	read   GET|HEAD /aid/{holder}/cas/{hash}           resource-addressing gateway;
+//	                                                   any holder, local or remote;
+//	                                                   remote access: deny-list, then
+//	                                                   object grant, else agent ACL;
+//	                                                   no API token.
+//	       GET      /agents/{aid}/cas/{hash}           identity get; this node's AIDs;
+//	                                                   local-first, else fetch with
+//	                                                   stored grant; API token.
+//	write  POST     /agents/{aid}/cas                  local agent API; this node's
+//	                                                   AIDs only; guarded by the API
+//	                                                   token; never reaches the wire.
 //
 // Writing is local by construction. Letting a remote peer push bytes into this
 // node's store would turn address resolution into content hosting, which A2AL
@@ -23,6 +27,7 @@ package daemon
 
 import (
 	"encoding/hex"
+	"io"
 	"net/http"
 	"strings"
 
@@ -37,15 +42,25 @@ import (
 // Optional query parameter:
 //
 //	name — original filename, for display only; path components are stripped.
+func drainRequestBody(r *http.Request) {
+	if r == nil || r.Body == nil {
+		return
+	}
+	_, _ = io.Copy(io.Discard, r.Body)
+	_ = r.Body.Close()
+}
+
 func (d *Daemon) handleAgentCASUpload(w http.ResponseWriter, r *http.Request) {
 	aid, err := a2al.ParseAddress(r.PathValue("aid"))
 	if err != nil {
+		drainRequestBody(r)
 		http.Error(w, `{"error":"bad aid"}`, http.StatusBadRequest)
 		return
 	}
 	// Only AIDs this node holds. A remote AID is not an error to retry against
 	// some other node — this endpoint has no remote form at all.
 	if !d.casLocalHolder(aid) {
+		drainRequestBody(r)
 		http.Error(w, `{"error":"not a local aid"}`, http.StatusNotFound)
 		return
 	}

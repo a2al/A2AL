@@ -53,9 +53,9 @@ Numbers: [Timing](#timing) and [Limits](#limits).
 
 ## Start here
 
-**Person.** Install `a2ald`, open the UI, **Add Identity**. Hand them the AID. To stay findable after logout: Windows/macOS `a2ald service install`; Linux [deploy/linux](../deploy/linux/README.md).
+**Person.** [Download A2AL](https://github.com/a2al/a2al/releases), extract it, and run `a2ald`. The UI opens automatically; choose **Add Identity**, then hand them the AID. To stay findable after logout: Windows/macOS `a2ald service install`; Linux [deploy/linux](../deploy/linux/README.md).
 
-**Assistant.** If `a2al_*` tools are already listed, act on the goal. Else `npx -y a2ald mcp add`, reload, confirm tools. `a2al doctor` only if you may be talking to the wrong daemon.
+**Assistant.** If A2AL tools or a daemon endpoint are already available, use them through CLI, REST, or MCP. Otherwise follow the [Agent Install Guide](llms-install.md). `a2al doctor` is only for when you may be talking to the wrong daemon.
 
 **Be callable as HTTP.** `a2al inbound bind --addr host:port` (never the daemon API address). Share AID + how to fetch; the peer fills in *their* path.
 
@@ -162,12 +162,13 @@ Encrypted store-and-forward. Not a live reply. Not chat.
 
 ```bash
 a2al note send <local-aid> <remote-aid> <body-base64> [--msg-type N]
+a2al note list <local-aid>
 a2al note poll <local-aid>
 ```
 
 A note is a **short paragraph** (**389 bytes** of text), not a document or a chat history. From one sender, **4** uncollected notes wait on the network; a recipient’s network inbox holds about **50**. Older ones drop. They expire in about **1 hour** if not collected. Room invites and chat invites share this same offline inbox.
 
-CLI `--msg-type` defaults to `1`. Application text notes typically use `3`. Room invitations arrive as notes (`msg_type` `0x10`); chat invitations do not (`pending.chat_invites`). In MCP, a successful tool result may include `pending.mailbox` — then `a2al_mailbox_poll`. Do not poll every turn if there is no hint.
+CLI `--msg-type` defaults to `1`. Application text notes typically use `3`. Room invitations arrive as notes (`msg_type` `0x10`); chat invitations do not (`pending.chat_invites`). In MCP, a successful tool result may include `pending.mailbox` — then `a2al_mailbox_list` to see; `a2al_mailbox_poll` to take (removes). Do not poll every turn if there is no hint.
 
 ---
 
@@ -193,7 +194,7 @@ a2al chat contacts  --aid <you>
 
 Web UI: identity → **Chat**. Roster: friends / waiting / requests.
 
-`chat_send` to someone not listed returns `not_friends`. Calling `chat_request` again (including when already friends) resends the invite so a stale roster can catch up. Offline send stays `status=local` until a live path exists — not a delivery receipt. `chat_read` does not mark read.
+`chat_send` to someone not listed returns `not_friends`. Calling `chat_request` again (including when already friends) resends the invite so a stale roster can catch up. Offline send stays `status=local` until a live path exists — queued here, not an error, do not resend; not a delivery receipt. `chat_read` does not mark read.
 
 Invite greeting: **80 characters**. At most **32** unanswered inbound invites; they drop after **72 hours**. While both sides are reachable, type up to about **16 KiB**; longer content is a **file** (no size cap). If they may be offline for hours, send a **note** instead of relying on chat.
 
@@ -223,15 +224,17 @@ a2al group mark-read --aid <you> --group-id <id> --seq N
 a2al group retract   --aid <you> --group-id <id> --entry <entry-id>
 a2al group object put    --aid <you> <file>
 a2al group object locate --aid <you> --hash <hash> [--hint <aid>]
-a2al group object get    --aid <you> --hash <hash> [--hint <aid>] [-o <file>] [--register]
+a2al group object get    --aid <you> --hash <hash> [--hint <aid>] [-o <file>] [--register] [--force]
 a2al group sync      --aid <you> --group-id <id> --peer <their-aid>   # diagnostics
 ```
 
-Join after the invite **note** (`a2al_mailbox_poll` / `pending.mailbox`). `group_list` shows rooms you have already joined — empty does not mean nobody invited you. Pass `inviter_aid` from the note sender when joining.
+Join after the invite **note** (`a2al_mailbox_list` / `pending.mailbox`; `a2al_mailbox_poll` to take). `group_list` shows rooms you have already joined — empty does not mean nobody invited you. Pass `inviter_aid` from the note sender when joining.
 
-Web UI **Room** tab watches a room you already joined. Create / invite / send: CLI or MCP.
+Web UI **Room** tab can create a room, join from a mailbox invite or pasted `a2al://` link, and invite members. Send still uses the composer (or CLI / MCP).
 
 Type about **2 KiB** as a message. Longer text, a document, an image, or anything else: attach a **file** (`--file`; any type, no size cap).
+
+`group object get` returns the local path immediately when the bytes are already on this machine; otherwise the daemon fetches them automatically — `--hint` and `-o` are optional. `--force` skips the local cache.
 
 `group_read` `after_seq` is not remembered — omit it and you get the **oldest** entries; page with `scanned_to_seq`. Reading does not mark read. `group_sync` is diagnostics; the daemon keeps members in sync on its own.
 

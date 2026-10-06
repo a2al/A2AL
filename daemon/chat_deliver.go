@@ -212,6 +212,18 @@ func (d *Daemon) chatWake(ctx context.Context, local, remote a2al.Address, sendP
 }
 
 func (d *Daemon) chatFlush(ctx context.Context, local, remote a2al.Address) {
+	d.flushChatUnsent(ctx, local, remote, false)
+}
+
+// settleChatUnsent is the pathLive settler: only the live pooled conn, never acquire.
+func (d *Daemon) settleChatUnsent(ctx context.Context, local, remote a2al.Address) {
+	if d.connPool == nil || d.connPool.getLive(local, remote) == nil {
+		return
+	}
+	d.flushChatUnsent(ctx, local, remote, true)
+}
+
+func (d *Daemon) flushChatUnsent(ctx context.Context, local, remote a2al.Address, liveOnly bool) {
 	st, err := d.chatStore(local)
 	if err != nil {
 		return
@@ -225,13 +237,32 @@ func (d *Daemon) chatFlush(ctx context.Context, local, remote a2al.Address) {
 		if err != nil {
 			continue
 		}
-		res, err := d.chatDeliver(ctx, local, remote, chat.KindMsg, body, false)
+		var res EnvelopeResult
+		if liveOnly {
+			res, err = d.sendChatUnsentLive(ctx, local, remote, body)
+		} else {
+			res, err = d.chatDeliver(ctx, local, remote, chat.KindMsg, body, false)
+		}
 		if err == nil && res.Code == protocol.EnvelopeOK {
 			_ = st.MarkSent(remote, rec.Seq)
 			continue
 		}
 		return
 	}
+}
+
+func (d *Daemon) sendChatUnsentLive(ctx context.Context, local, remote a2al.Address, body []byte) (EnvelopeResult, error) {
+	if d.chatDeliverHook != nil {
+		return d.chatDeliverHook(ctx, local, remote, chat.KindMsg, body, false)
+	}
+	if d.connPool == nil {
+		return EnvelopeResult{}, errEnvelopeUnavailable
+	}
+	conn := d.connPool.getLive(local, remote)
+	if conn == nil {
+		return EnvelopeResult{}, errEnvelopeUnavailable
+	}
+	return sendEnvelopeOn(ctx, conn, chat.KindMsg, body)
 }
 
 func (d *Daemon) chatDing(ctx context.Context, local, remote a2al.Address) {

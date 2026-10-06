@@ -57,4 +57,12 @@ func TestWire_msgSizeAndAuthor(t *testing.T) {
 	if _, err := RecFromMsg(Msg{Seq: 1, TS: 1, K: MsgText, Author: addr(4).String()}, peer); err == nil {
 		t.Fatal("author mismatch")
 	}
+	file := Msg{Seq: 2, TS: 2, K: MsgFile, Ref: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Grant: "tok", Name: "n", Size: 3}
+	rec, err := RecFromMsg(file, peer)
+	if err != nil || rec.Grant != "tok" || rec.Kind != KindFile {
+		t.Fatalf("%+v err=%v", rec, err)
+	}
+	if MsgFromRec(rec).Grant != "tok" {
+		t.Fatal("grant roundtrip")
+	}
 }

@@ -9,18 +9,15 @@ Data directory: `%APPDATA%\a2al\`
 
 ## Path A — Built-in service install (recommended)
 
-Install `a2ald` (choose one):
+Download `a2al_<version>_windows_amd64.zip` from [Releases](https://github.com/a2al/a2al/releases) and extract it.
 
 ```powershell
-npm install -g a2ald
-# or: download a2ald_windows_amd64.zip from Releases, extract, add to PATH
+.\a2ald.exe service install
 ```
 
-Then:
+The installer copies `a2ald.exe` to `%ProgramFiles%\A2AL\` and adds it to the system PATH — open a new terminal after install and use `a2ald` directly. The downloaded copy can be deleted.
 
-```powershell
-a2ald service install
-```
+Already using Node.js? `npm install -g a2ald` is an alternative that also places `a2ald` on PATH; then run `a2ald service install`.
 
 If this terminal already has administrator rights, that installs a Windows Service
 (survives reboot, no login required) and starts it.
@@ -35,10 +32,12 @@ If not, and stdin is a terminal, a menu appears:
 Skip the menu:
 
 ```powershell
-a2ald service install -user    # Task Scheduler; stops at logout
+.\a2ald.exe service install -user    # Task Scheduler; stops at logout
 ```
 
-Manage:
+(`-user` installs to `%LocalAppData%\A2AL\` and adds it to the user PATH.)
+
+Manage (in a new terminal, or after PATH has refreshed):
 
 ```powershell
 a2ald service status

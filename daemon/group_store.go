@@ -172,6 +172,8 @@ func (gm *GroupManager) Join(aid a2al.Address, groupID [32]byte, creatorAID a2al
 
 // List returns the metadata of all locally stored Groups for aid.
 func (gm *GroupManager) List(aid a2al.Address) ([]group.Meta, error) {
+	gm.mu.RLock()
+	defer gm.mu.RUnlock()
 	aidGroupsDir := filepath.Join(gm.baseDir, hex.EncodeToString(aid[:]), "groups")
 	dirs, err := os.ReadDir(aidGroupsDir)
 	if err != nil {
@@ -194,6 +196,18 @@ func (gm *GroupManager) List(aid a2al.Address) ([]group.Meta, error) {
 		metas = append(metas, m)
 	}
 	return metas, nil
+}
+
+// Drop closes the local replica and deletes it from disk.
+func (gm *GroupManager) Drop(aid a2al.Address, groupID [32]byte) error {
+	key := storeKey{AID: aid, GroupID: groupID}
+	gm.mu.Lock()
+	defer gm.mu.Unlock()
+	if s := gm.open[key]; s != nil {
+		delete(gm.open, key)
+		_ = s.Close()
+	}
+	return os.RemoveAll(gm.storeDir(aid, groupID))
 }
 
 // --- legacy migration ---

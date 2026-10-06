@@ -51,7 +51,7 @@ MCP: HTTP at this daemon's api_addr (default http://127.0.0.1:2121/mcp/). Stdio 
 
 If they are not reachable now, leave a note (a2al_mailbox_send) — they will have it when they are back. That is not an immediate answer.
 Incoming notes announce themselves — do not go looking when there is no hint:
-  - A successful tool result may include envelope field "pending": {"<aid>": {"mailbox": N, "chat_invites": N, "chat_unread": N, ...}}. mailbox → a2al_mailbox_poll. chat_invites → chat_contacts then chat_accept. chat_unread → chat_read then chat_mark_read. Other keys belong to the app that registered them.
+  - A successful tool result may include envelope field "pending": {"<aid>": {"mailbox": N, "chat_invites": N, "chat_unread": N, ...}}. mailbox → a2al_mailbox_list to see; a2al_mailbox_poll to take (removes). chat_invites → chat_contacts then chat_accept. chat_unread → chat_read then chat_mark_read. Other keys belong to the app that registered them.
   - No hint means nothing is waiting.
   - Group invitations still arrive as ordinary mailbox notes (pending.mailbox). Chat invitations do not: they are pending.chat_invites, never mailbox_poll.
 
@@ -153,8 +153,12 @@ func buildMCPServer(d *Daemon) *mcp.Server {
 		Description: "Leave a note for an agent by AID when they are not reachable now. They will have it when they are back. This is not an immediate answer.",
 	}, d.mcpMailboxSend)
 	mcp.AddTool(s, &mcp.Tool{
+		Name:        "a2al_mailbox_list",
+		Description: "List notes waiting for a local registered agent without taking them. Same messages[] as a2al_mailbox_poll. pending.mailbox is a hint to list; poll only when you will act.",
+	}, d.mcpMailboxList)
+	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_mailbox_poll",
-		Description: "Collect notes waiting for a local registered agent. Call this when a successful result told you a note is waiting; do not poll when there is no hint.",
+		Description: "Take notes waiting for a local registered agent. Each returned note is removed. Call this when you will act on a waiting note; use a2al_mailbox_list to look. Do not poll when there is no hint.",
 	}, d.mcpMailboxPoll)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "a2al_service_register",
@@ -187,9 +191,9 @@ func buildMCPServer(d *Daemon) *mcp.Server {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "a2al_events_poll",
-		Description: `Return queued daemon events for a local agent since a given sequence number. The types are exactly: mailbox.received, group.appended (your own write), group.unread (edge-triggered, 0 to positive only), group.mentioned (one per entry naming you), chat.invites, chat.unread (edge-triggered per peer, 0 to positive), chat.received.
-Use last_seq from each response as after_seq on the next call. If truncated is true the cursor is too old — reset after_seq to 0 and do a full resync. For real-time delivery use GET /agents/{aid}/events (omit last_event_id for live frames; pass last_event_id=N to replay from that id). On connect that stream may first send event: pending with no id — same {"<aid>":{"mailbox":N,...}} shape as a tool result; it is local inventory, not a log event. mailbox → a2al_mailbox_poll; other keys belong to the app that registered them.
-Events are droppable doorbells, not the record: an event you missed is not recoverable from here, so treat the Group log, the chat log, and the mailbox as the source of truth and use group_list / chat_contacts / a2al_mailbox_poll to find out what you actually have.`,
+		Description: `Return queued daemon events for a local agent since a given sequence number. The types are exactly: mailbox.received, group.appended (your own write), group.unread (edge-triggered, 0 to positive only), group.mentioned (one per entry naming you), chat.invites (count plus peers), chat.unread (edge-triggered per peer, 0 to positive), chat.received.
+Use last_seq from each response as after_seq on the next call. If truncated is true the cursor is too old — reset after_seq to 0 and do a full resync. For real-time delivery use GET /agents/{aid}/events (omit last_event_id for live frames; pass last_event_id=N to replay from that id). On connect that stream may first send event: pending with no id — same {"<aid>":{"mailbox":N,...}} shape as a tool result; it is local inventory, not a log event. mailbox → a2al_mailbox_list; a2al_mailbox_poll to take. Other keys belong to the app that registered them.
+Events are droppable doorbells, not the record: an event you missed is not recoverable from here, so treat the Group log, the chat log, and the mailbox as the source of truth and use group_list / chat_contacts / a2al_mailbox_list to find out what you actually have.`,
 	}, d.mcpEventsPoll)
 
 	d.registerGroupMCPTools(s)
@@ -506,6 +510,19 @@ func (d *Daemon) mcpMailboxSend(ctx context.Context, _ *mcp.ServerSession, param
 	return &mcp.CallToolResultFor[map[string]any]{StructuredContent: map[string]any{"ok": true, "message_id": msgID}}, nil
 }
 
+func (d *Daemon) mcpMailboxList(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[mcpAIDArgs]) (*mcp.CallToolResultFor[map[string]any], error) {
+	if _, err := d.resolveAgentAID(params.Arguments.AID); err != nil {
+		return nil, err
+	}
+	pctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	msgs, err := d.execMailboxList(pctx, params.Arguments.AID)
+	if err != nil {
+		return nil, err
+	}
+	return &mcp.CallToolResultFor[map[string]any]{StructuredContent: map[string]any{"messages": msgs}}, nil
+}
+
 func (d *Daemon) mcpMailboxPoll(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[mcpAIDArgs]) (*mcp.CallToolResultFor[map[string]any], error) {
 	pctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
@@ -620,6 +637,10 @@ func (d *Daemon) mcpFetch(ctx context.Context, _ *mcp.ServerSession, params *mcp
 			return nil, errors.New("connect failed: remote agent is not reachable now — leave a note with a2al_mailbox_send if you can wait")
 		case isAccessDeniedErr(err):
 			return nil, protocol.ErrAccessDenied
+		case errors.Is(err, protocol.ErrNoInbound):
+			return nil, errors.New("no inbound: that peer is not serving HTTP — use chat, note, or a room; a2al_fetch needs inbound bind")
+		case errors.Is(err, protocol.ErrInboundUnreachable):
+			return nil, errors.New("inbound unreachable: that peer has a bind, but its local HTTP did not accept")
 		default:
 			return nil, err
 		}

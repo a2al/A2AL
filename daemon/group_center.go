@@ -299,9 +299,7 @@ func (d *Daemon) centerPushTo(ctx context.Context, aid a2al.Address, gid [32]byt
 	d.clearPeerInflight(aid, peer, gid)
 	if err != nil {
 		d.notePeerFail(aid, peer, gid)
-		d.log.Debug("group center: push failed",
-			"group", hex.EncodeToString(gid[:4]),
-			"peer", hex.EncodeToString(peer[:4]), "err", err)
+		d.logAlignPeerFail("group center: push failed", peer, gid, err)
 		return
 	}
 	d.notePeerSync(aid, peer, gid)

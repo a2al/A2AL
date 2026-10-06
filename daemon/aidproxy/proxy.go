@@ -169,11 +169,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	dialCancel()
 	if dialErr != nil {
 		h.log.Debug("aidproxy: dial failed", "remote", remote.String(), "err", dialErr)
-		if isAccessDenied(dialErr) {
+		switch {
+		case isAccessDenied(dialErr):
 			http.Error(w, "access denied", http.StatusForbidden)
-			return
+		case errors.Is(dialErr, protocol.ErrNoInbound):
+			http.Error(w, "no inbound", http.StatusServiceUnavailable)
+		case errors.Is(dialErr, protocol.ErrInboundUnreachable):
+			http.Error(w, "inbound unreachable", http.StatusBadGateway)
+		default:
+			http.Error(w, "connect failed", http.StatusBadGateway)
 		}
-		http.Error(w, "connect failed", http.StatusBadGateway)
 		return
 	}
 	defer stream.Close()
@@ -218,6 +223,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "access denied", http.StatusForbidden)
 			return
 		}
+		if errors.Is(err, protocol.ErrNoInbound) || isStreamCode(err, protocol.StreamErrNoInbound) {
+			http.Error(w, "no inbound", http.StatusServiceUnavailable)
+			return
+		}
+		if errors.Is(err, protocol.ErrInboundUnreachable) || isStreamCode(err, protocol.StreamErrInboundUnreachable) {
+			http.Error(w, "inbound unreachable", http.StatusBadGateway)
+			return
+		}
 		http.Error(w, "upstream read failed", http.StatusBadGateway)
 		return
 	}
@@ -248,6 +261,10 @@ func isAccessDenied(err error) bool {
 	if errors.Is(err, protocol.ErrAccessDenied) {
 		return true
 	}
+	return isStreamCode(err, protocol.StreamErrAccessDenied)
+}
+
+func isStreamCode(err error, code uint64) bool {
 	var se *quic.StreamError
-	return errors.As(err, &se) && uint64(se.ErrorCode) == protocol.StreamErrAccessDenied
+	return errors.As(err, &se) && uint64(se.ErrorCode) == code
 }

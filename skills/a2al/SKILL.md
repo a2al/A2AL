@@ -16,10 +16,13 @@ When others should reach this agent: `a2al_agent_publish` so they can resolve yo
 
 If they are not:
 
-1. `npx -y a2ald mcp add` (or `a2ald mcp add`) — starts a daemon if none is running and registers this host.
-2. Reload the host. Confirm `a2al_*` tools appear. Then act on the goal.
+1. If a daemon endpoint is already available, use it through REST or the `a2al` CLI, or point this host at its `/mcp/` URL. Reuse it unless isolation is needed; another daemon is supported.
+2. If no daemon is available, download the prebuilt `a2ald` + `a2al` binaries from https://github.com/a2al/a2al/releases and run `a2ald --no-open-browser`.
+3. For a local MCP setup, run `a2ald mcp add`, reload the host, and confirm `a2al_*` tools appear. Then act on the goal.
 
-If add does not know this host, it wrote nothing: run `npx -y a2ald mcp print` and place that entry yourself. What must hold is the endpoint, the transport, and a running daemon: https://github.com/a2al/a2al/blob/main/doc/mcp-entry.md
+No MCP host? Use `a2al --api http://127.0.0.1:2121 status --json` or REST; success includes `node_aid`, `version`, and `commit`.
+
+If add does not know this host, it wrote nothing: run `a2ald mcp print` and place that entry yourself. What must hold is the endpoint, the transport, and a running daemon: https://github.com/a2al/a2al/blob/main/doc/mcp-entry.md
 
 `a2al doctor` is optional — use it only if you may be talking to the wrong daemon.
 

@@ -20,6 +20,7 @@ import (
 
 	"github.com/a2al/a2al"
 	"github.com/a2al/a2al/identity"
+	"github.com/a2al/a2al/internal/version"
 )
 
 type identityChoice struct {
@@ -82,7 +83,11 @@ func cmdStatus(c *Client, g globalOpts, args []string) {
 		fatal(err)
 	}
 	if g.JSON {
-		out := map[string]any{"status": st, "agents": agWrap.Agents}
+		out := map[string]any{
+			"status": st,
+			"agents": agWrap.Agents,
+			"cli":    map[string]any{"version": version.Version, "commit": version.Commit},
+		}
 		printJSON(true, out)
 		return
 	}
@@ -107,6 +112,7 @@ func cmdStatus(c *Client, g globalOpts, args []string) {
 	} else {
 		fmt.Printf("Node:    %s  (%s)\n", node, online)
 	}
+	fmt.Printf("Build:   %s\n", formatBuildLine(st))
 	if dd, _ := st["data_dir"].(string); dd != "" {
 		fmt.Printf("Data:    %s\n", dd)
 	}

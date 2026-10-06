@@ -134,8 +134,10 @@ func admitOpened(ctx context.Context, str quic.Stream, write func(io.Writer, str
 
 func admitErr(err error) error {
 	var se *quic.StreamError
-	if errors.As(err, &se) && uint64(se.ErrorCode) == protocol.StreamErrAccessDenied {
-		return protocol.ErrAccessDenied
+	if errors.As(err, &se) {
+		if e := protocol.StreamApplicationErr(uint64(se.ErrorCode)); e != nil {
+			return e
+		}
 	}
 	return err
 }

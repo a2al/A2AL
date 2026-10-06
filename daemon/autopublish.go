@@ -354,21 +354,24 @@ func (d *Daemon) tryRepublishAgent(ctx context.Context, aid a2al.Address) {
 	}
 
 	d.regMu.Lock()
-	defer d.regMu.Unlock()
 	e2 := d.reg.Get(aid)
 	if e2 == nil {
+		d.regMu.Unlock()
 		return
 	}
 	e2.Seq = nextSeq
 	if err := d.reg.Put(e2); err != nil {
+		d.regMu.Unlock()
 		d.log.Warn("agent republish persist", "err", err)
 		return
 	}
 	d.recordAgentPublishTime(aid)
 	d.log.Debug("agent endpoint republished", "aid", aid.String(), "seq", nextSeq)
+	snap := *e2
+	d.regMu.Unlock()
 
-	// Also re-publish all registered services (topic records) for this agent.
-	d.republishAgentServices(ctx, e2)
+	// DHT IO must not hold regMu — same split as execAgentPublish.
+	d.republishAgentServices(ctx, &snap)
 }
 
 func (d *Daemon) republishAgentServices(ctx context.Context, e *registry.Entry) {

@@ -101,6 +101,10 @@ type modeAConnPool struct {
 	flight singleflight.Group
 	dial   dialFunc
 	log    *slog.Logger
+	// onLive is invoked after a connection is newly written into the pool
+	// (including repair replacements). Cache hits do not call it. The
+	// callback must not run under p.mu.
+	onLive func(local, remote a2al.Address)
 }
 
 func newModeAConnPool(dial dialFunc, log *slog.Logger) *modeAConnPool {
@@ -109,6 +113,15 @@ func newModeAConnPool(dial dialFunc, log *slog.Logger) *modeAConnPool {
 		dial: dial,
 		log:  log,
 	}
+}
+
+func (p *modeAConnPool) setOnLive(fn func(local, remote a2al.Address)) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	p.onLive = fn
+	p.mu.Unlock()
 }
 
 // acquire returns a live QUIC connection for (local → remote).
@@ -189,8 +202,6 @@ func (p *modeAConnPool) startDial(ctx context.Context, key connPoolKey, local, r
 		conn, isRelayed, dialErr := p.dial(dialCtx, local, remote, er, noRelay, user)
 
 		p.mu.Lock()
-		defer p.mu.Unlock()
-
 		if dialErr != nil {
 			// Only record backoff for genuine network failures on auto paths.
 			// Excluded from the backoff penalty:
@@ -213,12 +224,18 @@ func (p *modeAConnPool) startDial(ctx context.Context, key connPoolKey, local, r
 				p.log.Debug("connpool: dial failed", "key", key.String(),
 					"fail_count", ent.failCount, "backoff", connPoolBackoff(ent.failCount), "err", dialErr)
 			}
+			p.mu.Unlock()
 			return nil, dialErr
 		}
 
 		p.evictIfFull()
 		p.pool[key] = &connPoolEntry{conn: conn, isRelayed: isRelayed, lastUsed: time.Now()}
+		onLive := p.onLive
 		p.log.Debug("connpool: connection cached", "key", key.String(), "is_relayed", isRelayed)
+		p.mu.Unlock()
+		if onLive != nil {
+			onLive(local, remote)
+		}
 		return dialResult{conn, isRelayed}, nil
 	})
 }

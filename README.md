@@ -5,35 +5,31 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/a2al/a2al.svg)](https://pkg.go.dev/github.com/a2al/a2al)
 [![License: MPL 2.0](https://img.shields.io/badge/License-MPL_2.0-brightgreen.svg)](LICENSE)
 
+*Agentic networking protocol for multi-agent AI — reach any agent, across NAT, machines, and sleep cycles, with no relay server and no cloud dependency. Open source, MPL-2.0.*
+
 **Official sites:** [a2al.org](https://a2al.org) · [Tangled Network](https://tanglednet.org) · [tngld.net](http://tngld.net)
 
-Give a **person, agent, device, or service** a permanent address — then find others and talk to them directly. No domain. No cloud account. No central registry.
+**Always reachable.** Give an **AI agent, app, device, or person** a reachable address — then find others and connect directly, across NAT and machine boundaries. No domain. No cloud account. No central registry.
 
-That address is an **AID**: it comes from a key you hold. Nobody issues it, revokes it, or reassigns it. You hand it over once. They still reach you when the laptop changes Wi-Fi, the box moves, or the machine was asleep when they first tried. After connect, application bytes go peer-to-peer; A2AL is not in the data path.
+**Your key, your address.** That address is an **AID**: it comes from a key you hold. Nobody issues it, revokes it, or reassigns it. You hand it over once. They still reach you when the laptop changes Wi-Fi, the box moves, or the machine was asleep when they first tried. After connect, application bytes go peer-to-peer; A2AL is not in the data path.
 
-MCP, A2A, and the rest already know how agents *talk* once they have a URL. They do not say how a laptop, a home server, and a worker in a vendor-less world share one address that survives the next NAT, the next cloud, the next company. That layer is missing. A2AL is that layer, and it has to live in the open — an address you own is only real if no one vendor has to stay up for you to exist.
+**The missing layer.** MCP, A2A, ANP, and the rest already know how **AI agents** *talk* once they have a URL. None of them say how a laptop, a home server, and a worker in a vendor-less world share one address that survives the next NAT, the next cloud, the next company — across agentic workflows and multi-agent systems alike. That layer is missing. A2AL is that layer, and it has to live in the open — an address you own is only real if no one vendor has to stay up for you to exist.
 
-`a2ald` is the local runtime: identities, connections, Web UI, REST, and an MCP server. It joins the public Tangled Network by default. Prefer a network only your machines belong to? `--bootstrap` your own seeds; the same addressing, notes, and rooms.
+**One daemon, full stack.** `a2ald` runs on your machine, open source: agent identities, direct cross-machine connections, Web UI, REST API, and a built-in MCP server. It joins the public Tangled Network by default. Prefer a network only your machines belong to? `--bootstrap` your own seeds; the same addressing, notes, and rooms.
 
-![Create an AID in the Web UI, then call agents by address](https://a2al.org/img/a2ald/quickstart-2.gif)
+![A2AL agentic networking: create an AI agent identity (AID) in the Web UI, then call other agents by address across machines](https://a2al.org/img/a2ald/quickstart-2.gif)
 
 ## Start
 
-**Person** — run the daemon, open the UI:
+**Person** — [download A2AL](https://github.com/a2al/a2al/releases) for your system, extract it, and run `a2ald` — a single binary, ~17 MB, no installer or runtime needed. The Web UI opens automatically. Create an identity; that is enough to begin.
 
-```bash
-npx -y a2ald
-```
+*(Windows: SmartScreen shows "More info → Run anyway" on first launch — this is expected for an unsigned open-source binary.)*
 
-→ [http://localhost:2121](http://localhost:2121). Create an identity. Keep `a2ald` running across logins if they must still find you after you close the terminal (Windows/macOS: `a2ald service install`; Linux: [deploy/linux](deploy/linux/README.md)).
+To stay reachable after closing the terminal: Windows/macOS `a2ald service install`; Linux [deploy/linux](deploy/linux/README.md).
 
-**Agent (MCP)** — one command:
+**Agent** — if a daemon endpoint is already available, connect through the `a2al` CLI, REST API, or MCP. Otherwise [download the binaries from Releases](https://github.com/a2al/a2al/releases) and run `a2ald --no-open-browser`. Full guide: [Agent Install](doc/llms-install.md).
 
-```bash
-npx -y a2ald mcp add
-```
-
-Known hosts: Claude Code, VS Code, Cursor, Claude Desktop, Windsurf, OpenClaw, Hermes, DeepSeek Harness. If add does not know this host, it writes nothing — `npx -y a2ald mcp print` and paste the entry yourself. Then reload and act on the goal. Do not wait for a peer count.
+Using an MCP host? `a2ald mcp add` wires it in; `a2ald mcp print` gives the entry to place by hand. Details: [MCP Setup](doc/mcp-setup.md).
 
 **Already have their AID** — any HTTP client:
 
@@ -43,7 +39,7 @@ http://127.0.0.1:2121/aid/{AID}/…
 
 There is no warm-up gate. The daemon answers locally as soon as it is up. Call others right away.
 
-Install for real: `npm install -g a2ald`, [GitHub Releases](https://github.com/a2al/a2al/releases) (`a2ald` + `a2al`), or `pip install a2al` (Python sidecar). Full path: [Quick Start](doc/quickstart.md).
+Other installation options: `npm install -g a2ald` (Node.js daemon/MCP server) · [`.deb` / `.rpm`](deploy/linux/README.md) (Linux service) · `pip install a2al` (Python SDK with sidecar). Full path: [Quick Start](doc/quickstart.md).
 
 ## When it's worth it
 
@@ -70,7 +66,7 @@ HTTP (recommended — REST and the Web UI come with it):
 }
 ```
 
-Hosts that only spawn a process: `"command": "a2ald", "args": ["--mcp-stdio"]` (proxies to a running daemon). Setup: [MCP Setup](doc/mcp-setup.md). Agent entry: [llms.txt](https://a2al.org/llms.txt).
+`a2ald mcp add` auto-configures **Claude Code, VS Code, Cursor, Claude Desktop, Windsurf, OpenClaw, Hermes, and DeepSeek Harness**. Hosts that only spawn a process: `"command": "a2ald", "args": ["--mcp-stdio"]` (proxies to a running daemon). Setup: [MCP Setup](doc/mcp-setup.md). Agent entry: [llms.txt](https://a2al.org/llms.txt).
 
 ## Everyday CLI
 
@@ -83,7 +79,7 @@ a2al inbound bind --addr 127.0.0.1:8080
 
 `a2al help` for the rest. Numbers (timing, note size, rooms): [User Guide](doc/user-guide.md).
 
-![Agents collaborating over AIDs](https://a2al.org/img/a2ald/collab-1.gif)
+![Multi-agent collaboration over A2AL: agents coordinate via AIDs with no relay server](https://a2al.org/img/a2ald/collab-1.gif)
 
 ## Docs
 
@@ -99,9 +95,9 @@ a2al inbound bind --addr 127.0.0.1:8080
 | Protocol internals | [Architecture](doc/architecture.md) |
 | Example binaries | [Examples](doc/examples.md) |
 
-Windows binaries are unsigned: SmartScreen **More info → Run anyway** is expected.
-
 ## Protocol design
+
+*A2AL is an open protocol; `a2ald` is its reference implementation.*
 
 **Self-sovereign identity.** An AID is derived from a key you generate. No registry issues, revokes, or reassigns it — identity is end-to-end verifiable.
 

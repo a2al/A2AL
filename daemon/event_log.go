@@ -170,3 +170,19 @@ func (el *EventLog) Since(aid a2al.Address, afterSeq uint64) ([]LoggedEvent, uin
 	}
 	return l.since(afterSeq)
 }
+
+// LastSeq is the newest seq still buffered for aid, or 0 if the log is empty.
+func (el *EventLog) LastSeq(aid a2al.Address) uint64 {
+	el.mu.RLock()
+	l := el.logs[aid]
+	el.mu.RUnlock()
+	if l == nil {
+		return 0
+	}
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	if l.count == 0 || l.nextSeq == 0 {
+		return 0
+	}
+	return l.nextSeq - 1
+}

@@ -12,6 +12,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/a2al/a2al/internal/version"
 )
 
 const (
@@ -107,7 +109,7 @@ func runDoctor(c *Client) []Check {
 		Name:   "daemon",
 		State:  statePass,
 		Detail: c.Base,
-	}, topologyCheck(kind, dataDir, apiAddr, listen, boots)}
+	}, buildCheck(st), topologyCheck(kind, dataDir, apiAddr, listen, boots)}
 
 	if mcpRouteUp(c) {
 		checks = append(checks, Check{Name: "mcp endpoint", State: statePass})
@@ -147,6 +149,20 @@ func runDoctor(c *Client) []Check {
 
 func daemonDownHint(api string) string {
 	return fmt.Sprintf("No daemon at %s. Start a2ald, or if you already started another copy, run: a2al doctor --api <that-url>", api)
+}
+
+func buildCheck(st map[string]any) Check {
+	return Check{
+		Name:  "build  " + formatBuildLine(st),
+		State: statePass,
+	}
+}
+
+// formatBuildLine is the one human-readable pair: this CLI vs the daemon it reached.
+func formatBuildLine(st map[string]any) string {
+	return fmt.Sprintf("cli %s (%s)  daemon %s (%s)",
+		version.Version, version.Commit,
+		jsonString(st["version"]), jsonString(st["commit"]))
 }
 
 func inferTopology(c *Client) (netKind, string, string, []string) {

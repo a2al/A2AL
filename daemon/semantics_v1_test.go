@@ -39,7 +39,7 @@ var removedConcepts = []struct{ term, why string }{
 	{"GroupPoke", "see Poke"},
 	{"group_poke", "see Poke"},
 	{"group.invited", "no such event: the room events are group.unread, group.mentioned and group.appended"},
-	{"group invitation", "not an event: invitations arrive as ordinary mailbox notes, so point callers at a2al_mailbox_poll"},
+	{"group invitation", "not an event: invitations arrive as ordinary mailbox notes, so point callers at a2al_mailbox_list"},
 	{"group.synced", "no such event: observe alignment through group_head or group_members instead"},
 	{"events?after_seq", "SSE replay cursor is last_event_id (and Last-Event-ID); after_seq belongs to events_poll and group_read"},
 }

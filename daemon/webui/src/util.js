@@ -5,6 +5,57 @@ export function shortAid(aid) {
   return aid.slice(0, 7) + '…' + aid.slice(-4);
 }
 
+function aidTone(aid) {
+  let h = 2166136261;
+  const s = String(aid || '');
+  for (let i = 0; i < s.length; i++) h = Math.imul(h ^ s.charCodeAt(i), 16777619);
+  return h >>> 0;
+}
+
+/** Local avatar color from AID. Not stored; same AID always same color on this client. */
+export function aidAvStyle(aid) {
+  const hue = aidTone(aid) % 360;
+  return `background:hsl(${hue},46%,44%);color:#fff`;
+}
+
+/** Short AID with a per-character hue sequence derived from the full AID. */
+export function shortAidHTML(aid) {
+  const s = shortAid(aid);
+  const tone = aidTone(aid);
+  const hue0 = tone % 360;
+  const step = 19 + (tone % 27);
+  let html = '<span class="aid-chroma">';
+  for (const [i, ch] of [...s].entries()) {
+    const h = (hue0 + i * step) % 360;
+    html += `<span style="color:hsl(${h},70%,36%)">${esc(ch)}</span>`;
+  }
+  html += '</span>';
+  return html;
+}
+
+/** Escape text, coloring `@shortAid` tokens when the AID is known. */
+export function colorizeAtShortAids(text, aids) {
+  const raw = String(text || '');
+  const byShort = new Map();
+  for (const aid of aids || []) {
+    if (!aid) continue;
+    byShort.set(shortAid(aid), aid);
+  }
+  const re = /@([^\s…]{7}…[^\s]{4})/g;
+  let html = '';
+  let last = 0;
+  let m;
+  while ((m = re.exec(raw))) {
+    html += esc(raw.slice(last, m.index));
+    const tok = m[1];
+    const aid = byShort.get(tok);
+    html += aid ? `@${shortAidHTML(aid)}` : `@${esc(tok)}`;
+    last = m.index + m[0].length;
+  }
+  html += esc(raw.slice(last));
+  return html;
+}
+
 /** Clickable short AID that toggles to the full string. */
 export function aidExpandHTML(full) {
   if (!full) return '';

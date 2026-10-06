@@ -15,6 +15,4 @@ This OpenClaw-specific copy is retained only so existing installs keep resolving
 
 **[`skills/a2al/SKILL.md`](https://github.com/a2al/a2al/blob/main/skills/a2al/SKILL.md)** — the single source, in the standard Agent Skills layout, usable by any host that reads `~/.agents/skills/` or an equivalent.
 
-Do not add setup or tool documentation here. Duplicating it is what let this file drift out of date: it still assumed a daemon was already running and sent users to the Releases page by hand.
-
-The procedure is `npx -y a2ald mcp add`, reload the host, confirm `a2al_*` tools appear — then act on the goal. `a2al doctor` is optional (wrong daemon). The MCP server's own instructions carry the rest. Host-agnostic entry reference: [`doc/mcp-entry.md`](https://github.com/a2al/a2al/blob/main/doc/mcp-entry.md).
+Do not add setup or tool documentation here. Duplicating it is what let this file drift out of date. Follow the canonical skill above for the current binary-first setup and for existing-daemon, CLI, REST, and MCP paths.

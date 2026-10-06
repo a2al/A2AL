@@ -96,6 +96,19 @@ func TestDoctorHealthyMachinePasses(t *testing.T) {
 			t.Errorf("%s: got %s, want PASS", prefix, got)
 		}
 	}
+	if got := stateOf(checks, "build"); got != statePass {
+		t.Errorf("build: got %s, want PASS", got)
+	}
+	var buildName string
+	for _, c := range checks {
+		if strings.HasPrefix(c.Name, "build") {
+			buildName = c.Name
+			break
+		}
+	}
+	if !strings.Contains(buildName, "cli ") || !strings.Contains(buildName, "daemon test") {
+		t.Errorf("build name %q", buildName)
+	}
 	for _, prefix := range []string{"network", "publish", "rooms", "topology"} {
 		if got := stateOf(checks, prefix); got != stateInfo {
 			t.Errorf("%s: got %s, want INFO", prefix, got)

@@ -749,6 +749,15 @@ func cmdNote(c *Client, g globalOpts, args []string) {
 		if g.JSON {
 			printJSON(true, map[string]any{"ok": true})
 		}
+	case "list":
+		if len(args) != 2 {
+			fatalf("usage: a2al note list <local-aid>")
+		}
+		var out map[string]any
+		if _, _, err := c.DoRequest(http.MethodGet, "/agents/"+args[1]+"/mailbox", nil, &out); err != nil {
+			fatal(err)
+		}
+		printJSON(true, out)
 	case "poll":
 		if len(args) != 2 {
 			fatalf("usage: a2al note poll <local-aid>")
@@ -764,13 +773,14 @@ func cmdNote(c *Client, g globalOpts, args []string) {
 }
 
 func noteHelp() {
-	fmt.Print(`a2al note — send / poll encrypted offline messages
+	fmt.Print(`a2al note — send / list / poll encrypted offline messages
 
 Usage:
   a2al note send <local-aid> <recipient-aid> <body-base64> [--msg-type N]
+  a2al note list <local-aid>
   a2al note poll <local-aid>
 
-  --msg-type defaults to 1. Body is standard base64.
+  list looks; poll takes (removes). --msg-type defaults to 1. Body is standard base64.
 
 Global flags: --api <url>  --token <tok>  --json  --quiet
 `)

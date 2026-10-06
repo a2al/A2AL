@@ -13,18 +13,18 @@ You do, when you have to work with an agent you cannot simply call:
 | Your situation | Your first call |
 |---|---|
 | Two agents on different machines, containers, or networks, with no public IP | `a2al_fetch` with their AID plus the path *they* name (e.g. `/health`) · `a2al_tunnel_open` with their AID — NAT traversal comes with the call, and the local port is yours |
-| Handing over a file of any size | `group_object_put --path` — hashed in place, no bucket in between |
+| Handing over a file of any size | `group_object_put` (MCP) · `a2al group object put --path <file>` (CLI) — hashed in place, no bucket in between |
 | A peer who is asleep, on another schedule, or hours away | `a2al_mailbox_send` — the note waits for them |
 | Several agents (and people) coordinating one job | a **room** — ordered entries, a cursor per agent, files by reference |
 | An identity that survives restarts, new machines, and platform changes | your **AID**, minted from a key you hold |
 | An agent that does X, and nobody handed you an AID | `a2al_discover` — search what agents have published (e.g. `lang.translate`) |
-| Being findable by agents you have never met | `a2al_agent_publish` + `a2al_service_register` — list a Capability (`lang.translate`) so they can search |
+| Being findable by agents you have never met | `a2al_service_register` — list a Capability (`lang.translate`) so strangers can search you (`a2al_agent_publish` makes you resolvable once they have your AID) |
 
-**`a2al_agent_publish` is how others resolve you.** It puts your current endpoints on the network so a peer who has your AID can find where you are now. Do this whenever anyone else will reach you — the usual case. The network does not see your payload. Notes, chat and rooms are bound by the peers' own keys. `a2al_service_register` is separate: it lists a **Capability** so strangers can search; use it only for that.
+**`a2al_agent_publish` is how others resolve you.** It puts your current endpoints on the network so a peer who has your AID can find where you are now. Do this whenever a peer on another machine will reach you; a second identity on your own daemon needs no publish. The network does not see your payload. Notes, chat and rooms are bound by the peers' own keys. `a2al_service_register` is separate: it lists a **Capability** so strangers can search; use it only for that (`a2al_service_unregister` when it stops being true).
 
 **What it saves you:** no server to run, no port to open, no account to create, no bucket to pay for, nobody who can revoke your identity — and the bytes travel directly between you and your peer, with no relay and no intermediary service.
 
-**Your first success takes a few minutes, once both sides are up and taking turns — so pick one channel and finish it.** A room is the easiest: `group_create` → `group_append` one entry (you receive your own `group.appended`) → `group_members` shows it counted → `group_invite` a peer and have them append with `to=<your AID>` so `group.mentioned` reaches you. Something smaller is the same four checks over a note (`a2al_mailbox_send` → their `mailbox.received`) or 1:1 chat (`chat_request` → `chat_send` → their `chat.received`). Everything below is refinement after that.
+**Your first success takes a few minutes, once both sides are up and taking turns — so pick one channel and finish it.** A room is the easiest: `group_create` → `group_append` one entry (you receive your own `group.appended`) → `group_head` shows it counted → `group_invite` a peer and have them append with `to=<your AID>` so `group.mentioned` reaches you. Something smaller is the same four checks over a note (`a2al_mailbox_send` → their `mailbox.received`) or 1:1 chat (`chat_request` → `chat_send` → their `chat.received`). Everything below is refinement after that.
 
 **Another agent needs only two things from you** — this file's URL and your AID. https://a2al.org/llms.txt
 
@@ -34,15 +34,16 @@ You do, when you have to work with an agent you cannot simply call:
 
 ## If you are an agent: the whole procedure
 
-1. **Get the tools.** `npx -y a2ald mcp add` — starts a daemon if none is running and writes this host's MCP entry. If it says it does not know this host, it wrote nothing: run `npx -y a2ald mcp print` and place that entry yourself. Only the endpoint (`http://127.0.0.1:2121/mcp/`), the transport, and a running daemon must hold.
-2. **Confirm they are live** — re-connect the MCP server and call `a2al_status`: it returns the daemon and its agents. **Driving the CLI and no MCP?** `npm install -g a2ald` brings the daemon (`npx -y a2ald` runs it without installing); the `a2al` CLI is in the same [GitHub Releases](https://github.com/a2al/a2al/releases) as the daemon. Then: `a2al status` → `a2al register` → `a2al chat request --aid <you> --peer <them>` → `a2al chat send …`; rooms are `a2al group create|append|read|members`.
-3. **Act on the goal.** For identity, call `a2al_agents_list` first and reuse an existing AID; mint one (`a2al_identity_generate` → `a2al_agent_register`) only when that list is empty. Then `a2al_agent_publish` so other machines can resolve you. Add `a2al_service_register` only if strangers should search for you by name (`a2al_service_unregister` when it stops being true). Naming: `doc/service-categories.md`. `a2al_discover` is how a stranger with a task finds you.
+1. **Connect to a daemon.** If an endpoint is already available, use it through REST, the `a2al` CLI, or MCP. Reuse it unless you need an isolated node; running another daemon is supported. Otherwise download the prebuilt `a2ald` + `a2al` binaries from [GitHub Releases](https://github.com/a2al/a2al/releases) and run the included `a2ald --no-open-browser` from that folder. No runtime or PATH setup is required. Node.js users may instead install the daemon/MCP server with `npm install -g a2ald`; the `a2al` CLI remains in the release download. Python users may use the `pip install a2al` sidecar.
+2. **Choose the tool surface and confirm it.** Shell/REST: `a2al --api http://127.0.0.1:2121 status --json`; success includes `node_aid`, `version`, and `commit`. MCP: point the host at the daemon's `/mcp/` endpoint; for a local daemon, `a2ald mcp add` starts it if needed and configures known hosts. Use `a2ald mcp print` for manual placement. Then call `a2al_status`. No MCP host? Keep using CLI or REST. CLI flow: `a2al status` → `a2al register` → `a2al chat request --aid <you> --peer <them>` → `a2al chat send …`; rooms are `a2al group create|append|read|members`.
+3. **Act on the goal.** Call `a2al_agents_list` first and reuse an existing AID; mint one (`a2al_identity_generate` → `a2al_agent_register`) only when that list is empty — no registration, no permission, no cost. Then `a2al_agent_publish` so other machines can resolve you; a second identity on your own daemon needs no publish. Add `a2al_service_register` only if strangers should search for you by name (`a2al_service_unregister` when it stops being true). Naming: `doc/service-categories.md`. `a2al_discover` is how a stranger with a task finds you.
+4. **Exchange addresses — the one step A2AL leaves to you.** Two addresses have to meet, and any channel you already have will do: a person, a message, a page. When the other side published a name, `a2al_discover` finds them.
 
 There is no warm-up gate and no peer count to wait for — the daemon answers locally as soon as it is up, and `aid` is never inferred (a "not found" error points at `a2al_agents_list`). `a2al_status` shows your daemon and its agents; `a2al doctor` serves one case: you may be talking to the wrong daemon.
 
-**Deciding whether a peer is reachable**, without guessing: `a2al_resolve` / `a2al_resolve_records` (their current endpoints) · `a2al_agent_probe` and `a2al_tunnel_list` (what works right now) · then read the answer with the identity in mind (§4).
+**Deciding whether a peer is reachable**, without guessing: `a2al_resolve` / `a2al_resolve_records` (their current endpoints) · `a2al_agent_probe` and `a2al_tunnel_list` (what works right now) · then read the answer with the identity in mind (§4). `resolve` is the directory, not a delivery receipt for `local`.
 
-**Check a shape once instead of retrying twice.** Two families live in the same toolset: MCP, `chat` and `group` take flags with plain text (MCP wants base64), while the `note` family takes **positional arguments** and base64 — `a2al note send <local-aid> <recipient-aid> <body-base64>`, `a2al note poll <local-aid>`; `a2al note send --help` and `a2al group help` both work. The MCP schemas are the parameter contract; the `--help` of the exact subcommand is the fastest answer.
+**Check a shape once instead of retrying twice.** The tool names above are exact: `a2al_*`, `chat_*` and `group_*` are MCP tool ids; spaced forms (`a2al group create`, `a2al chat send`) are the CLI's. Where the shapes differ: MCP `body` is **base64** (the CLI's `--body` takes plain text), and the `note` family takes **positional arguments** with a base64 body — `a2al note send <local-aid> <recipient-aid> <body-base64>`; `a2al note send --help` and `a2al group help` both work. The MCP schemas are the parameter contract; the `--help` of the exact subcommand is the fastest answer.
 
 ## Work the way the protocol expects
 
@@ -68,13 +69,17 @@ There is no warm-up gate and no peer count to wait for — the daemon answers lo
 - **Read before you conclude silence.** A wait reports what arrives *after* you subscribe — it does not tell you whether something is already sitting unread. Read the thread (`chat_read`, `group_read`), then wait: a turn boundary can sit earlier than your window.
 - **Agree who moves first.** The most common "stuck" is mutual waiting — each side waiting for the other. A turn-based agent hears nothing between two tool calls, so put the handshake in the message you send.
 
-**The standard waiting shape** (one stream, one process — rather than a connection per action):
+**The standard waiting shape** (one stream, one process — rather than a connection per action; a recommended pattern, not a required command sequence):
 
 1. open the stream and keep it open — `a2al_events_poll` over MCP, or `GET /agents/{aid}/events` (a long connection, one per process);
-2. take a **baseline** first — `chat_read` / `group_head` current position;
+2. take a **baseline** first — `chat_read` for a chat, `group_head` for a room (your replica's position);
 3. match the event you are waiting for (`chat.received`, `group.mentioned`, `mailbox.received`), taking anything at or below the baseline as history;
 4. on a match, act — then read the log, because the event is a hint and the log is the record;
 5. treat **timeout as "state unchanged"** — a failure judgement, and a good moment to read the state rather than poll faster.
+
+Continuation of the event log is SSE `last_event_id` or MCP `after_seq`; `chat read --after-seq` is the chat log — not the same number. Omit `last_event_id` for live frames only.
+
+CLI sketch of the same shape (recommended; `--help` wins if commands drift): `a2al chat read --json` (largest `seq` = chat cursor) → `GET /agents/{aid}/events` with no `last_event_id` → act (timeout / no frame = unchanged) → `a2al chat read --after-seq <that seq>`.
 
 ### 3 · Who wakes whom (learn this table and most of the confusion goes away)
 
@@ -92,15 +97,15 @@ There is no warm-up gate and no peer count to wait for — the daemon answers lo
 ### 4 · Identity is per-AID, not per-machine
 
 - One machine can hold **several identities**, and they are separate actors with separate state, separate rosters, separate cursors.
-- `tunnel open <peer>` acts as the **node** identity; `tunnel open <peer> --local-aid <aid>` acts as that **agent** identity. The two can disagree — one path fast, the other timing out — so run the probe you will actually use. Node reachability and the agent's chat/room path are worth checking separately, each labelled with the identity that produced it.
+- `a2al tunnel open <peer>` acts as the **node** identity; `a2al tunnel open <peer> --local-aid <aid>` acts as that **agent** identity. The two can disagree — one path fast, the other timing out — so run the probe you will actually use. Node reachability and the agent's chat/room path are worth checking separately, each labelled with the identity that produced it.
 - **State readings are per-identity.** `group_members` answers differently depending on which AID asked, and the `pending` map on a tool result summarises *each local identity's* own mail — a roster to check, not a certainty that someone wrote to you; the read itself is the authority. Label every reading with the AID that produced it, and read a stale number as "ask again", rather than as a peer that is gone.
 - **Copy AIDs exactly as given.** They are mixed-case hex, so the case carries meaning.
 
 ### 5 · Reading is how you know
 
 - **Logs are the record, events are hints**: events can be missed, replayed, or truncated, so reconcile content and membership from `group_read` / `chat_read`.
-- **The peer's own writes are the evidence of delivery.** A send reports `sent` (it left your machine) or `local` (still only here, e.g. before the peer accepted) — `sent` is the one that has left.
-- **Notes are take-on-read**: a poll **removes** what it returns, and the second poll of an unread note comes back empty. Persist the body as soon as you get it.
+- **The peer's own writes are the evidence of delivery.** A send reports `sent` (it left your machine) or `local` (queued here until a path exists — e.g. before the peer accepted — not an error, do not resend). Not resending does not mean it will arrive: a later live path as that local AID may drain the queue, but with no path it can stay `local`. Still `local` is not delivered; new content is a new `seq`. `resolve` is not that path. `sent` is the one that has left.
+- **Notes are take-on-read on poll**: a poll **removes** what it returns, and the second poll of an unread note comes back empty. Persist the body as soon as you take it. `a2al_mailbox_list` / `a2al note list` shows the same bodies without taking them.
 - Identify a room entry by **`entry_id`**. The `seq` an append returns is your replica's position, entries carry `id` in their body and `entry_id` in event frames, and `group_head`'s `max_seq` is where *your* replica stands.
 - Member numbers are observations: `replica_head` is what you last saw on their replica, `replica_seen_at` is stamped by **their** clock (so a negative difference across machines is ordinary), and the creator row plus your own row carry no `replica_head`.
 - Time: event frames use `at` (RFC 3339, second precision); entries and MCP events use `ts` (Unix ms) — read `ts` when you want milliseconds.
@@ -108,15 +113,15 @@ There is no warm-up gate and no peer count to wait for — the daemon answers lo
 
 ### 6 · Decide the route before you send, and hand identifiers over deliberately
 
-- Small text goes inline; anything bigger becomes an object and the entry carries a reference. Three routes: inline (small), `group_object_put --path` (no cap, hashed in place), or streaming the bytes to `POST /agents/{aid}/cas?name=` when the daemon cannot see your path (also no cap). Retrieval follows the **holder's** access control, and an object referenced by a room entry takes its author as a hint.
-- Invitations: `group_invite` authorises, `group_join` creates your replica, and `group_get_link` gives you the `a2al://…/groups/…` URL to hand over — a locator, not a ticket. The invitation itself arrives as a **mailbox note**, so read mail when a `pending` field says something is there. A `chat.invites` frame carries no peer id; `chat_contacts` names the requester.
-- Retrieving an object: `group_object_locate` (with the author as `--hint`), then `group_object_get` (or `a2al_object_get`), into a path under that machine's `files_root`.
+- Small text goes inline; anything bigger becomes an object and the entry carries a reference. Three routes: inline (small), `group_object_put` from MCP or `a2al group object put --path <file>` (no cap, hashed in place), or streaming the bytes to `POST /agents/{aid}/cas?name=` when the daemon cannot see your path (also no cap). Retrieval follows the **holder's** access control, and an object referenced by a room entry takes its author as a hint.
+- Invitations: `group_invite` authorises, `group_join` creates your replica, and `group_get_link` gives you the `a2al://…/groups/…` URL to hand over — a locator, not a ticket. The invitation itself arrives as a **mailbox note**, so `a2al_mailbox_list` when a `pending` field says something is there; `a2al_mailbox_poll` to take. A `chat.invites` frame carries `peers`; `chat_contacts` is still the roster.
+- Retrieving an object: call `group_object_get` with `object_id`; `dest` and `hint_aid` are optional. If the bytes are already local, the path is returned immediately. If not, the daemon fetches them using the credential and author address stored when the entry arrived — no extra arguments needed. Use `group_object_locate` to check status without downloading, or `--force` / `force=true` to bypass the local cache.
 - **Design around these sizes:** a room entry body **2048 B**, a note **389 B**, any JSON call **1 MiB** (file bytes excepted), a fetched answer **4 MiB** (then truncated), a tunnel **6 minutes** idle. Inlining a file as base64 tops out near **768 KiB** — larger, and streaming is the roomier route.
 
 ### 7 · Keeping it working
 
 - **Keep the daemon alive** so peers still reach you after you log out: `a2ald service install` (Windows/macOS; Linux in the deploy doc). A peer whose daemon is offline catches up when it returns — notes and room entries wait for it.
-- **Same state, by hand:** the Web UI at `http://localhost:2121/ui`, and `a2al_status` for the CLI view.
+- **Same state, by hand:** the Web UI at `http://localhost:2121/ui`, and `a2al_status` for the CLI view (`a2al status` also prints CLI and daemon builds).
 - **Upgrade on purpose:** `a2al update`. The binary moves faster than the docs, so after an upgrade re-run the exact call you depend on and compare it with what you recorded.
 - **Where it fits:** an MCP host gets networking from A2AL; agent-to-agent protocols (A2A, ANP) assume discovery and connectivity — A2AL supplies both, end to end, without becoming a middleman or a dependency.
 
@@ -129,13 +134,14 @@ There is no warm-up gate and no peer count to wait for — the daemon answers lo
 | `a2al note send --aid X --to Y --text T` | `http 400: invalid body_base64` | The `note` family is **positional + base64**: `a2al note send <local-aid> <recipient-aid> <body-base64>` |
 | `a2al group tail` | `unknown subcommand` | The room face is `a2al group …`; `a2al group help` lists it |
 | A large file inline | `413` | Use `--path` or the streaming endpoint |
-| A room file fetch with no hint | `locate=expired` / no holder known | Pass the author as `--hint` (their copy still exists) |
+| `group_object_get` returns an error with no local bytes | no holder reachable yet | The daemon retries when the peer is live; or pass `hint_aid` with the author's AID to pull immediately |
 | A `--dest` outside the sandbox | `path must be under files_root` | Stream instead, or pick a path inside it |
-| SSE with `after_seq=` | History replayed at you | Continuation is `last_event_id=N` |
-| A freshly opened stream | A burst of old frames | Take a baseline (`chat_read` / `group_head`) before you trigger |
-| `chat send` returns `status: local` | Looks like success | It has not left your machine yet — `sent` is the one that has |
-| `tunnel close <id>` via the CLI | `http 415: Content-Type must be application/json` | Close from MCP (`a2al_tunnel_close`), then check `tunnel list` |
-| `get <peer> /.well-known/agent.json` | `502 unexpected EOF` | That peer is not serving inbound yet |
+| SSE with `after_seq=` | `400` | Event-log continuation is `last_event_id=N` (SSE) or `after_seq` (`a2al_events_poll`); `chat read --after-seq` is the chat log — not the same number |
+| A freshly opened stream | A burst of old frames | Take a baseline (`chat_read` / `group_head`) before you trigger; omit `last_event_id` for live only |
+| `chat send` returns `status: local` | Looks like success | Queued here until a path exists — not an error, do not resend. Not resending does not mean it will arrive; it may stay `local` if no path. Still `local` is not delivered; new content is a new `seq`. `resolve` is not that path; `sent` is the one that has left |
+| `get <peer> /.well-known/agent.json` | `no inbound` / 503 | That peer is not serving HTTP — chat, note, and rooms still work. Only when you actually fetched |
+| `get <peer> /.well-known/agent.json` | `502 unexpected EOF` | Same cases on older daemons |
+| `get <peer> /…` | `inbound unreachable` | They have a bind; their local HTTP did not accept |
 | A container talking to a host daemon | `host header not allowed` | Reach the daemon as `127.0.0.1:2121` through a forwarder |
 | A call to an offline peer | `no matching records`, `connection refused` | Read the state or subscribe; if you retry, keep the attempts bounded and visible |
 | Any refused call | `access denied` | Their ACL (or join-password gate) — ask them to allow your AID |
@@ -165,4 +171,4 @@ These links use `/raw/`, which returns plain Markdown rather than HTML. The same
 
 ---
 
-Describes a2ald 0.3.x (repo main, 2026-10-01). The binary moves faster than the docs: the same version string has been seen with different behaviour, so after an upgrade re-run the exact call you depend on and compare it with what you recorded. The MCP tool schemas remain the parameter contract — one API, no second dialect.
+Describes a2ald 0.3.x (repo main, 2026-10-03). The binary moves faster than the docs: the same version string has been seen with different behaviour, so after an upgrade re-run the exact call you depend on and compare it with what you recorded. The MCP tool schemas remain the parameter contract — one API, no second dialect.

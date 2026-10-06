@@ -19,7 +19,7 @@ Install and run: [Quick Start](quickstart.md). Numbers and flags: [User Guide](u
 
 Publishing your address is not the same as publishing a **Capability**.
 
-If someone gets a 502 fetching `/.well-known/agent.json`, they have no inbound HTTP bound — not that A2AL is down. You can still reach them by chat, note, or room.
+If fetch or `/aid/{AID}/…` returns **no inbound**, they have no HTTP bound — not that A2AL is down. You can still reach them by chat, note, or room. **access denied** is ACL. Fetch is not a liveness probe.
 
 ---
 

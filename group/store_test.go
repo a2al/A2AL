@@ -344,7 +344,7 @@ func TestMissingAndIdempotentAppend(t *testing.T) {
 func TestMembers(t *testing.T) {
 	dir := t.TempDir()
 	privA, pubA, aidA := testIdentity(t)
-	_, _, aidB := testIdentity(t)
+	privB, pubB, aidB := testIdentity(t)
 
 	s, err := group.Create(dir, privA, aidA, "")
 	if err != nil {
@@ -381,6 +381,23 @@ func TestMembers(t *testing.T) {
 	}
 	if ms2.Role(aidB) != group.RoleMember {
 		t.Fatalf("expected member role for aidB after invite, got %v", ms2.Role(aidB))
+	}
+
+	leave, err := group.NewEntry(privB, aidB, s.Heads(), group.KindRevoke,
+		group.WithBody(group.EncodeMemberBody(aidB)),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Append(leave, pubB); err != nil {
+		t.Fatal(err)
+	}
+	ms3, err := s.Members()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ms3.Role(aidB) != group.RoleRevoked {
+		t.Fatalf("expected revoked after self-leave, got %v", ms3.Role(aidB))
 	}
 }
 

@@ -34,6 +34,7 @@ var allExpectedTools = []string{
 	"a2al_resolve",
 	"a2al_connect",
 	"a2al_mailbox_send",
+	"a2al_mailbox_list",
 	"a2al_mailbox_poll",
 	"a2al_service_register",
 	"a2al_service_unregister",

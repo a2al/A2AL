@@ -6,11 +6,15 @@ A2AL daemon (`a2ald`) runs as an MCP server: identity, discovery, fetch, tunnels
 
 ## Fastest path
 
-`npx -y a2ald mcp add` starts a daemon if none is running and registers the server with the hosts it finds.
+If a daemon endpoint is already available, point the host at its `/mcp/` URL and reload; nothing else needs to be installed.
+
+Need a local daemon? [Download A2AL](https://github.com/a2al/a2al/releases) for your system and extract it. Run the included `a2ald` with:
 
 ```bash
-npx -y a2ald mcp add       # or: a2ald mcp add
+a2ald mcp add
 ```
+
+This starts a daemon if none is running and registers the server with the hosts it finds. Here and below, `a2ald` means the included executable; it does not need to be placed on PATH.
 
 Reload the host and confirm `a2al_*` tools appear (chat and rooms are `chat_*` / `group_*`); then act on the goal. `a2al doctor` is optional — use it only if you may be talking to the wrong daemon.
 
@@ -35,9 +39,9 @@ A daemon started in the background is enough for the current session. Staying fi
 
 ---
 
-## Install `a2ald`
+## Other installation methods
 
-### Option A — npm (recommended)
+### Node.js — install globally
 
 ```bash
 npm install -g a2ald
@@ -45,9 +49,9 @@ npm install -g a2ald
 
 No Go toolchain required. The correct binary for your platform is installed automatically.
 
-### Option B — npx (zero install)
+### Node.js — run through npx
 
-Use `npx` directly in your MCP config — npm downloads `a2ald` on first use. This is stdio; if a daemon is already running, it proxies.
+If Node.js is already available, `npx` can run `a2ald` without a global npm install. This is stdio; if a daemon is already running, it proxies.
 
 ```json
 {
@@ -58,16 +62,6 @@ Use `npx` directly in your MCP config — npm downloads `a2ald` on first use. Th
     }
   }
 }
-```
-
-### Option C — binary download
-
-Download from [Releases](https://github.com/a2al/a2al/releases) and place `a2ald` in your PATH.
-
-macOS/Linux:
-```bash
-curl -fsSL https://github.com/a2al/a2al/releases/latest/download/a2ald_linux_amd64.tar.gz | tar xz
-sudo mv a2ald /usr/local/bin/
 ```
 
 ---
@@ -272,7 +266,7 @@ Edit `config.toml` in the data directory and set `api_addr = "127.0.0.1:<port>"`
 
 ## Available tools
 
-Identity and networking: `a2al_identity_generate`, `a2al_agents_list`, `a2al_agents_generate_ethereum`, `a2al_ethereum_delegation_message`, `a2al_ethereum_register`, `a2al_ethereum_proof`, `a2al_agent_register`, `a2al_agent_get`, `a2al_agent_probe`, `a2al_agent_patch`, `a2al_agent_publish`, `a2al_agent_heartbeat`, `a2al_agent_delete`, `a2al_status`, `a2al_agent_publish_record`, `a2al_resolve`, `a2al_resolve_records`, `a2al_discover`, `a2al_service_register`, `a2al_service_unregister`, `a2al_fetch`, `a2al_connect`, `a2al_tunnel_open`, `a2al_tunnel_close`, `a2al_tunnel_list`, `a2al_mailbox_send`, `a2al_mailbox_poll`, `a2al_events_poll`.
+Identity and networking: `a2al_identity_generate`, `a2al_agents_list`, `a2al_agents_generate_ethereum`, `a2al_ethereum_delegation_message`, `a2al_ethereum_register`, `a2al_ethereum_proof`, `a2al_agent_register`, `a2al_agent_get`, `a2al_agent_probe`, `a2al_agent_patch`, `a2al_agent_publish`, `a2al_agent_heartbeat`, `a2al_agent_delete`, `a2al_status`, `a2al_agent_publish_record`, `a2al_resolve`, `a2al_resolve_records`, `a2al_discover`, `a2al_service_register`, `a2al_service_unregister`, `a2al_fetch`, `a2al_connect`, `a2al_tunnel_open`, `a2al_tunnel_close`, `a2al_tunnel_list`, `a2al_mailbox_send`, `a2al_mailbox_list`, `a2al_mailbox_poll`, `a2al_events_poll`.
 
 Chat: `chat_request`, `chat_accept`, `chat_refuse`, `chat_remove`, `chat_block`, `chat_send`, `chat_read`, `chat_mark_read`, `chat_contacts`.
 

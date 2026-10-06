@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -132,6 +133,7 @@ func (d *Daemon) inspectGroupItem(aid a2al.Address, m group.Meta) map[string]any
 	}
 	if s, err := d.groups.Open(aid, m.GroupID); err == nil {
 		item["entry_count"] = s.EntryCount()
+		item["unread_count"] = s.UnreadCount(aid)
 		if ts := s.LastEntryTS(); ts != 0 {
 			item["last_activity_ms"] = ts
 		}
@@ -140,6 +142,28 @@ func (d *Daemon) inspectGroupItem(aid a2al.Address, m group.Meta) map[string]any
 		}
 	}
 	return item
+}
+
+func inspectMembers(s *group.Store) []map[string]any {
+	ms, err := s.Members()
+	if err != nil {
+		return []map[string]any{}
+	}
+	all := ms.All()
+	out := make([]map[string]any, 0, len(all))
+	for a, role := range all {
+		if role <= group.RoleRevoked {
+			continue
+		}
+		out = append(out, map[string]any{
+			"aid":  a.String(),
+			"role": roleToString(role),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i]["aid"].(string) < out[j]["aid"].(string)
+	})
+	return out
 }
 
 func inspectHeadMap(s *group.Store) map[string]any {
@@ -153,5 +177,6 @@ func inspectHeadMap(s *group.Store) map[string]any {
 	if ms, err := s.Members(); err == nil {
 		out["member_count"] = len(ms.All())
 	}
+	out["members"] = inspectMembers(s)
 	return out
 }

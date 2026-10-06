@@ -86,6 +86,8 @@ func (d *Daemon) initChat() {
 	d.registerChatConsumers()
 	d.RegisterPending("chat_invites", d.chatPendingInvites)
 	d.RegisterPending("chat_unread", d.chatPendingUnread)
+	d.registerPathSettler(d.settleChatUnsent)
+	d.registerPathSettler(d.settleCASWanted)
 }
 
 func (d *Daemon) chatPendingInvites(aid a2al.Address) int {
@@ -238,6 +240,10 @@ func (d *Daemon) onChatMsg(local, remote a2al.Address, _ string, body []byte) (b
 		if unreadEdge {
 			d.publishChat(local, "chat.unread", map[string]any{"peer": remote.String(), "unread_count": st.UnreadCount(remote)})
 		}
+		if rec.Kind == chat.KindFile && rec.Ref != ([32]byte{}) {
+			d.rememberObjectRef(local, rec.Ref, rec.Grant, remote, rec.Size)
+			go d.prefetchObject(local, rec.Ref, remote)
+		}
 	}
 	return true, EnvelopeResult{Code: protocol.EnvelopeOK}
 }
@@ -287,7 +293,13 @@ func (d *Daemon) noteChatInvites(aid a2al.Address) {
 		d.chats.inviteMu.Unlock()
 		return
 	}
-	d.publishChat(aid, "chat.invites", map[string]any{"count": n})
+	peers := make([]string, 0, n)
+	for _, e := range st.Contacts() {
+		if e.State == chat.StateInPending {
+			peers = append(peers, e.Peer.String())
+		}
+	}
+	d.publishChat(aid, "chat.invites", map[string]any{"count": n, "peers": peers})
 	d.chats.inviteMu.Lock()
 	defer d.chats.inviteMu.Unlock()
 	if d.chats.inviteTimer[aid] != nil {

@@ -88,10 +88,10 @@ without exposing the service publicly.
 **Step 1 — Wire the MCP server (if not already done):**
 
 ```bash
-npx -y a2ald mcp add
+a2ald mcp add
 ```
 
-Reload the host. Confirm `a2al_*` tools appear.
+Run this with the prebuilt `a2ald` from [GitHub Releases](https://github.com/a2al/a2al/releases), then reload the host and confirm `a2al_*` tools appear. If a daemon endpoint is already available, point the host at its `/mcp/` URL instead.
 
 **Step 2 — Register and bind your local service:**
 
@@ -179,15 +179,15 @@ PAYLOAD=$(echo -n '{"job":"process_data","file":"s3://..."}' | base64)
 a2al note send <your-aid> <their-aid> "$PAYLOAD"
 ```
 
-The recipient polls when they come back:
+The recipient lists when they come back, then polls to take:
 
 ```bash
-a2al note poll <their-aid>
-# → shows your message with sender AID, msg_type, and body
+a2al note list <their-aid>   # look
+a2al note poll <their-aid>   # take (removes)
 ```
 
-**For agents via MCP:** `a2al_mailbox_send` / `a2al_mailbox_poll`.  
-A successful tool result will include `pending.mailbox: N` — that is the signal to poll.
+**For agents via MCP:** `a2al_mailbox_send` / `a2al_mailbox_list` / `a2al_mailbox_poll`.  
+A successful tool result will include `pending.mailbox: N` — that is the signal to list. Poll when you will act.
 Do not poll every turn without that signal.
 
 **Notes are not chat.** If you need back-and-forth, use `a2al chat` after both sides are

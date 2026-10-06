@@ -12,19 +12,15 @@ Get an AID and reach another agent in a few minutes.
 
 ## Install
 
-- **Binary:** [GitHub Releases](https://github.com/a2al/a2al/releases) — `a2ald` + `a2al` on PATH.
-- **npm:** `npm install -g a2ald` (or `npx -y a2ald`).
-- **Python sidecar:** `pip install a2al`.
+[Download A2AL](https://github.com/a2al/a2al/releases) for your system and extract it. The download includes both the `a2ald` daemon and the `a2al` CLI; no additional runtime is required.
 
 ---
 
 ## Start
 
-```bash
-a2ald
-```
+Run the included `a2ald`. The Web UI opens automatically; if it does not, open **http://localhost:2121**.
 
-Open **http://localhost:2121**. First start generates a node identity and joins the public network (data dir: `%APPDATA%\a2al` / `~/Library/Application Support/a2al` / `~/.config/a2al`). Usable **< 1 min**; findable **1–2 min**. If `a2ald` is already running, there is no join wait. Do not wait for a peer count. Times: [User Guide — Timing](user-guide.md#timing).
+First start generates a node identity and joins the public network (data dir: `%APPDATA%\a2al` / `~/Library/Application Support/a2al` / `~/.config/a2al`). Usable **< 1 min**; findable **1–2 min**. If `a2ald` is already running, there is no join wait. Do not wait for a peer count. Times: [User Guide — Timing](user-guide.md#timing).
 
 **Keep it running across logins** — only if others must still find you after you close the terminal:
 
@@ -32,6 +28,12 @@ Open **http://localhost:2121**. First start generates a node identity and joins 
 |----------|-------------|
 | Windows / macOS | `a2ald service install` then `status` / `stop` / `start` / `uninstall` |
 | Linux | [Deploy on Linux](../deploy/linux/README.md) (package or systemd) |
+
+### Other installation methods
+
+- **Node.js daemon/MCP server:** `npm install -g a2ald`
+- **Linux service:** [`.deb` / `.rpm`](../deploy/linux/README.md)
+- **Python SDK with sidecar:** `pip install a2al`
 
 ---
 
@@ -77,6 +79,8 @@ Tabs: **Agents**, **Discover**, **Node**.
 
 ## CLI
 
+The commands below use `a2al` as shorthand for the executable included in the download; it can be run directly from the extracted folder.
+
 ```bash
 a2al status
 a2al register
@@ -99,10 +103,10 @@ http://127.0.0.1:2121/aid/{AID}/…
 ## MCP
 
 ```bash
-npx -y a2ald mcp add
+a2ald mcp add
 ```
 
-Reload the host and confirm `a2al_*` tools. Details: [MCP Setup](mcp-setup.md).
+Run this with the included `a2ald`, then reload the host and confirm `a2al_*` tools. Details: [MCP Setup](mcp-setup.md).
 
 ---
 

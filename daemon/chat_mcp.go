@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -41,8 +42,13 @@ func (d *Daemon) registerChatMCPTools(s *mcp.Server) {
 		Description: `Block a peer AID. Further chat envelopes are dropped. Does not tell them they were blocked.`,
 	}, d.mcpChatBlock)
 	mcp.AddTool(s, &mcp.Tool{
-		Name:        "chat_send",
-		Description: `Send text or a file reference to a peer on this identity's chat list. Returns not_friends if they are not listed — call chat_request first. Pass text and/or path or object_id (not both path and object_id).`,
+		Name: "chat_send",
+		Description: `Send text or a file reference to a peer on this identity's chat list. Returns not_friends if they are not listed — call chat_request first. Pass text and/or path or object_id (not both path and object_id). Optional name is the display filename for an attachment; without it, object_id uses the sandbox basename (often {hash}.bin). path must be readable by a2ald (under files_root when that is set). Across a container/VM boundary stream the bytes first:
+
+    POST /agents/{aid}/cas?name={filename}
+    Content-Type: application/octet-stream
+
+then chat_send with object_id and name from that response. status is sent (left this machine) or local (queued here until a path exists — not an error, do not resend).`,
 	}, d.mcpChatSend)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "chat_read",
@@ -70,6 +76,7 @@ type mcpChatSendArgs struct {
 	Text     string `json:"text,omitempty"`
 	Path     string `json:"path,omitempty"`
 	ObjectID string `json:"object_id,omitempty"`
+	Name     string `json:"name,omitempty"`
 }
 
 type mcpChatReadArgs struct {
@@ -131,7 +138,7 @@ func (d *Daemon) mcpChatBlock(_ context.Context, _ *mcp.ServerSession, p *mcp.Ca
 
 func (d *Daemon) mcpChatSend(ctx context.Context, _ *mcp.ServerSession, p *mcp.CallToolParamsFor[mcpChatSendArgs]) (*mcp.CallToolResultFor[map[string]any], error) {
 	a := p.Arguments
-	out, err := d.execChatSend(ctx, a.AID, a.Peer, a.Text, a.Path, a.ObjectID)
+	out, err := d.execChatSend(ctx, a.AID, a.Peer, a.Text, a.Path, a.ObjectID, a.Name)
 	if err != nil {
 		return nil, err
 	}
@@ -342,7 +349,17 @@ func (d *Daemon) execChatBlock(aidStr, peerStr string) (map[string]any, error) {
 	return map[string]any{"state": chat.StateBlocked}, nil
 }
 
-func (d *Daemon) execChatSend(ctx context.Context, aidStr, peerStr, text, path, objectID string) (map[string]any, error) {
+func chatAttachName(raw, fallback string) string {
+	s := strings.TrimSpace(raw)
+	s = strings.ReplaceAll(s, `\`, "/")
+	n := path.Base(s)
+	if s == "" || n == "" || n == "." || n == ".." {
+		return fallback
+	}
+	return n
+}
+
+func (d *Daemon) execChatSend(ctx context.Context, aidStr, peerStr, text, path, objectID, name string) (map[string]any, error) {
 	local, peer, err := d.parseChatPair(aidStr, peerStr)
 	if err != nil {
 		return nil, err
@@ -365,14 +382,19 @@ func (d *Daemon) execChatSend(ctx context.Context, aidStr, peerStr, text, path, 
 	}
 	rec := chat.Rec{Kind: chat.KindText, Body: text, TS: time.Now().UnixMilli()}
 	if path != "" {
-		id, size, name, err := d.registerLocalObject(local, path)
+		id, size, gotName, err := d.registerLocalObject(local, path)
 		if err != nil {
 			return nil, err
 		}
 		rec.Kind = chat.KindFile
 		rec.Ref = id
-		rec.Name = name
+		rec.Name = chatAttachName(name, gotName)
 		rec.Size = size
+		grant, err := d.ensureShareGrant(local, id)
+		if err != nil {
+			return nil, err
+		}
+		rec.Grant = grant
 	} else if objectID != "" {
 		id, err := parseHex32(objectID)
 		if err != nil {
@@ -384,8 +406,13 @@ func (d *Daemon) execChatSend(ctx context.Context, aidStr, peerStr, text, path, 
 		}
 		rec.Kind = chat.KindFile
 		rec.Ref = id
-		rec.Name = filepath.Base(p)
+		rec.Name = chatAttachName(name, filepath.Base(p))
 		rec.Size = size
+		grant, err := d.ensureShareGrant(local, id)
+		if err != nil {
+			return nil, err
+		}
+		rec.Grant = grant
 	}
 	seq, err := st.AppendOut(peer, rec)
 	if err != nil {
@@ -407,6 +434,8 @@ func (d *Daemon) execChatSend(ctx context.Context, aidStr, peerStr, text, path, 
 			d.chatDing(ctx, local, peer)
 		}
 	}
+	// local = queued on this machine (offline path); sent = left. Not a
+	// failure taxonomy and not a receipt — do not add reason fields here.
 	return map[string]any{"seq": seq, "status": status}, nil
 }
 
@@ -422,7 +451,7 @@ func (d *Daemon) execChatRead(aidStr, peerStr string, after uint64, limit int) (
 	entries, scanned, more := st.Read(peer, after, limit)
 	items := make([]map[string]any, 0, len(entries))
 	for _, r := range entries {
-		items = append(items, recToMap(local, peer, r))
+		items = append(items, d.recToMap(local, peer, r))
 	}
 	return map[string]any{
 		"entries":      items,
@@ -489,7 +518,7 @@ func (d *Daemon) execChatContacts(aidStr string) (map[string]any, error) {
 	}, nil
 }
 
-func recToMap(local, peer a2al.Address, r chat.Rec) map[string]any {
+func (d *Daemon) recToMap(local, peer a2al.Address, r chat.Rec) map[string]any {
 	author := local
 	if r.Dir == chat.DirIn {
 		author = peer
@@ -516,6 +545,14 @@ func recToMap(local, peer a2al.Address, r chat.Rec) map[string]any {
 			holder = peer
 		}
 		m["url"] = group.CASURL(holder, r.Ref)
+		if r.Grant != "" {
+			m["grant"] = r.Grant
+		}
+		if d != nil {
+			if rec, ok := d.casRec(local, r.Ref); ok && len(rec.Served) > 0 {
+				m["fetched"] = rec.Served
+			}
+		}
 	}
 	return m
 }

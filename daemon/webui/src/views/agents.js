@@ -715,31 +715,36 @@ export async function renderAgents(mount, ctx) {
       case 'recv': {
         panel.innerHTML = `
           <div style="display:flex;gap:.5rem;align-items:center;margin-bottom:.6rem">
-            <button type="button" class="btn btn-secondary btn-sm" id="fn-poll">${esc(t('agent.note.poll'))}</button>
-            <span id="fn-poll-status" class="muted" style="font-size:.85rem"></span>
+            <button type="button" class="btn btn-secondary btn-sm" id="fn-list">${esc(t('agent.note.list'))}</button>
+            <span id="fn-list-status" class="muted" style="font-size:.85rem"></span>
           </div>
           <div id="fn-notes"></div>`;
-        const doPoll = async () => {
-          const b = panel.querySelector('#fn-poll');
+        const doList = async () => {
+          const b = panel.querySelector('#fn-list');
           const noteList = panel.querySelector('#fn-notes');
-          const status = panel.querySelector('#fn-poll-status');
+          const status = panel.querySelector('#fn-list-status');
           setLoading(b, true);
           noteList.innerHTML = `<p class="muted">${esc(t('common.loading'))}</p>`;
           status.textContent = '';
           try {
-            const r = await api(`/agents/${encodeURIComponent(ag.aid)}/mailbox/poll`, { method: 'POST', body: '{}' });
+            const r = await api(`/agents/${encodeURIComponent(ag.aid)}/mailbox`);
             const msgs = r.messages || [];
             if (!msgs.length) { noteList.innerHTML = `<p class="muted">${esc(t('agent.note.empty'))}</p>`; return; }
             noteList.innerHTML = '';
             for (const m of msgs) {
+              const typ = Number(m.msg_type);
               let bodyText = m.body_base64 || '';
-              if (Number(m.msg_type) === 3 && bodyText) {
-                try {
-                  const bin = atob(bodyText);
-                  const bytes = new Uint8Array(bin.length);
-                  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-                  bodyText = new TextDecoder().decode(bytes);
-                } catch (_) {}
+              if ((typ === 3 || typ === 16) && bodyText) {
+                const decoded = base64ToUtf8(bodyText);
+                if (decoded) bodyText = decoded;
+                if (typ === 16) {
+                  try {
+                    const j = JSON.parse(decoded);
+                    const title = (j && j.title) || '';
+                    const link = (j && j.link) || '';
+                    bodyText = [t('agent.note.room_invite'), title, link].filter(Boolean).join('\n');
+                  } catch (_) { /* keep decoded */ }
+                }
               }
               const row = document.createElement('div');
               row.className = 'ag2-note-row';
@@ -754,9 +759,8 @@ export async function renderAgents(mount, ctx) {
             setLoading(b, false);
           }
         };
-        panel.querySelector('#fn-poll').onclick = doPoll;
-        // Auto-execute on open
-        doPoll();
+        panel.querySelector('#fn-list').onclick = doList;
+        doList();
         break;
       }
       case 'send': {

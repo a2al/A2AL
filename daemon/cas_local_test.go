@@ -116,17 +116,30 @@ func TestCASUploadRejectsForeignAID(t *testing.T) {
 	uploadForTest(t, srv.URL, foreign, "x.bin", []byte("nope"), http.StatusNotFound)
 }
 
-// Without a sandbox there is nowhere to put the bytes, and the architecture
-// forbids copying objects into dataDir. Say so instead of failing obscurely.
+// Web upload must work when files_root is unset: bytes go to {dataDir}/files
+// without turning files_root into a path sandbox for CLI --file.
 func TestCASUploadWithoutFilesRoot(t *testing.T) {
 	d := newTestDaemon(t)
 	d.cfg.FilesRoot = ""
 	srv := httptest.NewServer(d.routes())
 	defer srv.Close()
 
-	res := uploadForTest(t, srv.URL, d.nodeAddr, "x.bin", []byte("nope"), http.StatusConflict)
-	if msg, _ := res["error"].(string); !strings.Contains(msg, "files_root") {
-		t.Errorf("error should name files_root, got %q", msg)
+	payload := []byte("nope")
+	want := sha256.Sum256(payload)
+	res := uploadForTest(t, srv.URL, d.nodeAddr, "x.bin", payload, http.StatusOK)
+	if res["object_id"] != hex.EncodeToString(want[:]) {
+		t.Fatalf("object_id = %v", res["object_id"])
+	}
+	path, _, ok := d.lookupLocalObject(d.nodeAddr, want)
+	if !ok {
+		t.Fatal("uploaded object was not mapped")
+	}
+	wantDir, err := filepath.Abs(filepath.Join(d.dataDir, "files"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Clean(filepath.Dir(path)) != filepath.Clean(wantDir) {
+		t.Errorf("stored at %s, want under %s", path, wantDir)
 	}
 }
 

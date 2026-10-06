@@ -12,7 +12,9 @@ export async function api(path, opt = {}) {
   const isRead = method === 'GET' || method === 'HEAD';
   const headers = { ...(opt.headers || {}) };
   if (_token) headers.Authorization = 'Bearer ' + _token;
-  if (!isRead && !headers['Content-Type']) headers['Content-Type'] = 'application/json';
+  if (!isRead && !headers['Content-Type'] && !(opt.body instanceof Blob)) {
+    headers['Content-Type'] = 'application/json';
+  }
   const resp = await fetch(path, { ...opt, headers });
   const txt = await resp.text();
   let body;

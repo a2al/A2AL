@@ -20,6 +20,7 @@ import (
 	"github.com/a2al/a2al"
 	"github.com/a2al/a2al/config"
 	"github.com/a2al/a2al/host"
+	"github.com/a2al/a2al/internal/logedge"
 	"github.com/a2al/a2al/internal/nodeks"
 	"github.com/a2al/a2al/internal/registry"
 	"github.com/a2al/a2al/protocol"
@@ -67,6 +68,7 @@ func newTestDaemon(t *testing.T) *Daemon {
 		mboxStoreStop:    make(chan struct{}),
 		bus:              NewEventBus(slog.New(slog.NewTextHandler(io.Discard, nil))),
 		tunnels:          newTunnelRegistry(),
+		logEdge:          &logedge.Gate{Repeat: alignFailLogRepeat},
 	}
 	d.initRemoteAdmin()
 	d.initAddressBook()
@@ -77,6 +79,7 @@ func newTestDaemon(t *testing.T) *Daemon {
 	d.connPool = newModeAConnPool(func(context.Context, a2al.Address, a2al.Address, *protocol.EndpointRecord, bool, bool) (quic.Connection, bool, error) {
 		return nil, false, errEnvelopeUnavailable
 	}, d.log)
+	d.connPool.setOnLive(d.notePathLive)
 	d.initChat()
 	return d
 }

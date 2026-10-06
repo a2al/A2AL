@@ -129,6 +129,20 @@ func TestMailboxPollRecordsHeartbeatBeforeNetwork(t *testing.T) {
 	}
 }
 
+func TestMailboxListDoesNotRecordHeartbeat(t *testing.T) {
+	d := newTestDaemon(t)
+	priv, aid := testSyncIdentity(t)
+	if err := d.reg.Put(&registry.Entry{AID: aid, OpPriv: priv}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.execMailboxList(context.Background(), aid.String()); err != nil {
+		t.Fatal(err)
+	}
+	if d.aidHasHeartbeat(aid) {
+		t.Fatal("mailbox list is inspection, not presence")
+	}
+}
+
 func TestFetchRecordsHeartbeatOnlyForRegisteredLocal(t *testing.T) {
 	d := newTestDaemon(t)
 	priv, local := testSyncIdentity(t)

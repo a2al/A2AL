@@ -362,3 +362,44 @@ func TestOpenPooled_secondOpenDropsReplacement(t *testing.T) {
 		t.Fatal("replacement must close")
 	}
 }
+
+func TestConnPool_onLiveOnCacheNotOnHit(t *testing.T) {
+	fresh := newStubConn()
+	var n, dials int
+	p := newModeAConnPool(func(context.Context, a2al.Address, a2al.Address, *protocol.EndpointRecord, bool, bool) (quic.Connection, bool, error) {
+		dials++
+		return fresh, false, nil
+	}, slog.Default())
+	local := testAID(t, "b1")
+	remote := testAID(t, "b2")
+	p.setOnLive(func(l, r a2al.Address) {
+		if l != local || r != remote {
+			t.Errorf("onLive pair %s → %s", l, r)
+		}
+		n++
+	})
+	if _, _, err := p.acquire(context.Background(), local, remote, nil, false, true); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 || dials != 1 {
+		t.Fatalf("after insert onLive=%d dials=%d", n, dials)
+	}
+	if _, _, err := p.acquire(context.Background(), local, remote, nil, false, true); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 || dials != 1 {
+		t.Fatalf("cache hit must not fire onLive onLive=%d dials=%d", n, dials)
+	}
+	p.forget(local, remote, false)
+	next := newStubConn()
+	p.dial = func(context.Context, a2al.Address, a2al.Address, *protocol.EndpointRecord, bool, bool) (quic.Connection, bool, error) {
+		dials++
+		return next, false, nil
+	}
+	if _, _, err := p.acquire(context.Background(), local, remote, nil, false, true); err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Fatalf("replacement insert onLive=%d want 2", n)
+	}
+}
