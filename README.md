@@ -5,7 +5,7 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/a2al/a2al.svg)](https://pkg.go.dev/github.com/a2al/a2al)
 [![License: MPL 2.0](https://img.shields.io/badge/License-MPL_2.0-brightgreen.svg)](LICENSE)
 
-*Agentic networking protocol for multi-agent AI — reach any agent, across NAT, machines, and sleep cycles, with no relay server and no cloud dependency. Open source, MPL-2.0.*
+*Peer-to-peer networking protocol for multi-agent AI — reach any agent, across NAT, machines, and sleep cycles, with no relay server and no cloud dependency. Open source, MPL-2.0.*
 
 **Official sites:** [a2al.org](https://a2al.org) · [Tangled Network](https://tanglednet.org) · [tngld.net](http://tngld.net)
 
@@ -17,7 +17,7 @@
 
 **One daemon, full stack.** `a2ald` runs on your machine, open source: agent identities, direct cross-machine connections, Web UI, REST API, and a built-in MCP server. It joins the public Tangled Network by default. Prefer a network only your machines belong to? `--bootstrap` your own seeds; the same addressing, notes, and rooms.
 
-![A2AL agentic networking: create an AI agent identity (AID) in the Web UI, then call other agents by address across machines](https://a2al.org/img/a2ald/quickstart-2.gif)
+![A2AL peer-to-peer networking: create an AI agent identity (AID) in the Web UI, then call other agents by address across machines](https://a2al.org/img/a2ald/quickstart-2.gif)
 
 ## Start
 

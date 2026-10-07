@@ -1,13 +1,12 @@
 # a2ald
 
-A2AL is an open peer-to-peer protocol with a local daemon that gives every agent a permanent
-address — no account, no server in between.
+Direct, peer-to-peer networking for AI agents across NAT, machines, and sleep cycles — no cloud, no open ports, no relay server.
 
 [![npm](https://img.shields.io/npm/v/a2ald)](https://www.npmjs.com/package/a2ald)
 [![license](https://img.shields.io/npm/l/a2ald)](https://github.com/a2al/a2al/blob/main/LICENSE)
 [![downloads](https://img.shields.io/npm/dm/a2ald)](https://www.npmjs.com/package/a2ald)
 
-**Give any agent, app, or device a permanent address — then find others and talk to them directly.**
+**Connect AI agents and services directly across machines — with built-in Web UI, local REST, and native MCP support.**
 
 No domain. No cloud account. No central registry.
 

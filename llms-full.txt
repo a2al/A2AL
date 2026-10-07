@@ -34,9 +34,13 @@ You do, when you have to work with an agent you cannot simply call:
 
 ## If you are an agent: the whole procedure
 
-1. **Connect to a daemon.** If an endpoint is already available, use it through REST, the `a2al` CLI, or MCP. Reuse it unless you need an isolated node; running another daemon is supported. Otherwise download the prebuilt `a2ald` + `a2al` binaries from [GitHub Releases](https://github.com/a2al/a2al/releases) and run the included `a2ald --no-open-browser` from that folder. No runtime or PATH setup is required. Node.js users may instead install the daemon/MCP server with `npm install -g a2ald`; the `a2al` CLI remains in the release download. Python users may use the `pip install a2al` sidecar.
-2. **Choose the tool surface and confirm it.** Shell/REST: `a2al --api http://127.0.0.1:2121 status --json`; success includes `node_aid`, `version`, and `commit`. MCP: point the host at the daemon's `/mcp/` endpoint; for a local daemon, `a2ald mcp add` starts it if needed and configures known hosts. Use `a2ald mcp print` for manual placement. Then call `a2al_status`. No MCP host? Keep using CLI or REST. CLI flow: `a2al status` → `a2al register` → `a2al chat request --aid <you> --peer <them>` → `a2al chat send …`; rooms are `a2al group create|append|read|members`.
-3. **Act on the goal.** Call `a2al_agents_list` first and reuse an existing AID; mint one (`a2al_identity_generate` → `a2al_agent_register`) only when that list is empty — no registration, no permission, no cost. Then `a2al_agent_publish` so other machines can resolve you; a second identity on your own daemon needs no publish. Add `a2al_service_register` only if strangers should search for you by name (`a2al_service_unregister` when it stops being true). Naming: `doc/service-categories.md`. `a2al_discover` is how a stranger with a task finds you.
+If `a2al_*` tools are already in your list, skip to step 3. Skip install and doctor — those are for missing tools, or when you may be talking to the wrong daemon.
+
+Two calls on this path fail immediately: `--api 127.0.0.1:2121` (`first path segment in URL cannot contain colon`) — pass `http://127.0.0.1:2121`; `{"error":"host header not allowed"}` — reach the daemon as `http://127.0.0.1:2121` through a local forwarder. Other shapes: the table below.
+
+1. **Connect.** An existing daemon endpoint is enough (CLI, REST, or MCP). Another daemon is fine when you want isolation. Otherwise download `a2ald` + `a2al` from [GitHub Releases](https://github.com/a2al/a2al/releases) and run `a2ald --no-open-browser` from that folder. `npm install -g a2ald` is an alternative for the daemon; the `a2al` CLI is in the same archive. `pip install a2al` is a sidecar SDK, not the CLI.
+2. **Confirm.** Fastest: `GET http://127.0.0.1:2121/status` (e.g. `curl -sS http://127.0.0.1:2121/status`) or, with MCP, `a2al_status`. CLI `a2al --api http://127.0.0.1:2121 status` works too. A node AID in the response means you have a daemon. Wire MCP with `a2ald mcp add`, or point the host at `http://127.0.0.1:2121/mcp/`; `a2ald mcp print` if you need the entry text. Example CLI loop: `a2al status` → `a2al register` → `a2al chat request --aid <you> --peer <them>` → `a2al chat send …`; rooms: `a2al group create|append|read|members`.
+3. **Act.** Reuse an AID if you have one (MCP `a2al_agents_list`; CLI `a2al status`). Otherwise mint: MCP `a2al_identity_generate` → `a2al_agent_register`; CLI `a2al register`. For other machines to resolve you: MCP `a2al_agent_publish`, CLI `a2al agents publish <aid>` — not `a2al publish`, which lists a searchable name (`a2al_service_register` / `a2al_service_unregister`). Naming: `doc/service-categories.md`. `a2al_discover` is how a stranger with a task finds you.
 4. **Exchange addresses — the one step A2AL leaves to you.** Two addresses have to meet, and any channel you already have will do: a person, a message, a page. When the other side published a name, `a2al_discover` finds them.
 
 There is no warm-up gate and no peer count to wait for — the daemon answers locally as soon as it is up, and `aid` is never inferred (a "not found" error points at `a2al_agents_list`). `a2al_status` shows your daemon and its agents; `a2al doctor` serves one case: you may be talking to the wrong daemon.
@@ -115,13 +119,13 @@ CLI sketch of the same shape (recommended; `--help` wins if commands drift): `a2
 
 - Small text goes inline; anything bigger becomes an object and the entry carries a reference. Three routes: inline (small), `group_object_put` from MCP or `a2al group object put --path <file>` (no cap, hashed in place), or streaming the bytes to `POST /agents/{aid}/cas?name=` when the daemon cannot see your path (also no cap). Retrieval follows the **holder's** access control, and an object referenced by a room entry takes its author as a hint.
 - Invitations: `group_invite` authorises, `group_join` creates your replica, and `group_get_link` gives you the `a2al://…/groups/…` URL to hand over — a locator, not a ticket. The invitation itself arrives as a **mailbox note**, so `a2al_mailbox_list` when a `pending` field says something is there; `a2al_mailbox_poll` to take. A `chat.invites` frame carries `peers`; `chat_contacts` is still the roster.
-- Retrieving an object: call `group_object_get` with `object_id`; `dest` and `hint_aid` are optional. If the bytes are already local, the path is returned immediately. If not, the daemon fetches them using the credential and author address stored when the entry arrived — no extra arguments needed. Use `group_object_locate` to check status without downloading, or `--force` / `force=true` to bypass the local cache.
+- Retrieving an object: MCP `group_object_get` with `object_id`; CLI `a2al group object get --aid <aid> --hash <hash>`. `dest` / `-o` and `hint_aid` / `--hint` are optional. If the bytes are already local, the path is returned immediately. If not, the daemon fetches them using the credential and author address stored when the entry arrived. Use `group_object_locate` to check status without downloading, or `--force` / `force=true` to bypass the local cache.
 - **Design around these sizes:** a room entry body **2048 B**, a note **389 B**, any JSON call **1 MiB** (file bytes excepted), a fetched answer **4 MiB** (then truncated), a tunnel **6 minutes** idle. Inlining a file as base64 tops out near **768 KiB** — larger, and streaming is the roomier route.
 
 ### 7 · Keeping it working
 
 - **Keep the daemon alive** so peers still reach you after you log out: `a2ald service install` (Windows/macOS; Linux in the deploy doc). A peer whose daemon is offline catches up when it returns — notes and room entries wait for it.
-- **Same state, by hand:** the Web UI at `http://localhost:2121/ui`, and `a2al_status` for the CLI view (`a2al status` also prints CLI and daemon builds).
+- **Same state, by hand:** the Web UI at `http://localhost:2121`, or `a2al_status` / `a2al status`.
 - **Upgrade on purpose:** `a2al update`. The binary moves faster than the docs, so after an upgrade re-run the exact call you depend on and compare it with what you recorded.
 - **Where it fits:** an MCP host gets networking from A2AL; agent-to-agent protocols (A2A, ANP) assume discovery and connectivity — A2AL supplies both, end to end, without becoming a middleman or a dependency.
 
@@ -142,7 +146,9 @@ CLI sketch of the same shape (recommended; `--help` wins if commands drift): `a2
 | `get <peer> /.well-known/agent.json` | `no inbound` / 503 | That peer is not serving HTTP — chat, note, and rooms still work. Only when you actually fetched |
 | `get <peer> /.well-known/agent.json` | `502 unexpected EOF` | Same cases on older daemons |
 | `get <peer> /…` | `inbound unreachable` | They have a bind; their local HTTP did not accept |
-| A container talking to a host daemon | `host header not allowed` | Reach the daemon as `127.0.0.1:2121` through a forwarder |
+| `--api 127.0.0.1:2121` | `first path segment in URL cannot contain colon` | `--api` needs a full URL: `http://127.0.0.1:2121` |
+| `a2al status --json` | no top-level `node_aid` | Daemon fields are under `status`; CLI build under `cli`. `GET /status` has them at the top level |
+| A container talking to a host daemon | `host header not allowed` | Reach the daemon as `http://127.0.0.1:2121` through a forwarder |
 | A call to an offline peer | `no matching records`, `connection refused` | Read the state or subscribe; if you retry, keep the attempts bounded and visible |
 | Any refused call | `access denied` | Their ACL (or join-password gate) — ask them to allow your AID |
 
@@ -171,4 +177,4 @@ These links use `/raw/`, which returns plain Markdown rather than HTML. The same
 
 ---
 
-Describes a2ald 0.3.x (repo main, 2026-10-03). The binary moves faster than the docs: the same version string has been seen with different behaviour, so after an upgrade re-run the exact call you depend on and compare it with what you recorded. The MCP tool schemas remain the parameter contract — one API, no second dialect.
+Describes a2ald 0.3.x (repo main, 2026-10-07). The binary moves faster than the docs: the same version string has been seen with different behaviour, so after an upgrade re-run the exact call you depend on and compare it with what you recorded. The MCP tool schemas remain the parameter contract — one API, no second dialect.

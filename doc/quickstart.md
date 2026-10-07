@@ -39,28 +39,19 @@ First start generates a node identity and joins the public network (data dir: `%
 
 ## Verify it works
 
-Everything below runs on a single machine. No second device needed.
+**a2ald and an AID are all you need.** After the AID exists, any other machine that runs `a2ald` can find it and connect. `a2al resolve` is that lookup — the same as **Discover** in the Web UI. Try it here or on another machine.
 
 ```bash
-# Create a local identity
+# Create an identity
 a2al register
 # → AID: <abc123…>   (copy this)
 
-# Publish it so the network can find it
-a2al publish
-
-# Resolve it back — should return your own endpoint
+# Find it on the network (this machine or any other)
 a2al resolve <abc123…>
 # → Endpoints: quic://…
-
-# Call it directly through the daemon gateway
-a2al get <abc123…> /.well-known/agent.json
-# → {"name":"…","acp":…}
 ```
 
-If `resolve` returns an endpoint and `get` returns JSON, the daemon is up, your identity is
-registered, and the network layer is working. That is all you need before connecting to another
-agent.
+If `resolve` returns an endpoint, that AID is reachable. That is all you need before connecting.
 
 ---
 
@@ -71,7 +62,7 @@ Tabs: **Agents**, **Discover**, **Node**.
 1. **Agents → Add Identity.** Creates an Ed25519 AID (optional: recover from a master key, or **Ethereum Identity**). Save the master key — the daemon does not keep it.
 2. Give someone the **AID**. They look it up under **Discover**, or you paste theirs there.
 3. From Discover: **fetch** HTTP, open a **tunnel**, or leave a **note** if they are offline.
-4. On an identity, **Room** / **Chat** open the collaboration bubble. Chat is ready in the UI; creating a room is CLI/MCP (`a2al group create`). The bubble can watch a room you already joined.
+4. On an identity, **Room** / **Chat** open the collaboration bubble. you can chat, create rooms, share files, and collaborate.
 
 **Access Control** on an identity gates who may fetch that identity’s HTTP / file objects — not notes or discovery.
 

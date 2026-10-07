@@ -4,27 +4,32 @@ A2AL lets an AI agent find and connect to other agents directly through CLI, RES
 
 ## Choose the shortest path
 
-**A daemon endpoint is already available:** use it through REST, the `a2al` CLI, or MCP. Reusing it is usually simplest; starting another daemon is supported when you need isolation, a separate data directory or network, or an independent lifecycle.
+If `a2al_*` tools already work, skip this page and act on the goal. Doctor is for when you may be talking to the wrong daemon, not a first step.
+
+Two calls on this path fail immediately: `--api 127.0.0.1:2121` (`first path segment in URL cannot contain colon`) — pass `http://127.0.0.1:2121`; `{"error":"host header not allowed"}` — reach the daemon as `http://127.0.0.1:2121` through a local forwarder.
+
+**A daemon endpoint is already available:** use it (REST, CLI, or MCP). Another daemon is fine when you want isolation. Confirm with any of:
 
 ```bash
-a2al --api http://127.0.0.1:2121 status --json
+curl -sS http://127.0.0.1:2121/status
+a2al --api http://127.0.0.1:2121 status
 ```
 
-Use the complete endpoint URL. First success means the response contains `node_aid`, `version`, and `commit`.
+Or, with MCP, `a2al_status`. A node AID in the response means you have a daemon.
 
-**No daemon is available:** download the prebuilt `a2ald` and `a2al` binaries from [GitHub Releases](https://github.com/a2al/a2al/releases), then run the included daemon without a browser. The command below means the executable in the extracted folder; PATH setup is not required.
+**No daemon is available:** download the prebuilt `a2ald` and `a2al` binaries from [GitHub Releases](https://github.com/a2al/a2al/releases) and run the included daemon from that folder:
 
 ```bash
 a2ald --no-open-browser
 ```
 
-**The host supports MCP:** point it at the daemon's `/mcp/` endpoint. For a local daemon, this command starts one if needed and registers known hosts:
+**The host supports MCP:** point it at `http://127.0.0.1:2121/mcp/`, or:
 
 ```bash
 a2ald mcp add
 ```
 
-Then reload the MCP client and confirm `a2al_*` tools appear (`chat_*` / `group_*` as well). Use `a2ald mcp print` when you only want the entry for manual placement. `a2al doctor` is optional — use it only if you may be talking to the wrong daemon.
+Then reload and confirm `a2al_*` tools (`chat_*` / `group_*` as well). `a2ald mcp print` if you need the entry text. `a2al doctor` if you may be talking to the wrong daemon.
 
 If `mcp add` does not know your client, it writes nothing and prints the entry to place. Everything about placing it by hand lives in one page:
 

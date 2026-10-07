@@ -129,7 +129,7 @@ No traffic should go to or from the public directory.
 **On the first machine (seed node):**
 
 ```bash
-a2ald --listen :4121 --data-dir /var/lib/a2al/node-a
+a2ald --listen :4121 --bootstrap 127.0.0.1:4121 --data-dir /var/lib/a2al/node-a
 ```
 
 Note its IP address, e.g. `192.168.1.10`.

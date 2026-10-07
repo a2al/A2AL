@@ -307,7 +307,7 @@ UI: **Edit Profile**. REST: `POST`/`DELETE /agents/{aid}/profile`. `a2al info <a
 
 **`a2al doctor`** prints local observations for the whole node (`PASS`/`WARN`/`FAIL`/`INFO`). It is **not** a gate and not proof others can find you. Neighbor count is who is in view.
 
-**`a2al agents probe <aid>`** (MCP: `a2al_agent_probe`) checks whether a specific AID is reachable — both TCP connectivity and DHT record visibility. Use this when you want to verify that a particular identity can be found and connected to, not just that the node is generally healthy. Returns the result per-AID, not node-wide.
+**`GET /agents/{aid}/probe`** (MCP: `a2al_agent_probe`; no CLI) checks whether a specific AID is reachable — both TCP connectivity and DHT record visibility. Use this when you want to verify that a particular identity can be found and connected to, not just that the node is generally healthy. Returns the result per-AID, not node-wide.
 
 ---
 
@@ -326,7 +326,7 @@ Global: `--api`, `--token`, `--json`, `--quiet`. Env: `A2AL_API`, `A2AL_TOKEN`.
 | `get` / `post` | `--header` `--local-aid` `--access-token`; `post -d` |
 | `inbound bind` | `--addr host:port [--aid]` |
 | `connect` / `tunnel` | `tunnel open\|close\|reset\|status`; `--local-aid` `--access-token` `--local-port` `--idle-timeout` |
-| `note` | `send` (`--msg-type`) / `poll` |
+| `note` | `send` (`--msg-type`) / `list` / `poll` |
 | `chat` / `group` | 1:1 / rooms (`a2al group help`) |
 | `agents` | `new` `new-eth` `get` `update` `del` `publish` `heartbeat` `export` `import` `topic add\|del` `acl*` |
 | `config` | `get [key]` · `set <key> <value>` |

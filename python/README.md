@@ -1,17 +1,14 @@
 # a2al (Python)
 
-A2AL is an open peer-to-peer protocol with a local daemon that gives every agent a permanent
-address — no account, no server in between.
+Direct, peer-to-peer networking for AI agents across NAT, machines, and sleep cycles — no cloud, no open ports, no relay server.
 
 [![PyPI](https://img.shields.io/pypi/v/a2al)](https://pypi.org/project/a2al/)
 [![Python versions](https://img.shields.io/pypi/pyversions/a2al)](https://pypi.org/project/a2al/)
 [![license](https://img.shields.io/pypi/l/a2al)](https://github.com/a2al/a2al/blob/main/LICENSE)
 
-**Use A2AL from Python — give your app or agent a permanent address, find others, and talk to
-them directly.**
+**Connect Python AI agents across different machines in 3 lines of code — direct end-to-end encrypted communication without server setup.**
 
-`pip install a2al` bundles the `a2ald` daemon and runs it as a sidecar: one install, your own
-address, and no cloud account to sign up for. **An AID is self-sovereign: it comes from a key you
+`pip install a2al` bundles the `a2ald` daemon and runs it as a sidecar: zero-config networking, your own self-sovereign identity (AID), and no cloud account to sign up for. **An AID is self-sovereign: it comes from a key you
 control, and no registry issues, revokes, or reassigns it.**
 
 ![a2al in ten seconds: create an AID in the Web UI, then call your own agent and someone else's by address from a terminal](https://a2al.org/img/a2ald/quickstart-2.gif)
