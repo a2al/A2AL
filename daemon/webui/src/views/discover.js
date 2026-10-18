@@ -813,22 +813,20 @@ export async function renderDiscover(mount, ctx) {
     wrap.querySelector('#dMsgPanel').classList.add('hidden');
     msgBtnActive = false;
 
-    let resRes;
-    try {
-      resRes = { status: 'fulfilled', value: await api(`/resolve/${encodeURIComponent(currentAid)}`, { method: 'POST', body: '{}' }) };
-    } catch (reason) {
-      resRes = { status: 'rejected', reason };
-    }
-    if (queryStale(gen)) return;
-
-    let ttlValid = false;
-    let lastSeenStr = null;
-    if (resRes.status === 'fulfilled') {
+    function showUnavailable() {
       setQuerying(false);
-      const r = resRes.value;
+      resolveBox.style.color = 'var(--error)';
+      resolveBox.innerHTML = `<p style="margin:0">${esc(t('discover.resolve.unavailable'))}</p><p class="muted" style="margin:.2rem 0 0;font-size:.83rem">${esc(t('discover.resolve.unavailable_hint'))}</p>`;
+      setStatus(false, false, null, t('discover.resolve.unavailable'), t('discover.resolve.unavailable_hint'));
+      renderTargetIdentity(currentAid, null);
+      renderCapabilities([]);
+    }
+
+    function showEndpoint(r) {
+      setQuerying(false);
       const nowS = Math.floor(Date.now() / 1000);
-      ttlValid = !!(r.timestamp && r.ttl && (r.timestamp + r.ttl > nowS));
-      lastSeenStr = fmtShortDT(r.timestamp);
+      const ttlValid = !!(r.timestamp && r.ttl && (r.timestamp + r.ttl > nowS));
+      const lastSeenStr = fmtShortDT(r.timestamp);
       resolveBox.style.color = '';
       resolveBox.innerHTML = `
         <div style="display:grid;grid-template-columns:auto 1fr;gap:.2rem .8rem;align-items:baseline">
@@ -846,14 +844,17 @@ export async function renderDiscover(mount, ctx) {
         .then(() => { if (!queryStale(gen)) setStatus(true, ttlValid, lastSeenStr); })
         .catch((e) => { if (!queryStale(gen)) setStatus(e.status === 412 || isAccessDenied(e) ? true : false, ttlValid, lastSeenStr); });
       loadProfileAndServices(currentAid, gen);
-    } else {
-      setQuerying(false);
-      resolveBox.style.color = 'var(--error)';
-      resolveBox.innerHTML = `<p style="margin:0">${esc(t('discover.resolve.unavailable'))}</p><p class="muted" style="margin:.2rem 0 0;font-size:.83rem">${esc(t('discover.resolve.unavailable_hint'))}</p>`;
-      setStatus(false, false, null, t('discover.resolve.unavailable'), t('discover.resolve.unavailable_hint'));
-      renderTargetIdentity(currentAid, null);
-      renderCapabilities([]);
     }
+
+    let resRes;
+    try {
+      resRes = { status: 'fulfilled', value: await api(`/resolve/${encodeURIComponent(currentAid)}`, { method: 'POST', body: '{}' }) };
+    } catch (reason) {
+      resRes = { status: 'rejected', reason };
+    }
+    if (queryStale(gen)) return;
+    if (resRes.status === 'fulfilled') showEndpoint(resRes.value);
+    else showUnavailable();
   }
 
   wrap.querySelector('#dQuery').onclick = runQuery;

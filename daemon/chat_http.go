@@ -36,13 +36,12 @@ func (d *Daemon) handleChatInspectLog(w http.ResponseWriter, r *http.Request) {
 		writeJSONStatus(w, http.StatusBadRequest, map[string]string{"error": "bad peer"})
 		return
 	}
-	st, err := d.chatStore(aid)
-	if err != nil {
-		writeJSONStatus(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
+	var after *uint64
+	if _, ok := r.URL.Query()["after_seq"]; ok {
+		n := parseAfterSeq(r.URL.Query().Get("after_seq"))
+		after = &n
 	}
-	after := parseAfterSeq(r.URL.Query().Get("after_seq"))
-	limit := chat.DefaultLimit
+	limit := 0
 	if raw := r.URL.Query().Get("limit"); raw != "" {
 		n, err := strconv.Atoi(raw)
 		if err != nil || n <= 0 {
@@ -51,18 +50,12 @@ func (d *Daemon) handleChatInspectLog(w http.ResponseWriter, r *http.Request) {
 		}
 		limit = n
 	}
-	entries, scanned, more := st.Read(peer, after, limit)
-	items := make([]map[string]any, 0, len(entries))
-	for _, rec := range entries {
-		items = append(items, d.recToMap(aid, peer, rec))
+	out, err := d.execChatRead(aid.String(), peer.String(), after, limit)
+	if err != nil {
+		writeChatErr(w, err)
+		return
 	}
-	writeJSON(w, map[string]any{
-		"entries":      items,
-		"scanned_to":   scanned,
-		"has_more":     more,
-		"read_cursor":  st.ReadCursor(peer),
-		"unread_count": st.UnreadCount(peer),
-	})
+	writeJSON(w, out)
 }
 
 func (d *Daemon) chatContactsMap(st *chat.Store) map[string]any {

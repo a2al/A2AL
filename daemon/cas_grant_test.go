@@ -21,15 +21,66 @@ import (
 	"github.com/a2al/a2al/internal/registry"
 )
 
+func mustBefriend(t *testing.T, d *Daemon, a, b a2al.Address) {
+	t.Helper()
+	if _, err := d.execChatRequest(context.Background(), a.String(), b.String(), ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.execChatAccept(context.Background(), b.String(), a.String()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func casGetRoundtrip(t *testing.T, d *Daemon, holder, remote a2al.Address, id [32]byte, token string) (admitted bool, status int, body string) {
+	t.Helper()
+	c, s := net.Pipe()
+	defer c.Close()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer s.Close()
+		var magic [4]byte
+		if _, err := io.ReadFull(s, magic[:]); err != nil {
+			return
+		}
+		d.handleCASStream(holder, remote, nil, s)
+	}()
+	if err := host.WriteCASAdmission(c, token); err != nil {
+		t.Fatal(err)
+	}
+	ok, _, err := host.ReadAccessResult(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		<-done
+		return false, 0, ""
+	}
+	req, _ := http.NewRequest(http.MethodGet, "http://cas"+group.CASPath(id), nil)
+	if err := req.Write(c); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(c), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	<-done
+	return true, resp.StatusCode, string(b)
+}
+
 func TestCASGrantAdmitsDenyDefault(t *testing.T) {
 	d := newTestDaemon(t)
 	holder := newTestAgent(t, d)
 	peer := newTestAgent(t, d)
+	stranger := newTestAgent(t, d)
 	e := d.reg.Get(holder)
 	e.ACL = &registry.ACLPolicy{Default: registry.ACLDefaultDeny}
 	if err := d.reg.Put(e); err != nil {
 		t.Fatal(err)
 	}
+	mustBefriend(t, d, holder, peer)
 
 	path := filepath.Join(t.TempDir(), "f.bin")
 	if err := os.WriteFile(path, []byte("grant-bytes"), 0o600); err != nil {
@@ -43,58 +94,21 @@ func TestCASGrantAdmitsDenyDefault(t *testing.T) {
 	if err != nil || grant == "" {
 		t.Fatalf("grant %q err=%v", grant, err)
 	}
+	d.noteObjectCabinet(holder, id, cabinetChat, peer.String())
 
-	roundtrip := func(token string) (admitted bool, status int, body string) {
-		c, s := net.Pipe()
-		defer c.Close()
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			defer s.Close()
-			var magic [4]byte
-			if _, err := io.ReadFull(s, magic[:]); err != nil {
-				return
-			}
-			d.handleCASStream(holder, peer, nil, s)
-		}()
-		if err := host.WriteCASAdmission(c, token); err != nil {
-			t.Fatal(err)
-		}
-		ok, _, err := host.ReadAccessResult(c)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !ok {
-			<-done
-			return false, 0, ""
-		}
-		req, _ := http.NewRequest(http.MethodGet, "http://cas"+group.CASPath(id), nil)
-		if err := req.Write(c); err != nil {
-			t.Fatal(err)
-		}
-		resp, err := http.ReadResponse(bufio.NewReader(c), req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer resp.Body.Close()
-		b, _ := io.ReadAll(resp.Body)
-		<-done
-		return true, resp.StatusCode, string(b)
-	}
-
-	if ok, _, _ := roundtrip(""); ok {
+	if ok, _, _ := casGetRoundtrip(t, d, holder, peer, id, ""); ok {
 		t.Fatal("empty token must not admit deny-default")
 	}
-	ok, status, body := roundtrip(grant)
+	ok, status, body := casGetRoundtrip(t, d, holder, peer, id, grant)
 	if !ok || status != 200 || body != "grant-bytes" {
-		t.Fatalf("grant admit ok=%v status=%d body=%q", ok, status, body)
+		t.Fatalf("friend admit ok=%v status=%d body=%q", ok, status, body)
 	}
-	ok, status, _ = roundtrip("deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
+	ok, status, _ = casGetRoundtrip(t, d, holder, stranger, id, grant)
 	if !ok {
-		t.Fatal("non-empty wrong grant should open the stream")
+		t.Fatal("non-empty grant should open the stream")
 	}
 	if status != http.StatusForbidden {
-		t.Fatalf("wrong grant status %d, want 403", status)
+		t.Fatalf("stranger status %d, want 403", status)
 	}
 
 	rec, _ := d.casRec(holder, id)
@@ -161,6 +175,8 @@ func TestCASTransparentGetSameDaemon(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	mustBefriend(t, d, a, b)
+	d.noteObjectCabinet(a, id, cabinetChat, b.String())
 	d.rememberObjectRef(b, id, grant, a, size)
 
 	got, n, err := d.ensureObjectLocal(context.Background(), b, id, a, false, true, "")
@@ -255,6 +271,8 @@ func TestCASHTTPServedOnlyOnGET200(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	mustBefriend(t, d, holder, peer)
+	d.noteObjectCabinet(holder, id, cabinetChat, peer.String())
 
 	do := func(method string) int {
 		t.Helper()

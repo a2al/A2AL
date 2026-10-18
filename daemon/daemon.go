@@ -212,6 +212,9 @@ type Daemon struct {
 
 	joinProbeMu sync.Mutex
 	joinProbes  map[alignGroupKey]*joinProbe
+
+	// wake is the local agent-wake bridge. Nil-safe: unset means no binds.
+	wake *wakeScheduler
 }
 
 // APIAddr returns the REST API / Web UI listen address from the loaded config.
@@ -347,6 +350,7 @@ func New(cfg Config) (*Daemon, error) {
 		beacon:          newBeaconManager(h.Node(), &nodeCfg, log),
 		demo:            newDemoManager(),
 	}
+	d.wake = newWakeScheduler(d)
 	d.initRemoteAdmin()
 	d.initAddressBook()
 	d.groups = newGroupManager(cfg.DataDir, log)
@@ -503,6 +507,7 @@ func (d *Daemon) Run(ctx context.Context, mcpStdio bool) error {
 			}
 		}()
 	}
+	d.startWakeBridge(ctx)
 
 	d.log.Info("a2ald starting",
 		"node_aid", d.nodeAddr.String(),

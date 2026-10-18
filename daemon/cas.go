@@ -19,19 +19,33 @@ import (
 	"strings"
 
 	"github.com/a2al/a2al"
+	"github.com/a2al/a2al/chat"
 	"github.com/a2al/a2al/group"
+)
+
+const (
+	cabinetChat  = "chat"
+	cabinetGroup = "group"
 )
 
 const casGrantBytes = 32
 
+// casResource is which existing chat or group published this object.
+// Membership is not stored here; it is read from the roster / replica.
+type casResource struct {
+	Kind string `json:"kind"`
+	ID   string `json:"id"`
+}
+
 // casRec is one local hash→path mapping for an AID.
 // Path empty means the hash is known (grant/hint recorded) but bytes are not local.
 type casRec struct {
-	Path   string   `json:"path,omitempty"`
-	Size   int64    `json:"size,omitempty"`
-	Grant  string   `json:"grant,omitempty"`
-	Author string   `json:"author,omitempty"`
-	Served []string `json:"served,omitempty"`
+	Path      string        `json:"path,omitempty"`
+	Size      int64         `json:"size,omitempty"`
+	Grant     string        `json:"grant,omitempty"`
+	Author    string        `json:"author,omitempty"`
+	Served    []string      `json:"served,omitempty"`
+	Resources []casResource `json:"resources,omitempty"`
 }
 
 type casIndex struct {
@@ -194,6 +208,67 @@ func (d *Daemon) rememberObjectRef(aid a2al.Address, id [32]byte, grant string, 
 			rec.Size = size
 		}
 	})
+}
+
+func (d *Daemon) noteObjectCabinet(aid a2al.Address, id [32]byte, kind, resourceID string) {
+	kind = strings.TrimSpace(kind)
+	resourceID = strings.TrimSpace(resourceID)
+	if kind == "" || resourceID == "" || id == ([32]byte{}) {
+		return
+	}
+	_ = d.patchCasRec(aid, id, func(rec *casRec) {
+		for _, r := range rec.Resources {
+			if r.Kind == kind && r.ID == resourceID {
+				return
+			}
+		}
+		rec.Resources = append(rec.Resources, casResource{Kind: kind, ID: resourceID})
+	})
+}
+
+func (d *Daemon) objectInCabinetWith(local, remote a2al.Address, id [32]byte) bool {
+	rec, ok := d.casRec(local, id)
+	if !ok {
+		return false
+	}
+	for _, r := range rec.Resources {
+		if d.cabinetAllows(local, remote, r.Kind, r.ID) {
+			return true
+		}
+	}
+	return false
+}
+
+func (d *Daemon) cabinetAllows(local, remote a2al.Address, kind, id string) bool {
+	switch kind {
+	case cabinetChat:
+		peer, err := a2al.ParseAddress(id)
+		if err != nil || peer != remote {
+			return false
+		}
+		st, err := d.chatStore(local)
+		if err != nil {
+			return false
+		}
+		e, ok := st.Get(peer)
+		return ok && e.State == chat.StateMutual
+	case cabinetGroup:
+		gid, err := parseGroupID(id)
+		if err != nil || d.groups == nil {
+			return false
+		}
+		s, err := d.groups.Open(local, gid)
+		if err != nil {
+			return false
+		}
+		ms, err := s.Members()
+		if err != nil {
+			return false
+		}
+		return ms.Role(local) >= group.RoleMember && ms.Role(remote) >= group.RoleMember
+	default:
+		return false
+	}
 }
 
 func (d *Daemon) noteCASServed(holder, remote a2al.Address, id [32]byte) {

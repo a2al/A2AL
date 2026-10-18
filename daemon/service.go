@@ -905,6 +905,9 @@ func (d *Daemon) execAgentDelete(aidStr string) error {
 	d.h.Node().RemoveRepSetsForPublisher(a2al.NodeIDFromAddress(aid))
 	d.bumpIceRegistry()
 	d.syncLocalReceiveKeysLocked()
+	if d.wake != nil {
+		d.wake.removeBinding(aid)
+	}
 	return nil
 }
 

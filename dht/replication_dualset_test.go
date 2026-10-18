@@ -238,3 +238,15 @@ func TestRebalanceRepSets_idempotent(t *testing.T) {
 			size1, size2, xor1, xor2, direct1, direct2)
 	}
 }
+
+func TestXorCPL(t *testing.T) {
+	var z a2al.NodeID
+	if got := xorCPL(z); got != 256 {
+		t.Fatalf("zero dist cpl=%d want 256", got)
+	}
+	d := z
+	d[0] = 0x0f
+	if got := xorCPL(d); got != 4 {
+		t.Fatalf("0x0f cpl=%d want 4", got)
+	}
+}

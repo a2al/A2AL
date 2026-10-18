@@ -91,7 +91,7 @@ func (d *Daemon) casObjectAllowed(local, remote a2al.Address, token string, src 
 	e := d.reg.Get(local)
 	d.regMu.RUnlock()
 	if e == nil {
-		return true
+		return false
 	}
 	if d.aclIP.locked(src) {
 		return false
@@ -99,11 +99,7 @@ func (d *Daemon) casObjectAllowed(local, remote a2al.Address, token string, src 
 	if aclDenies(e.ACL, remote) {
 		return false
 	}
-	if e.ACL.Allows(remote, token) {
-		return true
-	}
-	rec, ok := d.casRec(local, id)
-	return ok && grantMatch(rec.Grant, token)
+	return d.objectInCabinetWith(local, remote, id)
 }
 
 func (d *Daemon) serveCASHTTP(rw io.ReadWriter, aid a2al.Address) {

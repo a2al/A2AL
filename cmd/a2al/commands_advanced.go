@@ -1105,6 +1105,7 @@ Commands (everyday use):
   get             HTTP GET to a remote agent (encrypted, NAT-traversing)
   post            HTTP POST to a remote agent (encrypted, NAT-traversing)
   inbound bind    Attach a local HTTP listen to an AID so others can fetch it
+  wake            Bind a local command the daemon runs when this AID is notified
 
 Commands (advanced):
   agents          Manage local agents
@@ -1130,6 +1131,8 @@ Examples:
   a2al get <aid> /.well-known/agent.json
   a2al post <aid> /tasks -d '{"text":"hello"}'
   a2al inbound bind --addr 127.0.0.1:18789
+  a2al wake bind --cmd /usr/local/bin/codex --arg queue --aid <local-aid>
+  a2al wake bind --via acp --cmd agent --arg acp --aid <local-aid>
   a2al tunnel open <aid>
   a2al tunnel
   a2al tunnel close <id>

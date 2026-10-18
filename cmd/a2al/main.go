@@ -69,6 +69,8 @@ func main() {
 		cmdUpdate(cli, g, args)
 	case "inbound":
 		cmdInbound(cli, g, args)
+	case "wake":
+		cmdWake(cli, g, args)
 	default:
 		fmt.Fprintf(os.Stderr, "a2al: unknown command %q (try a2al help)\n", cmd)
 		os.Exit(1)

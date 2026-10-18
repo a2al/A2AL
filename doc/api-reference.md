@@ -149,9 +149,19 @@ POST /agents/{aid}/mailbox/poll
 | `POST` | `/agents/{aid}/chat/send` | `{"peer","text?"}` plus `path` **or** `object_id` (not both) |
 | `POST` | `/agents/{aid}/chat/mark-read` | `{"peer","scanned_to?"}` |
 | `GET` | `/agents/{aid}/chat/contacts` | friends / `out_pending` / `in_pending` |
-| `GET` | `/agents/{aid}/chat/peers/{peer}` | `?after_seq` `&limit` → `{entries, scanned_to, has_more, read_cursor, unread_count}` |
+| `GET` | `/agents/{aid}/chat/peers/{peer}` | `?after_seq` `&limit` → `{entries, scanned_to, has_more, has_older, total, read_cursor, unread_count}`. Omit `after_seq` → newest page; `after_seq=0` → oldest. `has_more` = newer after `scanned_to`; `has_older` = window starts after idx 1 |
 
 Invite first; send without it → `not_friends`.
+
+### Wake bind
+
+| Method | Path | Body / Notes |
+|--------|------|------|
+| `GET` `PUT` `DELETE` | `/agents/{aid}/wake` | PUT: `{"cmd","via?","args?","cwd?","session_cwd?","cap?"}`. `via`: `exec` (default, stdin JSON) or `acp` (ACP JSON-RPC stdio). |
+| `POST` | `/agents/{aid}/wake/test` | `{}` — fires the binding immediately |
+| `GET` `PUT` `DELETE` | `/agents/{aid}/wake/handle` | PUT: `{"handle"}` |
+
+`cap`: soft ACP token budget — sends `session/cancel` on overflow and waits for the agent to finish its turn. `wake status` returns `last.pid`, `last.session_id`, `last.step`, `last.error`.
 
 ### Rooms (inspect vs write)
 
@@ -176,7 +186,7 @@ Content-Type: application/octet-stream
 GET|HEAD /aid/{holder}/cas/{object_id}
 ```
 
-Reads on `/aid/` follow the holder’s ACL. Writes are local-only (API token). `group_object_put` with `path` can hash in place without copying when the file is visible to `a2ald`.
+Remote reads: the holder serves only if the requester still belongs to the chat or group that published the object. Identity-level public/allow does not release files. App download is identity get `GET /agents/{aid}/cas/{object_id}` (API token). Writes are local-only (API token). `group_object_put` with `path` can hash in place without copying when the file is visible to `a2ald`.
 
 ### ACL (agent HTTP / objects)
 
@@ -260,7 +270,7 @@ Required fields in **bold**. `aid` on every `chat_*` / `group_*` is the **local*
 | `chat_request` | **peer**, `note?` |
 | `chat_accept` / `chat_refuse` / `chat_remove` / `chat_block` | **peer** |
 | `chat_send` | **peer**, `text?`, `path` **or** `object_id` |
-| `chat_read` | **peer**, `after_seq`, `limit?` → page with `scanned_to` |
+| `chat_read` | **peer**, `after_seq?`, `limit?` (default 50) → page with `scanned_to`. Omit `after_seq` → newest page; `after_seq=0` → oldest. Cursor is `scanned_to`, not entry `seq`. `has_more` = newer; `has_older` = older left of the window |
 | `chat_mark_read` | **peer**, `scanned_to` (0 / omit = all currently in the log) |
 | `chat_contacts` | (aid only) |
 
@@ -337,6 +347,7 @@ Global: `--api`, `--token`, `--json`, `--quiet`. Env `A2AL_API`, `A2AL_TOKEN`. `
 | `note list` | `<local>` — look |
 | `note poll` | `<local>` — take |
 | `chat` / `group` | Same flags as [User Guide](user-guide.md#chat-11) / [rooms](user-guide.md#rooms) |
+| `wake` | `bind --cmd <path> [--via exec\|acp] [--cwd] [--session-cwd] [--cap N] [--arg]… [--aid]` · `status` · `test` · `handle [--set\|--clear]` · `unbind` |
 | `agents` | `new` `new-eth` `get` `update --service-tcp` `del` `publish` `heartbeat` `export [-o] [--password]` `import [--password]` `topic add <aid> <svc>… [--name --brief --url --ttl --protocol --tag]` `topic del` `acl` `acl-default` `acl-allow` (`--secret`) `acl-deny` `acl-del` |
 | `config` | `get [key]` · `set <key> <value>` (PATCH-able keys only) |
 | `admin` | `on` `off` `password <secret>\|off` `allow` `deny` `del allow\|deny <id>` |

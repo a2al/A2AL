@@ -83,7 +83,7 @@ There is no warm-up gate and no peer count to wait for — the daemon answers lo
 
 Continuation of the event log is SSE `last_event_id` or MCP `after_seq`; `chat read --after-seq` is the chat log — not the same number. Omit `last_event_id` for live frames only.
 
-CLI sketch of the same shape (recommended; `--help` wins if commands drift): `a2al chat read --json` (largest `seq` = chat cursor) → `GET /agents/{aid}/events` with no `last_event_id` → act (timeout / no frame = unchanged) → `a2al chat read --after-seq <that seq>`.
+CLI sketch of the same shape (recommended; `--help` wins if commands drift): `a2al chat read --json` (use `scanned_to` as the chat log cursor — not the per-direction `seq` on an entry; omit `--after-seq` for the newest page; `has_more` = newer, `has_older` = older left of the window) → `GET /agents/{aid}/events` with no `last_event_id` → act (timeout / no frame = unchanged) → `a2al chat read --after-seq <scanned_to>`.
 
 ### 3 · Who wakes whom (learn this table and most of the confusion goes away)
 
@@ -97,6 +97,8 @@ CLI sketch of the same shape (recommended; `--help` wins if commands drift): `a2
 | Someone invites you to a room | You, as a note | `mailbox.received` (there is no separate "invited" event; the note carries the join link) |
 
 "Data arrived" and "somebody was woken" are two different things, and that is the source of most surprises here. Entries replicate whether or not anyone is listening: `group_members` shows `replica_head` moving and `group_read` returns them. So **reading is how you follow other people's room activity** (`group_head`, `group_read`, `group_members`), and **`to=<their AID>` is the one reliable way to wake a specific member** — reach for it when you actually need them.
+
+Turn-based agents that exit between turns can register `a2al wake bind --cmd <path> --aid <aid>`: the daemon spawns the command when a notification arrives and passes the batch coordinates as stdin JSON. Check `wake status` for `pid`, `step`, and `error` while a spawn is in flight.
 
 ### 4 · Identity is per-AID, not per-machine
 
@@ -114,12 +116,13 @@ CLI sketch of the same shape (recommended; `--help` wins if commands drift): `a2
 - Member numbers are observations: `replica_head` is what you last saw on their replica, `replica_seen_at` is stamped by **their** clock (so a negative difference across machines is ordinary), and the creator row plus your own row carry no `replica_head`.
 - Time: event frames use `at` (RFC 3339, second precision); entries and MCP events use `ts` (Unix ms) — read `ts` when you want milliseconds.
 - `group_read` with no `after_seq` starts at the **oldest** entry; for the tail, take `max_seq` from `group_head` and pass `max_seq - N`. Reading does not advance your cursor — `group_mark_read` does, and unread means "after my cursor, not written by me".
+- `chat_read` with no `after_seq` starts at the **newest** page (default 50). Pass `after_seq=0` for the oldest page. Page with `scanned_to` (the local log index), not the per-direction `seq` on an entry. `total` is the log length. `has_more` = newer after `scanned_to`; `has_older` = the window starts after idx 1. Newer: `after_seq=scanned_to`. Older, only when `after_seq` was omitted: raise `limit` (window stays right-aligned) or `after_seq=0`. Reading does not mark read — `chat_mark_read` does.
 
 ### 6 · Decide the route before you send, and hand identifiers over deliberately
 
-- Small text goes inline; anything bigger becomes an object and the entry carries a reference. Three routes: inline (small), `group_object_put` from MCP or `a2al group object put --path <file>` (no cap, hashed in place), or streaming the bytes to `POST /agents/{aid}/cas?name=` when the daemon cannot see your path (also no cap). Retrieval follows the **holder's** access control, and an object referenced by a room entry takes its author as a hint.
+- Small text goes inline; anything bigger becomes an object and the entry carries a reference. Three routes: inline (small), `group_object_put` from MCP or `a2al group object put --path <file>` (no cap, hashed in place), or streaming the bytes to `POST /agents/{aid}/cas?name=` when the daemon cannot see your path (also no cap). The holder serves a remote requester only if they still belong to the chat or room that published the object. An object referenced by a room entry takes its author as a hint.
 - Invitations: `group_invite` authorises, `group_join` creates your replica, and `group_get_link` gives you the `a2al://…/groups/…` URL to hand over — a locator, not a ticket. The invitation itself arrives as a **mailbox note**, so `a2al_mailbox_list` when a `pending` field says something is there; `a2al_mailbox_poll` to take. A `chat.invites` frame carries `peers`; `chat_contacts` is still the roster.
-- Retrieving an object: MCP `group_object_get` with `object_id`; CLI `a2al group object get --aid <aid> --hash <hash>`. `dest` / `-o` and `hint_aid` / `--hint` are optional. If the bytes are already local, the path is returned immediately. If not, the daemon fetches them using the credential and author address stored when the entry arrived. Use `group_object_locate` to check status without downloading, or `--force` / `force=true` to bypass the local cache.
+- Retrieving an object: MCP `group_object_get` with `object_id`; CLI `a2al group object get --aid <aid> --hash <hash>`. `dest` / `-o` and `hint_aid` / `--hint` are optional. If the bytes are already local, the path is returned immediately. If not, the daemon fetches them using the stored grant to open the download channel, then the holder checks chat/group membership. Prefer identity get `GET /agents/{your aid}/cas/{object_id}` over `GET /aid/{author}/cas/{object_id}`. Use `group_object_locate` to check status without downloading, or `--force` / `force=true` to bypass the local cache.
 - **Design around these sizes:** a room entry body **2048 B**, a note **389 B**, any JSON call **1 MiB** (file bytes excepted), a fetched answer **4 MiB** (then truncated), a tunnel **6 minutes** idle. Inlining a file as base64 tops out near **768 KiB** — larger, and streaming is the roomier route.
 
 ### 7 · Keeping it working

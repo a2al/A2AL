@@ -96,6 +96,24 @@ type Config struct {
 
 	// Update controls the auto-update behaviour.
 	Update UpdateConfig `toml:"update" json:"update,omitempty"`
+
+	// Wake holds optional agent-wake settings. Empty AllowedCmds means no
+	// extra restriction (default). Not exposed on PATCH /config.
+	Wake WakeConfig `toml:"wake,omitempty" json:"wake,omitempty"`
+}
+
+// WakeACPCapDefault is the default per-turn token cap for via=acp when the
+// binding does not set cap. Zero in both places refuses ACP.
+const WakeACPCapDefault int64 = 50000
+
+// WakeConfig is the optional local policy for the agent-wake bridge.
+type WakeConfig struct {
+	// AllowedCmds, when non-empty, is the executable whitelist. Bind and
+	// spawn both check it. Empty / omitted = unrestricted.
+	AllowedCmds []string `toml:"allowed_cmds,omitempty" json:"allowed_cmds,omitempty"`
+	// AcpCap is the default ACP per-turn token cap when the binding omits cap.
+	// Zero means no default; via=acp then requires a positive bind cap.
+	AcpCap int64 `toml:"acp_cap,omitempty" json:"acp_cap,omitempty"`
 }
 
 // UpdateConfig holds auto-update settings. Only Auto is user-facing;
@@ -127,6 +145,7 @@ func Default() Config {
 		OpenBrowser:      true,
 		SignalListenAddr: "",
 		LearnedPathFirst: true,
+		Wake:             WakeConfig{AcpCap: WakeACPCapDefault},
 	}
 }
 

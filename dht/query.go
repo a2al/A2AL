@@ -67,6 +67,9 @@ type Query struct {
 	// It counts the distinct peers that were actually contacted (i.e. had an RPC
 	// dispatched), which is a direct measure of query thoroughness.
 	nodesQueried int
+
+	// trace, when non-nil, records per-peer hops. Enable with EnableTrace.
+	trace *QueryTrace
 }
 
 // NodesContacted returns the number of distinct peers that sent a real reply
@@ -128,12 +131,19 @@ type slotRes struct {
 	recs  []protocol.SignedRecord
 	track int         // trackGood | trackUnknown | trackBad
 	from  a2al.NodeID // NodeID of the peer that returned nodes (zero if unknown)
+	peer  a2al.NodeID // queried peer (set even on timeout/error)
+	dist  a2al.NodeID // XOR(peer, target)
+	wave  int
+	addr  string
+	err   error
+	rtt   time.Duration
 }
 
 // reachCandItem is a candidate with pre-computed XOR distance (good or unknown track).
 type reachCandItem struct {
 	ni   protocol.NodeInfo
 	dist a2al.NodeID // XOR(nodeID, target)
+	wave int
 }
 
 // badCandItem is a bad-track candidate.  Health fields are snapshotted at
@@ -143,6 +153,7 @@ type badCandItem struct {
 	dist          a2al.NodeID
 	lastFailure   time.Time
 	totalAttempts int
+	wave          int
 }
 
 // xorLT reports whether XOR distance a is strictly less than b (a is closer).
@@ -230,6 +241,9 @@ func (q *Query) runIterQuery(
 	hitThreshold int,
 ) (outRecs []protocol.SignedRecord, outNodes []protocol.NodeInfo, err error) {
 	n := q.n
+	if q.trace != nil {
+		q.trace.begin(n, target, findValue, recType, hitThreshold)
+	}
 
 	// ── Candidate pools ───────────────────────────────────────────────────
 	// All three pools are owned exclusively by the main goroutine; no mutexes
@@ -259,7 +273,7 @@ func (q *Query) runIterQuery(
 
 	// addCand classifies ni and appends it to the appropriate pool.
 	// Must be called from the main goroutine only.
-	addCand := func(ni protocol.NodeInfo) {
+	addCand := func(ni protocol.NodeInfo, wave int) {
 		k := infoKey(ni)
 		if k == "" {
 			return
@@ -273,9 +287,15 @@ func (q *Query) runIterQuery(
 		// They are not yet reachable via any path; occupying a slot would block
 		// useful candidates and produce guaranteed failures.
 		if n.IsPunching(id) {
+			if q.trace != nil {
+				q.trace.SkipPunch++
+			}
 			return
 		}
 		if _, ok := n.lookupPeer(id); !ok {
+			if q.trace != nil {
+				q.trace.SkipNoAddr++
+			}
 			return
 		}
 		if !tryMark(k) {
@@ -284,14 +304,14 @@ func (q *Query) runIterQuery(
 		dist := xorNodeID(id, target)
 		switch n.PeerHealthOf(id) {
 		case PeerHealthGood:
-			goodCands = insertReach(goodCands, reachCandItem{ni: cloneNI(ni), dist: dist})
+			goodCands = insertReach(goodCands, reachCandItem{ni: cloneNI(ni), dist: dist, wave: wave})
 		case PeerHealthBad:
 			lf, ta := n.peerHealthForSort(id)
 			badCands = insertBad(badCands, badCandItem{
-				ni: cloneNI(ni), dist: dist, lastFailure: lf, totalAttempts: ta,
+				ni: cloneNI(ni), dist: dist, lastFailure: lf, totalAttempts: ta, wave: wave,
 			})
 		default: // Unknown
-			unknownCands = insertReach(unknownCands, reachCandItem{ni: cloneNI(ni), dist: dist})
+			unknownCands = insertReach(unknownCands, reachCandItem{ni: cloneNI(ni), dist: dist, wave: wave})
 		}
 	}
 
@@ -302,7 +322,10 @@ func (q *Query) runIterQuery(
 	// XOR-closest (which may all be unreachable) are included as candidates.
 	for _, ni := range n.tabNearest(target, routing.K*4) {
 		n.absorbNodeInfo(ni, a2al.NodeID{}) // local table: no specific source
-		addCand(ni)
+		addCand(ni, 0)
+	}
+	if q.trace != nil {
+		q.trace.Seeded = len(goodCands) + len(unknownCands) + len(badCands)
 	}
 
 	// ── Accumulators ──────────────────────────────────────────────────────
@@ -331,23 +354,28 @@ func (q *Query) runIterQuery(
 	// Buffered channel: holds results from all in-flight goroutines without blocking.
 	resultCh := make(chan slotRes, queryAlpha+queryGamma+queryBeta+4)
 
-	doRPC := func(ni protocol.NodeInfo, track int) {
+	doRPC := func(ni protocol.NodeInfo, track int, wave int, dist a2al.NodeID) {
 		var id a2al.NodeID
 		copy(id[:], ni.NodeID)
+		base := slotRes{track: track, peer: id, dist: dist, wave: wave}
 		addr, ok := n.lookupPeerHealthAware(id)
 		if !ok {
 			addr, ok = n.lookupPeer(id)
 		}
 		if !ok {
-			resultCh <- slotRes{track: track}
+			base.err = errNoDialAddr
+			resultCh <- base
 			return
 		}
+		base.addr = addr.String()
 		pctx, cancel := context.WithTimeout(ctx, queryPeerTimeout)
 		defer cancel()
+		t0 := time.Now()
 		if findValue {
 			// subscribe=true only in AggregateRecords mode (hitThreshold==0): request
 			// the peer to push future records via MsgDHTPush when they become available.
 			recs, nodes, rpcErr := n.FindValueWithNodes(pctx, addr, target, recType, hitThreshold == 0)
+			base.rtt = time.Since(t0)
 			if rpcErr != nil {
 				// Phase 6 (查询引擎, Lowest): bad-track RPC failure → speculative punch.
 				if track == trackBad {
@@ -355,12 +383,15 @@ func (q *Query) runIterQuery(
 						n.triggerPunch(id, er, PunchPriorityLowest)
 					}
 				}
-				resultCh <- slotRes{track: track}
+				base.err = rpcErr
+				resultCh <- base
 				return
 			}
-			resultCh <- slotRes{recs: recs, nodes: nodes, track: track, from: id}
+			base.recs, base.nodes, base.from = recs, nodes, id
+			resultCh <- base
 		} else {
 			nodes, rpcErr := n.FindNode(pctx, addr, target)
+			base.rtt = time.Since(t0)
 			if rpcErr != nil {
 				// Phase 6 (查询引擎, Lowest): bad-track RPC failure → speculative punch.
 				if track == trackBad {
@@ -368,36 +399,40 @@ func (q *Query) runIterQuery(
 						n.triggerPunch(id, er, PunchPriorityLowest)
 					}
 				}
-				resultCh <- slotRes{track: track}
+				base.err = rpcErr
+				resultCh <- base
 				return
 			}
-			resultCh <- slotRes{nodes: nodes, track: track, from: id}
+			base.nodes, base.from = nodes, id
+			resultCh <- base
 		}
 	}
 
-	launchGood := func(ni protocol.NodeInfo, delay time.Duration) {
+	launchGood := func(item reachCandItem, delay time.Duration) {
 		goodInFlight++
-		go func(ni protocol.NodeInfo, delay time.Duration) {
+		go func(item reachCandItem, delay time.Duration) {
 			if delay > 0 {
 				select {
 				case <-time.After(delay):
 				case <-ctx.Done():
-					resultCh <- slotRes{track: trackGood}
+					var id a2al.NodeID
+					copy(id[:], item.ni.NodeID)
+					resultCh <- slotRes{track: trackGood, peer: id, dist: item.dist, wave: item.wave, err: ctx.Err()}
 					return
 				}
 			}
-			doRPC(ni, trackGood)
-		}(ni, delay)
+			doRPC(item.ni, trackGood, item.wave, item.dist)
+		}(item, delay)
 	}
 
-	launchUnknown := func(ni protocol.NodeInfo) {
+	launchUnknown := func(item reachCandItem) {
 		unknownInFlight++
-		go func() { doRPC(ni, trackUnknown) }()
+		go func() { doRPC(item.ni, trackUnknown, item.wave, item.dist) }()
 	}
 
-	launchBad := func(ni protocol.NodeInfo) {
+	launchBad := func(item badCandItem) {
 		badInFlight++
-		go func() { doRPC(ni, trackBad) }()
+		go func() { doRPC(item.ni, trackBad, item.wave, item.dist) }()
 	}
 
 	// Initial fill of good slots with stagger to smooth the UDP burst.
@@ -407,7 +442,7 @@ func (q *Query) runIterQuery(
 		for i := 0; i < fill; i++ {
 			item := goodCands[0]
 			goodCands = goodCands[1:]
-			launchGood(item.ni, time.Duration(i)*querySlotStagger)
+			launchGood(item, time.Duration(i)*querySlotStagger)
 		}
 	}
 
@@ -425,31 +460,35 @@ func (q *Query) runIterQuery(
 			if k := infoKey(ni); k != "" {
 				allSeen[k] = cloneNI(ni)
 			}
-			addCand(ni)
+			addCand(ni, r.wave+1)
 		}
-		if !findValue {
-			return
-		}
-		// Track nodes that responded but held no records; used for path caching.
-		if hitThreshold > 0 && r.from != (a2al.NodeID{}) && len(r.recs) == 0 {
-			dist := xorNodeID(r.from, target)
-			pathCands = insertReach(pathCands, reachCandItem{
-				ni:   protocol.NodeInfo{NodeID: append([]byte(nil), r.from[:]...)},
-				dist: dist,
-			})
-		}
-		if len(r.recs) == 0 {
-			return
-		}
-		now := time.Now()
-		for _, rec := range filterRecordsAuth(n, target, r.recs, now) {
-			dk := aggregateDedupeKey(rec)
-			if prev, ok := hitMerged[dk]; !ok || protocol.RecordIsNewer(rec, prev) {
-				hitMerged[dk] = rec
+		var recsOK []protocol.SignedRecord
+		if findValue {
+			// Track nodes that responded but held no records; used for path caching.
+			if hitThreshold > 0 && r.from != (a2al.NodeID{}) && len(r.recs) == 0 {
+				dist := xorNodeID(r.from, target)
+				pathCands = insertReach(pathCands, reachCandItem{
+					ni:   protocol.NodeInfo{NodeID: append([]byte(nil), r.from[:]...)},
+					dist: dist,
+					wave: r.wave,
+				})
+			}
+			if len(r.recs) > 0 {
+				now := time.Now()
+				recsOK = filterRecordsAuth(n, target, r.recs, now)
+				for _, rec := range recsOK {
+					dk := aggregateDedupeKey(rec)
+					if prev, ok := hitMerged[dk]; !ok || protocol.RecordIsNewer(rec, prev) {
+						hitMerged[dk] = rec
+					}
+				}
+				if hitThreshold > 0 && len(hitMerged) >= hitThreshold {
+					hitReached = true
+				}
 			}
 		}
-		if hitThreshold > 0 && len(hitMerged) >= hitThreshold {
-			hitReached = true
+		if q.trace != nil {
+			q.trace.recordHop(r, findValue, recsOK)
 		}
 	}
 
@@ -464,7 +503,7 @@ mainLoop:
 		for !hitReached && goodInFlight < queryAlpha && len(goodCands) > 0 {
 			item := goodCands[0]
 			goodCands = goodCands[1:]
-			launchGood(item.ni, 0)
+			launchGood(item, 0)
 		}
 
 		goodDone := goodInFlight == 0 && len(goodCands) == 0
@@ -497,7 +536,7 @@ mainLoop:
 			if !hitReached && unknownInFlight < queryGamma && len(unknownCands) > 0 {
 				item := unknownCands[0]
 				unknownCands = unknownCands[1:]
-				launchUnknown(item.ni)
+				launchUnknown(item)
 			}
 
 		case <-badTicker.C:
@@ -505,7 +544,7 @@ mainLoop:
 			if !hitReached && badInFlight < queryBeta && len(badCands) > 0 {
 				item := badCands[0]
 				badCands = badCands[1:]
-				launchBad(item.ni)
+				launchBad(item)
 			}
 		}
 	}
@@ -546,6 +585,17 @@ mainLoop:
 	outNodes = sortedByDistance(allSeen, target)
 	if len(outNodes) > routing.K {
 		outNodes = outNodes[:routing.K]
+	}
+
+	if q.trace != nil {
+		stop := "exhausted"
+		if hitReached {
+			stop = "hit"
+		}
+		if ctx.Err() != nil {
+			stop = "deadline"
+		}
+		q.trace.finish(stop, respondedCount, outNodes, target)
 	}
 
 	if findValue && len(outRecs) == 0 {
@@ -642,6 +692,8 @@ var ErrNoEndpoint = errors.New("dht: no endpoint record")
 // ErrNoMatchingRecords is returned when FindRecords / AggregateRecords find
 // nothing for the filter.
 var ErrNoMatchingRecords = errors.New("dht: no matching records")
+
+var errNoDialAddr = errors.New("dht: no dial addr")
 
 func filterRecordsAuth(n *Node, targetKey a2al.NodeID, recs []protocol.SignedRecord, now time.Time) []protocol.SignedRecord {
 	var out []protocol.SignedRecord

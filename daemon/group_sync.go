@@ -515,12 +515,15 @@ func (d *Daemon) prefetchGroupFiles(localAID, peerAID a2al.Address, s *group.Sto
 	if err != nil {
 		return
 	}
+	gid := s.ID()
+	gidHex := hex.EncodeToString(gid[:])
 	for _, er := range entries {
 		if er.Ref == ([32]byte{}) || er.Author == localAID {
 			continue
 		}
 		grant, size := parseObjectMeta(er.Body)
 		d.rememberObjectRef(localAID, er.Ref, grant, er.Author, size)
+		d.noteObjectCabinet(localAID, er.Ref, cabinetGroup, gidHex)
 		if size > casPrefetchMax {
 			continue
 		}

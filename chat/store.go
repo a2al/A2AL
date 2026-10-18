@@ -475,6 +475,16 @@ func (s *Store) Unsent(peer a2al.Address) []Rec {
 	return out
 }
 
+func (s *Store) Len(peer a2al.Address) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	pl, err := s.loadLogLocked(peer)
+	if err != nil {
+		return 0
+	}
+	return len(pl.recs)
+}
+
 func (s *Store) Read(peer a2al.Address, after uint64, limit int) (out []Rec, scannedTo uint64, hasMore bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

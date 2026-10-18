@@ -242,6 +242,7 @@ func (d *Daemon) onChatMsg(local, remote a2al.Address, _ string, body []byte) (b
 		}
 		if rec.Kind == chat.KindFile && rec.Ref != ([32]byte{}) {
 			d.rememberObjectRef(local, rec.Ref, rec.Grant, remote, rec.Size)
+			d.noteObjectCabinet(local, rec.Ref, cabinetChat, remote.String())
 			go d.prefetchObject(local, rec.Ref, remote)
 		}
 	}

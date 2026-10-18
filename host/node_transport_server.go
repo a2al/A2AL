@@ -87,6 +87,7 @@ func (s *nodeTransportServer) register(ra *net.UDPAddr, tr *quic.Transport,
 	}()
 }
 
+// evict is the server-side last-ref closer.
 func (s *nodeTransportServer) evict(key string) {
 	s.mu.Lock()
 	e := s.entries[key]
@@ -96,7 +97,7 @@ func (s *nodeTransportServer) evict(key string) {
 		return
 	}
 	e.cancel()
-	_ = e.tr.Close()
+	closeICETransport(e.tr, e.sess)
 	e.sess.Close()
 	s.log.Debug("node transport server: evicted", "remote", key)
 }

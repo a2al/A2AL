@@ -83,6 +83,7 @@ func TestBootstrap_iterativeResolveMem(t *testing.T) {
 
 	C := &packs[3]
 	q := NewQuery(C.n)
+	tr := q.EnableTrace()
 	key := a2al.NodeIDFromAddress(A.ks.addr)
 	er, err := q.Resolve(ctx, key)
 	if err != nil {
@@ -90,6 +91,12 @@ func TestBootstrap_iterativeResolveMem(t *testing.T) {
 	}
 	if len(er.Endpoints) != 1 || er.Endpoints[0] != "quic://10.0.0.1:4242" {
 		t.Fatalf("endpoint %+v", er.Endpoints)
+	}
+	if tr == nil || tr.Attempted == 0 {
+		t.Fatalf("trace hops not recorded: %+v", tr)
+	}
+	if tr.Stop == "" {
+		t.Fatal("trace stop empty")
 	}
 }
 

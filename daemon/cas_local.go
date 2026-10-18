@@ -10,8 +10,10 @@ package daemon
 //	read   GET|HEAD /aid/{holder}/cas/{hash}           resource-addressing gateway;
 //	                                                   any holder, local or remote;
 //	                                                   remote access: deny-list, then
-//	                                                   object grant, else agent ACL;
-//	                                                   no API token.
+//	                                                   requester still in the chat or
+//	                                                   group that published the object;
+//	                                                   no API token. Identity-level
+//	                                                   public does not release files.
 //	       GET      /agents/{aid}/cas/{hash}           identity get; this node's AIDs;
 //	                                                   local-first, else fetch with
 //	                                                   stored grant; API token.

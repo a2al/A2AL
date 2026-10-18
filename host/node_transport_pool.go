@@ -30,8 +30,10 @@ type iceTransportWin struct {
 	remoteAddr *net.UDPAddr
 }
 
+// Last-ref / evict only. Do not Close from punch-join or a rejected control
+// stream. See doc-local/ICE与QUIC关闭原则.md.
 func (w *iceTransportWin) close() {
-	_ = w.tr.Close()
+	closeICETransport(w.tr, w.sess)
 	w.sess.Close()
 }
 
@@ -137,9 +139,9 @@ func (p *nodeTransportPool) evict(key string) {
 	p.mu.Unlock()
 }
 
-// releaseRef decrements e's reference count. When it reaches zero the
-// transport and session are closed, and the entry is removed from the pool
-// if it hasn't already been replaced by a newer entry.
+// releaseRef decrements e's reference count. At zero this is the last-ref
+// closer. Do not Close the same session from punch-join or a rejected control
+// stream. See doc-local/ICE与QUIC关闭原则.md.
 func (p *nodeTransportPool) releaseRef(e *nodeTransportEntry) {
 	if e.refs.Add(-1) == 0 {
 		p.mu.Lock()
@@ -147,7 +149,7 @@ func (p *nodeTransportPool) releaseRef(e *nodeTransportEntry) {
 			delete(p.pool, e.key)
 		}
 		p.mu.Unlock()
-		_ = e.tr.Close()
+		closeICETransport(e.tr, e.sess)
 		e.sess.Close()
 		p.log.Debug("node transport: closed (last ref released)", "remote", e.remoteAddr)
 	}

@@ -4,11 +4,18 @@
 package daemon
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -68,6 +75,7 @@ var allExpectedTools = []string{
 	"chat_mark_read",
 	"chat_contacts",
 	"a2al_events_poll",
+	"a2al_wake_handle",
 }
 
 // newMCPClientSession returns a ClientSession connected to the given server
@@ -310,4 +318,235 @@ func TestMCP_objectPutLocateGet(t *testing.T) {
 	if err != nil || string(b) != "object-bytes" {
 		t.Fatalf("dest %q err=%v", b, err)
 	}
+}
+
+func TestMCP_fillCallToolContent_neverJSONNull(t *testing.T) {
+	ctr := &mcp.CallToolResult{StructuredContent: map[string]any{"ok": true, "n": 1}}
+	fillMCPCallToolContent(ctr)
+	assertCallToolContentArray(t, ctr)
+	text := mcpTextJSON(t, ctr)
+	var got map[string]any
+	if err := json.Unmarshal([]byte(text), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["ok"] != true || got["n"] != float64(1) {
+		t.Fatalf("text JSON %v", got)
+	}
+
+	empty := &mcp.CallToolResult{}
+	fillMCPCallToolContent(empty)
+	assertCallToolContentArray(t, empty)
+
+	errRes := &mcp.CallToolResult{
+		IsError: true,
+		Content: []mcp.Content{&mcp.TextContent{Text: "boom"}},
+	}
+	fillMCPCallToolContent(errRes)
+	assertCallToolContentArray(t, errRes)
+	if mcpTextJSON(t, errRes) != "boom" {
+		t.Fatalf("error text rewritten: %q", mcpTextJSON(t, errRes))
+	}
+}
+
+func TestMCP_callTool_contentMirrorsStructured(t *testing.T) {
+	d := newTestDaemon(t)
+	cs := newMCPClientSession(t, buildMCPServer(d))
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "a2al_status",
+		Arguments: map[string]any{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.IsError {
+		t.Fatalf("tool error: %v", res.Content)
+	}
+	assertCallToolContentArray(t, res)
+	text := mcpTextJSON(t, res)
+	var fromText map[string]any
+	if err := json.Unmarshal([]byte(text), &fromText); err != nil {
+		t.Fatal(err)
+	}
+	sc, ok := res.StructuredContent.(map[string]any)
+	if !ok {
+		t.Fatalf("structured %T", res.StructuredContent)
+	}
+	if fromText["node_aid"] != sc["node_aid"] {
+		t.Fatalf("content text node_aid=%v structured=%v", fromText["node_aid"], sc["node_aid"])
+	}
+}
+
+func TestMCP_callTool_errorContentArray(t *testing.T) {
+	d := newTestDaemon(t)
+	cs := newMCPClientSession(t, buildMCPServer(d))
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "a2al_agent_heartbeat",
+		Arguments: map[string]any{"aid": d.nodeAddr.String()},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.IsError {
+		t.Fatal("expected tool error")
+	}
+	assertCallToolContentArray(t, res)
+	if mcpTextJSON(t, res) == "" {
+		t.Fatal("error content text empty")
+	}
+}
+
+func TestMCP_toolsList_optionalParamsNotRequired(t *testing.T) {
+	d := newTestDaemon(t)
+	cs := newMCPClientSession(t, buildMCPServer(d))
+	res, err := cs.ListTools(context.Background(), &mcp.ListToolsParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantOptional := map[string][]string{
+		"chat_read":           {"after_seq", "limit"},
+		"chat_mark_read":      {"scanned_to"},
+		"a2al_agent_register": {"service_tcp"},
+		"a2al_agent_patch":    {"operational_private_key_hex", "service_tcp"},
+	}
+	got := make(map[string]*mcp.Tool, len(res.Tools))
+	for _, tool := range res.Tools {
+		got[tool.Name] = tool
+	}
+	for name, optionals := range wantOptional {
+		tool, ok := got[name]
+		if !ok || tool.InputSchema == nil {
+			t.Fatalf("%s missing or no input schema", name)
+		}
+		req := make(map[string]bool, len(tool.InputSchema.Required))
+		for _, r := range tool.InputSchema.Required {
+			req[r] = true
+		}
+		for _, field := range optionals {
+			if req[field] {
+				t.Errorf("%s: %s must not be required, got required=%v", name, field, tool.InputSchema.Required)
+			}
+		}
+	}
+}
+
+func TestMCP_httpToolsCall_contentIsJSONArray(t *testing.T) {
+	d := newTestDaemon(t)
+	srv := httptest.NewServer(d.mcpHTTPHandler())
+	t.Cleanup(srv.Close)
+
+	initBody := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}`
+	initResp := mcpHTTPPost(t, srv.URL, "", initBody)
+	sid := initResp.Header.Get("Mcp-Session-Id")
+	if sid == "" {
+		t.Fatal("missing Mcp-Session-Id")
+	}
+	_ = parseSSEJSONRPCResult(t, initResp.Body)
+
+	_ = mcpHTTPPost(t, srv.URL, sid, `{"jsonrpc":"2.0","method":"notifications/initialized"}`)
+
+	call := mcpHTTPPost(t, srv.URL, sid, `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"a2al_status","arguments":{}}}`)
+	raw := parseSSEJSONRPCResult(t, call.Body)
+	var result struct {
+		Content           json.RawMessage `json:"content"`
+		StructuredContent json.RawMessage `json:"structuredContent"`
+		IsError           bool            `json:"isError"`
+	}
+	if err := json.Unmarshal(raw, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.IsError {
+		t.Fatalf("isError: %s", raw)
+	}
+	if bytes.Equal(result.Content, []byte("null")) || len(result.Content) == 0 || result.Content[0] != '[' {
+		t.Fatalf("content must be a JSON array, got %s", result.Content)
+	}
+	var blocks []map[string]any
+	if err := json.Unmarshal(result.Content, &blocks); err != nil {
+		t.Fatal(err)
+	}
+	if len(blocks) == 0 || blocks[0]["type"] != "text" {
+		t.Fatalf("content blocks %v", blocks)
+	}
+}
+
+func assertCallToolContentArray(t *testing.T, ctr *mcp.CallToolResult) {
+	t.Helper()
+	b, err := json.Marshal(ctr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire map[string]any
+	if err := json.Unmarshal(b, &wire); err != nil {
+		t.Fatal(err)
+	}
+	content, ok := wire["content"].([]any)
+	if !ok {
+		t.Fatalf("content JSON %T %v (raw %s)", wire["content"], wire["content"], b)
+	}
+	_ = content
+	if ctr.Content == nil {
+		t.Fatal("Content slice is nil")
+	}
+}
+
+func mcpTextJSON(t *testing.T, ctr *mcp.CallToolResult) string {
+	t.Helper()
+	for _, c := range ctr.Content {
+		if tc, ok := c.(*mcp.TextContent); ok {
+			return tc.Text
+		}
+	}
+	t.Fatal("no text content")
+	return ""
+}
+
+func mcpHTTPPost(t *testing.T, url, sessionID, body string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	if sessionID != "" {
+		req.Header.Set("Mcp-Session-Id", sessionID)
+	}
+	client := &http.Client{Timeout: 8 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = resp.Body.Close() })
+	return resp
+}
+
+func parseSSEJSONRPCResult(t *testing.T, r io.Reader) json.RawMessage {
+	t.Helper()
+	sc := bufio.NewScanner(r)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		var env struct {
+			Result json.RawMessage `json:"result"`
+			Error  json.RawMessage `json:"error"`
+		}
+		if err := json.Unmarshal([]byte(payload), &env); err != nil {
+			t.Fatalf("sse json: %v %s", err, payload)
+		}
+		if len(env.Error) > 0 && string(env.Error) != "null" {
+			t.Fatalf("rpc error %s", env.Error)
+		}
+		if len(env.Result) == 0 {
+			t.Fatalf("no result in %s", payload)
+		}
+		return env.Result
+	}
+	if err := sc.Err(); err != nil {
+		t.Fatal(err)
+	}
+	t.Fatal("no SSE data line")
+	return nil
 }

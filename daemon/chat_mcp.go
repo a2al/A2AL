@@ -52,7 +52,7 @@ then chat_send with object_id and name from that response. status is sent (left 
 	}, d.mcpChatSend)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "chat_read",
-		Description: `Read the local chat log with peer. after_seq is a local index cursor (0 = from the start), exclusive; page with scanned_to. Entries still status=local have not been delivered. Reading does not mark read: call chat_mark_read after you have dealt with inbound entries.`,
+		Description: `Read the local chat log with peer. after_seq is a local index cursor, exclusive; page forward with scanned_to (the log index, not the per-direction seq on an entry). Omit after_seq to get the newest page (default 50). Pass after_seq=0 for the oldest page. total is the log length. has_more means newer entries after scanned_to; has_older means the window does not start at the beginning. To page newer: after_seq=scanned_to. To include older when after_seq was omitted, raise limit (the window stays right-aligned) or pass after_seq=0. Raising limit after a fixed after_seq only extends toward newer entries. Entries still status=local have not been delivered. Reading does not mark read: call chat_mark_read after you have dealt with inbound entries.`,
 	}, d.mcpChatRead)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "chat_mark_read",
@@ -80,16 +80,16 @@ type mcpChatSendArgs struct {
 }
 
 type mcpChatReadArgs struct {
-	AID      string `json:"aid"`
-	Peer     string `json:"peer"`
-	AfterSeq uint64 `json:"after_seq"`
-	Limit    int    `json:"limit,omitempty"`
+	AID      string  `json:"aid"`
+	Peer     string  `json:"peer"`
+	AfterSeq *uint64 `json:"after_seq,omitempty"`
+	Limit    int     `json:"limit,omitempty"`
 }
 
 type mcpChatMarkReadArgs struct {
 	AID       string `json:"aid"`
 	Peer      string `json:"peer"`
-	ScannedTo uint64 `json:"scanned_to"`
+	ScannedTo uint64 `json:"scanned_to,omitempty"`
 }
 
 type mcpChatAIDArgs struct {
@@ -418,6 +418,9 @@ func (d *Daemon) execChatSend(ctx context.Context, aidStr, peerStr, text, path, 
 	if err != nil {
 		return nil, err
 	}
+	if rec.Kind == chat.KindFile {
+		d.noteObjectCabinet(local, rec.Ref, cabinetChat, peer.String())
+	}
 	status := chat.StatusLocal
 	e, _ := st.Get(peer)
 	if e.State == chat.StateMutual {
@@ -439,7 +442,7 @@ func (d *Daemon) execChatSend(ctx context.Context, aidStr, peerStr, text, path, 
 	return map[string]any{"seq": seq, "status": status}, nil
 }
 
-func (d *Daemon) execChatRead(aidStr, peerStr string, after uint64, limit int) (map[string]any, error) {
+func (d *Daemon) execChatRead(aidStr, peerStr string, after *uint64, limit int) (map[string]any, error) {
 	local, peer, err := d.parseChatPair(aidStr, peerStr)
 	if err != nil {
 		return nil, err
@@ -448,7 +451,17 @@ func (d *Daemon) execChatRead(aidStr, peerStr string, after uint64, limit int) (
 	if err != nil {
 		return nil, err
 	}
-	entries, scanned, more := st.Read(peer, after, limit)
+	if limit <= 0 {
+		limit = chat.DefaultLimit
+	}
+	total := st.Len(peer)
+	start := uint64(0)
+	if after != nil {
+		start = *after
+	} else if total > limit {
+		start = uint64(total - limit)
+	}
+	entries, scanned, more := st.Read(peer, start, limit)
 	items := make([]map[string]any, 0, len(entries))
 	for _, r := range entries {
 		items = append(items, d.recToMap(local, peer, r))
@@ -457,6 +470,8 @@ func (d *Daemon) execChatRead(aidStr, peerStr string, after uint64, limit int) (
 		"entries":      items,
 		"scanned_to":   scanned,
 		"has_more":     more,
+		"has_older":    start > 0,
+		"total":        total,
 		"read_cursor":  st.ReadCursor(peer),
 		"unread_count": st.UnreadCount(peer),
 	}, nil

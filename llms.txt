@@ -52,7 +52,7 @@ There is no warm-up gate and no peer count to wait for — the daemon answers lo
 - **Both ends wait** — when your peer polls on a 45-second loop you are measuring *its* loop — and **say your wait out loud** in the message: "waiting for X, up to N seconds; a timeout means unchanged". Mutual waiting is the most common "stuck", because a turn-based agent hears nothing between two tool calls.
 - **Read before you conclude silence.** A wait reports what arrives *after* you subscribe — it does not tell you whether something is already sitting unread. Read the thread (`chat_read`, `group_read`), then wait.
 
-One working CLI pattern (recommended reference, not a required ritual; `--help` wins if commands drift): `a2al chat read --json` (largest `seq` = chat cursor) → `GET /agents/{aid}/events` with no `last_event_id` → act (timeout / no frame = unchanged) → `a2al chat read --after-seq <that seq>`.
+One working CLI pattern (recommended reference, not a required ritual; `--help` wins if commands drift): `a2al chat read --json` (use `scanned_to` as the chat log cursor — not the per-direction `seq` on an entry; omit `--after-seq` for the newest page; `has_more` = newer, `has_older` = older left of the window) → `GET /agents/{aid}/events` with no `last_event_id` → act (timeout / no frame = unchanged) → `a2al chat read --after-seq <scanned_to>`.
 
 - **Who wakes whom** — this table is the whole mental model:
 
@@ -66,6 +66,7 @@ One working CLI pattern (recommended reference, not a required ritual; `--help` 
 | Someone invites you to a room | You, as a note | `mailbox.received` (there is no separate "invited" event; the note carries the join link) |
 
 - **Reading is how you follow others** (`group_head`, `group_read`, `group_members`) — entries replicate whether anyone listens — and **`to=<their AID>` is the one reliable way to wake a specific member**.
+- Turn-based agents that exit between turns: `a2al wake bind` — the daemon spawns the bound command on notification; stdin carries the coordinates. See `llms-full.txt` §3.
 - **Logs are the record, events are hints.** A send reports `sent` (it left your machine) or `local` (queued here — e.g. before the peer accepted — not an error, do not resend). Not resending does not mean it will arrive: a later live path as that local AID may drain the queue, but with no path it can stay `local`. Still `local` is not delivered; new content is a new `seq`. `resolve` is not that path. The peer's own writes are your evidence of delivery. Notes are take-on-read on poll: a poll removes what it returns, so persist the body. `a2al_mailbox_list` looks without taking.
 - **Identify room entries by `entry_id`** (the `seq` an append returns is your replica's position; `group_head`'s `max_seq` is where your replica stands).
 - **Readings are per-identity**: `group_members` answers for the AID that asked, and `a2al tunnel open <peer>` (node identity) and `a2al tunnel open <peer> --local-aid <aid>` (agent identity) can disagree — run the probe you will actually use, and label each reading. `a2al_resolve` and `a2al_agent_probe` are the quick reachability answers.

@@ -67,6 +67,7 @@ One-to-one chat (the chat_* tools) is not mailbox and not a Group:
   - Do not use a2al_mailbox_send as chat. Invite with chat_request; send with chat_send.
   - chat_send to someone not on the list returns not_friends — call chat_request first. If already friends, chat_request resends the invite to heal a stale peer roster. chat_remove drops a friend (both sides); chat_block keeps them blocked.
   - Invitations: pending.chat_invites / chat.invites / chat_contacts (in_pending). Unread: pending.chat_unread / chat.unread / chat_read, then chat_mark_read. chat.received is for an open thread, not the red-dot.
+  - chat_read's after_seq is per call and not remembered. Omit it and you get the newest page (default 50), not the oldest. Pass after_seq=0 for the oldest page. Page forward with scanned_to (the log index), not the per-direction seq on an entry. has_more = newer after scanned_to; has_older = the window starts after idx 1. Newer: after_seq=scanned_to. Older, only when after_seq was omitted: raise limit (window stays right-aligned) or after_seq=0. Reading does not mark read.
 `
 
 func buildMCPServer(d *Daemon) *mcp.Server {
@@ -198,6 +199,7 @@ Events are droppable doorbells, not the record: an event you missed is not recov
 
 	d.registerGroupMCPTools(s)
 	d.registerChatMCPTools(s)
+	d.registerWakeMCPTools(s)
 
 	return s
 }
@@ -211,6 +213,11 @@ Events are droppable doorbells, not the record: an event you missed is not recov
 // single builder: group_mcp.go funnels through mcpOK, but mcp.go constructs
 // CallToolResultFor values inline in ~28 places. One middleware covers both, and
 // covers stdio and HTTP alike since both modes go through buildMCPServer.
+//
+// After hitching, it also fills CallToolResult.content (MCP 2025-06-18: content
+// is a required array; structuredContent SHOULD also appear as a TextContent
+// JSON block). The Go SDK marshals a nil Content slice as JSON null, which
+// strict hosts reject.
 //
 // MCP is the only surface that gets this on every reply, because it is the only
 // one without an event loop — a turn-based agent cannot be woken by an event, so
@@ -228,24 +235,48 @@ func pendingHitchMiddleware(d *Daemon) mcp.Middleware[*mcp.ServerSession] {
 				return res, err
 			}
 			ctr, ok := res.(*mcp.CallToolResult)
-			if !ok || ctr.IsError {
-				// A failed call must not carry unrelated state.
-				return res, err
-			}
-			m, ok := ctr.StructuredContent.(map[string]any)
 			if !ok {
 				return res, err
 			}
-			if _, taken := m["pending"]; taken {
-				// A tool's own field always wins; never shadow business data.
-				return res, err
+			if !ctr.IsError {
+				if m, ok := ctr.StructuredContent.(map[string]any); ok {
+					if _, taken := m["pending"]; !taken {
+						if p := d.pendingSnapshot(ctx, ss); len(p) > 0 {
+							m["pending"] = p
+						}
+					}
+				}
 			}
-			if p := d.pendingSnapshot(ctx, ss); len(p) > 0 {
-				m["pending"] = p
-			}
+			fillMCPCallToolContent(ctr)
 			return res, err
 		}
 	}
+}
+
+// fillMCPCallToolContent makes a tools/call result spec-legal:
+// content is always a JSON array, never null; when structuredContent is set,
+// a text block carries the same JSON so hosts that only read content still see it.
+func fillMCPCallToolContent(ctr *mcp.CallToolResult) {
+	if ctr == nil {
+		return
+	}
+	if ctr.StructuredContent != nil && !mcpContentHasText(ctr.Content) {
+		if b, err := json.Marshal(ctr.StructuredContent); err == nil {
+			ctr.Content = append(ctr.Content, &mcp.TextContent{Text: string(b)})
+		}
+	}
+	if ctr.Content == nil {
+		ctr.Content = []mcp.Content{}
+	}
+}
+
+func mcpContentHasText(content []mcp.Content) bool {
+	for _, c := range content {
+		if _, ok := c.(*mcp.TextContent); ok {
+			return true
+		}
+	}
+	return false
 }
 
 func (d *Daemon) mcpIdentityGenerate(ctx context.Context, _ *mcp.ServerSession, _ *mcp.CallToolParamsFor[struct{}]) (*mcp.CallToolResultFor[map[string]any], error) {
@@ -346,7 +377,7 @@ func (d *Daemon) mcpAgentsList(ctx context.Context, _ *mcp.ServerSession, _ *mcp
 type mcpRegisterArgs struct {
 	OperationalPrivateKeyHex string `json:"operational_private_key_hex"`
 	DelegationProofHex       string `json:"delegation_proof_hex"`
-	ServiceTCP               string `json:"service_tcp"`
+	ServiceTCP               string `json:"service_tcp,omitempty"`
 }
 
 func (d *Daemon) mcpAgentRegister(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[mcpRegisterArgs]) (*mcp.CallToolResultFor[map[string]any], error) {
@@ -388,8 +419,8 @@ func (d *Daemon) mcpAgentProbe(ctx context.Context, _ *mcp.ServerSession, params
 
 type mcpPatchArgs struct {
 	AID                      string  `json:"aid"`
-	OperationalPrivateKeyHex string  `json:"operational_private_key_hex"`
-	ServiceTCP               *string `json:"service_tcp"`
+	OperationalPrivateKeyHex string  `json:"operational_private_key_hex,omitempty"`
+	ServiceTCP               *string `json:"service_tcp,omitempty"`
 }
 
 func (d *Daemon) mcpAgentPatch(ctx context.Context, _ *mcp.ServerSession, params *mcp.CallToolParamsFor[mcpPatchArgs]) (*mcp.CallToolResultFor[map[string]any], error) {

@@ -146,6 +146,13 @@ func TestMCP_pendingHitch_bothResultBuilders(t *testing.T) {
 		if got := per["mailbox"]; got != float64(1) && got != 1 {
 			t.Fatalf("%s: mailbox = %v (%T), want 1", tc.tool, got, got)
 		}
+		var fromText map[string]any
+		if err := json.Unmarshal([]byte(mcpTextJSON(t, res)), &fromText); err != nil {
+			t.Fatalf("%s: content text: %v", tc.tool, err)
+		}
+		if _, ok := fromText["pending"]; !ok {
+			t.Fatalf("%s: content text missing pending: %v", tc.tool, fromText)
+		}
 	}
 }
 

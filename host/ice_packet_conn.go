@@ -4,11 +4,28 @@
 package host
 
 import (
+	"errors"
 	"net"
 	"time"
 
 	ice "github.com/pion/ice/v3"
+	"github.com/quic-go/quic-go"
 )
+
+// closeICETransport tears down a quic.Transport on ice.Conn.
+//
+// Agent close must go through sess.closeAgent (per-session Once). pion's
+// SetReadDeadline is a stub, so Transport.Close cannot unblock listen until
+// the agent is closed (buf.Close wakes ice.Conn.Read). Reverse order deadlocks.
+// See doc-local/ICE与QUIC关闭原则.md.
+func closeICETransport(tr *quic.Transport, sess *iceSession) {
+	if sess != nil {
+		sess.closeAgent()
+	}
+	if tr != nil {
+		_ = tr.Close()
+	}
+}
 
 // icePacketConn adapts ice.Conn (stream-oriented, single remote peer) to
 // net.PacketConn so it can back a quic.Transport.
@@ -35,18 +52,32 @@ import (
 // newSendConn captures LocalAddr once at dial time), so a static snapshot is
 // both correct and consistent with quic-go's expectations.
 //
+// If LocalAddr is already nil (agent closed or selected pair gone),
+// newIcePacketConn returns an error: ICE data-path setup failed. That is
+// expected when punch already won and closed the agent.
+//
 // RemoteAddr() in ReadFrom is safe: when ICE disconnects, Read() returns an
 // error first, so the nil RemoteAddr is never reached or used.
+//
+// Close does not close the ICE agent. Agent lifetime is owned by
+// iceSession.closeAgent. quic-go Transport.Close does not call PacketConn.Close
+// when it did not create the conn (createdConn == false).
 type icePacketConn struct {
 	c         *ice.Conn
 	localAddr net.Addr
 }
 
-// newIcePacketConn constructs an icePacketConn. Must be called immediately
-// after completeICESession succeeds, while the ICE agent is still Connected
-// and LocalAddr() is guaranteed non-nil.
-func newIcePacketConn(c *ice.Conn) *icePacketConn {
-	return &icePacketConn{c: c, localAddr: c.LocalAddr()}
+// newIcePacketConn constructs an icePacketConn. LocalAddr must still be
+// non-nil; a nil addr means the agent is already down.
+func newIcePacketConn(c *ice.Conn) (*icePacketConn, error) {
+	if c == nil {
+		return nil, errors.New("a2al/host: ice conn is nil")
+	}
+	la := c.LocalAddr()
+	if la == nil {
+		return nil, errors.New("a2al/host: ice LocalAddr is nil")
+	}
+	return &icePacketConn{c: c, localAddr: la}, nil
 }
 
 func (p *icePacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
@@ -61,7 +92,7 @@ func (p *icePacketConn) WriteTo(b []byte, _ net.Addr) (int, error) {
 	return p.c.Write(b)
 }
 
-func (p *icePacketConn) Close() error                       { return p.c.Close() }
+func (p *icePacketConn) Close() error                       { return nil }
 func (p *icePacketConn) LocalAddr() net.Addr                { return p.localAddr }
 func (p *icePacketConn) SetDeadline(t time.Time) error      { return p.c.SetDeadline(t) }
 func (p *icePacketConn) SetReadDeadline(t time.Time) error  { return p.c.SetReadDeadline(t) }

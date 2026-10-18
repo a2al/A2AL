@@ -10,6 +10,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -48,7 +49,7 @@ func TestChat_sameDaemonInviteSend(t *testing.T) {
 	if _, err := d.execChatSend(context.Background(), a.String(), b.String(), "hello", "", "", ""); err != nil {
 		t.Fatal(err)
 	}
-	got, err := d.execChatRead(b.String(), a.String(), 0, 20)
+	got, err := d.execChatRead(b.String(), a.String(), u64ptr(0), 20)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +57,7 @@ func TestChat_sameDaemonInviteSend(t *testing.T) {
 	if len(entries) != 1 || entries[0]["body"] != "hello" || entries[0]["status"] != chat.StatusIn {
 		t.Fatalf("%v", entries)
 	}
-	sent, err := d.execChatRead(a.String(), b.String(), 0, 20)
+	sent, err := d.execChatRead(a.String(), b.String(), u64ptr(0), 20)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,7 +87,7 @@ func TestChat_sendStaysLocalWhenAcquireFails(t *testing.T) {
 	if out["status"] != chat.StatusLocal {
 		t.Fatalf("%v", out)
 	}
-	got, err := d.execChatRead(a.String(), peer.String(), 0, 20)
+	got, err := d.execChatRead(a.String(), peer.String(), u64ptr(0), 20)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +152,7 @@ func TestChat_blockKeepsRow(t *testing.T) {
 	if _, err := d.execChatSend(context.Background(), b.String(), a.String(), "no", "", "", ""); err != nil {
 		t.Fatal(err)
 	}
-	got, _ := d.execChatRead(a.String(), b.String(), 0, 10)
+	got, _ := d.execChatRead(a.String(), b.String(), u64ptr(0), 10)
 	if n := len(got["entries"].([]map[string]any)); n != 0 {
 		t.Fatalf("blocked must drop msg, n=%d", n)
 	}
@@ -226,7 +227,7 @@ func TestChat_sendPendingStaysLocal(t *testing.T) {
 	if out["status"] != chat.StatusLocal {
 		t.Fatalf("%v", out)
 	}
-	got, _ := d.execChatRead(b.String(), a.String(), 0, 10)
+	got, _ := d.execChatRead(b.String(), a.String(), u64ptr(0), 10)
 	if n := len(got["entries"].([]map[string]any)); n != 0 {
 		t.Fatalf("pending must not deliver, n=%d", n)
 	}
@@ -340,7 +341,7 @@ func TestChat_unreadMarkRead(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("missing chat.unread")
 	}
-	got, err := d.execChatRead(b.String(), a.String(), 0, 20)
+	got, err := d.execChatRead(b.String(), a.String(), u64ptr(0), 20)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -350,7 +351,7 @@ func TestChat_unreadMarkRead(t *testing.T) {
 	if _, err := d.execChatMarkRead(b.String(), a.String(), 0); err != nil {
 		t.Fatal(err)
 	}
-	got, _ = d.execChatRead(b.String(), a.String(), 0, 20)
+	got, _ = d.execChatRead(b.String(), a.String(), u64ptr(0), 20)
 	if got["unread_count"] != 0 {
 		t.Fatalf("after mark %v", got)
 	}
@@ -631,7 +632,7 @@ func waitChatStatus(t *testing.T, d *Daemon, local, peer a2al.Address, want stri
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		got, err := d.execChatRead(local.String(), peer.String(), 0, 20)
+		got, err := d.execChatRead(local.String(), peer.String(), u64ptr(0), 20)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -730,7 +731,7 @@ func TestChat_pathLiveSkipsWithoutHeartbeat(t *testing.T) {
 		t.Fatal("settler must not send without heartbeat")
 	case <-time.After(80 * time.Millisecond):
 	}
-	got, err := d.execChatRead(a.String(), peer.String(), 0, 20)
+	got, err := d.execChatRead(a.String(), peer.String(), u64ptr(0), 20)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -775,7 +776,7 @@ func TestChat_sendObjectIDUsesDisplayName(t *testing.T) {
 	if _, err := d.execChatSend(context.Background(), a.String(), b.String(), "", "", oid, "notes.txt"); err != nil {
 		t.Fatal(err)
 	}
-	got, err := d.execChatRead(b.String(), a.String(), 0, 20)
+	got, err := d.execChatRead(b.String(), a.String(), u64ptr(0), 20)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -808,7 +809,7 @@ func TestChat_sendObjectIDUsesDisplayName(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	sent, err := d.execChatRead(a.String(), b.String(), 0, 20)
+	sent, err := d.execChatRead(a.String(), b.String(), u64ptr(0), 20)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -825,7 +826,7 @@ func TestChat_sendObjectIDUsesDisplayName(t *testing.T) {
 	if _, err := d.execChatSend(context.Background(), a.String(), b.String(), "", "", oid2, ""); err != nil {
 		t.Fatal(err)
 	}
-	got, err = d.execChatRead(b.String(), a.String(), 0, 20)
+	got, err = d.execChatRead(b.String(), a.String(), u64ptr(0), 20)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -864,4 +865,96 @@ func fetchedHas(v any, aid string) bool {
 		}
 	}
 	return false
+}
+
+func u64ptr(n uint64) *uint64 { return &n }
+
+func TestChat_readOmitAfterSeqReturnsNewestPage(t *testing.T) {
+	d := newTestDaemon(t)
+	a := newTestAgent(t, d)
+	b := newTestAgent(t, d)
+	if _, err := d.execChatRequest(context.Background(), a.String(), b.String(), ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.execChatAccept(context.Background(), b.String(), a.String()); err != nil {
+		t.Fatal(err)
+	}
+	const n, limit = 12, 5
+	for i := 0; i < n; i++ {
+		if _, err := d.execChatSend(context.Background(), a.String(), b.String(), strconv.Itoa(i), "", "", ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	tail, err := d.execChatRead(b.String(), a.String(), nil, limit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := tail["entries"].([]map[string]any)
+	if len(entries) != limit {
+		t.Fatalf("omit after_seq: n=%d, want %d", len(entries), limit)
+	}
+	if tail["total"] != n {
+		t.Fatalf("total=%v, want %d", tail["total"], n)
+	}
+	if tail["has_more"] != false {
+		t.Fatalf("tail has_more=%v, want false", tail["has_more"])
+	}
+	if tail["has_older"] != true {
+		t.Fatalf("tail has_older=%v, want true", tail["has_older"])
+	}
+	if tail["scanned_to"] != uint64(n) {
+		t.Fatalf("scanned_to=%v, want %d", tail["scanned_to"], n)
+	}
+	if entries[0]["idx"] != uint64(n-limit+1) || entries[0]["body"] != strconv.Itoa(n-limit) {
+		t.Fatalf("tail first=%v", entries[0])
+	}
+	if entries[limit-1]["body"] != strconv.Itoa(n-1) {
+		t.Fatalf("tail last=%v", entries[limit-1])
+	}
+
+	oldest, err := d.execChatRead(b.String(), a.String(), u64ptr(0), limit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := oldest["entries"].([]map[string]any)
+	if len(old) != limit || old[0]["idx"] != uint64(1) || old[0]["body"] != "0" {
+		t.Fatalf("after_seq=0: %v", old)
+	}
+	if oldest["has_more"] != true || oldest["has_older"] != false || oldest["scanned_to"] != uint64(limit) || oldest["total"] != n {
+		t.Fatalf("after_seq=0 meta %v", oldest)
+	}
+
+	full, err := d.execChatRead(b.String(), a.String(), nil, n)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if full["has_more"] != false || full["has_older"] != false || full["scanned_to"] != uint64(n) {
+		t.Fatalf("limit>=total meta %v", full)
+	}
+
+	code, httpTail := doJSON(t, d, http.MethodGet, "/agents/"+b.String()+"/chat/peers/"+a.String()+"?limit=5", "")
+	if code != http.StatusOK {
+		t.Fatalf("GET omit after_seq status %d %v", code, httpTail)
+	}
+	httpEntries, _ := httpTail["entries"].([]any)
+	if len(httpEntries) != limit {
+		t.Fatalf("HTTP omit after_seq n=%d", len(httpEntries))
+	}
+	first, _ := httpEntries[0].(map[string]any)
+	if first["body"] != strconv.Itoa(n-limit) {
+		t.Fatalf("HTTP tail first=%v", first)
+	}
+	if httpTail["has_older"] != true || httpTail["has_more"] != false {
+		t.Fatalf("HTTP tail flags %v", httpTail)
+	}
+	code, httpOld := doJSON(t, d, http.MethodGet, "/agents/"+b.String()+"/chat/peers/"+a.String()+"?after_seq=0&limit=5", "")
+	if code != http.StatusOK {
+		t.Fatalf("GET after_seq=0 status %d %v", code, httpOld)
+	}
+	oldEntries, _ := httpOld["entries"].([]any)
+	oldFirst, _ := oldEntries[0].(map[string]any)
+	if oldFirst["body"] != "0" {
+		t.Fatalf("HTTP after_seq=0 first=%v", oldFirst)
+	}
 }

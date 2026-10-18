@@ -18,6 +18,7 @@ import (
 	"net/url"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
@@ -74,6 +75,19 @@ type iceSession struct {
 	// mistaken for a hopeless session.
 	remoteEOC     chan struct{}
 	remoteEOCOnce sync.Once
+
+	// closeAgentOnce serializes Agent.Close. pion taskloop.Close is not safe
+	// for concurrent callers: two Close can both pass Err() then close(done).
+	closeAgentOnce sync.Once
+	agentClosed    atomic.Bool
+
+	// Unselected candidate pruning (ice_prune.go).
+	cnet         *candidateNet
+	pruneMu      sync.Mutex
+	pruneTimer   *time.Timer
+	pruneDone    bool
+	iceConnected atomic.Bool
+	prunedAt     atomic.Int64
 }
 
 // remoteGatherDone reports whether the remote has signalled (via "eoc") that
@@ -179,14 +193,26 @@ func (s *iceSession) isDirectCandidate() bool {
 	return isDirect(pair.Local.Type()) && isDirect(pair.Remote.Type())
 }
 
-// Close tears down all resources: WebSocket, ICE connection, and agent.
+// closeAgent is the only path that may call pion Agent.Close. All other
+// teardown (sess.Close, closeICETransport) must go through here.
+func (s *iceSession) closeAgent() {
+	if s == nil {
+		return
+	}
+	s.closeAgentOnce.Do(func() {
+		s.agentClosed.Store(true)
+		s.stopPrune()
+		if s.agent != nil {
+			_ = s.agent.Close()
+		}
+	})
+}
+
+// Close tears down signaling and the ICE agent. Does not close a quic.Transport
+// sitting on ice.Conn; that is closeICETransport. See doc-local/ICE与QUIC关闭原则.md.
 func (s *iceSession) Close() {
 	s.CloseSignaling()
-	if s.iceConn != nil {
-		_ = s.iceConn.Close() // also closes the agent
-	} else if s.agent != nil {
-		_ = s.agent.Close()
-	}
+	s.closeAgent()
 }
 
 // mergeICEURLs builds a deduplicated list of STUN/TURN URIs from local config.
@@ -351,11 +377,12 @@ func candidateFromAddrType(ip string, port int, typ ice.CandidateType) (ice.Cand
 	}
 }
 
-func newICEAgent(urls []*stun.URI, hostOnly, disableRelay bool, networkTypes []ice.NetworkType) (*ice.Agent, error) {
+func newICEAgent(urls []*stun.URI, hostOnly, disableRelay bool, networkTypes []ice.NetworkType, cnet *candidateNet) (*ice.Agent, error) {
 	cfg := &ice.AgentConfig{
 		Urls:             urls,
 		NetworkTypes:     networkTypes,
 		MulticastDNSMode: ice.MulticastDNSModeDisabled,
+		Net:              cnet,
 	}
 	if hostOnly {
 		cfg.CandidateTypes = []ice.CandidateType{ice.CandidateTypeHost}
@@ -418,7 +445,12 @@ func startICESession(ctx context.Context, wsURL string, urls []*stun.URI, contro
 	// slog.Debug("ice agent urls", "controlling", controlling, "count", len(urls), "urls", fmt.Sprintf("%v", urls))
 
 	// --- 2. ICE agent ---
-	agent, err := newICEAgent(urls, hostOnly, disableRelay, networkTypes)
+	cnet, err := newCandidateNet()
+	if err != nil {
+		return nil, [2]string{}, err
+	}
+	sess.cnet = cnet
+	agent, err := newICEAgent(urls, hostOnly, disableRelay, networkTypes, cnet)
 	if err != nil {
 		return nil, [2]string{}, err
 	}
@@ -426,8 +458,10 @@ func startICESession(ctx context.Context, wsURL string, urls []*stun.URI, contro
 
 	_ = agent.OnConnectionStateChange(func(st ice.ConnectionState) {
 		slog.Debug("ice state changed", "controlling", controlling, "state", st)
+		sess.onICEState(st)
 	})
 	_ = agent.OnSelectedCandidatePairChange(func(local, remote ice.Candidate) {
+		sess.schedulePrune()
 		relayed := local.Type() == ice.CandidateTypeRelay || remote.Type() == ice.CandidateTypeRelay
 		slog.Debug("ice pair selected",
 			"controlling", controlling,

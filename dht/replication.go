@@ -1548,6 +1548,13 @@ func xorNodeID(a, b a2al.NodeID) a2al.NodeID {
 	return d
 }
 
+// xorCPL is the Kademlia common-prefix length of a XOR distance (leading zero bits).
+// Larger CPL = nearer. 0 is a valid far distance.
+func xorCPL(d a2al.NodeID) int {
+	var z a2al.NodeID
+	return a2al.CommonPrefixLen(z, d)
+}
+
 // xorGT reports whether XOR distance a is strictly greater than b
 // (i.e. a is farther from the key than b).
 func xorGT(a, b a2al.NodeID) bool {

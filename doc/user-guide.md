@@ -187,14 +187,14 @@ a2al chat refuse    --aid <you> --peer <them>   # inbound refuse or withdraw out
 a2al chat remove    --aid <you> --peer <them>   # drop a friend (both sides)
 a2al chat block     --aid <you> --peer <them>   # silent; they are not told
 a2al chat send      --aid <you> --peer <them> --text '…'   # or --file <path>
-a2al chat read      --aid <you> --peer <them> [--after-seq N] [--limit N]
+a2al chat read      --aid <you> --peer <them> [--after-seq N] [--limit N]  # omit --after-seq = newest page; 0 = oldest
 a2al chat mark-read --aid <you> --peer <them> [--after-seq N]   # maps to scanned_to
 a2al chat contacts  --aid <you>
 ```
 
 Web UI: identity → **Chat**. Roster: friends / waiting / requests.
 
-`chat_send` to someone not listed returns `not_friends`. Calling `chat_request` again (including when already friends) resends the invite so a stale roster can catch up. Offline send stays `status=local` until a live path exists — queued here, not an error, do not resend; not a delivery receipt. `chat_read` does not mark read.
+`chat_send` to someone not listed returns `not_friends`. Calling `chat_request` again (including when already friends) resends the invite so a stale roster can catch up. Offline send stays `status=local` until a live path exists — queued here, not an error, do not resend; not a delivery receipt. `chat_read` does not mark read. Omit `--after-seq` for the newest page; `--after-seq 0` starts at the oldest. Page newer with `--after-seq <scanned_to>`. `has_older` means history left of the window: raise `--limit` only when `--after-seq` is omitted, or `--after-seq 0`. Page with `scanned_to` (log index), not the per-direction `seq` on an entry.
 
 Invite greeting: **80 characters**. At most **32** unanswered inbound invites; they drop after **72 hours**. While both sides are reachable, type up to about **16 KiB**; longer content is a **file** (no size cap). If they may be offline for hours, send a **note** instead of relying on chat.
 

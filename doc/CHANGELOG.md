@@ -11,6 +11,27 @@ GitHub Release notes are derived from each version section below.
 
 ## [Unreleased]
 
+## [0.3.5] - 2026-10-18
+
+Turn-based agents that exit between turns can now be woken by the local daemon when a notification arrives — a chat message, a room mention, or a note. File object access is tightened to current session or room members. Leftover ICE sockets are cleaned up after hole punching completes.
+
+### Added
+
+- **[Daemon]** Local wake binding: `a2al wake bind|status|test|handle|unbind`; REST `/agents/{aid}/wake` (write restricted to loopback); MCP `a2al_wake_handle`.
+- **[Daemon]** Triggers: `chat.received`, `chat.invites`, `group.mentioned`, `mailbox.received`; debounced and batched per AID; no spawn if nothing new.
+- **[Daemon]** `exec` mode: JSON coordinates on stdin, `{{handle}}` substituted in argv. `acp` mode: ACP JSON-RPC over stdio (`session/new` or `session/load`, then `session/prompt`), with a per-turn token cap (soft: `session/cancel`, no process kill).
+- **[Chat]** `chat_read` adds `has_older`; omitting `after_seq` returns the newest page (`after_seq=0` still returns the oldest).
+
+### Changed
+
+- **[Files]** Objects served only to the current chat peer or active group members.
+- **[CLI]** Unknown flags now fail explicitly instead of being silently ignored.
+- **[Docs]** Wake binding documented in `llms.txt` and the API reference.
+
+### Fixed
+
+- **[Network]** Unused ICE candidate sockets pruned after path selection; redundant ICE session closed when Mode B punch wins; ICE agent teardown order fixed.
+
 ## [0.3.4] - 2026-10-07
 
 v0.3.4 focuses on usability and transfer efficiency. The Web UI can now create and join rooms directly with links and interact with quotes and mentions. Files transfer peer-to-peer with encryption and background prefetch, without any cloud relay. Offline chat messages queue locally and drain automatically once peers reconnect. Notes now support read-only preview.
@@ -348,7 +369,8 @@ First installable A2AL release: local daemon `a2ald` (REST, embedded Web UI, MCP
 
 - **[Daemon]** Hardened key and DHT data paths.
 
-[Unreleased]: https://github.com/a2al/a2al/compare/v0.3.4...HEAD
+[Unreleased]: https://github.com/a2al/a2al/compare/v0.3.5...HEAD
+[0.3.5]: https://github.com/a2al/a2al/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/a2al/a2al/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/a2al/a2al/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/a2al/a2al/compare/v0.3.1...v0.3.2

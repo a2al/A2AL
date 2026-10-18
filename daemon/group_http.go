@@ -126,6 +126,7 @@ func (d *Daemon) execGroupAppendHTTP(aidStr, groupIDStr string, body groupAppend
 
 	kind := "msg"
 	var opts []group.EntryOption
+	var ref [32]byte
 	if hasText {
 		raw := []byte(body.Text)
 		if len(raw) > group.MaxEntryBodySize {
@@ -133,7 +134,8 @@ func (d *Daemon) execGroupAppendHTTP(aidStr, groupIDStr string, body groupAppend
 		}
 		opts = append(opts, group.WithBody(raw))
 	} else {
-		ref, err := parseHex32(obj)
+		var err error
+		ref, err = parseHex32(obj)
 		if err != nil {
 			return nil, fmt.Errorf("object_id: %w", err)
 		}
@@ -166,6 +168,9 @@ func (d *Daemon) execGroupAppendHTTP(aidStr, groupIDStr string, body groupAppend
 	}
 	if err := s.Append(e, nil); err != nil {
 		return nil, fmt.Errorf("append: %w", err)
+	}
+	if hasObj {
+		d.noteObjectCabinet(aid, ref, cabinetGroup, hex.EncodeToString(groupID[:]))
 	}
 	d.kickAlignAuthored(aid, groupID)
 	d.bus.Publish(Event{Type: "group.appended", AID: aid, Data: map[string]any{

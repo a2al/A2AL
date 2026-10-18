@@ -57,13 +57,20 @@ Usage:
   a2al chat mark-read --aid <aid> --peer <aid> [--after-seq <n>]
   a2al chat contacts  --aid <aid>
 
+  chat read: omit --after-seq for the newest page (default 50). --after-seq 0
+  starts at the oldest. Page newer with --after-seq <scanned_to>. has_older
+  means there is history left of the window: raise --limit only when
+  --after-seq is omitted (window stays right-aligned), or --after-seq 0.
+  Page with scanned_to from JSON (log index), not the per-direction seq.
+  Reading does not mark read.
+
 Global flags: --api <url>  --token <tok>  --json  --quiet
 `)
 }
 
 func chatRequest(c *Client, g globalOpts, args []string) {
 	var aid, peer, note string
-	parseGroupFlags(args, map[string]*string{"--aid": &aid, "--peer": &peer, "--note": &note})
+	mustParseFlags("chat request", args, map[string]*string{"--aid": &aid, "--peer": &peer, "--note": &note}, 0)
 	if aid == "" || peer == "" {
 		fatalf("usage: a2al chat request --aid <aid> --peer <aid> [--note <text>]")
 	}
@@ -81,7 +88,7 @@ func chatRequest(c *Client, g globalOpts, args []string) {
 
 func chatAccept(c *Client, g globalOpts, args []string) {
 	var aid, peer string
-	parseGroupFlags(args, map[string]*string{"--aid": &aid, "--peer": &peer})
+	mustParseFlags("chat accept", args, map[string]*string{"--aid": &aid, "--peer": &peer}, 0)
 	if aid == "" || peer == "" {
 		fatalf("usage: a2al chat accept --aid <aid> --peer <aid>")
 	}
@@ -95,7 +102,7 @@ func chatAccept(c *Client, g globalOpts, args []string) {
 
 func chatRefuse(c *Client, g globalOpts, args []string) {
 	var aid, peer string
-	parseGroupFlags(args, map[string]*string{"--aid": &aid, "--peer": &peer})
+	mustParseFlags("chat refuse", args, map[string]*string{"--aid": &aid, "--peer": &peer}, 0)
 	if aid == "" || peer == "" {
 		fatalf("usage: a2al chat refuse --aid <aid> --peer <aid>")
 	}
@@ -109,7 +116,7 @@ func chatRefuse(c *Client, g globalOpts, args []string) {
 
 func chatRemove(c *Client, g globalOpts, args []string) {
 	var aid, peer string
-	parseGroupFlags(args, map[string]*string{"--aid": &aid, "--peer": &peer})
+	mustParseFlags("chat remove", args, map[string]*string{"--aid": &aid, "--peer": &peer}, 0)
 	if aid == "" || peer == "" {
 		fatalf("usage: a2al chat remove --aid <aid> --peer <aid>")
 	}
@@ -123,7 +130,7 @@ func chatRemove(c *Client, g globalOpts, args []string) {
 
 func chatBlock(c *Client, g globalOpts, args []string) {
 	var aid, peer string
-	parseGroupFlags(args, map[string]*string{"--aid": &aid, "--peer": &peer})
+	mustParseFlags("chat block", args, map[string]*string{"--aid": &aid, "--peer": &peer}, 0)
 	if aid == "" || peer == "" {
 		fatalf("usage: a2al chat block --aid <aid> --peer <aid>")
 	}
@@ -145,7 +152,7 @@ func chatFileUnreachable(err error) bool {
 
 func chatSend(c *Client, g globalOpts, args []string) {
 	var aid, peer, text, file string
-	parseGroupFlags(args, map[string]*string{"--aid": &aid, "--peer": &peer, "--text": &text, "--file": &file})
+	mustParseFlags("chat send", args, map[string]*string{"--aid": &aid, "--peer": &peer, "--text": &text, "--file": &file}, 0)
 	if aid == "" || peer == "" {
 		fatalf("usage: a2al chat send --aid <aid> --peer <aid> [--text <text>] [--file <path>]")
 	}
@@ -191,7 +198,7 @@ func chatSend(c *Client, g globalOpts, args []string) {
 
 func chatRead(c *Client, g globalOpts, args []string) {
 	var aid, peer, after, limit string
-	parseGroupFlags(args, map[string]*string{"--aid": &aid, "--peer": &peer, "--after-seq": &after, "--limit": &limit})
+	mustParseFlags("chat read", args, map[string]*string{"--aid": &aid, "--peer": &peer, "--after-seq": &after, "--limit": &limit}, 0)
 	if aid == "" || peer == "" {
 		fatalf("usage: a2al chat read --aid <aid> --peer <aid> [--after-seq <n>] [--limit <n>]")
 	}
@@ -220,11 +227,52 @@ func chatRead(c *Client, g globalOpts, args []string) {
 		e, _ := raw.(map[string]any)
 		fmt.Printf("%v %v %v %v\n", e["idx"], e["dir"], e["status"], e["body"])
 	}
+	total := jsonUint(res["total"])
+	scanned := jsonUint(res["scanned_to"])
+	first := scanned
+	if len(entries) > 0 {
+		if e, ok := entries[0].(map[string]any); ok {
+			first = jsonUint(e["idx"])
+		}
+	}
+	fmt.Printf("# %d..%d of %d", first, scanned, total)
+	if older, _ := res["has_older"].(bool); older {
+		fmt.Printf("  older -> --after-seq 0")
+		if after == "" && total > 0 {
+			fmt.Printf(" or --limit %d", total)
+		}
+	}
+	if more, _ := res["has_more"].(bool); more {
+		fmt.Printf("  newer -> --after-seq %d", scanned)
+	}
+	if unread := jsonUint(res["unread_count"]); unread > 0 {
+		fmt.Printf("  unread %d", unread)
+	}
+	fmt.Println()
+}
+
+func jsonUint(v any) uint64 {
+	switch n := v.(type) {
+	case float64:
+		if n < 0 {
+			return 0
+		}
+		return uint64(n)
+	case int:
+		if n < 0 {
+			return 0
+		}
+		return uint64(n)
+	case uint64:
+		return n
+	default:
+		return 0
+	}
 }
 
 func chatMarkRead(c *Client, g globalOpts, args []string) {
 	var aid, peer, after string
-	parseGroupFlags(args, map[string]*string{"--aid": &aid, "--peer": &peer, "--after-seq": &after})
+	mustParseFlags("chat mark-read", args, map[string]*string{"--aid": &aid, "--peer": &peer, "--after-seq": &after}, 0)
 	if aid == "" || peer == "" {
 		fatalf("usage: a2al chat mark-read --aid <aid> --peer <aid> [--after-seq <n>]")
 	}
@@ -246,7 +294,7 @@ func chatMarkRead(c *Client, g globalOpts, args []string) {
 
 func chatContacts(c *Client, g globalOpts, args []string) {
 	var aid string
-	parseGroupFlags(args, map[string]*string{"--aid": &aid})
+	mustParseFlags("chat contacts", args, map[string]*string{"--aid": &aid}, 0)
 	if aid == "" {
 		fatalf("usage: a2al chat contacts --aid <aid>")
 	}

@@ -39,29 +39,52 @@ func tryCallMCP(c *Client, tool string, args map[string]any) (map[string]any, er
 	return result, err
 }
 
-// parseGroupFlags parses common group flags from argv.
-// Returns remaining positional args after consuming known flags.
-func parseGroupFlags(argv []string, flags map[string]*string) []string {
+// parseFlagsStrict consumes known flags from argv. Unknown -flags, flags
+// missing a value, and extra positionals (beyond maxPos) are errors.
+// A bare "-" is a positional (stdin); "--" ends flag parsing.
+func parseFlagsStrict(argv []string, flags map[string]*string, maxPos int) ([]string, error) {
 	var pos []string
 	for i := 0; i < len(argv); i++ {
 		a := argv[i]
-		consumed := false
-		for flag, ptr := range flags {
-			if a == flag && i+1 < len(argv) {
-				i++
-				*ptr = argv[i]
-				consumed = true
-				break
-			}
-			if strings.HasPrefix(a, flag+"=") {
-				*ptr = strings.TrimPrefix(a, flag+"=")
-				consumed = true
-				break
-			}
+		if a == "--" {
+			pos = append(pos, argv[i+1:]...)
+			break
 		}
-		if !consumed {
-			pos = append(pos, a)
+		if strings.HasPrefix(a, "-") && a != "-" {
+			matched := false
+			for flag, ptr := range flags {
+				if a == flag {
+					if i+1 >= len(argv) {
+						return nil, fmt.Errorf("missing value for %s", flag)
+					}
+					i++
+					*ptr = argv[i]
+					matched = true
+					break
+				}
+				if strings.HasPrefix(a, flag+"=") {
+					*ptr = strings.TrimPrefix(a, flag+"=")
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				return nil, fmt.Errorf("unknown flag %s", a)
+			}
+			continue
 		}
+		pos = append(pos, a)
+	}
+	if maxPos >= 0 && len(pos) > maxPos {
+		return nil, fmt.Errorf("unexpected argument %s", pos[maxPos])
+	}
+	return pos, nil
+}
+
+func mustParseFlags(cmd string, argv []string, flags map[string]*string, maxPos int) []string {
+	pos, err := parseFlagsStrict(argv, flags, maxPos)
+	if err != nil {
+		fatalf("%s: %v", cmd, err)
 	}
 	return pos
 }
@@ -136,7 +159,7 @@ Global flags: --api <url>  --token <tok>  --json  --quiet
 
 func groupCreate(c *Client, g globalOpts, args []string) {
 	var aid, title string
-	parseGroupFlags(args, map[string]*string{"--aid": &aid, "--title": &title})
+	mustParseFlags("group create", args, map[string]*string{"--aid": &aid, "--title": &title}, 0)
 	if aid == "" {
 		fatalf("usage: a2al group create --aid <aid> [--title <title>]")
 	}
@@ -154,7 +177,7 @@ func groupCreate(c *Client, g globalOpts, args []string) {
 
 func groupList(c *Client, g globalOpts, args []string) {
 	var aid string
-	parseGroupFlags(args, map[string]*string{"--aid": &aid})
+	mustParseFlags("group list", args, map[string]*string{"--aid": &aid}, 0)
 	if aid == "" {
 		fatalf("usage: a2al group list --aid <aid>")
 	}
@@ -182,11 +205,11 @@ func groupList(c *Client, g globalOpts, args []string) {
 
 func groupJoin(c *Client, g globalOpts, args []string) {
 	var aid, link, groupID, creator, peer, title, inviter string
-	parseGroupFlags(args, map[string]*string{
+	mustParseFlags("group join", args, map[string]*string{
 		"--aid": &aid, "--link": &link, "--group-id": &groupID,
 		"--creator": &creator, "--peer": &peer, "--title": &title,
 		"--inviter": &inviter,
-	})
+	}, 0)
 	if aid == "" || (link == "" && (groupID == "" || creator == "")) {
 		fatalf("usage: a2al group join --aid <aid> (--link <url> | --group-id <id> --creator <aid>) [--peer <aid>] [--inviter <aid>] [--title <t>]")
 	}
@@ -217,7 +240,7 @@ func groupJoin(c *Client, g globalOpts, args []string) {
 
 func groupInvite(c *Client, g globalOpts, args []string) {
 	var aid, groupID, target string
-	parseGroupFlags(args, map[string]*string{"--aid": &aid, "--group-id": &groupID, "--target": &target})
+	mustParseFlags("group invite", args, map[string]*string{"--aid": &aid, "--group-id": &groupID, "--target": &target}, 0)
 	if aid == "" || groupID == "" || target == "" {
 		fatalf("usage: a2al group invite --aid <aid> --group-id <id> --target <aid>")
 	}
@@ -235,17 +258,22 @@ func groupAppend(c *Client, g globalOpts, args []string) {
 	// Collect --to flags manually before generic parse.
 	filtered := args[:0:0]
 	for i := 0; i < len(args); i++ {
-		if args[i] == "--to" && i+1 < len(args) {
+		if args[i] == "--to" {
+			if i+1 >= len(args) {
+				fatalf("group append: missing value for --to")
+			}
 			toAIDs = append(toAIDs, args[i+1])
 			i++
+		} else if strings.HasPrefix(args[i], "--to=") {
+			toAIDs = append(toAIDs, strings.TrimPrefix(args[i], "--to="))
 		} else {
 			filtered = append(filtered, args[i])
 		}
 	}
-	parseGroupFlags(filtered, map[string]*string{
+	mustParseFlags("group append", filtered, map[string]*string{
 		"--aid": &aid, "--group-id": &groupID, "--kind": &kind,
 		"--body": &body, "--file": &file, "--reply-to": &replyTo,
-	})
+	}, 0)
 	if aid == "" || groupID == "" {
 		fatalf("usage: a2al group append --aid <aid> --group-id <id> [--kind <k>] [--body <text>] [--file <path>] [--reply-to <id>] [--to <aid>]")
 	}
@@ -301,11 +329,11 @@ func groupAppend(c *Client, g globalOpts, args []string) {
 
 func groupRead(c *Client, g globalOpts, args []string) {
 	var aid, groupID, afterSeqStr, limitStr, kind, cursorStr string
-	parseGroupFlags(args, map[string]*string{
+	mustParseFlags("group read", args, map[string]*string{
 		"--aid": &aid, "--group-id": &groupID,
 		"--after-seq": &afterSeqStr, "--limit": &limitStr, "--kind": &kind,
 		"--cursor": &cursorStr,
-	})
+	}, 0)
 	if cursorStr != "" {
 		fatalf("--cursor was renamed to --after-seq")
 	}
@@ -360,7 +388,7 @@ func groupRead(c *Client, g globalOpts, args []string) {
 
 func groupHead(c *Client, g globalOpts, args []string) {
 	var aid, groupID string
-	parseGroupFlags(args, map[string]*string{"--aid": &aid, "--group-id": &groupID})
+	mustParseFlags("group head", args, map[string]*string{"--aid": &aid, "--group-id": &groupID}, 0)
 	if aid == "" || groupID == "" {
 		fatalf("usage: a2al group head --aid <aid> --group-id <id>")
 	}
@@ -380,7 +408,7 @@ func groupHead(c *Client, g globalOpts, args []string) {
 
 func groupSync(c *Client, g globalOpts, args []string) {
 	var aid, groupID, peer string
-	parseGroupFlags(args, map[string]*string{"--aid": &aid, "--group-id": &groupID, "--peer": &peer})
+	mustParseFlags("group sync", args, map[string]*string{"--aid": &aid, "--group-id": &groupID, "--peer": &peer}, 0)
 	if aid == "" || groupID == "" || peer == "" {
 		fatalf("usage: a2al group sync --aid <aid> --group-id <id> --peer <aid>")
 	}
@@ -394,7 +422,7 @@ func groupSync(c *Client, g globalOpts, args []string) {
 
 func groupMembers(c *Client, g globalOpts, args []string) {
 	var aid, groupID string
-	parseGroupFlags(args, map[string]*string{"--aid": &aid, "--group-id": &groupID})
+	mustParseFlags("group members", args, map[string]*string{"--aid": &aid, "--group-id": &groupID}, 0)
 	if aid == "" || groupID == "" {
 		fatalf("usage: a2al group members --aid <aid> --group-id <id>")
 	}
@@ -420,7 +448,7 @@ func groupMembers(c *Client, g globalOpts, args []string) {
 
 func groupGetLink(c *Client, g globalOpts, args []string) {
 	var aid, groupID string
-	parseGroupFlags(args, map[string]*string{"--aid": &aid, "--group-id": &groupID})
+	mustParseFlags("group get-link", args, map[string]*string{"--aid": &aid, "--group-id": &groupID}, 0)
 	if aid == "" || groupID == "" {
 		fatalf("usage: a2al group get-link --aid <aid> --group-id <id>")
 	}
@@ -434,7 +462,7 @@ func groupGetLink(c *Client, g globalOpts, args []string) {
 
 func groupMarkRead(c *Client, g globalOpts, args []string) {
 	var aid, groupID, seqStr string
-	parseGroupFlags(args, map[string]*string{"--aid": &aid, "--group-id": &groupID, "--seq": &seqStr})
+	mustParseFlags("group mark-read", args, map[string]*string{"--aid": &aid, "--group-id": &groupID, "--seq": &seqStr}, 0)
 	if aid == "" || groupID == "" || seqStr == "" {
 		fatalf("usage: a2al group mark-read --aid <aid> --group-id <id> --seq <n>")
 	}
@@ -452,7 +480,7 @@ func groupMarkRead(c *Client, g globalOpts, args []string) {
 
 func groupRetract(c *Client, g globalOpts, args []string) {
 	var aid, groupID, entryID string
-	parseGroupFlags(args, map[string]*string{"--aid": &aid, "--group-id": &groupID, "--entry": &entryID})
+	mustParseFlags("group retract", args, map[string]*string{"--aid": &aid, "--group-id": &groupID, "--entry": &entryID}, 0)
 	if aid == "" || groupID == "" || entryID == "" {
 		fatalf("usage: a2al group retract --aid <aid> --group-id <id> --entry <entry-id>")
 	}
@@ -484,7 +512,7 @@ func groupObject(c *Client, g globalOpts, args []string) {
 
 func groupObjectPut(c *Client, g globalOpts, args []string) {
 	var aid string
-	pos := parseGroupFlags(args, map[string]*string{"--aid": &aid})
+	pos := mustParseFlags("group object put", args, map[string]*string{"--aid": &aid}, 1)
 	if aid == "" || len(pos) == 0 {
 		fatalf("usage: a2al group object put --aid <aid> <file>")
 	}
@@ -530,7 +558,7 @@ func uploadObject(c *Client, aid, filePath string) (map[string]any, error) {
 
 func groupObjectLocate(c *Client, g globalOpts, args []string) {
 	var aid, hash, hint string
-	parseGroupFlags(args, map[string]*string{"--aid": &aid, "--hash": &hash, "--hint": &hint})
+	mustParseFlags("group object locate", args, map[string]*string{"--aid": &aid, "--hash": &hash, "--hint": &hint}, 0)
 	if aid == "" || hash == "" {
 		fatalf("usage: a2al group object locate --aid <aid> --hash <hash> [--hint <aid>]")
 	}
@@ -568,9 +596,9 @@ func groupObjectGet(c *Client, g globalOpts, args []string) {
 		}
 		filtered = append(filtered, args[i])
 	}
-	parseGroupFlags(filtered, map[string]*string{
+	mustParseFlags("group object get", filtered, map[string]*string{
 		"--aid": &aid, "--hash": &hash, "--hint": &hint, "-o": &outFile,
-	})
+	}, 0)
 	if aid == "" || hash == "" {
 		fatalf("usage: a2al group object get --aid <aid> --hash <hash> [--hint <aid>] [-o <file>] [--register] [--force]")
 	}

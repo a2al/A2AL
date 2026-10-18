@@ -89,7 +89,7 @@ body_base64 travels inside this JSON call and so is capped by the API request li
     Content-Type: application/octet-stream
     <raw file bytes>
 
-That endpoint has no size limit, returns the same {object_id, size, name, url}, and needs the same API token as this one. Read objects back with GET /aid/{holder}/cas/{object_id}, which also streams.`,
+That endpoint has no size limit, returns the same {object_id, size, name, url}, and needs the same API token as this one. Read objects back with GET /agents/{this aid}/cas/{object_id} (same API token). The holder serves a remote requester only if they still belong to the chat or room that published the object.`,
 	}, d.mcpGroupObjectPut)
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "group_object_locate",
@@ -353,6 +353,7 @@ func (d *Daemon) mcpGroupAppend(_ context.Context, _ *mcp.ServerSession, p *mcp.
 	}
 	opts := []group.EntryOption{}
 	var body []byte
+	var ref [32]byte
 	if a.Body != "" {
 		var err error
 		body, err = base64.StdEncoding.DecodeString(a.Body)
@@ -365,7 +366,8 @@ func (d *Daemon) mcpGroupAppend(_ context.Context, _ *mcp.ServerSession, p *mcp.
 		}
 	}
 	if a.Ref != "" {
-		ref, err := parseHex32(a.Ref)
+		var err error
+		ref, err = parseHex32(a.Ref)
 		if err != nil {
 			return nil, fmt.Errorf("group_append: ref: %w", err)
 		}
@@ -405,6 +407,9 @@ func (d *Daemon) mcpGroupAppend(_ context.Context, _ *mcp.ServerSession, p *mcp.
 	}
 	if err := s.Append(e, nil); err != nil {
 		return nil, fmt.Errorf("group_append: append: %w", err)
+	}
+	if a.Ref != "" {
+		d.noteObjectCabinet(aid, ref, cabinetGroup, hex.EncodeToString(groupID[:]))
 	}
 	d.kickAlignAuthored(aid, groupID)
 	d.bus.Publish(Event{Type: "group.appended", AID: aid, Data: map[string]any{
